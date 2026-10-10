@@ -2,7 +2,7 @@
 // Constantin Clerc (c22dev) - 0.1
 
 use anyhow::{bail, Context, Result};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -91,16 +91,24 @@ pub fn import(zip_path: &Path, dest: &Path, keep_code: bool, mut progress: impl 
 }
 
 fn tidy_lists(data: &Path) -> Result<()> {
+    let mut modified_sizes = HashMap::new();
     let dlc = data.join("common/data/dlcList.xml");
     if let Ok(text) = std::fs::read_to_string(&dlc) {
         let kept: Vec<&str> = text.lines().filter(|l| !SKIPPED_DIRS.iter().any(|d| l.to_ascii_lowercase().contains(d))).collect();
         std::fs::write(&dlc, kept.join("\n") + "\n")?;
+        modified_sizes.insert("common/data/dlcList.xml", std::fs::metadata(&dlc)?.len());
     }
     let manifest_path = data.join("manifest.json");
     let mut manifest: serde_json::Value = serde_json::from_slice(&std::fs::read(&manifest_path)?).context("manifest.json")?;
     let present: HashSet<PathBuf> = walk(data);
     if let Some(files) = manifest.get_mut("files").and_then(|f| f.as_array_mut()) {
         files.retain(|f| f.get(0).and_then(|p| p.as_str()).is_some_and(|p| present.contains(&data.join(p))));
+        for file in files.iter_mut() {
+            let size = file.get(0).and_then(|p| p.as_str()).and_then(|p| modified_sizes.get(p)).copied();
+            if let Some(size) = size {
+                *file.get_mut(1).context("modified asset manifest entry has no byte size")? = size.into();
+            }
+        }
     }
     std::fs::write(&manifest_path, serde_json::to_vec(&manifest)?)?;
     Ok(())
@@ -120,6 +128,82 @@ fn walk(dir: &Path) -> HashSet<PathBuf> {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::FileExt;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    struct TestDirectory(PathBuf);
+
+    impl Drop for TestDirectory {
+        fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); }
+    }
+
+    #[test]
+    fn import_updates_only_modified_asset_sizes_and_removes_skipped_assets() -> Result<()> {
+        let unique = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+        let temporary = TestDirectory(std::env::temp_dir().join(format!("muguet-import-{}-{unique}", std::process::id())));
+        std::fs::create_dir(&temporary.0)?;
+        let archive_path = temporary.0.join("game.zip");
+        let destination = temporary.0.join("game");
+        let original_dlc = b"<Paths>\n<Item>dlcpacks:/env_test/</Item>\n<Item>dlcpacks:/main/</Item>\n</Paths>\r\n";
+        let kept_dlc = b"<Paths>\n<Item>dlcpacks:/main/</Item>\n</Paths>\n";
+        let regular = b"regular asset\0";
+        let regular_row = serde_json::json!(["regular.bin", regular.len(), {"preserved": true}]);
+        // An unrelated mismatch must not be silently normalized by this repair.
+        let unchanged_row = serde_json::json!(["unchanged-size.bin", 999]);
+        let original_manifest = serde_json::json!({
+            "mount": "/", "version": "fixture", "custom": {"keep": [1, 2]},
+            "files": [
+                ["common/data/dlcList.xml", original_dlc.len(), {"preserved": "dlc"}],
+                ["dlcpacks/env_test/asset.bin", 7], regular_row.clone(), unchanged_row.clone()
+            ]
+        });
+        let manifest_bytes = serde_json::to_vec(&original_manifest)?;
+        let mut archive = zip::ZipWriter::new(File::create(&archive_path)?);
+        let options = zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+        for (name, bytes) in [
+            ("package/data/manifest.json", manifest_bytes.as_slice()),
+            ("package/data/common/data/dlcList.xml", original_dlc.as_slice()),
+            ("package/data/dlcpacks/env_test/asset.bin", b"skipped".as_slice()),
+            ("package/data/regular.bin", regular.as_slice()),
+            ("package/data/unchanged-size.bin", b"keep".as_slice()),
+            ("package/b/test/shaders/index.json", b"{}".as_slice()),
+            ("package/b/test/game.wasm", b"\0asm\x01\0\0\0".as_slice()),
+        ] {
+            archive.start_file(name, options)?;
+            archive.write_all(bytes)?;
+        }
+        archive.finish()?;
+
+        import(&archive_path, &destination, true, |_, _| {})?;
+        let data = destination.join("data");
+        let manifest: serde_json::Value = serde_json::from_slice(&std::fs::read(data.join("manifest.json"))?)?;
+        assert_eq!(manifest["mount"], original_manifest["mount"]);
+        assert_eq!(manifest["version"], original_manifest["version"]);
+        assert_eq!(manifest["custom"], original_manifest["custom"]);
+        let files = manifest["files"].as_array().unwrap();
+        assert_eq!(files.len(), 3);
+        assert!(!data.join("dlcpacks/env_test/asset.bin").exists());
+        assert!(!files.iter().any(|row| row[0] == "dlcpacks/env_test/asset.bin"));
+        assert!(files.contains(&regular_row));
+        assert!(files.contains(&unchanged_row));
+        assert_eq!(std::fs::read(data.join("regular.bin"))?, regular);
+        assert_eq!(std::fs::read(data.join("unchanged-size.bin"))?, b"keep");
+        let dlc_row = files.iter().find(|row| row[0] == "common/data/dlcList.xml").unwrap();
+        assert_eq!(dlc_row[2], serde_json::json!({"preserved": "dlc"}));
+        let advertised_size = dlc_row[1].as_u64().unwrap();
+        let dlc_file = File::open(data.join("common/data/dlcList.xml"))?;
+        assert_eq!(advertised_size, dlc_file.metadata()?.len());
+        assert!(advertised_size < original_dlc.len() as u64);
+        let mut read_to_advertised_eof = vec![0; advertised_size as usize];
+        dlc_file.read_exact_at(&mut read_to_advertised_eof, 0)?;
+        assert_eq!(read_to_advertised_eof, kept_dlc);
+        Ok(())
+    }
 }
 
 #[cfg(target_os = "ios")]

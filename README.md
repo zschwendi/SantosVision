@@ -13,6 +13,10 @@ still targets iOS and macOS. Full immersive GTA gameplay is not implemented or v
   The repository includes no retail-to-web-port converter.
 - Run `python3 scripts/validate-game.py /path/to/game.zip` before building.
   See [game-file requirements](docs/GAME-FILES.md).
+- The [full-game-v1 snapshot release](https://github.com/alihammoud21/playgta5/releases/tag/full-game-v1)
+  provides 14 independent game archives. `scripts/assemble-game.py` verifies them
+  and combines their game files into one Muguet ZIP; the linked game-file guide
+  covers the required metadata and two known source-manifest repairs.
 - `python3 scripts/precompile-visionos.py /path/to/game.zip` uses a built host
   compiler to produce visionOS AOT code. It does not create a playable app.
 - `cargo build --locked --bin inspect-game`, followed by
@@ -21,6 +25,12 @@ still targets iOS and macOS. Full immersive GTA gameplay is not implemented or v
 - The native target in `visionos/` is a separate **head-tracking calibration**
   checkpoint. It contains no GTA engine or game assets. See its README for build
   instructions and the remaining integration work.
+
+On October 10, 2026, the real snapshot module (build `8b0b5899ed`, SHA-256
+`11ca8d2c04c5e843d18ff4aea4899d72c86973c6b031df334e67c446b2ae83e0`)
+passed read-only WASM validation and Muguet hook inspection, and compiled for
+`aarch64-apple-visionos` with this fork's host compiler. These checks do not
+establish game launch, shader compatibility, stereo rendering, or headset tracking.
 
 The upstream instructions below describe the existing iOS/macOS port.
 

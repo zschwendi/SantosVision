@@ -80,6 +80,7 @@ fn inventory(bytes: &[u8]) -> Result<Value> {
         name.contains("camera") || name.contains("gameplaycam") || name.contains("setcam")
             || name.contains("renderscriptcam") || name.contains("frustum")
             || name.contains("projectionmatrix") || name.contains("viewmatrix")
+            || name.contains("grcviewport::")
     }).map(|(&index, name)| describe(index, name)).collect::<Result<Vec<_>>>()?;
     let exported_functions = exports.iter().map(|(name, &index)| describe(index, name))
         .collect::<Result<Vec<_>>>()?;
