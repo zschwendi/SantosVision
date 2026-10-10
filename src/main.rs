@@ -119,15 +119,18 @@ fn main() -> Result<()> {
         return Ok(());
     }
     #[cfg(feature = "jit")]
-    if argv.get(1).map(String::as_str) == Some("--precompile-ios") {
-        let (wasm, out) = (argv.get(2).context("--precompile-ios <wasm> <out>")?, argv.get(3).context("--precompile-ios <wasm> <out>")?);
+    if matches!(argv.get(1).map(String::as_str), Some("--precompile-ios" | "--precompile-visionos")) {
+        let option = argv[1].as_str();
+        let usage = format!("{option} <wasm> <out>");
+        let (wasm, out) = (argv.get(2).context(usage.clone())?, argv.get(3).context(usage)?);
+        let target = if option == "--precompile-visionos" { "aarch64-apple-visionos" } else { "aarch64-apple-ios" };
         let mut config = engine_config_for(true);
-        config.target("aarch64-apple-ios").map_err(anyhow::Error::from)?;
+        config.target(target).map_err(anyhow::Error::from)?;
         unsafe { config.cranelift_flag_enable("has_lse") };
         let engine = Engine::new(&config).map_err(anyhow::Error::from)?;
         let patched = patch::patch(&std::fs::read(wasm)?, mp::COMMANDS)?;
         std::fs::write(out, engine.precompile_module(&patched).map_err(anyhow::Error::from)?)?;
-        eprintln!("[host] precompiled {wasm} -> {out}");
+        eprintln!("[host] precompiled {wasm} for {target} -> {out}");
         return Ok(());
     }
     let startup = match config::setup() {
@@ -370,6 +373,23 @@ fn engine_config_for(ios: bool) -> Config {
         config.cranelift_flag_set("enable_table_access_spectre_mitigation", "false");
     }
     config
+}
+
+#[cfg(all(test, feature = "jit"))]
+mod platform_tests {
+    #[test]
+    fn visionos_aot_accepts_target_and_compiles_wasm() {
+        // Check the actual cross compiler before asking for a multi-gigabyte game package.
+        // This does not exercise the GTA engine or signed execution on a headset.
+        let mut config = super::engine_config_for(true);
+        config.target("aarch64-apple-visionos").expect("visionOS target");
+        unsafe { config.cranelift_flag_enable("has_lse") };
+        let engine = wasmtime::Engine::new(&config).expect("visionOS AOT compiler");
+        // add(i32, i32) -> i32 forces actual machine-code generation.
+        let module = b"\0asm\x01\0\0\0\x01\x07\x01\x60\x02\x7f\x7f\x01\x7f\x03\x02\x01\0\x07\x07\x01\x03add\0\0\x0a\x09\x01\x07\0\x20\0\x20\x01\x6a\x0b";
+        let compiled = engine.precompile_module(module).expect("compile WASM function for visionOS");
+        assert!(!compiled.is_empty());
+    }
 }
 
 pub fn instantiate(rt: &Arc<Runtime>, pthread: u64) -> Result<(Store<HostState>, Instance)> {

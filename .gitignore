@@ -1,10 +1,13 @@
 /target
+/.tools/
 /build
+/visionos/*.xcodeproj
 /ios/*.xcodeproj
 xcuserdata/
 DerivedData/
 *.xcworkspace
 .DS_Store
+__pycache__/
 .vscode/
 .idea/
 

@@ -1,0 +1,30 @@
+name: SantosVision
+options:
+  deploymentTarget:
+    visionOS: "26.0"
+  createIntermediateGroups: true
+targets:
+  SantosVision:
+    type: application
+    platform: visionOS
+    sources:
+      - path: Sources
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.zephyrstudios.santosvision
+        PRODUCT_NAME: SantosVision
+        INFOPLIST_FILE: ../../visionos/Info.plist
+        GENERATE_INFOPLIST_FILE: NO
+        SWIFT_VERSION: "6.0"
+        SWIFT_STRICT_CONCURRENCY: complete
+        SWIFT_DEFAULT_ACTOR_ISOLATION: nonisolated
+        CODE_SIGN_STYLE: Automatic
+        TARGETED_DEVICE_FAMILY: "7"
+        ENABLE_USER_SCRIPT_SANDBOXING: YES
+        SUPPORTS_MACCATALYST: NO
+        ENABLE_DEBUG_DYLIB: NO
+        SDKROOT: xros
+    dependencies:
+      - sdk: CompositorServices.framework
+      - sdk: ARKit.framework
+      - sdk: Metal.framework

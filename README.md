@@ -1,6 +1,29 @@
 # Muguet
 A native Mach-O iOS/macOS port of GTA V, with multiplayer
 
+## SantosVision fork — visionOS work in progress
+
+The requested goal for this fork is GTA V surrounding the player with head tracking
+and stereoscopic world rendering on Apple Vision Pro. The inherited game runtime
+still targets iOS and macOS. Full immersive GTA gameplay is not implemented or verified.
+
+- Game input is a compiled **GTA V web-port ZIP**, with `data/manifest.json`,
+  `b/<build>/game.wasm`, `b/<build>/shaders/index.json` and matching `.wgsl` shaders.
+  A retail PC installation or console ISO/ROM does not supply that WebAssembly build.
+  The repository includes no retail-to-web-port converter.
+- Run `python3 scripts/validate-game.py /path/to/game.zip` before building.
+  See [game-file requirements](docs/GAME-FILES.md).
+- `python3 scripts/precompile-visionos.py /path/to/game.zip` uses a built host
+  compiler to produce visionOS AOT code. It does not create a playable app.
+- `cargo build --locked --bin inspect-game`, followed by
+  `target/debug/inspect-game /path/to/game.wasm`, inventories actual function
+  names and signatures without executing the game, for camera-hook research.
+- The native target in `visionos/` is a separate **head-tracking calibration**
+  checkpoint. It contains no GTA engine or game assets. See its README for build
+  instructions and the remaining integration work.
+
+The upstream instructions below describe the existing iOS/macOS port.
+
 ## How does this work ?
 this whole port relies on the WebAssembly compilation of the game. in a browser, that `game.wasm` runs inside the JS engine, behind WebGPU, Web Audio, web workers...
 Muguet throws that layer away and runs the same `game.wasm` as a regular native app, with [wasmtime](https://wasmtime.dev) for the code and [wgpu](https://wgpu.rs) on Metal for the graphics
