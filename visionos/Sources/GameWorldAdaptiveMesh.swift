@@ -130,7 +130,8 @@ final class GameWorldAdaptiveMesh: @unchecked Sendable {
     let rejectBorderTiles: UInt32 = 1
     let skyFanEnabled: Bool
 
-    init?(device: any MTLDevice, library: any MTLLibrary, colorFormat: MTLPixelFormat, depthFormat: MTLPixelFormat) {
+    init?(device: any MTLDevice, library: any MTLLibrary, colorFormat: MTLPixelFormat,
+          depthFormat: MTLPixelFormat, skyFanEnabled: Bool) {
         guard let resetFunction = library.makeFunction(name: "gameWorldAdaptiveReset"),
               let classifyFunction = library.makeFunction(name: "gameWorldAdaptiveClassify"),
               let fanVertex = library.makeFunction(name: "gameWorldAdaptiveFanVertex"),
@@ -161,7 +162,7 @@ final class GameWorldAdaptiveMesh: @unchecked Sendable {
         self.fanIndexBuffer = fanIndexBuffer
         let requested = UInt32(ProcessInfo.processInfo.environment["MUGUET_COMPOSITOR_ADAPTIVE_TOLERANCE_ULP"] ?? "") ?? 16
         toleranceULPs = min(max(requested, 1), 4096)
-        skyFanEnabled = ProcessInfo.processInfo.environment["MUGUET_COMPOSITOR_ADAPTIVE_SKY_FAN"] == "1"
+        self.skyFanEnabled = skyFanEnabled
     }
 
     func params(for set: AdaptiveScratchSet) -> GameWorldAdaptiveParams {

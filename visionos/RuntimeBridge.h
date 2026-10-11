@@ -15,6 +15,10 @@ int32_t sv_runtime_start(const char *game_root, const char *save_root,
                          char *error, size_t capacity);
 int32_t sv_runtime_status(char *json, size_t capacity);
 int32_t sv_runtime_set_active(uint32_t active);
+/* Pre-start app request for the immutable frozen-depth handoff. 0/1 only;
+ * explicit MUGUET_TRANSFER_FROZEN_DEPTH=0/1 overrides it for diagnostics.
+ * Returns -1 during or after native startup. */
+int32_t sv_world_set_frozen_depth_transfer(uint32_t enabled);
 /* Queue readback of the next actual game GPU presentation to a PPM file. */
 int32_t sv_gpu_capture_next(const char *output_ppm_path);
 

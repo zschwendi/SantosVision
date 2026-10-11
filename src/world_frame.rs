@@ -130,7 +130,7 @@ pub(crate) fn paired_render_requested() -> bool {
 }
 
 fn frozen_depth_transfer_requested() -> bool {
-    std::env::var("MUGUET_TRANSFER_FROZEN_DEPTH").is_ok_and(|value| value == "1")
+    crate::native::frozen_depth_transfer_requested()
 }
 
 fn fresh_completed_views(frames: &Frames) -> bool {

@@ -370,10 +370,12 @@ final class GameWorldRenderer: @unchecked Sendable {
                                   colorFormat: layer.configuration.colorFormat,
                                   depthFormat: layer.configuration.depthFormat) : nil
         allowSyntheticAnchorCopy = environment["MUGUET_COMPOSITOR_SOURCE_ANCHOR_COPY_ALLOW_SYNTHETIC"] == "1"
-        let adaptiveRequested = environment["MUGUET_COMPOSITOR_ADAPTIVE_MESH"] == "1"
+        let adaptiveRequested = RenderingOptimizations.adaptiveMeshEnabled
+        let skyFanRequested = RenderingOptimizations.skyFanEnabled
         adaptiveMesh = adaptiveRequested ? GameWorldAdaptiveMesh(device: layer.device, library: library,
                                                                  colorFormat: layer.configuration.colorFormat,
-                                                                 depthFormat: layer.configuration.depthFormat) : nil
+                                                                 depthFormat: layer.configuration.depthFormat,
+                                                                 skyFanEnabled: skyFanRequested) : nil
         anchorProbe = probeRequested ? GameWorldAnchorProbe(device: layer.device, library: library) : nil
         probeTiming = probeRequested ? GameWorldGpuTiming() : nil
         pairedRender = environment["MUGUET_XR_PAIRED_RENDER"] == "1"

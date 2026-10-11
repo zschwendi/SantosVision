@@ -148,6 +148,7 @@ private struct LauncherView: View {
             Text(runtime.status).font(.callout)
             if runtime.isLinked {
                 nativeGraphicsControls
+                renderingOptimizationControls
                 HStack {
                     Button("Check native game module") { Task { await runtime.probe() } }
                         .disabled(runtime.isBusy || runtime.hasStarted)
@@ -266,6 +267,21 @@ private struct LauncherView: View {
                     .disabled(!runtime.canChangeGraphics)
             }
         }
+    }
+
+    private var renderingOptimizationControls: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("Rendering optimizations").font(.headline)
+            Toggle("Adaptive rendering (experimental)", isOn: Binding(
+                get: { runtime.adaptiveRenderingEnabled },
+                set: { runtime.setAdaptiveRendering($0) }))
+            Toggle("Reduce frame-copy overhead", isOn: Binding(
+                get: { runtime.frozenDepthHandoffEnabled },
+                set: { runtime.setFrozenDepthHandoff($0) }))
+            Text("Adaptive rendering simplifies flat surfaces and sky; it starts off while visual accuracy is being checked. Reducing frame-copy overhead starts on. Choose before starting the game; quit and reopen SantosVision to change these settings.")
+                .font(.caption).foregroundStyle(.secondary)
+        }
+        .disabled(!runtime.canChangeRenderingOptimizations)
     }
 
     private var gameIsOpen: Bool {

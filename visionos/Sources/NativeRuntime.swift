@@ -31,8 +31,12 @@ private enum NativeRuntime {
         #endif
     }
 
-    static func start(gameRoot: String, saveRoot: String) -> NativeRuntimeResult {
+    static func start(gameRoot: String, saveRoot: String, frozenDepthHandoff: Bool) -> NativeRuntimeResult {
         #if SV_GAME_RUNTIME
+        let configCode = sv_world_set_frozen_depth_transfer(frozenDepthHandoff ? 1 : 0)
+        guard configCode == 0 else {
+            return NativeRuntimeResult(code: configCode, payload: "Frozen-depth setting could not be applied before native startup (\(configCode)).")
+        }
         return gameRoot.withCString { game in
             saveRoot.withCString { saves in
                 readBuffer { sv_runtime_start(game, saves, $0, $1) }
@@ -85,10 +89,13 @@ final class NativeRuntimeModel: ObservableObject {
     @Published private(set) var nativeDetails = ""
     @Published private(set) var isBusy = false
     @Published private(set) var hasStarted = false
+    @Published private(set) var startupAttempted = false
     @Published private(set) var probePassed = false
     @Published private(set) var engineFailed = false
     @Published private(set) var graphicsSettings = NativeGraphicsSettings()
     @Published private(set) var graphicsStatus = ""
+    @Published private(set) var adaptiveRenderingEnabled = RenderingOptimizations.storedAdaptive
+    @Published private(set) var frozenDepthHandoffEnabled = RenderingOptimizations.storedFrozenDepth
     let isLinked = NativeRuntime.isLinked
     let gameRoot: URL
     let saveRoot: URL
@@ -115,6 +122,7 @@ final class NativeRuntimeModel: ObservableObject {
 
     var graphicsConfigURL: URL { saveRoot.appendingPathComponent("native-graphics.json") }
     var canChangeGraphics: Bool { isLinked && !hasStarted && !isBusy }
+    var canChangeRenderingOptimizations: Bool { isLinked && !startupAttempted && !hasStarted && !isBusy }
 
     init(arguments: [String] = ProcessInfo.processInfo.arguments) {
         let documents = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
@@ -189,9 +197,11 @@ final class NativeRuntimeModel: ObservableObject {
             return
         }
         status = "Starting the native GTA engine…"
+        startupAttempted = true
         let game = gameRoot.path, saves = saveRoot.path
+        let frozenDepthHandoff = frozenDepthHandoffEnabled
         let result = await Task.detached(priority: .userInitiated) {
-            NativeRuntime.start(gameRoot: game, saveRoot: saves)
+            NativeRuntime.start(gameRoot: game, saveRoot: saves, frozenDepthHandoff: frozenDepthHandoff)
         }.value
         lastStart = result
         hasStarted = result.code == 0
@@ -225,6 +235,20 @@ final class NativeRuntimeModel: ObservableObject {
         guard canChangeGraphics else { return }
         graphicsSettings = NativeGraphicsSettings()
         saveGraphicsSelection()
+    }
+
+    func setAdaptiveRendering(_ enabled: Bool) {
+        guard canChangeRenderingOptimizations else { return }
+        adaptiveRenderingEnabled = enabled
+        UserDefaults.standard.set(enabled, forKey: RenderingOptimizations.adaptiveKey)
+        recordReport()
+    }
+
+    func setFrozenDepthHandoff(_ enabled: Bool) {
+        guard canChangeRenderingOptimizations else { return }
+        frozenDepthHandoffEnabled = enabled
+        UserDefaults.standard.set(enabled, forKey: RenderingOptimizations.frozenDepthKey)
+        recordReport()
     }
 
     private func saveGraphicsSelection() {
@@ -432,6 +456,14 @@ final class NativeRuntimeModel: ObservableObject {
             "graphics_config_path": graphicsConfigURL.path,
             "graphics_config_written": graphicsConfigWritten,
             "graphics_settings_status": graphicsStatus,
+            "rendering_optimizations_requested": [
+                "adaptive_mesh_and_sky_fan": adaptiveRenderingEnabled,
+                "frozen_depth_handoff": frozenDepthHandoffEnabled
+            ],
+            "rendering_optimizations_effective": [
+                "adaptive_mesh": RenderingOptimizations.adaptiveMeshEnabled,
+                "sky_fan": RenderingOptimizations.skyFanEnabled
+            ],
             "probe": payload(lastProbe), "start": payload(lastStart), "status": payload(lastStatus),
             "head_pose_source": SimulatorPoseFixture.shared == nil ? "ARKit" : "simulator_fixture",
             "simulator_pose_fixture": SimulatorPoseFixture.shared?.reportValue ?? [:],

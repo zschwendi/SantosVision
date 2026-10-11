@@ -16,6 +16,7 @@ struct Status {
     graphics: Option<serde_json::Value>,
 }
 static ACTIVE: AtomicBool = AtomicBool::new(true);
+static APP_FROZEN_DEPTH_REQUESTED: AtomicBool = AtomicBool::new(false);
 static INPUT_LIFECYCLE: Mutex<()> = Mutex::new(());
 
 static STATUS: LazyLock<Mutex<Status>> = LazyLock::new(|| Mutex::new(Status { state: "idle", ..Default::default() }));
@@ -44,6 +45,34 @@ pub(crate) fn report_error(error: String) {
 }
 
 pub(crate) fn is_active() -> bool { ACTIVE.load(Ordering::Acquire) }
+
+fn resolve_frozen_depth_request(environment: Option<&str>, app_requested: bool) -> bool {
+    match environment {
+        Some("1") => true,
+        Some("0") => false,
+        _ => app_requested,
+    }
+}
+
+pub(crate) fn frozen_depth_transfer_requested() -> bool {
+    let environment = std::env::var("MUGUET_TRANSFER_FROZEN_DEPTH").ok();
+    resolve_frozen_depth_request(environment.as_deref(), APP_FROZEN_DEPTH_REQUESTED.load(Ordering::Acquire))
+}
+
+fn can_configure_depth_before_start(state: &str, runtime_initialized: bool) -> bool {
+    !runtime_initialized && matches!(state, "idle" | "failed")
+}
+
+#[no_mangle]
+pub extern "C" fn sv_world_set_frozen_depth_transfer(enabled: u32) -> i32 {
+    if enabled > 1 { return -1; }
+    let Ok(status) = STATUS.lock() else { return -1; };
+    if !can_configure_depth_before_start(status.state, crate::RT.get().is_some()) {
+        return -1;
+    }
+    APP_FROZEN_DEPTH_REQUESTED.store(enabled == 1, Ordering::Release);
+    0
+}
 
 pub(crate) fn refresh_input_state() {
     let _guard = INPUT_LIFECYCLE.lock().unwrap_or_else(|poison| poison.into_inner());
@@ -196,6 +225,7 @@ pub extern "C" fn sv_runtime_status(out: *mut c_char, capacity: usize) -> i32 {
         "graphics": status.graphics,
         "heap_bytes": crate::RT.get().map(|runtime| runtime.mem.data_size()).unwrap_or(0),
         "gpu_started": crate::gpu::STARTED.load(Ordering::Relaxed),
+        "frozen_depth_transfer_requested": frozen_depth_transfer_requested(),
         "presents": crate::gpu::PRESENTS.load(Ordering::Relaxed),
         "geometry_capture_diagnostics": crate::gpu::geometry_capture_diagnostics_json(),
         "immersive_game_renderer_connected": crate::world_frame::renderer_connected(),
@@ -205,6 +235,29 @@ pub extern "C" fn sv_runtime_status(out: *mut c_char, capacity: usize) -> i32 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn depth_request_configuration_requires_uninitialized_runtime_and_prestart_state() {
+        use super::can_configure_depth_before_start as allowed;
+        assert!(allowed("idle", false));
+        assert!(allowed("failed", false));
+        for state in ["idle", "failed", "initializing", "starting", "running", "returned", "exited", "panicked"] {
+            assert!(!allowed(state, true), "initialized runtime accepted state {state}");
+        }
+        for state in ["initializing", "starting", "running", "returned", "exited", "panicked", "unknown"] {
+            assert!(!allowed(state, false), "prestart state {state} accepted");
+        }
+    }
+
+    #[test]
+    fn frozen_depth_environment_override_has_precedence_over_app_request() {
+        use super::resolve_frozen_depth_request as resolve;
+        assert!(!resolve(None, false));
+        assert!(resolve(None, true));
+        assert!(resolve(Some("1"), false));
+        assert!(!resolve(Some("0"), true));
+        assert!(resolve(Some("unexpected"), true));
+    }
+
     #[test]
     fn undersized_json_buffer_is_reported_without_partial_json() {
         let mut out = [1i8; 3];

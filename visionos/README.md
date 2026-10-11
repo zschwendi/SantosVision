@@ -19,6 +19,8 @@ Build products live under `target/visionos-xcode/DerivedData-<mode>-<destination
 
 Game builds use Swift `-O` by default, even though the Xcode configuration is named Debug. Set `MUGUET_SWIFT_OPTIMIZATION=-Onone` for Swift debugging. Simulator and device low-graphics builds both passed the final link, including all 15 native symbols and read/execute protection on `__GAME`; receipts are `target/verification/native-shell-low-simulator-link.json` and `native-shell-low-device-link.json`. The device result is a cross-build, with no physical-headset run established.
 
+The launcher persists two pre-start Rendering optimizations choices. **Adaptive depth mesh and sky fan** defaults OFF while its absolute precision gate remains unresolved. **Frozen-depth handoff** defaults ON in the app and reuses the qualified pre-UI snapshot; the native non-app request remains OFF unless set before startup. Controls lock after a native startup attempt; quit and reopen the app to change them. Explicit diagnostic `MUGUET_COMPOSITOR_ADAPTIVE_MESH=0/1` and `MUGUET_COMPOSITOR_ADAPTIVE_SKY_FAN=0/1` each override the saved adaptive choice. `MUGUET_TRANSFER_FROZEN_DEPTH=0/1` overrides the typed pre-start native request. Source-anchor copy and the analytic probe remain diagnostic-only.
+
 ## Native engine startup
 
 The **Check native game module** button loads the actual embedded module and displays the C ABI's JSON result. **Start native engine** validates game data and starts the native runtime, then displays its state and any reported error. A successful startup request alone does not demonstrate gameplay.
