@@ -46,4 +46,17 @@ Root qualification after the request-receipt change, with unchanged frozen Rust 
 - The serial consumed-request history unit test passed (1/1). It covers later request advancement, epoch/time/pose/sequence mismatch, capacity eviction, invalidation and raw ABI bytes. Log SHA256 `3c2a631c4693737ff2aff1a66eef807e667e54727ad692228da66e9ccadc89f9` in `capture-rust-regression-v2/`.
 - The canonical synthetic geometry test passed all ten rejection gates and exclusive output protection. Log SHA256 `22e3b198f47ae1cbec68ec0d55b06652747b516a762df01ac791de193c362cef` in `capture-rust-regression-v2/`.
 
-Two unsupported no-JIT macOS compiler/test invocations failed on the existing `load_module` configuration requirement; they remain recorded and are not passes. The successful checks used the default host JIT feature. No game, GPU capture or headset run was performed, and no full-scene stereo producer is certified.
+Two unsupported no-JIT macOS compiler/test invocations failed on the existing `load_module` configuration requirement; they remain recorded and are not passes. The successful checks used the default host JIT feature. Those qualification runs did not execute the game or capture a GPU draw. No full-scene stereo producer is certified.
+
+## Optional real-draw Mac driver
+
+`src/bin/geometry-capture.rs` starts the existing native game runtime offscreen and submits an explicitly synthetic, static 64 mm two-eye request through the public XR ABI. Game geometry, shaders, buffers, and the consumed request receipt still come from the real game. This is a single-draw experiment, not two rendered game streams. It requires repository-root working directory, `MUGUET_GEOMETRY_STEREO_CAPTURE=1`, an absolute extracted game root, an absent capture file, and a fresh save root. It seeds Low 640×360 at 30 FPS, forces master gain zero and disables host audio, and never changes existing game assets or saves.
+
+After building the host binary with the default JIT feature, invoke:
+
+```sh
+MUGUET_GEOMETRY_STEREO_CAPTURE=1 <geometry-capture-binary> \
+  <absolute-game-root> <fresh-save-root> [deadline-seconds]
+```
+
+The deadline defaults to 120 seconds; an explicit value up to 600 permits initial host compilation. Existing capture evidence is never overwritten. Exit zero requires complete JSON with `status: captured`; rejection and timeout return failure. Runtime status is logged every five seconds. The first root attempt timed out during compilation, before GPU startup. Its immutable logs are in `target/verification/reprojection-implementation-v1/host-capture-runs/root-real-draw-1/`. A source-bound Rust 1.98.1 rebuild of the explicit longer-deadline driver passed; receipt `host-capture-runs/root-real-draw-2/build-result.json`, executable SHA256 `be995cfcd98c92b05acd3face28c3d599e545f52f508fceee1c2a208351a2c25`. The longer runtime attempt is pending; neither compilation nor supplying two synthetic eye transforms qualifies real stereo rendering.
