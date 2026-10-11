@@ -9,7 +9,7 @@ struct AdaptiveScratchSet: @unchecked Sendable {
     let classes: any MTLBuffer
     let fanTiles: any MTLBuffer
     let fallbackTiles: any MTLBuffer
-    /// Two MTLDrawPrimitivesIndirectArguments: [0] fan, [1] fallback. Private.
+    /// Two 32-byte records: indexed fan arguments at byte 0, fallback arguments at byte 32. Private.
     let draws: any MTLBuffer
     /// Shared copy of `draws` taken at the end of the command for completion-time counters.
     let stats: any MTLBuffer
@@ -29,8 +29,19 @@ struct AdaptiveScratchLease: @unchecked Sendable {
 final class AdaptiveScratchPool: @unchecked Sendable {
     static let tile = 8
     static let maximumSets = 6
-    /// 4K is 480x270 = 129,600 tiles: three 4-byte entries per tile plus 64 bytes, about 1.48 MiB.
+    /// 4K is 480x270 = 129,600 tiles: three 4-byte entries per tile plus 128 bytes, about 1.48 MiB.
     static let maximumBytesPerSet = 4 << 20
+    /// Exactly the old 32-triangle fan order, with a shared centre and 32 shared perimeter corners.
+    static let fanIndices: [UInt16] = {
+        var indices = [UInt16]()
+        indices.reserveCapacity(96)
+        for triangle in 0..<32 {
+            indices.append(0)
+            indices.append(UInt16(1 + triangle))
+            indices.append(UInt16(1 + (triangle + 1) % 32))
+        }
+        return indices
+    }()
     private let lock = NSLock()
     private var entries: [(set: AdaptiveScratchSet, busy: Bool)] = []
 
@@ -39,7 +50,7 @@ final class AdaptiveScratchPool: @unchecked Sendable {
         guard width >= 3, height >= 3, width <= 16_384, height <= 16_384 else { return nil }
         let count = SIMD2<UInt32>(UInt32((width + tile - 1) / tile), UInt32((height + tile - 1) / tile))
         let tiles = Int(count.x) * Int(count.y)
-        guard tiles * 12 + 64 <= maximumBytesPerSet else { return nil }
+        guard tiles * 12 + 128 <= maximumBytesPerSet else { return nil }
         return count
     }
 
@@ -57,8 +68,8 @@ final class AdaptiveScratchPool: @unchecked Sendable {
         guard let classes = device.makeBuffer(length: tiles * 4, options: .storageModePrivate),
               let fan = device.makeBuffer(length: tiles * 4, options: .storageModePrivate),
               let fallback = device.makeBuffer(length: tiles * 4, options: .storageModePrivate),
-              let draws = device.makeBuffer(length: 32, options: .storageModePrivate),
-              let stats = device.makeBuffer(length: 32, options: .storageModeShared) else { return nil }
+              let draws = device.makeBuffer(length: 64, options: .storageModePrivate),
+              let stats = device.makeBuffer(length: 64, options: .storageModeShared) else { return nil }
         classes.label = "Game world adaptive tile classes"
         fan.label = "Game world adaptive fan tiles"
         fallback.label = "Game world adaptive fallback tiles"
@@ -109,6 +120,7 @@ final class GameWorldAdaptiveMesh: @unchecked Sendable {
     let classify: any MTLComputePipelineState
     let fan: any MTLRenderPipelineState
     let fallback: any MTLRenderPipelineState
+    let fanIndexBuffer: any MTLBuffer
     let pool = AdaptiveScratchPool()
     /// Stated initial tolerance for "one plane": default 16 ULP of the largest depth in the
     /// tile and halo, overridable with MUGUET_COMPOSITOR_ADAPTIVE_TOLERANCE_ULP (1...4096).
@@ -133,12 +145,17 @@ final class GameWorldAdaptiveMesh: @unchecked Sendable {
             descriptor.depthAttachmentPixelFormat = depthFormat
             return try? device.makeRenderPipelineState(descriptor: descriptor)
         }
+        let indices = AdaptiveScratchPool.fanIndices
         guard let fan = pipeline(fanVertex, "Actual native GTA world depth reprojection, adaptive tile fan"),
-              let fallback = pipeline(fallbackVertex, "Actual native GTA world depth reprojection, adaptive per-texel fallback") else { return nil }
+              let fallback = pipeline(fallbackVertex, "Actual native GTA world depth reprojection, adaptive per-texel fallback"),
+              let fanIndexBuffer = device.makeBuffer(bytes: indices, length: indices.count * MemoryLayout<UInt16>.stride,
+                                                     options: .storageModeShared) else { return nil }
         self.reset = reset
         self.classify = classify
         self.fan = fan
         self.fallback = fallback
+        fanIndexBuffer.label = "Game world adaptive 32-triangle fan indices"
+        self.fanIndexBuffer = fanIndexBuffer
         let requested = UInt32(ProcessInfo.processInfo.environment["MUGUET_COMPOSITOR_ADAPTIVE_TOLERANCE_ULP"] ?? "") ?? 16
         toleranceULPs = min(max(requested, 1), 4096)
     }
@@ -185,24 +202,25 @@ final class GameWorldAdaptiveMesh: @unchecked Sendable {
         encoder.setFragmentTexture(color, index: 0)
         encoder.setRenderPipelineState(fan)
         encoder.setVertexBuffer(set.fanTiles, offset: 0, index: 2)
-        encoder.drawPrimitives(type: .triangle, indirectBuffer: set.draws, indirectBufferOffset: 0)
+        encoder.drawIndexedPrimitives(type: .triangle, indexType: .uint16, indexBuffer: fanIndexBuffer,
+                                      indexBufferOffset: 0, indirectBuffer: set.draws, indirectBufferOffset: 0)
         encoder.setRenderPipelineState(fallback)
         encoder.setVertexBuffer(set.fallbackTiles, offset: 0, index: 2)
-        encoder.drawPrimitives(type: .triangleStrip, indirectBuffer: set.draws, indirectBufferOffset: 16)
+        encoder.drawPrimitives(type: .triangleStrip, indirectBuffer: set.draws, indirectBufferOffset: 32)
     }
 
     /// Copies the final indirect arguments into the shared counter buffer.
     func encodeCounterCopy(commands: any MTLCommandBuffer, set: AdaptiveScratchSet) {
         guard let blit = commands.makeBlitCommandEncoder() else { return }
         blit.label = "Game world adaptive counters"
-        blit.copy(from: set.draws, sourceOffset: 0, to: set.stats, destinationOffset: 0, size: 32)
+        blit.copy(from: set.draws, sourceOffset: 0, to: set.stats, destinationOffset: 0, size: 64)
         blit.endEncoding()
     }
 
     /// Valid only after the command buffer that encoded the copy has completed.
     static func counters(_ set: AdaptiveScratchSet) -> GameWorldAdaptiveCounters {
         let words = set.stats.contents().assumingMemoryBound(to: UInt32.self)
-        return GameWorldAdaptiveCounters(fanTiles: words[1], fallbackInstances: words[5])
+        return GameWorldAdaptiveCounters(fanTiles: words[1], fallbackInstances: words[9])
     }
 }
 #endif

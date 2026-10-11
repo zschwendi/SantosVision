@@ -23,10 +23,25 @@ A separate explicitly diagnostic timing run `runs/root-diagnostic-timing-v1/` re
 
 The street accepted 84,608 / 129,600 tiles; the plane accepted 128,104; sky and noise accepted none. Classification overhead hurts all-fallback scenes. Copy requires a matching lattice, projection, eye calibration and retained anchor; game copy additionally needs a certified pair for a two-view drawable. Its cheap command cost therefore cannot be extrapolated to this game's current stereo pipeline. None of these timings include guest rendering, display composition, headset reprojection or two streams.
 
-## Outstanding work
+## Indexed fan checkpoint
 
-The next reversible experiment is an indexed fan with the same 32 triangles and 33 unique vertex definitions instead of 96 repeated definitions. It must preserve exact corner values, triangle order, fallback strips, classification, leases and gates; it needs fresh qualification.
+The accepted fan now evaluates 33 unique vertices and draws the exact original 32 triangles through 96 static UInt16 indices. Fallback strips, classifier, geometry and gates are unchanged. The first indexed static check rejected a complex Swift initializer; replacing it with an explicit append loop fixed compilation. `native-indexed-static-v2/summary.json` records all strict Swift, Metal and harness checks passing with unchanged source (output SHA256 `bf662ca262288323d3c96ba8885ab989de40cfa9b45762c188d5e02dece33b1b`).
 
-The real-draw experiment is separate. Mac startup and two-eye camera consumption work with sound muted. The initially selected shader is unused in the actual Low scene; a pinned `VS_TransformD` variant is active. The exact request link through the certified forward-to-reverse camera clone was added and its focused CPU regression passed. A bounded actual-position-buffer capture and CPU two-eye proof are still being qualified. They cannot publish `CertifiedPairEpoch` or substitute for stereo-safe culling, GBuffer, deferred shading and post passes.
+`runs/root-indexed-batch-v1/root-validation.json` compares every color, depth and coverage image SHA256 with the unindexed `root-final-batch-v3`: all 31 fixtures are bit-identical. Default/OFF remains bit-identical to the original. The inherited square-border absolute failure remains, so overall qualification is still FAIL. The candidate relative guards pass. Parity JSON SHA256 is `78bdd10b4df9d0f797486558c93e85e27914d3b2cde3e4b6796ff766caeaf7c5`.
 
-Unsigned app builds and the synthetic simulator probe remain pending this checkpoint. Headset display-time adjustment needs physical-device evidence; simulator matrices have no DeviceAnchor.
+A separate diagnostic run `runs/root-indexed-diagnostic-timing-v1/` retains the same 20 samples and image gates. It again fails only the street-copy 5-versus-4-ULP comparison. Its one-image M4 medians are:
+
+| 3840×2160 scene | Original | Indexed adaptive | Prior unindexed adaptive | Copy |
+|---|---:|---:|---:|---:|
+| Street | 57.929 ms | 35.645 ms | 42.490 ms | 1.983 ms |
+| Plane | 60.795 ms | 23.277 ms | 34.235 ms | 1.456 ms |
+| Sky | 55.065 ms | 57.286 ms | 59.148 ms | 1.597 ms |
+| Noise | 64.937 ms | 71.772 ms | 70.592 ms | 2.423 ms |
+
+Prior adaptive values came from the earlier separate diagnostic batch, not a simultaneous indexed/unindexed A/B measurement. Current original/indexed values are sampled together. Vertex reuse helps accepted planes but cannot meet a 16.67 ms two-stream budget on these commands; all-fallback classification remains overhead. These synthetic Mac results do not establish actual game or headset FPS. All production flags remain OFF.
+
+## Real geometry checkpoint and remaining work
+
+Muted offscreen Mac run6 captured a real `VS_TransformD` indexed game draw. The exact consumed request survives its certified forward-to-reverse camera clone, and the focused regression passed. `geometry-proof-real-run-002/report.json` passes at the captured 640×360 viewport using 502 triangles, 9/10 covered pixels and 11 distinct eye-coverage pixels. This is one draw's CPU position/depth math, without GPU fragment shading or full-scene rendering. Details and earlier failed attempts remain in `GEOMETRY-STEREO-PROBE-20261011.md`. Commit `406f2a7` preserves the capture/proof work separately from the indexed native change.
+
+The proof cannot publish `CertifiedPairEpoch` or substitute for stereo-safe culling, GBuffer, deferred shading and post passes. Unsigned app builds and the synthetic simulator probe remain pending this checkpoint. Headset display-time adjustment needs physical-device evidence; simulator matrices have no DeviceAnchor.

@@ -290,7 +290,7 @@ constant uint GAME_WORLD_TILE = 8;
 constant uint GAME_WORLD_TILE_TEXELS = GAME_WORLD_TILE * GAME_WORLD_TILE;
 constant uint GAME_WORLD_TILE_CORNERS = (GAME_WORLD_TILE + 1) * (GAME_WORLD_TILE + 1);
 constant uint GAME_WORLD_TILE_HALO = (GAME_WORLD_TILE + 2) * (GAME_WORLD_TILE + 2);
-constant uint GAME_WORLD_FAN_VERTICES = 32 * 3;
+constant uint GAME_WORLD_FAN_INDICES = 32 * 3;
 
 struct GameWorldAdaptiveParams {
     uint2 tileCount;
@@ -298,25 +298,42 @@ struct GameWorldAdaptiveParams {
     uint rejectBorderTiles;
 };
 
-// Matches MTLDrawPrimitivesIndirectArguments; instanceCount is the compaction counter.
+// The fan matches MTLDrawIndexedPrimitivesIndirectArguments (20 bytes) in a
+// 32-byte record. The fallback matches MTLDrawPrimitivesIndirectArguments
+// (16 bytes) in the second 32-byte record. Instance counts are the compaction
+// counters; the padding keeps each record's address fixed for Metal and Swift.
+struct GameWorldIndexedIndirectDraw {
+    uint indexCount;
+    atomic_uint instanceCount;
+    uint indexStart;
+    int baseVertex;
+    uint baseInstance;
+    uint padding[3];
+};
 struct GameWorldIndirectDraw {
     uint vertexCount;
     atomic_uint instanceCount;
     uint vertexStart;
     uint baseInstance;
+    uint padding[4];
+};
+struct GameWorldAdaptiveDraws {
+    GameWorldIndexedIndirectDraw fan;
+    GameWorldIndirectDraw fallback;
 };
 
 kernel void gameWorldAdaptiveReset(uint id [[thread_position_in_grid]],
-                                   device GameWorldIndirectDraw *draws [[buffer(0)]]) {
+                                   device GameWorldAdaptiveDraws &draws [[buffer(0)]]) {
     if (id != 0) { return; }
-    draws[0].vertexCount = GAME_WORLD_FAN_VERTICES;
-    atomic_store_explicit(&draws[0].instanceCount, 0u, memory_order_relaxed);
-    draws[0].vertexStart = 0;
-    draws[0].baseInstance = 0;
-    draws[1].vertexCount = 4;
-    atomic_store_explicit(&draws[1].instanceCount, 0u, memory_order_relaxed);
-    draws[1].vertexStart = 0;
-    draws[1].baseInstance = 0;
+    draws.fan.indexCount = GAME_WORLD_FAN_INDICES;
+    atomic_store_explicit(&draws.fan.instanceCount, 0u, memory_order_relaxed);
+    draws.fan.indexStart = 0;
+    draws.fan.baseVertex = 0;
+    draws.fan.baseInstance = 0;
+    draws.fallback.vertexCount = 4;
+    atomic_store_explicit(&draws.fallback.instanceCount, 0u, memory_order_relaxed);
+    draws.fallback.vertexStart = 0;
+    draws.fallback.baseInstance = 0;
 }
 
 static float gameWorldToleranceAt(float magnitude, uint ulps) {
@@ -332,7 +349,7 @@ kernel void gameWorldAdaptiveClassify(uint2 tile [[threadgroup_position_in_grid]
                                       constant GameWorldAdaptiveParams &p [[buffer(1)]],
                                       device uint *fanTiles [[buffer(2)]],
                                       device uint *fallbackTiles [[buffer(3)]],
-                                      device GameWorldIndirectDraw *draws [[buffer(4)]],
+                                      device GameWorldAdaptiveDraws &draws [[buffer(4)]],
                                       device uint *classes [[buffer(5)]],
                                       texture2d<float, access::read> depth [[texture(0)]]) {
     threadgroup float halo[GAME_WORLD_TILE_HALO];
@@ -415,11 +432,11 @@ kernel void gameWorldAdaptiveClassify(uint2 tile [[threadgroup_position_in_grid]
         }
     }
     if (flags == 0) {
-        const uint slot = atomic_fetch_add_explicit(&draws[0].instanceCount, 1u, memory_order_relaxed);
+        const uint slot = atomic_fetch_add_explicit(&draws.fan.instanceCount, 1u, memory_order_relaxed);
         fanTiles[slot] = tileIndex;
         classes[tileIndex] = 1u;
     } else {
-        const uint base = atomic_fetch_add_explicit(&draws[1].instanceCount, GAME_WORLD_TILE_TEXELS, memory_order_relaxed);
+        const uint base = atomic_fetch_add_explicit(&draws.fallback.instanceCount, GAME_WORLD_TILE_TEXELS, memory_order_relaxed);
         fallbackTiles[base / GAME_WORLD_TILE_TEXELS] = tileIndex;
         classes[tileIndex] = flags << 1;
     }
@@ -441,8 +458,9 @@ vertex GameWorldVertex gameWorldAdaptiveFanVertex(uint id [[vertex_id]],
                                                   texture2d<float, access::read> depth [[texture(0)]]) {
     const uint tileIndex = fanTiles[instance];
     const uint2 origin = uint2(tileIndex % p.tileCount.x, tileIndex / p.tileCount.x) * GAME_WORLD_TILE;
-    const uint triangle = id / 3, k = id % 3;
-    const uint2 corner = origin + (k == 0 ? uint2(GAME_WORLD_TILE / 2) : gameWorldFanPerimeter((triangle + (k - 1)) & 31));
+    // Indexed triangles [0, 1+t, 1+(t+1)%32] reuse one centre and the 32
+    // existing perimeter corners without changing their positions or order.
+    const uint2 corner = origin + (id == 0 ? uint2(GAME_WORLD_TILE / 2) : gameWorldFanPerimeter(id - 1));
     // The owning texel inside this tile; for an accepted tile every owner is valid
     // and non-clear, so the owner only fixes `valid` and `background` as the fine path does.
     const uint2 owner = uint2(corner.x == origin.x + GAME_WORLD_TILE ? corner.x - 1 : corner.x,

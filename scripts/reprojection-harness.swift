@@ -325,6 +325,7 @@ final class Rig {
     let candidateLibrary: any MTLLibrary
     let reset: any MTLComputePipelineState
     let classify: any MTLComputePipelineState
+    let fanIndexBuffer: any MTLBuffer
     let pool = AdaptiveScratchPool()
     var toleranceULPs: UInt32 = 16
     private var pipelines = [String: any MTLRenderPipelineState]()
@@ -348,6 +349,10 @@ final class Rig {
               let classifyFunction = candidateLibrary.makeFunction(name: "gameWorldAdaptiveClassify") else { throw HarnessError("candidate lacks adaptive kernels") }
         reset = try device.makeComputePipelineState(function: resetFunction)
         classify = try device.makeComputePipelineState(function: classifyFunction)
+        let indices = AdaptiveScratchPool.fanIndices
+        guard let fanIndexBuffer = device.makeBuffer(bytes: indices, length: indices.count * MemoryLayout<UInt16>.stride,
+                                                     options: .storageModeShared) else { throw HarnessError("no adaptive fan index buffer") }
+        self.fanIndexBuffer = fanIndexBuffer
         if let value = ProcessInfo.processInfo.environment["HARNESS_TOLERANCE_ULP"], let parsed = UInt32(value) { toleranceULPs = parsed }
     }
 
@@ -447,14 +452,15 @@ final class Rig {
         encoder.setRenderPipelineState(try pipeline("fan", library: candidateLibrary, vertex: "gameWorldAdaptiveFanVertex",
                                                     fragment: "gameWorldFragment", format: target.color.pixelFormat))
         encoder.setVertexBuffer(set.fanTiles, offset: 0, index: 2)
-        encoder.drawPrimitives(type: .triangle, indirectBuffer: set.draws, indirectBufferOffset: 0)
+        encoder.drawIndexedPrimitives(type: .triangle, indexType: .uint16, indexBuffer: fanIndexBuffer,
+                                      indexBufferOffset: 0, indirectBuffer: set.draws, indirectBufferOffset: 0)
         encoder.setRenderPipelineState(try pipeline("fallback", library: candidateLibrary, vertex: "gameWorldAdaptiveFallbackVertex",
                                                     fragment: "gameWorldFragment", format: target.color.pixelFormat))
         encoder.setVertexBuffer(set.fallbackTiles, offset: 0, index: 2)
-        encoder.drawPrimitives(type: .triangleStrip, indirectBuffer: set.draws, indirectBufferOffset: 16)
+        encoder.drawPrimitives(type: .triangleStrip, indirectBuffer: set.draws, indirectBufferOffset: 32)
         encoder.endEncoding()
         guard let blit = commands.makeBlitCommandEncoder() else { throw HarnessError("no blit encoder") }
-        blit.copy(from: set.draws, sourceOffset: 0, to: set.stats, destinationOffset: 0, size: 32)
+        blit.copy(from: set.draws, sourceOffset: 0, to: set.stats, destinationOffset: 0, size: 64)
         blit.endEncoding()
     }
 
@@ -521,7 +527,7 @@ final class Rig {
         if let set = lease.sets.first {
             let words = set.stats.contents().assumingMemoryBound(to: UInt32.self)
             result.fan = words[1]
-            result.fallback = words[5] / 64
+            result.fallback = words[9] / 64
             if let classesBuffer {
                 let count = classesBuffer.length / 4
                 result.classes = Array(UnsafeBufferPointer(start: classesBuffer.contents().assumingMemoryBound(to: UInt32.self), count: count))
