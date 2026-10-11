@@ -1,0 +1,71 @@
+{
+  "schema": 1,
+  "recorded_at_utc": "2026-10-11T06:04:27.514706+00:00",
+  "scope": "Bounded simulator screening of alternate GTA renderer. Not a controlled renderer benchmark, headset test, or stereo qualification.",
+  "decision": "Retain SantosVision as the Vision Pro integration base. Alternate is not a demonstrated overall upgrade; its Metal upload/buffer reuse remains a useful implementation reference.",
+  "limitations": [
+    "Different spawn locations: alternate Sandy Shores, baseline Michael mansion.",
+    "iOS27 versus visionOS27 simulator shells on a shared Mac, not physical hardware.",
+    "Same960x540 and60fps cap with Low/performance configuration intent; alternate12explicit quality options matched, but reading the copied XML from the assumed guest settings path was not instrumented.",
+    "Alternate wasm2c compiler policy and2-worker default differ from Wasmtime and host core count.",
+    "Audio silent in both: alternate simulator output mixer0; baseline game master0.",
+    "No immersive compositor in either measured screen; no4K/high-settings or matched-stereo result.",
+    "Mac had32GiB RAM and16.2GiB swap in use when sampled; this does not by itself prove active paging during every measured window."
+  ],
+  "baseline": {
+    "name": "Existing qualified SantosVision build",
+    "runtime": "visionOS27 simulator",
+    "source_fps_120s": 44.509462382471746,
+    "outcome": "completed_120s_verified_warmed_source",
+    "binary_sha256": "00163f8ff076195dc8ad8feaa717d6e4bb9f9a709f1e767b849d8d912421b822",
+    "metal_sha256": "41f66e75b32a7c24254ed5d111dded945ebf843e859baaf6476e3e1ba0322cff",
+    "source_ppm_sha256": "14a058101eada5576d7435e429245b1f9c301336c971892637409b2a042f236e",
+    "location": "Michael mansion driveway",
+    "master_volume": 0,
+    "settings_exactly_restored": true,
+    "note": "Installed pre-correctness executable. Current prototype source checkpoint e74b9d2 was not built or benchmarked here."
+  },
+  "alternate": {
+    "repository": "https://github.com/kevinerikjs/gta5-ios-port",
+    "upstream_commit": "09666696dad120a75edd22478efb45fa91fc4806",
+    "trial_commit": "992a6951c8bd22bba936c9fe0962189571b8a6de",
+    "runtime": "iOS27 simulator with small UIKit scene lifecycle fix",
+    "binary_sha256": "ce0e058b5cf77ef2dda7ca6fb612d07b7be5bd03c4747388d1737eb692d6f1e8",
+    "approximate_source_fps_120s": 26.67677664638025,
+    "frames": 3213,
+    "interval_seconds_inferred_from_rounded_window_fps": 120.44183757995249,
+    "window_fps": [
+      8.509,
+      1.982,
+      4.318,
+      27.286,
+      32.262,
+      52.474,
+      45.731,
+      41.292
+    ],
+    "final_three_windows_fps_approximate": 46.49950118414073,
+    "source_png_sha256": "a58ce3198ace92f46fdf561cabe88df3d9909dbbd69ecf7d95f7e8040ed40a92",
+    "location": "Sandy Shores",
+    "visual_observations": [
+      "Magenta patches visible on some ground/road objects.",
+      "Visible line/edge artifacts; unequal scene prevents attributing every visual difference to the renderer."
+    ],
+    "startup": "Original build aborted in iOS27 UIKit before engine startup. Scene lifecycle patch992a695 built in7.65s with zero game C recompiles. iOS26 launch also eventually started engine, but was shut down during the bounded compatibility switch; no benchmark from it.",
+    "settings": "Typed preferences were required: command-line NO was ignored by the app as?Bool getter; confirmed finalGraphics960x540 with60fpscap andshadow0/pedVariety1/vehicleVariety1."
+  },
+  "local_evidence_root": "/Users/zach/gaming/gta5-port-comparison-20261010/trial",
+  "evidence": {
+    "candidate-final/result.json": "9d0d8e487ac8a453c933e5c7baa0b3a58ff26b66fd6535f71c9634de268d1ec4",
+    "candidate-final/launch.json": "53636d454509090effa881c33acdd2c380c214f451d43c35585b07e757e81b77",
+    "candidate-final/world-confirmation.json": "ed8f8d3e478e0c0748b24a8126dbe7813c7cfa267b9f216fc9eaf58dcc26aa07",
+    "baseline/screen-v1/result.json": "cd7843ef0e0eb80d86d167c0491e2c5a7018785efd650142a69768378f0f8e21",
+    "baseline/screen-v1/launch.json": "66fd4a2f7b4075c74d49a0ce50c574dd8bafdec652c3e8de8279ba2e7329f002",
+    "baseline/screen-v1/world-confirmation.json": "d399f9b520c7a83100a8df82637a5d5fb0965bd43fe0e9946953a1cc0f73425e"
+  },
+  "local_checkpoints": {
+    "main_prototype": "e74b9d25b9627f02077fc22814bc124db8f02505",
+    "alternate_trial_setup": "19429f36589626abcc301ec7b9156bee3c5a3b9b",
+    "alternate_scene_lifecycle": "992a6951c8bd22bba936c9fe0962189571b8a6de"
+  }
+}
