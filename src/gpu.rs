@@ -885,6 +885,8 @@ pub struct Gpu {
     last_submit: Option<SubmissionIndex>,
     vb_avail: [u64; 16],
     dbg_idx: u64,
+    geometry_stereo_capture: bool,
+    geometry_stereo_capture_done: bool,
 
     draws: u64,
     skipped: u64,
@@ -1019,6 +1021,8 @@ impl Gpu {
             pending_resolve: Vec::new(), pending_events: Vec::new(), pending_maps: Vec::new(), counter_src: None, counter_slot: 0,
             frame_slot_done: (0..FRAME_SLOTS).map(|_| None).collect(), last_submit: None, vb_avail: [0; 16],
             dbg_idx: if dbg != 0 { dbg + 424 } else { 0 },
+            geometry_stereo_capture: std::env::var("MUGUET_GEOMETRY_STEREO_CAPTURE").as_deref() == Ok("1"),
+            geometry_stereo_capture_done: false,
             draws: 0, skipped: 0, presents: 0, pipe_creates: 0, fps_t0: Instant::now(), fps_n0: 0, fps_d0: 0,
             buffer_uploads: [BufferUploadStats::default(); UPLOAD_SOURCE_COUNT], indirect_reads: IndirectReadStats::default(),
             uploads: crate::buffer_upload::BufferUploads::from_environment(),
@@ -2584,6 +2588,161 @@ impl Gpu {
         Some(arguments)
     }
 
+    // One-shot, opt-in frozen draw evidence for the CPU geometry-stereo proof.
+    // This never creates a second guest call or publishes an XR frame. The
+    // selected opaque deferred shader pair is checked by the guest's own hashes.
+    #[allow(clippy::too_many_arguments)]
+    fn capture_geometry_stereo_draw(&mut self, kind: u32, count: u32, inst: u32, start: u32,
+        base_vertex: i32, start_instance: u32, layout: &LayoutObj, vs: &Program, ps: Option<&Program>,
+        viewport: [f32; 6], writes_depth: bool) {
+        if !self.geometry_stereo_capture || self.geometry_stereo_capture_done { return; }
+        let ps_id = self.s.shader[1];
+        let vs_hash = match self.obj(self.s.shader[0]) { Some(Obj::Shader(s)) => s.hash.clone(), _ => return };
+        let ps_hash = match self.obj(ps_id) { Some(Obj::Shader(s)) => s.hash.clone(), _ => return };
+        if vs_hash != "2e9584811e870546" || ps_hash != "75cf2d53bf9497c9" { return; }
+        // Menu and offscreen uses of this same shader pair are not the proof target.
+        let eligible_view = self.world_view.is_some_and(|v| v.headset_applied && v.depth_reverse_z);
+        let eligible_target = self.tex(self.s.ds.tex).is_some_and(|depth|
+            is_depth(depth.format) && depth.desc.samples == 1 && depth.desc.d == 1
+            && viewport == [0., 0., depth.desc.w as f32, depth.desc.h as f32, 0., 1.]);
+        if !eligible_view || !eligible_target || !writes_depth || self.s.ds.mip != 0
+            || self.s.ds.slice != 0 || kind != 1 || inst != 1 || start_instance != 0
+            || count < 3 || count > 65536 || self.s.topo != 4 { return; }
+        self.geometry_stereo_capture_done = true;
+        let output = std::path::Path::new("target/verification/reprojection-implementation-v1/frozen-game-draw.json");
+        let result = (|| -> Result<serde_json::Value, String> {
+            let view = self.world_view.filter(|v| v.headset_applied && v.depth_reverse_z)
+                .ok_or("missing qualified reverse-Z command view")?;
+            let request_record = crate::xr_view::consumed_request_receipt(&view)
+                .ok_or("exact consumed stereo request receipt unavailable")?;
+            if kind != 1 || inst != 1 || count < 3 || count > 65536 || self.s.topo != 4 {
+                return Err("expected one bounded indexed triangle-list instance".into());
+            }
+            if !writes_depth || self.s.ds.tex == 0 || self.s.ds.mip != 0 || self.s.ds.slice != 0 {
+                return Err("draw does not write main world depth".into());
+            }
+            let depth = self.tex(self.s.ds.tex).ok_or("missing depth target")?;
+            if depth.desc.samples != 1 || depth.desc.d != 1 || !is_depth(depth.format)
+                || viewport != [0., 0., depth.desc.w as f32, depth.desc.h as f32, 0., 1.] {
+                return Err("depth target or full viewport not qualified".into());
+            }
+            let ps = ps.ok_or("missing pixel shader")?;
+            if ps.info.writes_fragment_depth { return Err("pixel shader overrides depth".into()); }
+            let source_vs = std::fs::read_to_string(self.shader_dir.join(format!("{vs_hash}.wgsl")))
+                .map_err(|e| format!("VS source read: {e}"))?;
+            let source_ps = std::fs::read_to_string(self.shader_dir.join(format!("{ps_hash}.wgsl")))
+                .map_err(|e| format!("PS source read: {e}"))?;
+            if source_vs.len() > 256 * 1024 || source_ps.len() > 256 * 1024
+                || vs.text.len() > 256 * 1024 || ps.text.len() > 256 * 1024 {
+                return Err("shader text exceeds capture bound".into());
+            }
+            let mut constant_buffers = Vec::new();
+            let mut constant_bytes = 0usize;
+            for (stage, program) in [(0usize, vs), (1usize, ps)] {
+                let pack = program.pack.as_ref().ok_or("shader has no bound CB pack")?;
+                for member in &pack.members {
+                    let cb = self.s.cb[stage].get(member.binding as usize).ok_or("CB binding out of range")?;
+                    let buffer = self.buf(cb.buf).ok_or("bound CB missing")?;
+                    let shadow = buffer.shadow.as_ref().ok_or("bound CB has no CPU shadow")?;
+                    let from = cb.first as usize * 16;
+                    let end = from.checked_add(member.size as usize).ok_or("CB range overflow")?;
+                    let bytes = shadow.get(from..end).ok_or("CB range unavailable")?;
+                    constant_bytes += bytes.len();
+                    if constant_bytes > 256 * 1024 { return Err("CB capture exceeds 256 KiB".into()); }
+                    constant_buffers.push(serde_json::json!({"stage":stage,"binding":member.binding,
+                        "buffer_id":cb.buf,"first_16byte":cb.first,"version":buffer.version,
+                        "bytes_hex":bytes.iter().map(|b| format!("{b:02x}")).collect::<String>()}));
+                }
+            }
+            let mut gpu_buffers: Vec<(u32, Buffer, u64)> = Vec::new();
+            let mut vertex_buffers = Vec::new();
+            let mut total = 0u64;
+            for &(slot, cls) in &layout.slots {
+                let binding = self.s.vb.get(slot as usize).ok_or("VB slot out of range")?;
+                let buffer = self.buf(binding.buf).ok_or("bound VB missing")?;
+                let gpu = buffer.gpu.clone().ok_or("bound VB lacks GPU storage")?;
+                if buffer.bytes == 0 || buffer.bytes > 1024 * 1024 { return Err("VB exceeds 1 MiB bound".into()); }
+                total += buffer.bytes;
+                gpu_buffers.push((binding.buf, gpu, buffer.bytes));
+                vertex_buffers.push(serde_json::json!({"slot":slot,"class":cls,"buffer_id":binding.buf,
+                    "stride":binding.stride,"offset":binding.offset,"size":buffer.size,
+                    "readback_size":buffer.bytes,"version":buffer.version}));
+            }
+            let (ib_id, ib_format, ib_offset) = self.s.ib;
+            let ib = self.buf(ib_id).ok_or("bound IB missing")?;
+            let ib_gpu = ib.gpu.clone().ok_or("bound IB lacks GPU storage")?;
+            if ib.bytes == 0 || ib.bytes > 1024 * 1024 { return Err("IB exceeds 1 MiB bound".into()); }
+            total += ib.bytes;
+            if total > 2 * 1024 * 1024 { return Err("geometry exceeds 2 MiB capture bound".into()); }
+            let ib_meta = serde_json::json!({"buffer_id":ib_id,"format":ib_format,"offset":ib_offset,
+                "size":ib.size,"readback_size":ib.bytes,"version":ib.version});
+            gpu_buffers.push((ib_id, ib_gpu, ib.bytes));
+            let mut staging = Vec::new();
+            self.end_pass();
+            for (_, source, size) in &gpu_buffers {
+                let dst = self.device.create_buffer(&BufferDescriptor { label: Some("geometry stereo proof readback"),
+                    size:*size, usage:BufferUsages::COPY_DST | BufferUsages::MAP_READ, mapped_at_creation:false });
+                self.encoder().copy_buffer_to_buffer(source, 0, &dst, 0, *size);
+                staging.push(dst);
+            }
+            self.flush();
+            let mut data = Vec::new();
+            for dst in &staging {
+                let (send, receive) = std::sync::mpsc::sync_channel(1);
+                dst.slice(..).map_async(MapMode::Read, move |r| { let _ = send.send(r); });
+                self.device.poll(PollType::Wait { submission_index: self.last_submit.clone(), timeout: Some(Duration::from_secs(5)) })
+                    .map_err(|e| format!("geometry readback poll: {e:?}"))?;
+                receive.try_recv().map_err(|e| format!("geometry readback callback: {e}"))?
+                    .map_err(|e| format!("geometry readback map: {e:?}"))?;
+                let mapped = dst.slice(..).get_mapped_range().map_err(|e| format!("geometry mapped range: {e:?}"))?;
+                data.push(mapped.iter().map(|b| format!("{b:02x}")).collect::<String>());
+                drop(mapped);
+                dst.unmap();
+            }
+            for (meta, bytes) in vertex_buffers.iter_mut().zip(data.iter()) { meta["bytes_hex"] = bytes.clone().into(); }
+            let mut index_buffer = ib_meta;
+            index_buffer["bytes_hex"] = data.last().cloned().unwrap_or_default().into();
+            let elements: Vec<_> = layout.els.iter().map(|e| serde_json::json!({"semantic":e.sem,"semantic_index":e.idx,
+                "format":e.fmt,"slot":e.slot,"offset":e.offset,"class":e.cls})).collect();
+            let signature: Vec<_> = match self.obj(self.s.shader[0]) {
+                Some(Obj::Shader(shader)) => shader.sig.iter().map(|e| serde_json::json!({
+                    "semantic":e.sem,"semantic_index":e.idx,"register":e.reg})).collect(),
+                _ => return Err("vertex signature unavailable".into()),
+            };
+            Ok(serde_json::json!({"schema":1,"status":"captured","source":"Gpu::do_draw",
+                "shader":{"vertex_id":self.s.shader[0],"vertex_hash":vs_hash,"vertex_label":vs.label,
+                    "pixel_id":ps_id,"pixel_hash":ps_hash,"pixel_label":ps.label,
+                    "vertex_source_wgsl":source_vs,"pixel_source_wgsl":source_ps,
+                    "vertex_translated_wgsl":vs.text,"pixel_translated_wgsl":ps.text},
+                "world_view":{"provenance_epoch":view.provenance_epoch,"camera_sequence":view.camera_sequence,
+                    "request_frame":view.request_frame,"head_pose_frame":view.head_pose_frame,
+                    "presentation_time_seconds":view.presentation_time_seconds,
+                    "eye_index":view.eye_index,"view_count":view.view_count,"game_from_eye":view.game_from_eye,
+                    "projection_from_eye":view.projection_from_eye,"depth_reverse_z":view.depth_reverse_z,
+                    "headset_applied":view.headset_applied},
+                "draw":{"kind":kind,"count":count,"instances":inst,"start_index":start,
+                    "base_vertex":base_vertex,"start_instance":start_instance,"topology":self.s.topo},
+                "viewport":viewport,"depth_target":self.s.ds.tex,"render_targets":self.s.rt.iter().map(|r| r.tex).collect::<Vec<_>>(),
+                "layout":elements,"vertex_signature":signature,"constant_buffers":constant_buffers,"vertex_buffers":vertex_buffers,
+                "index_buffer":index_buffer,"request_record":request_record}))
+        })();
+        let value = match result { Ok(value) => value, Err(reason) => serde_json::json!({"schema":1,
+            "status":"rejected","source":"Gpu::do_draw","reason":reason,"vertex_hash":vs_hash,"pixel_hash":ps_hash}) };
+        if let Some(parent) = output.parent() {
+            if parent.is_dir() {
+                if let Ok(body) = serde_json::to_vec_pretty(&value) {
+                    use std::io::Write;
+                    match std::fs::OpenOptions::new().write(true).create_new(true).open(output) {
+                        Ok(mut file) => if let Err(e) = file.write_all(&body) {
+                            log(&format!("geometry proof capture write failed: {e}"));
+                        },
+                        Err(e) => log(&format!("geometry proof capture file unavailable (never overwritten): {e}")),
+                    }
+                }
+            } else { log("geometry proof capture target directory missing"); }
+        }
+    }
+
     fn do_draw(&mut self, p: u64) {
         if self.dbg_idx != 0 {
             let lim = atomic(&self.mem, self.dbg_idx).load(Ordering::Relaxed);
@@ -2851,6 +3010,11 @@ impl Gpu {
                     self.invalidate_world_depth_inner(ds.tex, reason, ui_depth_clear);
                 }
             }
+        }
+        if self.geometry_stereo_capture && !self.geometry_stereo_capture_done
+            && d_count == count as i64 && d_inst == inst as i64 {
+            self.capture_geometry_stereo_draw(kind, count, inst, start, base_vertex, start_instance, &layout, &vs,
+                ps.as_deref(), actual_viewport, writes_depth);
         }
     }
 

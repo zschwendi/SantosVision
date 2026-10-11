@@ -97,6 +97,66 @@ struct RenderThread {
     current: Option<WorldView>,
 }
 
+// Only an opt-in proof run retains the request actually used by a successful
+// camera update. Keeping the consumed WorldView avoids consulting a newer
+// request when the GPU thread eventually reaches that draw.
+#[derive(Clone, Copy)]
+struct ConsumedRequest { view: WorldView, request: SVXRViewRequest }
+const MAX_CONSUMED_REQUESTS: usize = 96;
+static CAPTURE_CONSUMED_REQUESTS: LazyLock<bool> = LazyLock::new(||
+    std::env::var("MUGUET_GEOMETRY_STEREO_CAPTURE").as_deref() == Ok("1"));
+
+fn push_consumed_request(state: &mut State, view: WorldView, request: SVXRViewRequest) {
+    state.consumed_requests.push_back(ConsumedRequest { view, request });
+    while state.consumed_requests.len() > MAX_CONSUMED_REQUESTS {
+        state.consumed_requests.pop_front();
+    }
+}
+
+fn remember_consumed_request(state: &mut State, view: WorldView, request: SVXRViewRequest) {
+    if !*CAPTURE_CONSUMED_REQUESTS || !view.headset_applied || view.view_count != 2
+        || request.view_count != 2 || view.request_frame != request.frame { return; }
+    push_consumed_request(state, view, request);
+}
+
+fn find_consumed_request(state: &State, view: &WorldView) -> Option<SVXRViewRequest> {
+    state.consumed_requests.iter().rev().find(|entry|
+        entry.view.provenance_epoch == view.provenance_epoch
+        && entry.view.request_frame == view.request_frame
+        && entry.view.presentation_time_seconds.to_bits() == view.presentation_time_seconds.to_bits()
+        && entry.view.head_pose_frame == view.head_pose_frame
+        && entry.view.camera_sequence == view.camera_sequence
+        && entry.view.eye_index == view.eye_index
+        && entry.view == *view).map(|entry| entry.request)
+}
+
+fn request_bytes(request: SVXRViewRequest) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(288);
+    bytes.extend_from_slice(&request.version.to_le_bytes());
+    bytes.extend_from_slice(&request.size.to_le_bytes());
+    bytes.extend_from_slice(&request.frame.to_le_bytes());
+    bytes.extend_from_slice(&request.presentation_time_seconds.to_le_bytes());
+    bytes.extend_from_slice(&request.view_count.to_le_bytes());
+    bytes.extend_from_slice(&request.reserved.to_le_bytes());
+    for eye in request.views {
+        for value in eye.head_from_eye.into_iter().chain(eye.projection_from_eye) {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+    }
+    debug_assert_eq!(bytes.len(), 288);
+    bytes
+}
+
+pub(crate) fn consumed_request_receipt(view: &WorldView) -> Option<serde_json::Value> {
+    if !*CAPTURE_CONSUMED_REQUESTS || !view.headset_applied || view.view_count != 2 { return None; }
+    let request = find_consumed_request(&lock_world_state(), view)?;
+    if request.frame != view.request_frame || request.view_count != 2 { return None; }
+    let bytes = request_bytes(request);
+    Some(serde_json::json!({"schema":1,"source":"sv_xr_submit_views",
+        "request_bytes_hex":bytes.iter().map(|byte| format!("{byte:02x}")).collect::<String>(),
+        "provenance_epoch":view.provenance_epoch,"head_pose_frame":view.head_pose_frame}))
+}
+
 thread_local! {
     static RENDER_THREAD: RefCell<RenderThread> = RefCell::new(RenderThread::default());
 }
@@ -104,6 +164,7 @@ thread_local! {
 #[derive(Default)]
 struct State {
     request: Option<(SVXRViewRequest, Instant)>,
+    consumed_requests: VecDeque<ConsumedRequest>,
     gameplay_ready_at: Option<Instant>,
     history: VecDeque<SavedViewport>,
     markers: BTreeMap<u64, Option<WorldView>>,
@@ -167,6 +228,7 @@ pub fn set_active(_active: bool) {
 
 fn invalidate_state(state: &mut State) {
     state.request = None;
+    state.consumed_requests.clear();
     state.gameplay_ready_at = None;
     state.history.clear();
     state.last_main = None;
@@ -462,6 +524,7 @@ pub fn camera_post(caller: &mut Caller<'_, HostState>, source: u64, _frame: u64)
                 view.headset_applied = true;
                 let mut state = lock_world_state();
                 if provenance_epoch != EPOCH.load(Ordering::Acquire) { return Ok(()); }
+                if let Some(consumed) = request { remember_consumed_request(&mut state, view, consumed); }
                 state.overrides_applied += 1; state.last_error = None;
             }
             Err(error) => {
@@ -731,6 +794,51 @@ mod tests {
         crate::xr::CameraUpdate { frame: 1, heading_degrees: 90., pitch_degrees: 0., roll_degrees: 0., relative_position_meters: [0.2, 0.1, -0.3] }
     }
     fn projection() -> [f32;16] { [1.,0.,0.,0., 0.,1.,0.,0., 0.,0.,0.001,-1., 0.,0.,0.1,0.] }
+    #[test]
+    fn consumed_request_lookup_survives_newer_request_but_rejects_mismatch_reset_and_overflow() {
+        let eye = SVXREyeView { head_from_eye: identity(), projection_from_eye: projection() };
+        let make_request = |frame| SVXRViewRequest { version: 1, size: 288, frame,
+            presentation_time_seconds: frame as f64, view_count: 2, reserved: 0, views: [eye; 2] };
+        let mut state = State::default();
+        let mut original = view(0, 1);
+        original.request_frame = 10;
+        original.camera_sequence = 100;
+        original.presentation_time_seconds = 10.25;
+        original.head_pose_frame = 99;
+        push_consumed_request(&mut state, original, make_request(10));
+        let mut latest = original;
+        latest.request_frame = 11;
+        latest.camera_sequence = 101;
+        latest.presentation_time_seconds = 11.25;
+        latest.head_pose_frame = 100;
+        push_consumed_request(&mut state, latest, make_request(11));
+        state.request = Some((make_request(11), Instant::now())); // latest advanced after the original camera consumed frame 10
+        assert_eq!(find_consumed_request(&state, &original).map(|r| r.frame), Some(10));
+        let bytes = request_bytes(find_consumed_request(&state, &original).unwrap());
+        assert_eq!(bytes.len(), 288);
+        assert_eq!(u64::from_le_bytes(bytes[8..16].try_into().unwrap()), 10);
+        let mut miss = original; miss.provenance_epoch += 1;
+        assert!(find_consumed_request(&state, &miss).is_none());
+        miss = original; miss.presentation_time_seconds += 0.001;
+        assert!(find_consumed_request(&state, &miss).is_none());
+        miss = original; miss.head_pose_frame += 1;
+        assert!(find_consumed_request(&state, &miss).is_none());
+        miss = original; miss.camera_sequence += 1;
+        assert!(find_consumed_request(&state, &miss).is_none());
+        for frame in 12..(12 + MAX_CONSUMED_REQUESTS as u64) {
+            let mut view = original;
+            view.request_frame = frame;
+            view.camera_sequence = frame;
+            view.presentation_time_seconds = frame as f64;
+            push_consumed_request(&mut state, view, make_request(frame));
+        }
+        assert_eq!(state.consumed_requests.len(), MAX_CONSUMED_REQUESTS);
+        assert!(find_consumed_request(&state, &original).is_none());
+        assert!(find_consumed_request(&state, &latest).is_none());
+        invalidate_state(&mut state);
+        assert!(state.consumed_requests.is_empty());
+    }
+
     #[test]
     fn full_camera_composition_keeps_head_translation_and_distinct_eye_offsets() {
         let head = native_head(pose()).unwrap();
