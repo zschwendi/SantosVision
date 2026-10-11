@@ -59,6 +59,26 @@ pub struct WorldView {
     pub headset_applied: bool,
 }
 
+/// A scene epoch may only be minted at a certified render-only guest boundary
+/// after simulation has been frozen for both eye renders. There is deliberately
+/// no constructor in the current natural-frame path: alternating camera updates
+/// cannot claim a coherent pair, even if request/head counters happen to match.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct CertifiedPairEpoch {
+    scene_epoch: u64,
+    provenance_epoch: u64,
+}
+
+impl CertifiedPairEpoch {
+    pub(crate) fn scene_epoch(self) -> u64 { self.scene_epoch }
+    pub(crate) fn provenance_epoch(self) -> u64 { self.provenance_epoch }
+}
+
+#[cfg(test)]
+pub(crate) fn fixture_certified_pair_epoch(scene_epoch: u64, provenance_epoch: u64) -> CertifiedPairEpoch {
+    CertifiedPairEpoch { scene_epoch, provenance_epoch }
+}
+
 #[derive(Clone, Copy)]
 struct SavedViewport {
     pointer: u64, source: u64, view: WorldView,
@@ -180,7 +200,7 @@ fn identity() -> [f32; 16] {
     [1.,0.,0.,0., 0.,1.,0.,0., 0.,0.,1.,0., 0.,0.,0.,1.]
 }
 
-fn rigid(m: &[f32; 16]) -> bool {
+pub(crate) fn rigid(m: &[f32; 16]) -> bool {
     if m.iter().any(|value| !value.is_finite()) || m[3].abs() > 1e-4 || m[7].abs() > 1e-4
         || m[11].abs() > 1e-4 || (m[15] - 1.).abs() > 1e-4 { return false; }
     for a in 0..3 { for b in 0..3 {

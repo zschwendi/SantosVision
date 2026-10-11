@@ -2,6 +2,7 @@
 #define SANTOSVISION_WORLD_BRIDGE_H
 #include <stdint.h>
 #define SV_WORLD_FRAME_ABI_VERSION 1u
+#define SV_WORLD_PAIR_ABI_VERSION 1u
 
 /* Immutable snapshots of distinct native game views. These are full viewport
  * world images with the matching real game depth, never a virtual-screen plane.
@@ -34,11 +35,27 @@ typedef struct {
     float depth_far;
 } SVWorldFrame;
 
+/* One GPU-complete render transaction for two distinct eyes of one frozen
+ * simulation scene and one consumed native head pose. scene_epoch is issued
+ * only by the certified guest paired-render producer; matching counters from
+ * independent natural game frames do not qualify. Each returned texture is
+ * retained by its own lease until explicit release after Metal completion. */
+typedef struct {
+    uint32_t abi_version;
+    uint32_t byte_size;
+    uint64_t scene_epoch;
+    SVWorldFrame eyes[2];
+} SVWorldPair;
+
 /* Caller sets version/size. 0 = ready, 1 = awaiting a qualified world frame,
  * -1 = invalid arguments/ABI, -2 = unavailable native Metal backend.
  * Bound to at most 12 outstanding leases; do not acquire indefinitely.
  * Compare both textures' Metal device with the compositor's device. */
 int32_t sv_world_acquire_frame(uint32_t view_index, SVWorldFrame *frame);
+/* Caller initializes version/size. 0 = both eyes ready atomically, 1 = no
+ * qualified pair (including when MUGUET_XR_PAIRED_RENDER is off), -1 = bad
+ * ABI/arguments. Never assemble a pair from two acquire_frame calls. */
+int32_t sv_world_acquire_pair(SVWorldPair *pair);
 /* Release ONLY after the compositor command buffer finishes reading textures.
  * Duplicate/unknown lease tokens return -1 and never release another frame. */
 int32_t sv_world_release_frame(uint64_t lease);
