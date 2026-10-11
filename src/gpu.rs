@@ -21,6 +21,10 @@ use render_prepare::{PassKey, RenderPrepare};
 mod uniform_pack;
 use uniform_pack::UniformPack;
 
+#[path = "bind_group_prepare.rs"]
+mod bind_group_prepare;
+use bind_group_prepare::{BindGroupPrepare, EntryScratch, KeyScratch};
+
 #[cfg(all(test, target_os = "macos"))]
 #[path = "guest_write_tests.rs"]
 mod guest_write_tests;
@@ -880,6 +884,7 @@ pub struct Gpu {
     numeric_bgl_cache: HashMap<(u64, u32, u32), (BindGroupLayout, u64)>,
     render_prepare: RenderPrepare,
     uniform_pack: UniformPack,
+    bind_group_prepare: BindGroupPrepare,
     empty_bgl: Option<(BindGroupLayout, u64)>,
     pipelines: HashMap<Vec<i64>, PipeEntry>,
     pipe_jobs: Option<std::sync::mpsc::Sender<(u64, PipeJob)>>,
@@ -1041,6 +1046,8 @@ impl Gpu {
         log(&format!("render prepare: {}", render_prepare.metrics(0, 0, 0, 0, 0)));
         let uniform_pack = UniformPack::from_environment();
         log(&format!("uniform stage pack: {}", uniform_pack.metrics(0, 0, 0, 0)));
+        let bind_group_prepare = BindGroupPrepare::from_environment();
+        log(&format!("bind group prepare: {}", bind_group_prepare.metrics()));
         Ok(Gpu {
             instance: instance.clone(), pending_clears: HashMap::new(), clears_folded: 0, pipe_jobs, pipe_results, pipe_pending: HashMap::new(), pending_skips: 0, pending_skips0: 0,
             base, mem, ring, device, queue, adapter, surface, surface_format, surface_size: (0, 0),
@@ -1048,7 +1055,7 @@ impl Gpu {
             s: State::new(), world_view: None, world_depths: HashMap::new(), world_depth_before_ui: HashMap::new(), world_depth_snapshot_overflow: false, world_depth_snapshots_this_present: 0, world_depth_trace: HashMap::new(), world_depth_anomalies: Vec::new(), pdirty: true, last_pl: None, last_program_uids: None,
             float_programs: HashMap::new(), shader_index, shader_dir, next_uid: 1,
             bgl_cache: HashMap::new(), empty_bgl: None, pipelines: HashMap::new(), compute: HashMap::new(), bind_groups: HashMap::new(),
-            numeric_bgl_cache: HashMap::new(), render_prepare, uniform_pack,
+            numeric_bgl_cache: HashMap::new(), render_prepare, uniform_pack, bind_group_prepare,
             ubo_slots: (0..FRAME_SLOTS).map(|_| Vec::new()).collect(), ubo_shared: Vec::new(), ubo_slot: 0, ubo_chunk: 0, ubo_off: 0,
             dummy_tex: HashMap::new(), dummy_smp: None, dummy_cmp: None, dummy_bufs: HashMap::new(), zero_vb: None, zero_src: None, scratch: None,
             proxy_pipelines: HashMap::new(), f2d_pipeline: None, blit: None, mip_pipelines: HashMap::new(), mip_sampler: None,
@@ -1144,6 +1151,13 @@ impl Gpu {
         }
         if self.objs.len() <= i {
             self.objs.resize_with(i + 1, || None);
+        }
+        // Even a previously empty ID can be referenced by an existing view.
+        // That view may currently cache a dummy native binding under its own
+        // unchanged ID, so every successful insertion must invalidate it.
+        if self.bind_group_prepare.enabled {
+            self.bind_groups.clear();
+            self.bind_group_prepare.invalidated();
         }
         self.invalidate_world_depth(id, serde_json::json!("set_obj"));
         if self.occlusion_active == Some(id) { self.end_active_occlusion(); }
@@ -1448,6 +1462,10 @@ impl Gpu {
         if self.is_bound(id) { self.pdirty = true; }
         if self.obj(id).is_none() { return; }
         if self.used(id) { self.flush(); }
+        if self.bind_group_prepare.enabled {
+            self.bind_groups.clear();
+            self.bind_group_prepare.invalidated();
+        }
         if self.occlusion_active == Some(id) { self.end_active_occlusion(); }
         if let Some(o) = self.objs.get_mut(id as usize).and_then(|o| o.take()) {
             match o {
@@ -2318,10 +2336,21 @@ impl Gpu {
     }
 
     fn stage_bind_group(&mut self, stage: usize, prog: &Program, group: u32, bgl: &(BindGroupLayout, u64)) -> Option<BgResult> {
+        let sample = self.bind_group_prepare.begin_call();
+        let started = sample.then(Instant::now);
+        let result = self.stage_bind_group_inner(stage, prog, group, bgl);
+        if let Some(started) = started {
+            self.bind_group_prepare.record_wall(started.elapsed());
+        }
+        result
+    }
+
+    fn stage_bind_group_inner(&mut self, stage: usize, prog: &Program, group: u32, bgl: &(BindGroupLayout, u64)) -> Option<BgResult> {
         enum Res { Buf(Buffer, u64, Option<u64>), View(TextureView), Smp(Sampler) }
         let bindings = self.render_prepare.bindings(prog.group_bindings.get(&group).map(Vec::as_slice).unwrap_or(&[]));
-        let mut entries: Vec<(u32, Res)> = Vec::new();
-        let mut key: Vec<u64> = vec![bgl.1, prog.uid, stage as u64];
+        let fast = self.bind_group_prepare.enabled;
+        let mut entries = EntryScratch::<(u32, Res)>::new(fast);
+        let mut key = KeyScratch::new(fast, &[bgl.1, prog.uid, stage as u64]);
         let mut dyn_off = None;
         for b in bindings.as_ref() {
             match b.kind {
@@ -2434,11 +2463,15 @@ impl Gpu {
                 }
             }
         }
-        let cached = self.bind_groups.get(&key);
+        let cached = self.bind_groups.get(key.as_slice());
         self.render_prepare.bind_group_lookup(cached.is_some());
+        self.bind_group_prepare.lookup(cached.is_some(), key.spilled(), entries.spilled());
         if let Some((bg, uid)) = cached {
             return Some(BgResult { bg: bg.clone(), uid: *uid, dyn_off });
         }
+        self.bind_group_prepare.materialized_miss(entries.len());
+        let entries = entries.into_vec();
+        let key = key.into_vec();
         let wentries: Vec<BindGroupEntry> = entries.iter().map(|(binding, r)| BindGroupEntry {
             binding: *binding,
             resource: match r {
@@ -2448,7 +2481,10 @@ impl Gpu {
             },
         }).collect();
         let bg = self.scoped(&format!("bind group {}", prog.label), |d| d.create_bind_group(&BindGroupDescriptor { label: None, layout: &bgl.0, entries: &wentries }))?;
-        if self.bind_groups.len() > BG_LIMIT * 3 / 2 { self.bind_groups.clear(); }
+        if self.bind_groups.len() > BG_LIMIT * 3 / 2 {
+            self.bind_groups.clear();
+            self.bind_group_prepare.invalidated();
+        }
         let uid = self.uid();
         self.bind_groups.insert(key, (bg.clone(), uid));
         Some(BgResult { bg, uid, dyn_off })
@@ -3930,6 +3966,7 @@ impl Gpu {
             self.log_upload_timing(dt);
             log(&format!("render prepare: {}", self.render_prepare.metrics(self.presents, self.draws, self.passes, self.submits, self.errors.load(Ordering::Relaxed))));
             log(&format!("uniform stage pack: {}", self.uniform_pack.metrics(self.presents, self.draws, self.submits, self.errors.load(Ordering::Relaxed))));
+            log(&format!("bind group prepare: {}", self.bind_group_prepare.metrics()));
             if let Some(r) = self.instance.generate_report() {
                 let h = &r.hub;
                 log(&format!("live wgpu objects: buffers {} textures {} views {} bind groups {} samplers {} pipelines {} | engine objects {}",

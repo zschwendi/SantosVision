@@ -1,0 +1,9 @@
+# Bind-group preparation experiment
+
+`MUGUET_BIND_GROUP_PREPARE_OPT=1` enables a bounded stack key (32 `u64` words) and a bounded stack entry list (12 entries) in `stage_bind_group`. Longer keys and entry lists retain every element through a heap fallback. The normal cache key words, binding order, dynamic uniform offset, and native resource selection are unchanged. The default is OFF.
+
+The complete resource walk still runs before lookup on every draw. It still packs a fresh constant-buffer snapshot, materializes pending clears, records texture and buffer use, and marks bound resources. A cache hit drops the temporary entry handles. A miss converts the temporary key and entries into owned vectors and creates the bind group. The opt-in path clears the bind-group cache on every successful guest object insertion or destruction. This covers both ID reuse and a previously missing resource becoming available behind an unchanged view ID; either transition can change the native binding without changing the lookup words. The original cache size limit remains.
+
+The `bind group prepare:` startup and ten-second log records lookup hits/misses, inline and spill lookups, owned key/entry materializations, invalidations, and sampled CPU wall time for one in 64 calls. These are source-site counters and timing samples, not allocator measurements or GPU timing. Native handle clones still occur in the resource walk on hits.
+
+The helper tests compare complete ordered key words against the legacy `Vec<u64>` lookup, exercise heap fallback without truncation, and verify inline entry conversion. A Metal fixture is provided for root's serialized test run: it checks two distinct dynamic uniform snapshots on a cache hit, reuses a guest view ID for another native buffer, then checks missing-to-real regular and counter-buffer bindings with fixed view IDs and GPU readback. No build, test, or GPU run was performed while preparing this patch.
