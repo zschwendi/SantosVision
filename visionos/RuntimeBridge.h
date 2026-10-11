@@ -19,6 +19,10 @@ int32_t sv_runtime_set_active(uint32_t active);
  * explicit MUGUET_TRANSFER_FROZEN_DEPTH=0/1 overrides it for diagnostics.
  * Returns -1 during or after native startup. */
 int32_t sv_world_set_frozen_depth_transfer(uint32_t enabled);
+/* Pre-start app request for render preparation, uniform staging, and bind-group
+ * preparation. Initially OFF. Exact 1/0 diagnostic environment values override
+ * each experiment separately. Returns -1 during or after native startup. */
+int32_t sv_runtime_set_draw_setup_overhead(uint32_t enabled);
 /* Queue readback of the next actual game GPU presentation to a PPM file. */
 int32_t sv_gpu_capture_next(const char *output_ppm_path);
 

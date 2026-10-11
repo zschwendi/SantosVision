@@ -254,7 +254,7 @@ pub(super) struct RenderPrepare {
 
 impl RenderPrepare {
     pub(super) fn from_environment() -> Self {
-        Self::new(std::env::var("MUGUET_RENDER_PREPARE_OPT").as_deref() == Ok("1"))
+        Self::new(crate::draw_setup::render_prepare_enabled())
     }
 
     fn new(enabled: bool) -> Self {

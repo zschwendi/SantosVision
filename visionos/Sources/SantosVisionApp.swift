@@ -278,7 +278,10 @@ private struct LauncherView: View {
             Toggle("Reduce frame-copy overhead", isOn: Binding(
                 get: { runtime.frozenDepthHandoffEnabled },
                 set: { runtime.setFrozenDepthHandoff($0) }))
-            Text("Adaptive rendering simplifies flat surfaces and sky; it starts off while visual accuracy is being checked. Reducing frame-copy overhead starts on. Choose before starting the game; quit and reopen SantosVision to change these settings.")
+            Toggle("Reduce draw setup overhead (experimental)", isOn: Binding(
+                get: { runtime.drawSetupOverheadEnabled },
+                set: { runtime.setDrawSetupOverhead($0) }))
+            Text("Adaptive rendering simplifies flat surfaces and sky; it starts off while visual accuracy is being checked. Reducing frame-copy overhead starts on. Draw setup starts off and is experimental. Choose before starting the game; quit and reopen SantosVision to change these settings.")
                 .font(.caption).foregroundStyle(.secondary)
         }
         .disabled(!runtime.canChangeRenderingOptimizations)

@@ -31,11 +31,16 @@ private enum NativeRuntime {
         #endif
     }
 
-    static func start(gameRoot: String, saveRoot: String, frozenDepthHandoff: Bool) -> NativeRuntimeResult {
+    static func start(gameRoot: String, saveRoot: String, frozenDepthHandoff: Bool,
+                      drawSetupOverhead: Bool) -> NativeRuntimeResult {
         #if SV_GAME_RUNTIME
         let configCode = sv_world_set_frozen_depth_transfer(frozenDepthHandoff ? 1 : 0)
         guard configCode == 0 else {
             return NativeRuntimeResult(code: configCode, payload: "Frozen-depth setting could not be applied before native startup (\(configCode)).")
+        }
+        let drawSetupCode = sv_runtime_set_draw_setup_overhead(drawSetupOverhead ? 1 : 0)
+        guard drawSetupCode == 0 else {
+            return NativeRuntimeResult(code: drawSetupCode, payload: "Draw-setup setting could not be applied before native startup (\(drawSetupCode)).")
         }
         return gameRoot.withCString { game in
             saveRoot.withCString { saves in
@@ -96,6 +101,7 @@ final class NativeRuntimeModel: ObservableObject {
     @Published private(set) var graphicsStatus = ""
     @Published private(set) var adaptiveRenderingEnabled = RenderingOptimizations.storedAdaptive
     @Published private(set) var frozenDepthHandoffEnabled = RenderingOptimizations.storedFrozenDepth
+    @Published private(set) var drawSetupOverheadEnabled = RenderingOptimizations.storedDrawSetup
     let isLinked = NativeRuntime.isLinked
     let gameRoot: URL
     let saveRoot: URL
@@ -200,8 +206,10 @@ final class NativeRuntimeModel: ObservableObject {
         startupAttempted = true
         let game = gameRoot.path, saves = saveRoot.path
         let frozenDepthHandoff = frozenDepthHandoffEnabled
+        let drawSetupOverhead = drawSetupOverheadEnabled
         let result = await Task.detached(priority: .userInitiated) {
-            NativeRuntime.start(gameRoot: game, saveRoot: saves, frozenDepthHandoff: frozenDepthHandoff)
+            NativeRuntime.start(gameRoot: game, saveRoot: saves, frozenDepthHandoff: frozenDepthHandoff,
+                                drawSetupOverhead: drawSetupOverhead)
         }.value
         lastStart = result
         hasStarted = result.code == 0
@@ -248,6 +256,13 @@ final class NativeRuntimeModel: ObservableObject {
         guard canChangeRenderingOptimizations else { return }
         frozenDepthHandoffEnabled = enabled
         UserDefaults.standard.set(enabled, forKey: RenderingOptimizations.frozenDepthKey)
+        recordReport()
+    }
+
+    func setDrawSetupOverhead(_ enabled: Bool) {
+        guard canChangeRenderingOptimizations else { return }
+        drawSetupOverheadEnabled = enabled
+        UserDefaults.standard.set(enabled, forKey: RenderingOptimizations.drawSetupKey)
         recordReport()
     }
 
@@ -458,11 +473,15 @@ final class NativeRuntimeModel: ObservableObject {
             "graphics_settings_status": graphicsStatus,
             "rendering_optimizations_requested": [
                 "adaptive_mesh_and_sky_fan": adaptiveRenderingEnabled,
-                "frozen_depth_handoff": frozenDepthHandoffEnabled
+                "frozen_depth_handoff": frozenDepthHandoffEnabled,
+                "draw_setup_overhead": drawSetupOverheadEnabled
             ],
             "rendering_optimizations_effective": [
                 "adaptive_mesh": RenderingOptimizations.adaptiveMeshEnabled,
-                "sky_fan": RenderingOptimizations.skyFanEnabled
+                "sky_fan": RenderingOptimizations.skyFanEnabled,
+                "render_prepare": RenderingOptimizations.renderPrepareEnabled,
+                "uniform_stage_pack": RenderingOptimizations.uniformStagePackEnabled,
+                "bind_group_prepare": RenderingOptimizations.bindGroupPrepareEnabled
             ],
             "probe": payload(lastProbe), "start": payload(lastStart), "status": payload(lastStatus),
             "head_pose_source": SimulatorPoseFixture.shared == nil ? "ARKit" : "simulator_fixture",

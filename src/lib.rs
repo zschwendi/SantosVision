@@ -6,6 +6,7 @@ mod app;
 mod audio;
 mod bc;
 mod buffer_upload;
+mod draw_setup;
 pub mod config;
 mod fs;
 mod float_sampling;

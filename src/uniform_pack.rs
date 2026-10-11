@@ -30,7 +30,7 @@ pub(super) struct UniformPack {
 
 impl UniformPack {
     pub(super) fn from_environment() -> Self {
-        Self::new(std::env::var("MUGUET_UNIFORM_STAGE_PACK_OPT").as_deref() == Ok("1"))
+        Self::new(crate::draw_setup::uniform_stage_pack_enabled())
     }
 
     fn new(enabled: bool) -> Self {

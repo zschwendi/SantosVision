@@ -59,7 +59,7 @@ pub(crate) fn frozen_depth_transfer_requested() -> bool {
     resolve_frozen_depth_request(environment.as_deref(), APP_FROZEN_DEPTH_REQUESTED.load(Ordering::Acquire))
 }
 
-fn can_configure_depth_before_start(state: &str, runtime_initialized: bool) -> bool {
+fn can_configure_before_start(state: &str, runtime_initialized: bool) -> bool {
     !runtime_initialized && matches!(state, "idle" | "failed")
 }
 
@@ -67,10 +67,23 @@ fn can_configure_depth_before_start(state: &str, runtime_initialized: bool) -> b
 pub extern "C" fn sv_world_set_frozen_depth_transfer(enabled: u32) -> i32 {
     if enabled > 1 { return -1; }
     let Ok(status) = STATUS.lock() else { return -1; };
-    if !can_configure_depth_before_start(status.state, crate::RT.get().is_some()) {
+    if !can_configure_before_start(status.state, crate::RT.get().is_some()) {
         return -1;
     }
     APP_FROZEN_DEPTH_REQUESTED.store(enabled == 1, Ordering::Release);
+    0
+}
+
+/// Typed pre-start request for the three draw-setup experiments. The status
+/// lock is also held by `start` while it changes idle/failed to initializing.
+#[no_mangle]
+pub extern "C" fn sv_runtime_set_draw_setup_overhead(enabled: u32) -> i32 {
+    if enabled > 1 { return -1; }
+    let Ok(status) = STATUS.lock() else { return -1; };
+    if !can_configure_before_start(status.state, crate::RT.get().is_some()) {
+        return -1;
+    }
+    crate::draw_setup::set_app_requested(enabled == 1);
     0
 }
 
@@ -226,6 +239,7 @@ pub extern "C" fn sv_runtime_status(out: *mut c_char, capacity: usize) -> i32 {
         "heap_bytes": crate::RT.get().map(|runtime| runtime.mem.data_size()).unwrap_or(0),
         "gpu_started": crate::gpu::STARTED.load(Ordering::Relaxed),
         "frozen_depth_transfer_requested": frozen_depth_transfer_requested(),
+        "draw_setup": crate::draw_setup::status_json(),
         "presents": crate::gpu::PRESENTS.load(Ordering::Relaxed),
         "geometry_capture_diagnostics": crate::gpu::geometry_capture_diagnostics_json(),
         "immersive_game_renderer_connected": crate::world_frame::renderer_connected(),
@@ -237,7 +251,7 @@ pub extern "C" fn sv_runtime_status(out: *mut c_char, capacity: usize) -> i32 {
 mod tests {
     #[test]
     fn depth_request_configuration_requires_uninitialized_runtime_and_prestart_state() {
-        use super::can_configure_depth_before_start as allowed;
+        use super::can_configure_before_start as allowed;
         assert!(allowed("idle", false));
         assert!(allowed("failed", false));
         for state in ["idle", "failed", "initializing", "starting", "running", "returned", "exited", "panicked"] {
@@ -246,6 +260,12 @@ mod tests {
         for state in ["initializing", "starting", "running", "returned", "exited", "panicked", "unknown"] {
             assert!(!allowed(state, false), "prestart state {state} accepted");
         }
+    }
+
+    #[test]
+    fn draw_setup_typed_setter_rejects_invalid_values_without_runtime_start() {
+        assert_eq!(super::sv_runtime_set_draw_setup_overhead(2), -1);
+        assert_eq!(super::sv_runtime_set_draw_setup_overhead(u32::MAX), -1);
     }
 
     #[test]

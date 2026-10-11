@@ -5,12 +5,14 @@ import Foundation
 enum RenderingOptimizations {
     static let adaptiveKey = "SantosVisionAdaptiveRenderingEnabled"
     static let frozenDepthKey = "SantosVisionFrozenDepthHandoffEnabled"
+    static let drawSetupKey = "SantosVisionDrawSetupOverheadEnabled"
 
     static var storedAdaptive: Bool { UserDefaults.standard.bool(forKey: adaptiveKey) }
     static var storedFrozenDepth: Bool {
         guard UserDefaults.standard.object(forKey: frozenDepthKey) != nil else { return true }
         return UserDefaults.standard.bool(forKey: frozenDepthKey)
     }
+    static var storedDrawSetup: Bool { UserDefaults.standard.bool(forKey: drawSetupKey) }
 
     private static func resolved(_ name: String, stored: Bool) -> Bool {
         switch ProcessInfo.processInfo.environment[name] {
@@ -26,5 +28,17 @@ enum RenderingOptimizations {
 
     static var skyFanEnabled: Bool {
         resolved("MUGUET_COMPOSITOR_ADAPTIVE_SKY_FAN", stored: storedAdaptive)
+    }
+
+    static var renderPrepareEnabled: Bool {
+        resolved("MUGUET_RENDER_PREPARE_OPT", stored: storedDrawSetup)
+    }
+
+    static var uniformStagePackEnabled: Bool {
+        resolved("MUGUET_UNIFORM_STAGE_PACK_OPT", stored: storedDrawSetup)
+    }
+
+    static var bindGroupPrepareEnabled: Bool {
+        resolved("MUGUET_BIND_GROUP_PREPARE_OPT", stored: storedDrawSetup)
     }
 }
