@@ -147,6 +147,71 @@ private final class GameWorldLease: @unchecked Sendable {
     deinit { release() }
 }
 
+// BEGIN CornerScratchPool (the standalone GPU harness compiles this block verbatim)
+/// The corner textures one command buffer holds until it completes.
+struct CornerScratchLease: @unchecked Sendable {
+    var textures: [any MTLTexture] = []
+}
+
+/// Bounded scratch textures for the optional corner-depth precompute. A texture
+/// is handed to one command buffer and returns to the pool only from that
+/// buffer's completion handler, so it is never rewritten while an earlier
+/// submission can still read it. Nothing is cached between source frames.
+final class CornerScratchPool: @unchecked Sendable {
+    /// Three in-flight command buffers, two eyes each.
+    static let maximumTextures = 6
+    /// One corner texture. 3841x2161 R32Float, the 4K case, is 31.7 MiB.
+    static let maximumTextureBytes = 64 << 20
+    private let lock = NSLock()
+    private var entries: [(texture: any MTLTexture, busy: Bool)] = []
+
+    /// The (width + 1) x (height + 1) corner grid, or nil outside the bound.
+    static func cornerSize(width: Int, height: Int) -> (width: Int, height: Int)? {
+        guard width > 0, height > 0, width <= 16_384, height <= 16_384,
+              (width + 1) * (height + 1) * 4 <= maximumTextureBytes else { return nil }
+        return (width + 1, height + 1)
+    }
+
+    /// A texture no other submission is using, or nil when the bound is reached.
+    func acquire(device: any MTLDevice, width: Int, height: Int) -> (any MTLTexture)? {
+        guard let size = Self.cornerSize(width: width, height: height) else { return nil }
+        lock.lock()
+        defer { lock.unlock() }
+        if let index = entries.firstIndex(where: { !$0.busy && $0.texture.width == size.width && $0.texture.height == size.height }) {
+            entries[index].busy = true
+            return entries[index].texture
+        }
+        // Idle textures of another size are dropped first, so a change of source size cannot grow the pool.
+        entries.removeAll { !$0.busy }
+        guard entries.count < Self.maximumTextures else { return nil }
+        let descriptor = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .r32Float, width: size.width,
+                                                                  height: size.height, mipmapped: false)
+        descriptor.usage = [.shaderRead, .shaderWrite]
+        descriptor.storageMode = .private
+        guard let texture = device.makeTexture(descriptor: descriptor) else { return nil }
+        texture.label = "Game world qualified corner depths"
+        entries.append((texture, true))
+        return texture
+    }
+
+    /// Called from the completion handler of the command buffer that used them.
+    func release(_ lease: CornerScratchLease) {
+        guard !lease.textures.isEmpty else { return }
+        lock.lock()
+        defer { lock.unlock() }
+        for texture in lease.textures {
+            if let index = entries.firstIndex(where: { $0.texture === texture }) { entries[index].busy = false }
+        }
+    }
+
+    var statistics: (textures: Int, busy: Int, bytes: Int) {
+        lock.lock()
+        defer { lock.unlock() }
+        return (entries.count, entries.filter(\.busy).count, entries.reduce(0) { $0 + $1.texture.width * $1.texture.height * 4 })
+    }
+}
+// END CornerScratchPool
+
 /// Native Metal snapshots are immutable and already GPU-complete when leased.
 /// The render thread only calls host mailbox/lease APIs, never guest functions.
 final class GameWorldRenderer: @unchecked Sendable {
@@ -155,6 +220,11 @@ final class GameWorldRenderer: @unchecked Sendable {
     private let tracking = WorldTrackingProvider()
     private let queue: any MTLCommandQueue
     private let pipeline: any MTLRenderPipelineState
+    /// Optional exact corner-depth precompute (MUGUET_COMPOSITOR_CORNER_PRECOMPUTE=1); nil keeps the
+    /// single-pass pipeline above. Off by default.
+    private let cornerPrecompute: (kernel: any MTLComputePipelineState, pipeline: any MTLRenderPipelineState,
+                                   scratch: CornerScratchPool)?
+    private var loggedCornerFallback = false
     private let depthState: any MTLDepthStencilState
     private let report: @Sendable (GameWorldEvent) -> Void
     private let gpuTiming = ProcessInfo.processInfo.environment["MUGUET_COMPOSITOR_GPU_TIMING"] == "1"
@@ -185,6 +255,19 @@ final class GameWorldRenderer: @unchecked Sendable {
         descriptor.colorAttachments[0].pixelFormat = layer.configuration.colorFormat
         descriptor.depthAttachmentPixelFormat = layer.configuration.depthFormat
         pipeline = try layer.device.makeRenderPipelineState(descriptor: descriptor)
+        let cornerRequested = ProcessInfo.processInfo.environment["MUGUET_COMPOSITOR_CORNER_PRECOMPUTE"] == "1"
+        var precompute: (kernel: any MTLComputePipelineState, pipeline: any MTLRenderPipelineState, scratch: CornerScratchPool)?
+        if cornerRequested, let kernelFunction = library.makeFunction(name: "gameWorldCornerDepths"),
+           let precomputedVertex = library.makeFunction(name: "gameWorldPrecomputedVertex"),
+           let kernel = try? layer.device.makeComputePipelineState(function: kernelFunction) {
+            // Same fragment stage, attachments and depth state; only the vertex entry point differs.
+            descriptor.label = "Actual native GTA world depth reprojection, precomputed corners"
+            descriptor.vertexFunction = precomputedVertex
+            if let precomputed = try? layer.device.makeRenderPipelineState(descriptor: descriptor) {
+                precompute = (kernel, precomputed, CornerScratchPool())
+            }
+        }
+        cornerPrecompute = precompute
         let depthDescriptor = MTLDepthStencilDescriptor()
         depthDescriptor.depthCompareFunction = .greaterEqual
         depthDescriptor.isDepthWriteEnabled = true
@@ -192,6 +275,9 @@ final class GameWorldRenderer: @unchecked Sendable {
             throw GameWorldError.missingMetal
         }
         self.depthState = depthState
+        if cornerRequested {
+            log.info("Corner-depth precompute requested: \(precompute == nil ? "unavailable, using the single-pass pipeline" : "enabled", privacy: .public)")
+        }
     }
 
     func start() async throws {
@@ -279,6 +365,7 @@ final class GameWorldRenderer: @unchecked Sendable {
         guard let commands = queue.makeCommandBuffer() else { return }
         commands.label = "SantosVision actual game world compositor frame"
         var leases: [GameWorldLease] = []
+        var cornerScratch = CornerScratchLease()
         var presentation: GameWorldPresentation?
         var debugCapture: GameWorldDebugCapture?
         for drawable in drawables {
@@ -328,7 +415,7 @@ final class GameWorldRenderer: @unchecked Sendable {
                 reportStatus("The compositor supplied an unsupported game view count (\(drawable.views.count)); this bridge supports one or two views.")
             }
             let encodedViews = encode(drawable: drawable, stageFromHead: stageFromHead,
-                                      leases: drawableLeases, commands: commands)
+                                      leases: drawableLeases, commands: commands, cornerScratch: &cornerScratch)
             if builtIn, encodedViews == drawable.views.count, !drawableLeases.isEmpty {
                 presentation = GameWorldPresentation(viewCount: drawable.views.count,
                     gameFrames: drawableLeases.map { $0.native.game_frame },
@@ -357,13 +444,20 @@ final class GameWorldRenderer: @unchecked Sendable {
             drawable.encodePresent(commandBuffer: commands)
         }
         let completedLeases = leases
+        let completedCornerScratch = cornerScratch
+        let cornerPool = cornerPrecompute?.scratch
         let completedPresentation = presentation
         let completedDebugCapture = debugCapture
         let reportThisFrame = !loggedFrame || frameNumber % 120 == 0
         if presentation != nil { loggedFrame = true }
         frameNumber &+= 1
         commands.addCompletedHandler { [inFlight, report, log, gpuTiming] buffer in
-            defer { inFlight.signal(); completedLeases.forEach { $0.release() } }
+            defer {
+                inFlight.signal()
+                completedLeases.forEach { $0.release() }
+                // Only now can a later submission write these corner textures.
+                cornerPool?.release(completedCornerScratch)
+            }
             var acknowledged = false
             if let completedPresentation {
                 let tokens = completedLeases.map { $0.native.lease }
@@ -420,8 +514,40 @@ final class GameWorldRenderer: @unchecked Sendable {
         if result != 0 { reportStatus("Native compositor view submission failed (\(result)).") }
     }
 
+    /// Encodes the corner-depth kernel for one eye on `commands`, ahead of that eye's draw. Returns nil,
+    /// leaving the single-pass pipeline in use for this eye, when no bounded scratch texture is free.
+    private func encodeCornerDepths(lease: GameWorldLease, uniforms: GameWorldUniforms, commands: any MTLCommandBuffer,
+                                    cornerScratch: inout CornerScratchLease) -> (any MTLTexture)? {
+        guard let precompute = cornerPrecompute else { return nil }
+        guard let corners = precompute.scratch.acquire(device: layer.device, width: Int(lease.native.width),
+                                                       height: Int(lease.native.height)) else {
+            if !loggedCornerFallback {
+                loggedCornerFallback = true
+                log.error("Corner-depth precompute had no bounded scratch texture for \(lease.native.width)x\(lease.native.height); that eye used the single-pass pipeline.")
+            }
+            return nil
+        }
+        // Held by this command buffer until its completion handler returns it.
+        cornerScratch.textures.append(corners)
+        guard let encoder = commands.makeComputeCommandEncoder() else { return nil }
+        var uniforms = uniforms
+        encoder.label = "Game world corner depths"
+        encoder.setComputePipelineState(precompute.kernel)
+        encoder.setBytes(&uniforms, length: MemoryLayout<GameWorldUniforms>.stride, index: 0)
+        encoder.setTexture(lease.depth, index: 0)
+        encoder.setTexture(corners, index: 1)
+        let groupWidth = precompute.kernel.threadExecutionWidth
+        let groupHeight = max(1, precompute.kernel.maxTotalThreadsPerThreadgroup / groupWidth)
+        encoder.dispatchThreadgroups(MTLSize(width: (corners.width + groupWidth - 1) / groupWidth,
+                                             height: (corners.height + groupHeight - 1) / groupHeight, depth: 1),
+                                     threadsPerThreadgroup: MTLSize(width: groupWidth, height: groupHeight, depth: 1))
+        encoder.endEncoding()
+        return corners
+    }
+
     private func encode(drawable: LayerRenderer.Drawable, stageFromHead: simd_float4x4?,
-                        leases: [GameWorldLease], commands: any MTLCommandBuffer) -> Int {
+                        leases: [GameWorldLease], commands: any MTLCommandBuffer,
+                        cornerScratch: inout CornerScratchLease) -> Int {
         var clearedTextures = Set<String>()
         var encodedViews = 0
         for (eye, view) in drawable.views.enumerated() {
@@ -438,13 +564,26 @@ final class GameWorldRenderer: @unchecked Sendable {
             pass.depthAttachment.loadAction = firstPass ? .clear : .load
             pass.depthAttachment.storeAction = .store
             pass.depthAttachment.clearDepth = 0
+            var source: (lease: GameWorldLease, uniforms: GameWorldUniforms)?
+            if let stageFromHead, let lease = leases.first(where: { $0.native.view_index == UInt32(eye) }) {
+                source = (lease, worldUniforms(lease: lease, stageFromHead: stageFromHead, headFromEye: view.transform,
+                    projection: drawable.computeProjection(convention: .rightUpBack, viewIndex: eye)))
+            }
+            // The kernel is encoded on this command buffer before the eye's render pass that reads its result.
+            let corners = source.flatMap {
+                encodeCornerDepths(lease: $0.lease, uniforms: $0.uniforms, commands: commands, cornerScratch: &cornerScratch)
+            }
             guard let encoder = commands.makeRenderCommandEncoder(descriptor: pass) else { continue }
             encoder.label = "Actual GTA world eye \(eye)"
             encoder.setViewport(map.viewport)
-            if let stageFromHead, let lease = leases.first(where: { $0.native.view_index == UInt32(eye) }) {
-                var uniforms = worldUniforms(lease: lease, stageFromHead: stageFromHead, headFromEye: view.transform,
-                    projection: drawable.computeProjection(convention: .rightUpBack, viewIndex: eye))
-                encoder.setRenderPipelineState(pipeline)
+            if let (lease, sourceUniforms) = source {
+                var uniforms = sourceUniforms
+                if let corners, let precompute = cornerPrecompute {
+                    encoder.setRenderPipelineState(precompute.pipeline)
+                    encoder.setVertexTexture(corners, index: 1)
+                } else {
+                    encoder.setRenderPipelineState(pipeline)
+                }
                 encoder.setDepthStencilState(depthState)
                 encoder.setCullMode(.none)
                 encoder.setVertexBytes(&uniforms, length: MemoryLayout<GameWorldUniforms>.stride, index: 0)
@@ -455,7 +594,7 @@ final class GameWorldRenderer: @unchecked Sendable {
                     instanceCount: Int(lease.native.width) * Int(lease.native.height))
                 encodedViews += 1
                 if !loggedFrame {
-                    log.info("Actual GTA source eye \(eye): size=\(lease.native.width)x\(lease.native.height) format=\(lease.color.pixelFormat.rawValue) color_device=\(lease.color.device.registryID) compositor_device=\(self.layer.device.registryID) eye_x=\(view.transform.columns.3.x) projection_x=\(uniforms.currentClipFromEye.columns.2.x) source_near=\(lease.native.depth_near) source_far=\(lease.native.depth_far)")
+                    log.info("Actual GTA source eye \(eye): size=\(lease.native.width)x\(lease.native.height) format=\(lease.color.pixelFormat.rawValue) color_device=\(lease.color.device.registryID) compositor_device=\(self.layer.device.registryID) eye_x=\(view.transform.columns.3.x) projection_x=\(uniforms.currentClipFromEye.columns.2.x) source_near=\(lease.native.depth_near) source_far=\(lease.native.depth_far) corner_precompute=\(corners != nil)")
                 }
             }
             encoder.endEncoding()
