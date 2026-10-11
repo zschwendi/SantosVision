@@ -12,18 +12,27 @@ import sys
 import zipfile
 from pathlib import Path
 
-VS_HASH = '2e9584811e870546'
+VS_HASH = '6a6a0898a51cf403'  # Active Low-scene default::VS_TransformD.
+OLD_VS_HASH = '2e9584811e870546'  # Frozen synthetic regression fixture.
 PS_HASH = '75cf2d53bf9497c9'
-VS_SHA256 = '696bab4312d89127bcbec89d20e5158ee45e1af6f5d726892e02867f62e6572d'
+VS_SHA256 = 'fc914d159a51b8bd8e6d35633dd385a6cef50fb1ed740d5ad3d86893a03acb61'
+OLD_VS_SHA256 = '696bab4312d89127bcbec89d20e5158ee45e1af6f5d726892e02867f62e6572d'
 PS_SHA256 = '1e3d02aa02c1219e721c351c2fbcebc45154b2f9b1a8f2bdc8f1f6a96ff0daed'
 DEFAULT_ZIP = Path('/Users/zach/gaming/game-assets/playgta5-full-game-v1/playgta5-part-01-of-14.zip')
 CLIP_PATTERN = ('x0[0u].x = dot(r0, cb0_0.tint_symbol_1[0u]);',
                 'o5[0u] = x0[0u].x;', 'o5[1u] = x0[0u].y;',
                 'o5[2u] = x0[0u].z;', 'o5[3u] = x0[0u].w;')
-POSITION_PATTERN = ('r0 = (v0.yyyy * cb1_1.tint_symbol[9u]);',
-                    'r0 = fma(v0.xxxx, cb1_1.tint_symbol[8u], r0);',
-                    'r0 = fma(v0.zzzz, cb1_1.tint_symbol[10u], r0);',
-                    'r0 = (r0 + cb1_1.tint_symbol[11u]);', 'o4 = r0;')
+POSITION_PREFIX = ('r0 = (v0.yyyy * cb1_1.tint_symbol[9u]);',
+                   'r0 = fma(v0.xxxx, cb1_1.tint_symbol[8u], r0);',
+                   'r0 = fma(v0.zzzz, cb1_1.tint_symbol[10u], r0);')
+OLD_POSITION_PATTERN = POSITION_PREFIX + ('r0 = (r0 + cb1_1.tint_symbol[11u]);', 'o4 = r0;',
+                                          '@builtin(position)\n  o4 : vec4<f32>,')
+D_POSITION_PATTERN = POSITION_PREFIX + ('o0 = (r0 + cb1_1.tint_symbol[11u]);',
+                                        '@builtin(position)\n  o0 : vec4<f32>,')
+VS_VARIANTS = {
+    OLD_VS_HASH: (OLD_VS_SHA256, OLD_POSITION_PATTERN + CLIP_PATTERN, True),
+    VS_HASH: (VS_SHA256, D_POSITION_PATTERN, False),
+}
 
 
 def require(condition, reason):
@@ -31,7 +40,9 @@ def require(condition, reason):
         raise ValueError(reason)
 
 
-def shader_evidence(archive):
+def shader_evidence(archive, vs_hash):
+    require(vs_hash in VS_VARIANTS, 'unsupported vertex shader variant')
+    vs_digest, position_pattern, has_user_clip = VS_VARIANTS[vs_hash]
     with zipfile.ZipFile(archive) as z:
         names = z.namelist()
         def read(hash_id, digest):
@@ -40,11 +51,14 @@ def shader_evidence(archive):
             data = z.read(name)
             require(hashlib.sha256(data).hexdigest() == digest, 'packaged shader digest changed: ' + hash_id)
             return data.decode('utf-8')
-        vs = read(VS_HASH, VS_SHA256)
+        vs = read(vs_hash, vs_digest)
         ps = read(PS_HASH, PS_SHA256)
-    require(all(token in vs for token in POSITION_PATTERN + CLIP_PATTERN), 'source VS position/clip formula changed')
+    source_vs = vs.replace('\r\n', '\n')
+    require(all(token in source_vs for token in position_pattern), 'source VS position formula changed')
+    require(('@builtin(clip_distances)' in source_vs) == has_user_clip,
+            'source VS user clip-distance contract changed')
     require('discard;' not in ps and '@builtin(frag_depth)' not in ps, 'source PS alpha/depth behavior changed')
-    return {'vertex_shader_sha256': VS_SHA256, 'pixel_shader_sha256': PS_SHA256}
+    return {'vertex_shader_sha256': vs_digest, 'pixel_shader_sha256': PS_SHA256}, position_pattern, has_user_clip
 
 
 def mat_col_major(values):
@@ -242,23 +256,45 @@ def write_ppm(path, coverage, width, height, tint):
             f.write(bytes(tint if covered else (0, 0, 0)))
 
 
+def scratch_size(capture):
+    viewport = capture.get('viewport')
+    require(isinstance(viewport, list) and len(viewport) == 6,
+            'captured full viewport missing')
+    require(all(isinstance(value, (int, float)) and not isinstance(value, bool)
+                and math.isfinite(value) for value in viewport),
+            'viewport contains nonfinite or nonnumeric values')
+    x, y, width, height, near, far = viewport
+    require(x == 0 and y == 0 and near == 0 and far == 1,
+            'viewport origin or depth range is not full target')
+    require(width == int(width) and height == int(height) and width > 0 and height > 0,
+            'viewport extent is not positive integer pixels')
+    width, height = int(width), int(height)
+    require(width <= 1024 and height <= 1024 and width * height <= 1_000_000,
+            'captured viewport exceeds bounded scratch resolution')
+    return width, height
+
+
 def qualify(capture, request_record, archive, output, allow_synthetic=False):
-    shader = shader_evidence(archive)
     synthetic = capture.get('synthetic', False)
     require(not synthetic or allow_synthetic, 'synthetic fixture cannot qualify a real game draw')
     require(capture.get('schema') == 1 and capture.get('status') == 'captured'
             and capture.get('source') == 'Gpu::do_draw', 'requires one actual host draw capture')
-    require(capture['shader']['vertex_hash'] == VS_HASH and capture['shader']['pixel_hash'] == PS_HASH,
+    vs_hash = capture['shader']['vertex_hash']
+    require(vs_hash in VS_VARIANTS and capture['shader']['pixel_hash'] == PS_HASH,
             'draw shader pair is not the frozen opaque fixture')
-    for stage, expected in [('vertex', VS_SHA256), ('pixel', PS_SHA256)]:
+    shader, position_pattern, has_user_clip = shader_evidence(archive, vs_hash)
+    for stage, expected in [('vertex', shader['vertex_shader_sha256']),
+                            ('pixel', PS_SHA256)]:
         source = capture['shader'][stage + '_source_wgsl'].encode('utf-8')
         translated = capture['shader'][stage + '_translated_wgsl'].encode('utf-8')
         require(hashlib.sha256(source).hexdigest() == expected, stage + ' captured source differs from package')
         require(0 < len(translated) <= 256 * 1024, stage + ' translated shader missing/oversize')
         shader[stage + '_translated_sha256'] = hashlib.sha256(translated).hexdigest()
-    require(all(token in capture['shader']['vertex_translated_wgsl'].replace('cbpack_v.', '')
-                for token in POSITION_PATTERN + CLIP_PATTERN),
-            'translated VS position/clip path changed')
+    translated_vs = capture['shader']['vertex_translated_wgsl'].replace('cbpack_v.', '').replace('\r\n', '\n')
+    require(all(token in translated_vs for token in position_pattern),
+            'translated VS position path changed')
+    require(('@builtin(clip_distances)' in translated_vs) == has_user_clip,
+            'translated VS user clip-distance contract changed')
     source_view = capture['world_view']
     require(source_view['headset_applied'] and source_view['depth_reverse_z'], 'source view unqualified')
     require(capture['draw']['kind'] == 1 and capture['draw']['instances'] == 1
@@ -275,11 +311,12 @@ def qualify(capture, request_record, archive, output, allow_synthetic=False):
                 and request_record['head_pose_frame'] == captured_receipt['head_pose_frame'],
                 'separate request record differs from consumed host receipt')
     eyes, request_digest, eye_separation = request_eyes(request_record, source_view, embedded=embedded)
-    # The selected VS emits four clip distances. Its first is dot(clip, CB0[0]);
-    # the other three are zero. We only model the identically disabled plane.
-    clip_plane = cb_vec(capture, 0, 0)
-    require(all(abs(value) <= 1e-7 for value in clip_plane),
-            'game VS clip distance plane is active or ambiguous')
+    if has_user_clip:
+        # The old VS emits four clip distances. Its first is dot(clip, CB0[0]);
+        # the other three are zero. We only model the identically disabled plane.
+        clip_plane = cb_vec(capture, 0, 0)
+        require(all(abs(value) <= 1e-7 for value in clip_plane),
+                'game VS clip distance plane is active or ambiguous')
     positions = decode_positions(capture)
     object_to_game = from_columns(cb_columns(capture, 1, 0))
     source_local_to_clip = from_columns(cb_columns(capture, 1, 8))
@@ -291,7 +328,7 @@ def qualify(capture, request_record, archive, output, allow_synthetic=False):
     require(mismatch < 0.02, f'game shader CB clip matrix does not match command camera ({mismatch:.6g})')
     inv_source = inverse(source_local_to_clip)
     check_unclipped([vec(source_local_to_clip, p) for p in positions], 'source')
-    width, height = 128, 128
+    width, height = scratch_size(capture)
     results = []
     screens = []
     for index, eye in enumerate(eyes):
@@ -323,9 +360,10 @@ def qualify(capture, request_record, archive, output, allow_synthetic=False):
               'draw_shader': {key: capture['shader'][key] for key in ('vertex_id', 'vertex_hash', 'pixel_id', 'pixel_hash')
                               if key in capture['shader']}, **shader, 'vertices': len(positions),
               'request_sha256': request_digest, 'eye_separation_m': eye_separation,
+              'scratch_size': {'width': width, 'height': height, 'source': 'captured_full_viewport'},
               'source_matrix_max_error': mismatch, 'eyes': results, 'distinct_coverage_pixels': distinct_pixels,
               'limits': ['CPU position/depth only; game PS not evaluated',
-                         'active clip plane and any side/near/far crossing rejected',
+                         'any user clip plane or side/eye/near/far crossing rejected',
                          'one draw only; no union-culling or deferred/post graph proof']}
     output.mkdir(parents=False, exist_ok=False)
     for index, cov in enumerate(screens):

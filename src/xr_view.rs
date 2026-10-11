@@ -130,6 +130,51 @@ fn find_consumed_request(state: &State, view: &WorldView) -> Option<SVXRViewRequ
         && entry.view == *view).map(|entry| entry.request)
 }
 
+fn same_matrix_bits(a: &[f32; 16], b: &[f32; 16]) -> bool {
+    a.iter().zip(b).all(|(a, b)| a.to_bits() == b.to_bits())
+}
+
+/// The opaque reverse-Z clone is derived from a successful forward-Z primary.
+/// A raw request may follow it only when the exact recorded primary view and
+/// the requested eye projection explain the entire derived command view.
+fn remember_derived_consumed_request(state: &mut State, primary: WorldView, derived: WorldView) -> bool {
+    if !primary.headset_applied || primary.depth_reverse_z || !derived.headset_applied
+        || !derived.depth_reverse_z || primary.view_count != 2 || derived.view_count != 2
+        || primary.eye_index >= 2 { return false; }
+    let Some(request) = find_consumed_request(state, &primary) else { return false; };
+    if validate_request(&request).is_err() || request.frame != primary.request_frame
+        || request.presentation_time_seconds.to_bits() != primary.presentation_time_seconds.to_bits() {
+        return false;
+    }
+    let requested_projection = request.views[primary.eye_index as usize].projection_from_eye;
+    if reverse_z(&requested_projection) != Some(true)
+        || !same_matrix_bits(&primary.projection_from_eye, &for_game_depth(requested_projection, false)) {
+        return false;
+    }
+    let mut expected = primary;
+    // The certified clone flips the already converted primary depth row.
+    // An f32 double flip can differ by a few ULPs from the raw request, so
+    // compare the exact operation the guest command actually received.
+    expected.projection_from_eye = flip_projection_depth(primary.projection_from_eye);
+    expected.depth_reverse_z = true;
+    if derived != expected
+        || derived.presentation_time_seconds.to_bits() != expected.presentation_time_seconds.to_bits()
+        || !same_matrix_bits(&derived.projection_from_eye, &expected.projection_from_eye)
+        || !same_matrix_bits(&derived.game_from_eye, &expected.game_from_eye)
+        || !same_matrix_bits(&derived.game_from_stage, &expected.game_from_stage) {
+        return false;
+    }
+    if let Some(existing) = find_consumed_request(state, &derived) {
+        if request_bytes(existing) == request_bytes(request) { return true; }
+        // A conflicting receipt for the same complete command view must not
+        // survive as an apparently exact GPU lookup.
+        state.consumed_requests.retain(|entry| entry.view != derived);
+        return false;
+    }
+    push_consumed_request(state, derived, request);
+    true
+}
+
 fn request_bytes(request: SVXRViewRequest) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(288);
     bytes.extend_from_slice(&request.version.to_le_bytes());
@@ -656,6 +701,9 @@ pub fn current_view(caller: &mut Caller<'_, HostState>, viewport: u64, _set_wind
                     // and frustums BEFORE original SetCurrent binds the clone.
                     if already_current { state.projection_clones_already_current += 1; }
                     else { state.projection_clone_updates += 1; }
+                    if *CAPTURE_CONSUMED_REQUESTS {
+                        remember_derived_consumed_request(&mut state, saved.view, derived);
+                    }
                     state.history.push_back(SavedViewport { pointer:viewport,view:derived,..saved });
                     while state.history.len() > HISTORY { state.history.pop_front(); }
                     view = Some(derived);
@@ -837,6 +885,52 @@ mod tests {
         assert!(find_consumed_request(&state, &latest).is_none());
         invalidate_state(&mut state);
         assert!(state.consumed_requests.is_empty());
+    }
+
+    #[test]
+    fn reverse_clone_receipt_requires_exact_primary_request_and_derived_view() {
+        let mut native = projection(); native[8] = 0.14; native[9] = -0.07;
+        let eye = SVXREyeView { head_from_eye: identity(), projection_from_eye: native };
+        let request = SVXRViewRequest { version: 1, size: 288, frame: 17,
+            presentation_time_seconds: 1., view_count: 2, reserved: 0, views: [eye; 2] };
+        assert_eq!(validate_request(&request), Ok(()));
+        let mut primary = view(0, 7);
+        primary.request_frame = 17;
+        primary.head_pose_frame = 9;
+        primary.projection_from_eye = for_game_depth(native, false);
+        primary.depth_reverse_z = false;
+        let mut derived = primary;
+        derived.projection_from_eye = flip_projection_depth(primary.projection_from_eye);
+        derived.depth_reverse_z = true;
+        assert!(matrix_error(&derived.projection_from_eye, &native) < 1e-7);
+        assert!(!same_matrix_bits(&derived.projection_from_eye, &native));
+        let mut state = State::default();
+        push_consumed_request(&mut state, primary, request);
+        let mut later = request; later.frame = 18;
+        state.request = Some((later, Instant::now()));
+        assert!(remember_derived_consumed_request(&mut state, primary, derived));
+        assert_eq!(find_consumed_request(&state, &derived).map(|r| r.frame), Some(17));
+        assert!(remember_derived_consumed_request(&mut state, primary, derived));
+        assert_eq!(state.consumed_requests.len(), 2); // repeated clone cannot flood the 96-entry history
+
+        let mut wrong_projection = derived; wrong_projection.projection_from_eye[10] += 0.001;
+        assert!(!remember_derived_consumed_request(&mut state, primary, wrong_projection));
+        assert!(find_consumed_request(&state, &wrong_projection).is_none());
+        let mut wrong_camera = derived; wrong_camera.game_from_eye[12] += 0.01;
+        assert!(!remember_derived_consumed_request(&mut state, primary, wrong_camera));
+        assert!(find_consumed_request(&state, &wrong_camera).is_none());
+        let mut wrong_epoch = derived; wrong_epoch.provenance_epoch += 1;
+        assert!(!remember_derived_consumed_request(&mut state, primary, wrong_epoch));
+        assert!(find_consumed_request(&state, &wrong_epoch).is_none());
+
+        let mut stale_state = State::default();
+        let mut stale_request = request; stale_request.frame = 16;
+        push_consumed_request(&mut stale_state, primary, stale_request);
+        assert!(!remember_derived_consumed_request(&mut stale_state, primary, derived));
+        assert!(find_consumed_request(&stale_state, &derived).is_none());
+        invalidate_state(&mut state);
+        assert!(!remember_derived_consumed_request(&mut state, primary, derived));
+        assert!(find_consumed_request(&state, &derived).is_none());
     }
 
     #[test]

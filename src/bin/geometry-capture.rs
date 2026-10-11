@@ -2,6 +2,7 @@
 //! Run only under the exclusive GPU slot with MUGUET_GEOMETRY_STEREO_CAPTURE=1.
 use muguet::{native, xr, xr_view};
 use std::ffi::CString;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
@@ -25,19 +26,67 @@ fn identity() -> [f32; 16] {
     [1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1.]
 }
 
-fn parse_args() -> Result<(PathBuf, PathBuf, Duration), String> {
+fn cache_seed_name(path: &Path) -> Result<String, String> {
+    if !path.is_absolute() { return Err("--cache-seed requires an absolute file path".into()); }
+    let meta = std::fs::symlink_metadata(path).map_err(|e| format!("cache seed metadata: {e}"))?;
+    if meta.file_type().is_symlink() || !meta.file_type().is_file() {
+        return Err("cache seed must be a regular file, not a symlink or directory".into());
+    }
+    if meta.len() == 0 || meta.len() > 512 * 1024 * 1024 {
+        return Err("cache seed must contain 1..512 MiB".into());
+    }
+    let name = path.file_name().and_then(|name| name.to_str())
+        .ok_or("cache seed filename is not UTF-8")?;
+    let stem = name.strip_suffix(".cwasm").ok_or("cache seed filename must end in .cwasm")?;
+    let parts: Vec<_> = stem.split('-').collect();
+    if parts.len() != 4 || parts[0] != "game"
+        || parts[1].is_empty() || !parts[1].bytes().all(|b| b.is_ascii_digit())
+        || parts[2].is_empty() || !parts[2].bytes().all(|b| b.is_ascii_digit())
+        || parts[3].len() != 8 || !parts[3].bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err("cache seed filename must be game-<length>-<stamp>-<8hex>.cwasm".into());
+    }
+    Ok(name.into())
+}
+
+fn copy_cache_seed(source: &Path, save_root: &Path, name: &str) -> Result<(), String> {
+    let cache_dir = save_root.join("cache");
+    std::fs::create_dir(&cache_dir).map_err(|e| format!("create fresh cache directory: {e}"))?;
+    let mut input = std::fs::File::open(source).map_err(|e| format!("open cache seed: {e}"))?;
+    let size = input.metadata().map_err(|e| format!("cache seed opened metadata: {e}"))?;
+    if !size.is_file() || size.len() == 0 || size.len() > 512 * 1024 * 1024 {
+        return Err("opened cache seed is not a bounded regular file".into());
+    }
+    let destination = cache_dir.join(name);
+    let mut output = std::fs::OpenOptions::new().write(true).create_new(true).open(&destination)
+        .map_err(|e| format!("create exclusive cache seed target {}: {e}", destination.display()))?;
+    let copied = std::io::copy(&mut input.take(512 * 1024 * 1024 + 1), &mut output)
+        .map_err(|e| format!("copy cache seed: {e}"))?;
+    if copied != size.len() { return Err("cache seed changed size during copy".into()); }
+    output.sync_all().map_err(|e| format!("sync cache seed copy: {e}"))?;
+    eprintln!("[geometry-capture] copied root-verified local Mac JIT cache seed {} ({} bytes); runtime will validate compatibility", name, copied);
+    Ok(())
+}
+
+fn parse_args() -> Result<(PathBuf, PathBuf, Duration, Option<PathBuf>), String> {
     let mut args = std::env::args().skip(1);
     let (Some(game_root), Some(save_root)) = (args.next(), args.next()) else {
-        return Err("usage: geometry-capture <absolute-game-root> <fresh-save-root> [deadline-seconds: 1..600]".into());
+        return Err("usage: geometry-capture <absolute-game-root> <fresh-save-root> [deadline-seconds: 1..600] [--cache-seed <absolute-file>]".into());
     };
-    let deadline = match args.next() {
-        Some(value) => value.parse::<u64>().map_err(|_| "deadline must be an integer")?,
-        None => 120,
-    };
-    if args.next().is_some() || !(1..=600).contains(&deadline) {
-        return Err("deadline must be 1..600 seconds; no extra arguments".into());
+    let mut deadline = None;
+    let mut cache_seed = None;
+    while let Some(arg) = args.next() {
+        if arg == "--cache-seed" {
+            if cache_seed.is_some() { return Err("--cache-seed specified twice".into()); }
+            cache_seed = Some(PathBuf::from(args.next().ok_or("--cache-seed needs a file")?));
+        } else if deadline.is_none() {
+            deadline = Some(arg.parse::<u64>().map_err(|_| "deadline must be an integer")?);
+        } else {
+            return Err("unexpected argument or duplicate deadline".into());
+        }
     }
-    Ok((PathBuf::from(game_root), PathBuf::from(save_root), Duration::from_secs(deadline)))
+    let deadline = deadline.unwrap_or(120);
+    if !(1..=600).contains(&deadline) { return Err("deadline must be 1..600 seconds".into()); }
+    Ok((PathBuf::from(game_root), PathBuf::from(save_root), Duration::from_secs(deadline), cache_seed))
 }
 
 fn captured_status(path: &Path) -> Result<Option<String>, String> {
@@ -52,14 +101,27 @@ fn captured_status(path: &Path) -> Result<Option<String>, String> {
 }
 
 fn native_status() -> Option<serde_json::Value> {
-    let mut bytes = [0i8; 32768];
+    let mut bytes = [0i8; 131072];
     (native::sv_runtime_status(bytes.as_mut_ptr(), bytes.len()) == 0)
         .then(|| unsafe { std::ffi::CStr::from_ptr(bytes.as_ptr()) })
         .and_then(|text| serde_json::from_slice(text.to_bytes()).ok())
 }
 
+fn write_final_native_status(save_root: &Path, outcome: &str) -> Result<(), String> {
+    let status = native_status().ok_or("final native status unavailable")?;
+    let body = serde_json::to_vec_pretty(&serde_json::json!({
+        "schema":1,"outcome":outcome,"native_status":status,
+        "input_kind":"synthetic static 64 mm two-view request; actual game draw required"
+    })).map_err(|e| format!("serialize final native status: {e}"))?;
+    let path = save_root.join("final-native-status.json");
+    let mut file = std::fs::OpenOptions::new().write(true).create_new(true).open(&path)
+        .map_err(|e| format!("create exclusive final native status {}: {e}", path.display()))?;
+    file.write_all(&body).map_err(|e| format!("write final native status: {e}"))?;
+    Ok(())
+}
+
 fn run() -> Result<(), String> {
-    let (game_root, save_root, deadline) = parse_args()?;
+    let (game_root, save_root, deadline, cache_seed) = parse_args()?;
     if std::env::var("MUGUET_GEOMETRY_STEREO_CAPTURE").as_deref() != Ok("1") {
         return Err("set MUGUET_GEOMETRY_STEREO_CAPTURE=1 explicitly".into());
     }
@@ -77,10 +139,16 @@ fn run() -> Result<(), String> {
         .any(|entry| entry.path().join("game.wasm").is_file()
             && entry.path().join("shaders/index.json").is_file());
     if !has_build { return Err("game root lacks b/<build>/game.wasm and shaders/index.json".into()); }
+    let seed_name = cache_seed.as_deref().map(cache_seed_name).transpose()?;
     if save_root.exists() { return Err("save root must be fresh; existing saves are never reused".into()); }
     let parent = save_root.parent().ok_or("save root has no parent")?;
     std::fs::create_dir_all(parent).map_err(|e| format!("create run parent: {e}"))?;
     std::fs::create_dir(&save_root).map_err(|e| format!("create fresh save root: {e}"))?;
+    if let (Some(source), Some(name)) = (cache_seed.as_deref(), seed_name.as_deref()) {
+        // Only the caller can establish provenance against the exact game WASM,
+        // toolchain and patch version. This copies one explicitly supplied file.
+        copy_cache_seed(source, &save_root, name)?;
+    }
     std::fs::write(save_root.join("native-graphics.json"),
         b"{\"width\":640,\"height\":360,\"fps_limit\":30,\"graphics_preset\":\"low\"}\n")
         .map_err(|e| format!("seed low graphics: {e}"))?;
@@ -136,24 +204,35 @@ fn run() -> Result<(), String> {
         }
         if let Some(status) = captured_status(capture)? {
             if status == "captured" {
+                write_final_native_status(&save_root, "captured")?;
                 eprintln!("[geometry-capture] real game draw captured at {}; input was synthetic, result is one draw only", capture.display());
                 return Ok(());
             }
             let body = std::fs::read_to_string(capture).map_err(|e| format!("read rejected capture: {e}"))?;
             let value: serde_json::Value = serde_json::from_str(&body).map_err(|e| format!("parse rejected capture: {e}"))?;
+            write_final_native_status(&save_root, "rejected")?;
             return Err(format!("capture rejected: {}", value["reason"].as_str().unwrap_or("reason unavailable")));
         }
         if Instant::now() >= next_report {
             let status = xr_view::status_json();
             let runtime = native_status().unwrap_or(serde_json::Value::Null);
+            let gates = &runtime["geometry_capture_diagnostics"];
             eprintln!("[geometry-capture] startup={} native_state={} gpu_started={} presents={} elapsed={}s requests={} main_camera={} overrides={} last_error={}",
                 startup_done, runtime["state"], runtime["gpu_started"], runtime["presents"],
                 started.elapsed().as_secs(), frame - 1,
                 status["main_camera_calls"], status["overrides_applied"], status["last_error"]);
+            if gates["enabled"] == true {
+                eprintln!("[geometry-capture] gates considered={} vs={} pair={} view={} target={} depth={} surface={} draw={} eligible={} world_depth_draws={} other_pairs={}",
+                    gates["considered_unclamped_draws"], gates["vertex_match"], gates["pair_match"],
+                    gates["view_match"], gates["target_match"], gates["depth_write_match"],
+                    gates["surface_match"], gates["draw_match"], gates["eligible_attempts"],
+                    gates["qualified_world_depth_draws"], gates["other_qualified_pair_draws"]);
+            }
             next_report = Instant::now() + Duration::from_secs(5);
         }
         std::thread::sleep(Duration::from_millis(25));
     }
+    write_final_native_status(&save_root, "deadline_expired")?;
     Err(format!("deadline expired after {}s; no complete real game draw capture", deadline.as_secs()))
 }
 

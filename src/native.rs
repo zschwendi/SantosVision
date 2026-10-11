@@ -197,6 +197,7 @@ pub extern "C" fn sv_runtime_status(out: *mut c_char, capacity: usize) -> i32 {
         "heap_bytes": crate::RT.get().map(|runtime| runtime.mem.data_size()).unwrap_or(0),
         "gpu_started": crate::gpu::STARTED.load(Ordering::Relaxed),
         "presents": crate::gpu::PRESENTS.load(Ordering::Relaxed),
+        "geometry_capture_diagnostics": crate::gpu::geometry_capture_diagnostics_json(),
         "immersive_game_renderer_connected": crate::world_frame::renderer_connected(),
         "immersive_stereo_connected": crate::world_frame::stereo_connected(), "xr": crate::xr::status_json(), "world_view": crate::xr_view::status_json(),
         "world_frames": crate::world_frame::status_json(), "capture": crate::capture::status_json()}).to_string())

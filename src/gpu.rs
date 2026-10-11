@@ -63,6 +63,40 @@ const THREAD_PRESENT_BEFORE_WAIT: usize = 8;
 const THREAD_WORLD_PUBLICATION: usize = 9;
 const THREAD_PIPELINE_COLLECTION: usize = 10;
 const THREAD_TIMING_COUNT: usize = 11;
+const GEOMETRY_DIAG_PAIR_CAP: usize = 32;
+
+static GEOMETRY_DIAG_STATUS: LazyLock<Mutex<serde_json::Value>> =
+    LazyLock::new(|| Mutex::new(serde_json::json!({"enabled":false})));
+
+pub(crate) fn geometry_capture_diagnostics_json() -> serde_json::Value {
+    GEOMETRY_DIAG_STATUS.lock().map(|status| status.clone())
+        .unwrap_or_else(|_| serde_json::json!({"enabled":true,"error":"diagnostic lock poisoned"}))
+}
+
+#[derive(Default)]
+struct GeometryCaptureDiagnostics {
+    considered: u64,
+    vertex_match: u64,
+    pair_match: u64,
+    view_match: u64,
+    target_match: u64,
+    depth_write_match: u64,
+    surface_match: u64,
+    draw_match: u64,
+    eligible_attempts: u64,
+    qualified_world_depth_draws: u64,
+    other_qualified_pairs: u64,
+    qualified_pairs: Vec<GeometryPairCount>,
+    first_pair_state: Option<serde_json::Value>,
+}
+
+struct GeometryPairCount {
+    vertex_hash: String,
+    pixel_hash: String,
+    vertex_label: String,
+    pixel_label: String,
+    draws: u64,
+}
 const API_WALL_NS_BOUNDS: [u64; 4] = [10_000, 100_000, 1_000_000, 10_000_000];
 const UPLOAD_BYTE_BOUNDS: [u64; 4] = [256, 4096, 65536, 1048576];
 
@@ -887,6 +921,7 @@ pub struct Gpu {
     dbg_idx: u64,
     geometry_stereo_capture: bool,
     geometry_stereo_capture_done: bool,
+    geometry_capture_diagnostics: GeometryCaptureDiagnostics,
 
     draws: u64,
     skipped: u64,
@@ -1023,6 +1058,7 @@ impl Gpu {
             dbg_idx: if dbg != 0 { dbg + 424 } else { 0 },
             geometry_stereo_capture: std::env::var("MUGUET_GEOMETRY_STEREO_CAPTURE").as_deref() == Ok("1"),
             geometry_stereo_capture_done: false,
+            geometry_capture_diagnostics: GeometryCaptureDiagnostics::default(),
             draws: 0, skipped: 0, presents: 0, pipe_creates: 0, fps_t0: Instant::now(), fps_n0: 0, fps_d0: 0,
             buffer_uploads: [BufferUploadStats::default(); UPLOAD_SOURCE_COUNT], indirect_reads: IndirectReadStats::default(),
             uploads: crate::buffer_upload::BufferUploads::from_environment(),
@@ -2588,6 +2624,43 @@ impl Gpu {
         Some(arguments)
     }
 
+    fn note_geometry_world_pair(&mut self, vs: &Program, ps: Option<&Program>) {
+        let Some(ps) = ps else { return; };
+        let vertex_hash = match self.obj(self.s.shader[0]) { Some(Obj::Shader(s)) => s.hash.clone(), _ => return };
+        let pixel_hash = match self.obj(self.s.shader[1]) { Some(Obj::Shader(s)) => s.hash.clone(), _ => return };
+        let diag = &mut self.geometry_capture_diagnostics;
+        diag.qualified_world_depth_draws = diag.qualified_world_depth_draws.saturating_add(1);
+        if let Some(pair) = diag.qualified_pairs.iter_mut().find(|pair|
+            pair.vertex_hash == vertex_hash && pair.pixel_hash == pixel_hash) {
+            pair.draws = pair.draws.saturating_add(1);
+        } else if diag.qualified_pairs.len() < GEOMETRY_DIAG_PAIR_CAP {
+            diag.qualified_pairs.push(GeometryPairCount { vertex_hash, pixel_hash,
+                vertex_label: vs.label.clone(), pixel_label: ps.label.clone(), draws: 1 });
+        } else {
+            diag.other_qualified_pairs = diag.other_qualified_pairs.saturating_add(1);
+        }
+    }
+
+    fn publish_geometry_capture_diagnostics(&self) {
+        if !self.geometry_stereo_capture { return; }
+        let d = &self.geometry_capture_diagnostics;
+        let pairs: Vec<_> = d.qualified_pairs.iter().map(|pair| serde_json::json!({
+            "vertex_hash":pair.vertex_hash,"pixel_hash":pair.pixel_hash,
+            "vertex_label":pair.vertex_label,"pixel_label":pair.pixel_label,"draws":pair.draws
+        })).collect();
+        let value = serde_json::json!({"enabled":true,"schema":1,
+            "capture_attempted":self.geometry_stereo_capture_done,
+            "considered_unclamped_draws":d.considered,"vertex_match":d.vertex_match,
+            "pair_match":d.pair_match,"view_match":d.view_match,
+            "target_match":d.target_match,"depth_write_match":d.depth_write_match,
+            "surface_match":d.surface_match,"draw_match":d.draw_match,
+            "eligible_attempts":d.eligible_attempts,
+            "first_pair_state":d.first_pair_state,
+            "qualified_world_depth_draws":d.qualified_world_depth_draws,
+            "qualified_pairs_first_32":pairs,"other_qualified_pair_draws":d.other_qualified_pairs});
+        if let Ok(mut status) = GEOMETRY_DIAG_STATUS.lock() { *status = value; }
+    }
+
     // One-shot, opt-in frozen draw evidence for the CPU geometry-stereo proof.
     // This never creates a second guest call or publishes an XR frame. The
     // selected opaque deferred shader pair is checked by the guest's own hashes.
@@ -2596,18 +2669,51 @@ impl Gpu {
         base_vertex: i32, start_instance: u32, layout: &LayoutObj, vs: &Program, ps: Option<&Program>,
         viewport: [f32; 6], writes_depth: bool) {
         if !self.geometry_stereo_capture || self.geometry_stereo_capture_done { return; }
+        let diag = &mut self.geometry_capture_diagnostics;
+        diag.considered = diag.considered.saturating_add(1);
         let ps_id = self.s.shader[1];
         let vs_hash = match self.obj(self.s.shader[0]) { Some(Obj::Shader(s)) => s.hash.clone(), _ => return };
+        if vs_hash != "6a6a0898a51cf403" { return; }
+        self.geometry_capture_diagnostics.vertex_match = self.geometry_capture_diagnostics.vertex_match.saturating_add(1);
         let ps_hash = match self.obj(ps_id) { Some(Obj::Shader(s)) => s.hash.clone(), _ => return };
-        if vs_hash != "2e9584811e870546" || ps_hash != "75cf2d53bf9497c9" { return; }
+        if ps_hash != "75cf2d53bf9497c9" { return; }
+        self.geometry_capture_diagnostics.pair_match = self.geometry_capture_diagnostics.pair_match.saturating_add(1);
         // Menu and offscreen uses of this same shader pair are not the proof target.
         let eligible_view = self.world_view.is_some_and(|v| v.headset_applied && v.depth_reverse_z);
         let eligible_target = self.tex(self.s.ds.tex).is_some_and(|depth|
             is_depth(depth.format) && depth.desc.samples == 1 && depth.desc.d == 1
             && viewport == [0., 0., depth.desc.w as f32, depth.desc.h as f32, 0., 1.]);
-        if !eligible_view || !eligible_target || !writes_depth || self.s.ds.mip != 0
-            || self.s.ds.slice != 0 || kind != 1 || inst != 1 || start_instance != 0
-            || count < 3 || count > 65536 || self.s.topo != 4 { return; }
+        let eligible_surface = self.s.ds.mip == 0 && self.s.ds.slice == 0;
+        let eligible_draw = kind == 1 && inst == 1 && start_instance == 0
+            && count >= 3 && count <= 65536 && self.s.topo == 4;
+        if self.geometry_capture_diagnostics.first_pair_state.is_none() {
+            let depth = self.tex(self.s.ds.tex).map(|t| serde_json::json!({"id":self.s.ds.tex,
+                "width":t.desc.w,"height":t.desc.h,"layers":t.desc.d,"samples":t.desc.samples,
+                "format":format!("{:?}",t.format)}));
+            self.geometry_capture_diagnostics.first_pair_state = Some(serde_json::json!({
+                "viewport":viewport,"depth_target":depth,"depth_mip":self.s.ds.mip,
+                "depth_slice":self.s.ds.slice,
+                "depth_state":self.state(self.s.dss.0).map(|s| s.words.clone()),
+                "world_view":self.world_view.map(|v| serde_json::json!({
+                    "camera_sequence":v.camera_sequence,"headset_applied":v.headset_applied,
+                    "depth_reverse_z":v.depth_reverse_z})),
+                "kind":kind,"instances":inst,"start_instance":start_instance,
+                "count":count,"topology":self.s.topo,
+                "eligible_view":eligible_view,"eligible_target":eligible_target,
+                "writes_depth":writes_depth,"eligible_surface":eligible_surface,
+                "eligible_draw":eligible_draw}));
+        }
+        if !eligible_view { return; }
+        self.geometry_capture_diagnostics.view_match = self.geometry_capture_diagnostics.view_match.saturating_add(1);
+        if !eligible_target { return; }
+        self.geometry_capture_diagnostics.target_match = self.geometry_capture_diagnostics.target_match.saturating_add(1);
+        if !writes_depth { return; }
+        self.geometry_capture_diagnostics.depth_write_match = self.geometry_capture_diagnostics.depth_write_match.saturating_add(1);
+        if !eligible_surface { return; }
+        self.geometry_capture_diagnostics.surface_match = self.geometry_capture_diagnostics.surface_match.saturating_add(1);
+        if !eligible_draw { return; }
+        self.geometry_capture_diagnostics.draw_match = self.geometry_capture_diagnostics.draw_match.saturating_add(1);
+        self.geometry_capture_diagnostics.eligible_attempts = self.geometry_capture_diagnostics.eligible_attempts.saturating_add(1);
         self.geometry_stereo_capture_done = true;
         let output = std::path::Path::new("target/verification/reprojection-implementation-v1/frozen-game-draw.json");
         let result = (|| -> Result<serde_json::Value, String> {
@@ -2657,17 +2763,53 @@ impl Gpu {
             let mut gpu_buffers: Vec<(u32, Buffer, u64)> = Vec::new();
             let mut vertex_buffers = Vec::new();
             let mut total = 0u64;
-            for &(slot, cls) in &layout.slots {
-                let binding = self.s.vb.get(slot as usize).ok_or("VB slot out of range")?;
-                let buffer = self.buf(binding.buf).ok_or("bound VB missing")?;
-                let gpu = buffer.gpu.clone().ok_or("bound VB lacks GPU storage")?;
-                if buffer.bytes == 0 || buffer.bytes > 1024 * 1024 { return Err("VB exceeds 1 MiB bound".into()); }
-                total += buffer.bytes;
-                gpu_buffers.push((binding.buf, gpu, buffer.bytes));
-                vertex_buffers.push(serde_json::json!({"slot":slot,"class":cls,"buffer_id":binding.buf,
-                    "stride":binding.stride,"offset":binding.offset,"size":buffer.size,
-                    "readback_size":buffer.bytes,"version":buffer.version}));
+            // This proof decodes VS location 0 positions only. Other layout slots
+            // may be unused by the active shader or bound to the renderer's
+            // synthetic zero buffer; neither is evidence for CPU geometry.
+            let position_sig = match self.obj(self.s.shader[0]) {
+                Some(Obj::Shader(shader)) => {
+                    let mut matches = shader.sig.iter().filter(|e| e.reg == 0);
+                    let first = matches.next().ok_or("VS position register 0 absent")?;
+                    if matches.next().is_some() { return Err("VS position register 0 ambiguous".into()); }
+                    (first.sem, first.idx)
+                }
+                _ => return Err("vertex signature unavailable".into()),
+            };
+            let mut position_elements = layout.els.iter().filter(|e|
+                e.sem == position_sig.0 && e.idx == position_sig.1);
+            let position = position_elements.next().ok_or("position semantic absent from layout")?;
+            if position_elements.next().is_some() { return Err("position semantic ambiguous in layout".into()); }
+            let (slot, cls) = (position.slot, position.cls);
+            if cls != 0 || position.fmt != 6 {
+                return Err(format!("position slot {slot} is not per-vertex DXGI R32G32B32_FLOAT"));
             }
+            if !layout.slots.iter().any(|&(s, c)| s == slot && c == 0) {
+                return Err(format!("position slot {slot} missing from layout slots"));
+            }
+            let binding = self.s.vb.get(slot as usize)
+                .ok_or_else(|| format!("position VB slot {slot} out of range"))?;
+            let position_end = (binding.offset as u64)
+                .checked_add(position.offset as u64)
+                .and_then(|n| n.checked_add(12))
+                .ok_or("position VB offset overflow")?;
+            if (binding.stride as u64) < position.offset as u64 + 12 {
+                return Err(format!("position VB slot {slot} stride too small"));
+            }
+            let buffer = self.buf(binding.buf)
+                .ok_or_else(|| format!("position VB slot {slot} buffer {} missing", binding.buf))?;
+            let gpu = buffer.gpu.clone()
+                .ok_or_else(|| format!("position VB slot {slot} buffer {} lacks GPU storage", binding.buf))?;
+            if buffer.bytes == 0 || buffer.bytes > 1024 * 1024 {
+                return Err(format!("position VB slot {slot} exceeds 1 MiB bound"));
+            }
+            if position_end > buffer.size {
+                return Err(format!("position VB slot {slot} offset exceeds logical buffer size"));
+            }
+            total += buffer.bytes;
+            gpu_buffers.push((binding.buf, gpu, buffer.bytes));
+            vertex_buffers.push(serde_json::json!({"slot":slot,"class":cls,"buffer_id":binding.buf,
+                "stride":binding.stride,"offset":binding.offset,"size":buffer.size,
+                "readback_size":buffer.bytes,"version":buffer.version}));
             let (ib_id, ib_format, ib_offset) = self.s.ib;
             let ib = self.buf(ib_id).ok_or("bound IB missing")?;
             let ib_gpu = ib.gpu.clone().ok_or("bound IB lacks GPU storage")?;
@@ -2710,6 +2852,7 @@ impl Gpu {
                 _ => return Err("vertex signature unavailable".into()),
             };
             Ok(serde_json::json!({"schema":1,"status":"captured","source":"Gpu::do_draw",
+                "capture_scope":"cpu_position_vertex_buffer_and_index_only",
                 "shader":{"vertex_id":self.s.shader[0],"vertex_hash":vs_hash,"vertex_label":vs.label,
                     "pixel_id":ps_id,"pixel_hash":ps_hash,"pixel_label":ps.label,
                     "vertex_source_wgsl":source_vs,"pixel_source_wgsl":source_ps,
@@ -2726,8 +2869,22 @@ impl Gpu {
                 "layout":elements,"vertex_signature":signature,"constant_buffers":constant_buffers,"vertex_buffers":vertex_buffers,
                 "index_buffer":index_buffer,"request_record":request_record}))
         })();
-        let value = match result { Ok(value) => value, Err(reason) => serde_json::json!({"schema":1,
-            "status":"rejected","source":"Gpu::do_draw","reason":reason,"vertex_hash":vs_hash,"pixel_hash":ps_hash}) };
+        let value = match result { Ok(value) => value, Err(reason) => {
+            let position_binding = match self.obj(self.s.shader[0]) {
+                Some(Obj::Shader(shader)) => shader.sig.iter().find(|e| e.reg == 0)
+                    .and_then(|sig| layout.els.iter().find(|e| e.sem == sig.sem && e.idx == sig.idx))
+                    .map(|el| serde_json::json!({"slot":el.slot,"class":el.cls,"format":el.fmt,
+                        "element_offset":el.offset,"bound":self.s.vb.get(el.slot as usize)
+                            .map(|vb| serde_json::json!({"buffer_id":vb.buf,"stride":vb.stride,"offset":vb.offset}))})),
+                _ => None,
+            };
+            serde_json::json!({"schema":1,"status":"rejected","source":"Gpu::do_draw",
+                "reason":reason,"vertex_hash":vs_hash,"pixel_hash":ps_hash,
+                "world_view_identity":self.world_view.map(|v| serde_json::json!({
+                    "provenance_epoch":v.provenance_epoch,"camera_sequence":v.camera_sequence,
+                    "request_frame":v.request_frame,"eye_index":v.eye_index,"depth_reverse_z":v.depth_reverse_z})),
+                "position_binding":position_binding})
+        } };
         if let Some(parent) = output.parent() {
             if parent.is_dir() {
                 if let Ok(body) = serde_json::to_vec_pretty(&value) {
@@ -2934,14 +3091,21 @@ impl Gpu {
         self.draws += 1;
         // Camera context arrives with this exact GPU command, not from a newer
         // game-thread camera. Only record the qualified world's real depth.
-        let ds = &self.s.ds;
+        let ds_tex = self.s.ds.tex;
         let actual_viewport = viewport.unwrap_or([0., 0., pass_width as f32, pass_height as f32, 0., 1.]);
-        let full_world_viewport = self.tex(ds.tex).is_some_and(|t| {
+        let full_world_viewport = self.tex(ds_tex).is_some_and(|t| {
             let expected = [0., 0., t.desc.w as f32, t.desc.h as f32, 0., 1.];
             actual_viewport.iter().zip(expected).all(|(&actual, expected)| actual.is_finite() && (actual - expected).abs() <= 0.00002)
         });
         let writes_depth = !pass_ro_depth && self.state(self.s.dss.0).is_some_and(|state|
             state.words.first().copied().unwrap_or(0) != 0 && state.words.get(1) == Some(&1));
+        if self.geometry_stereo_capture && writes_depth && full_world_viewport
+            && self.world_view.is_some_and(|view| view.headset_applied && view.depth_reverse_z)
+            && self.tex(ds_tex).is_some_and(|texture| is_depth(texture.format)
+                && texture.desc.samples == 1 && texture.desc.d == 1) {
+            self.note_geometry_world_pair(&vs, ps.as_deref());
+        }
+        let ds = &self.s.ds;
         if writes_depth && !full_world_viewport && ds.tex != 0
             && self.world_view.is_some_and(|view| view.headset_applied) && self.world_depth_anomalies.len() < 8 {
             let depth_state = self.state(self.s.dss.0).map(|state| state.words.clone());
@@ -3679,6 +3843,7 @@ impl Gpu {
         self.thread_wall[THREAD_PRESENT_BEFORE_WAIT].record(present_started.elapsed());
         self.presents += 1;
         PRESENTS.store(self.presents, Ordering::Relaxed);
+        self.publish_geometry_capture_diagnostics();
         self.log_fps();
 
         self.frame_slot_done[self.ubo_slot] = self.last_submit.clone();
