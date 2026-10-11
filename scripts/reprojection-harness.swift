@@ -33,6 +33,7 @@ struct AdaptiveParams {
     var tileCount: SIMD2<UInt32>
     var toleranceULPs: UInt32
     var rejectBorderTiles: UInt32
+    var reserved: UInt32 = 0
 }
 
 struct CopyUniforms {
@@ -136,6 +137,8 @@ enum Field {
     case stepAt(Plane, Plane, Int)          // step at a given column
     case island(Plane, Plane, Int, Int)     // plane with one texel at another plane
     case sky
+    case skyInvalid(Int, Int)               // exact-clear sky with one invalid texel
+    case skyForegroundIsland(Plane, Int, Int) // exact-clear sky with one foreground texel
     case skyStep(Plane)                     // foreground left, exact clear right
     case skyIslands(Plane)                  // plane with isolated exact-clear texels
     case invalidIslands(Plane)              // plane with isolated NaN, infinity and out-of-range texels
@@ -157,9 +160,13 @@ struct Fixture {
     var copyFadeOracleOnly = false
     /// Square pixels for a non-square image (x tangent scaled by height / width).
     var squarePixels = false
+    /// Fixture-owned sky colour variation; zero leaves all earlier fixtures unchanged.
+    var colorSalt = 0
     /// Predeclared number of accepted (fan) tiles for the adaptive path; nil means the fixture is not
     /// parity-gated on acceptance (timing scenes). Every parity fixture declares it.
     var expectedFanTiles: Int? = nil
+    /// Class 3 is a sky fan; the aggregate expectedFanTiles includes class 1 and 3.
+    var expectedSkyTiles = 0
     var aspect: Float { squarePixels ? Float(height) / Float(width) : 1 }
     func projectionMatrix(_ reversedZ: Bool) -> simd_float4x4 { projection(reversedZ, aspect: aspect) }
     var currentProjection: simd_float4x4 { projection(true, aspect: aspect) }
@@ -209,6 +216,9 @@ func depths(_ fixture: Fixture) -> [Float] {
             case .stepAt(let left, let right, let column): value = planeDepth(x < column ? left : right, x: x, y: y, width: w, height: h, reversed: fixture.reversed, aspect: fixture.aspect)
             case .island(let plane, let other, let ix, let iy): value = planeDepth(x == ix && y == iy ? other : plane, x: x, y: y, width: w, height: h, reversed: fixture.reversed, aspect: fixture.aspect)
             case .sky: value = clear
+            case .skyInvalid(let ix, let iy): value = x == ix && y == iy ? .nan : clear
+            case .skyForegroundIsland(let plane, let ix, let iy):
+                value = x == ix && y == iy ? planeDepth(plane, x: x, y: y, width: w, height: h, reversed: fixture.reversed, aspect: fixture.aspect) : clear
             case .skyStep(let plane): value = x < w / 2 ? planeDepth(plane, x: x, y: y, width: w, height: h, reversed: fixture.reversed, aspect: fixture.aspect) : clear
             case .skyIslands(let plane): value = (x * 7 + y * 3) % 11 == 0 ? clear : planeDepth(plane, x: x, y: y, width: w, height: h, reversed: fixture.reversed, aspect: fixture.aspect)
             case .invalidIslands(let plane):
@@ -232,9 +242,9 @@ func colors(_ fixture: Fixture) -> [UInt8] {
     for y in 0..<h {
         for x in 0..<w {
             let i = (y * w + x) * 4
-            out[i] = UInt8(40 + (x * 211) % 200)
-            out[i + 1] = UInt8(40 + (y * 173) % 200)
-            out[i + 2] = UInt8(60 + ((x + y) * 97) % 180)
+            out[i] = UInt8(40 + (x * 211 + fixture.colorSalt * 17) % 200)
+            out[i + 1] = UInt8(40 + (y * 173 + fixture.colorSalt * 31) % 200)
+            out[i + 2] = UInt8(60 + ((x + y) * 97 + fixture.colorSalt * 43) % 180)
             out[i + 3] = 255
         }
     }
@@ -258,9 +268,14 @@ let fixtures: [Fixture] = [
     // Step inside tile column 4 only: that column falls back (36 - 6).
     Fixture(name: "step_inside_tile", field: .stepAt(Plane(distance: 3), Plane(distance: 6), 36), expectedFanTiles: 30),
     // Foreground on the left half: interior columns 1 and 2 qualify; column 3's halo touches sky.
-    Fixture(name: "sky_foreground", field: .skyStep(Plane(distance: 2)), expectedFanTiles: 12),
+    Fixture(name: "sky_foreground", field: .skyStep(Plane(distance: 2)), expectedFanTiles: 24, expectedSkyTiles: 12),
     Fixture(name: "sky_islands", field: .skyIslands(Plane(distance: 2.5)), expectedFanTiles: 0),
-    Fixture(name: "sky_only_rotated", field: .sky, transform: motion(yaw: 4, roll: 3), expectedFanTiles: 0),
+    Fixture(name: "sky_only_rotated", field: .sky, transform: motion(yaw: 4, roll: 3), colorSalt: 37, expectedFanTiles: 36, expectedSkyTiles: 36),
+    Fixture(name: "sky_only_identity_reverse", field: .sky, scale: 1, colorSalt: 91, expectedFanTiles: 36, expectedSkyTiles: 36),
+    Fixture(name: "sky_only_forward_pitch", field: .sky, reversed: false, transform: motion(pitch: -5, roll: 2, x: 0.14, y: -0.06, z: 0.20), colorSalt: 13, expectedFanTiles: 36, expectedSkyTiles: 36),
+    Fixture(name: "sky_only_asymmetric_projection", field: .sky, width: 37, height: 23, transform: motion(yaw: -3, pitch: 2), squarePixels: true, colorSalt: 61, expectedFanTiles: 3, expectedSkyTiles: 3),
+    Fixture(name: "sky_invalid_one", field: .skyInvalid(28, 28), expectedFanTiles: 35, expectedSkyTiles: 35),
+    Fixture(name: "sky_foreground_island", field: .skyForegroundIsland(Plane(distance: 2), 28, 28), expectedFanTiles: 35, expectedSkyTiles: 35),
     Fixture(name: "invalid_islands", field: .invalidIslands(Plane(distance: 2.5)), expectedFanTiles: 0),
     // Non-square image with the shared unit-tangent projection (as in runs v1 and v2 before the square variant): 5x3 tiles, interior 3x1.
     Fixture(name: "borders_37x23_slope", field: .plane(Plane(distance: 2.5, ax: 0.2, ay: 0.1)), width: 37, height: 23, transform: motion(roll: 4), expectedFanTiles: 3),
@@ -281,7 +296,7 @@ let fixtures: [Fixture] = [
     Fixture(name: "copy_step_sky_invalid", field: .invalidIslands(Plane(distance: 2.5)), scale: 1, expectedFanTiles: 0),
     Fixture(name: "copy_noise", field: .noise(11), scale: 1, expectedFanTiles: 0),
     Fixture(name: "copy_fade", field: .plane(Plane(distance: 0.30)), scale: 1, expectedFanTiles: 0),
-    Fixture(name: "copy_sky_foreground", field: .skyStep(Plane(distance: 2)), scale: 1, expectedFanTiles: 12),
+    Fixture(name: "copy_sky_foreground", field: .skyStep(Plane(distance: 2)), scale: 1, expectedFanTiles: 24, expectedSkyTiles: 12),
     // Translated head: output stays source-anchored, the fade band moves with the head.
     Fixture(name: "copy_fade_translated", field: .plane(Plane(distance: 0.30)), transform: motion(x: 0.06, z: 0.12), scale: 1, copyFadeOracleOnly: true, expectedFanTiles: 0),
     Fixture(name: "copy_fade_translated_away", field: .plane(Plane(distance: 0.42)), transform: motion(z: -0.2), scale: 1, copyFadeOracleOnly: true, expectedFanTiles: 36),
@@ -328,6 +343,8 @@ final class Rig {
     let fanIndexBuffer: any MTLBuffer
     let pool = AdaptiveScratchPool()
     var toleranceULPs: UInt32 = 16
+    /// Candidate-only opt-in. A separate opt-out draw checks the unchanged sky fallback.
+    var skyFanReservedBit: UInt32 = 1
     private var pipelines = [String: any MTLRenderPipelineState]()
     let sources: [String: String]
 
@@ -426,7 +443,8 @@ final class Rig {
     func encodeAdaptive(_ commands: any MTLCommandBuffer, source: Source, target: Target, set: AdaptiveScratchSet) throws {
         guard let compute = commands.makeComputeCommandEncoder() else { throw HarnessError("no compute encoder") }
         var uniforms = source.uniforms
-        var params = AdaptiveParams(tileCount: set.tileCount, toleranceULPs: toleranceULPs, rejectBorderTiles: 1)
+        var params = AdaptiveParams(tileCount: set.tileCount, toleranceULPs: toleranceULPs,
+                                    rejectBorderTiles: 1, reserved: skyFanReservedBit)
         compute.setComputePipelineState(reset)
         compute.setBuffer(set.draws, offset: 0, index: 0)
         compute.dispatchThreads(MTLSize(width: 1, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 1, height: 1, depth: 1))
@@ -499,7 +517,7 @@ final class Rig {
         var ms: Double
         var fan: UInt32?
         var fallback: UInt32?
-        /// Per-tile class from the classification kernel (1 = accepted fan, 0 = fallback, >1 reject flags << 1).
+        /// Per-tile class: 1 = plane fan, 3 = exact-clear sky fan, even values = fallback reject flags << 1.
         var classes: [UInt32]?
     }
 
@@ -581,7 +599,7 @@ func knownDiscontinuityTexels(_ fixture: Fixture, depths field: [Float]) -> [Boo
     case .step: for y in 0..<h { flagged[y * w + w / 2] = true; if w / 2 > 0 { flagged[y * w + w / 2 - 1] = true } }
     case .stepAt(_, _, let column): for y in 0..<h where column < w { flagged[y * w + column] = true; if column > 0 { flagged[y * w + column - 1] = true } }
     case .island(_, _, let ix, let iy): if ix < w, iy < h { flagged[iy * w + ix] = true }
-    case .sky, .skyStep, .skyIslands, .invalidIslands: flagInvalidAndClear()
+    case .sky, .skyInvalid, .skyForegroundIsland, .skyStep, .skyIslands, .invalidIslands: flagInvalidAndClear()
     case .noise: for i in 0..<(w * h) { flagged[i] = true }
     }
     var dilated = flagged
@@ -854,6 +872,71 @@ func analyticOracle(_ fixture: Fixture, image: Image, sourceColors: [UInt8], geo
     return report
 }
 
+/// Independent Double homography for an all-clear image. The source sky is at
+/// infinity: current-eye translation does not move a ray. This oracle derives
+/// its expected coverage and bilinear colour per output pixel, rather than
+/// consulting tile classes or either rendered image. Only the half-texel
+/// source-footprint band is ambiguous under rasterizer edge rules.
+struct SkyOracleReport {
+    var eligible = 0, written = 0, missing = 0, unexpected = 0, skippedBand = 0
+    var invalidDepth = 0, nonzeroDepth = 0, colorMismatches = 0, maximumColorDifference = 0
+    var json: [String: Any] {
+        ["eligible_pixels": eligible, "checked_written_pixels": written, "missing_coverage": missing,
+         "unexpected_coverage": unexpected, "skipped_footprint_band": skippedBand,
+         "invalid_written_depth": invalidDepth, "nonzero_sky_depth": nonzeroDepth,
+         "color_mismatches_beyond_tolerance": colorMismatches,
+         "color_maximum_difference_8bit": maximumColorDifference,
+         "method": "Double inverse current projection and inverse rotation, exact source footprint, independent bilinear clamp-to-edge colour; translation discarded for infinity rays"]
+    }
+}
+
+func analyticSkyOracle(_ fixture: Fixture, image: Image, sourceColors: [UInt8]) -> SkyOracleReport? {
+    guard case .sky = fixture.field else { return nil }
+    let sourceProjection = doubleMatrix(fixture.projectionMatrix(fixture.reversed))
+    let currentProjection = doubleMatrix(fixture.currentProjection)
+    let sourceFromCurrent = doubleMatrix(fixture.transform).inverse
+    let (w, h) = (image.width, image.height)
+    let band = SIMD2(1.0 / Double(fixture.width), 1.0 / Double(fixture.height))
+    var report = SkyOracleReport()
+    for y in 0..<h {
+        for x in 0..<w {
+            let i = y * w + x
+            let ndc = SIMD2((Double(x) + 0.5) / Double(w) * 2 - 1,
+                            1 - (Double(y) + 0.5) / Double(h) * 2)
+            let currentPoint = currentProjection.inverse * SIMD4<Double>(ndc.x, ndc.y, 0.5, 1)
+            let currentRay = SIMD4<Double>(currentPoint.x, currentPoint.y, currentPoint.z, 0)
+            let sourceRay = sourceFromCurrent * currentRay
+            let sourceClip = sourceProjection * sourceRay
+            let finite = sourceClip.x.isFinite && sourceClip.y.isFinite && sourceClip.w.isFinite && sourceClip.w > 1e-12
+            let sourceNDC = finite ? SIMD2(sourceClip.x / sourceClip.w, sourceClip.y / sourceClip.w) : SIMD2(Double.infinity, Double.infinity)
+            let inBand = abs(sourceNDC.x) <= 1 + band.x && abs(sourceNDC.y) <= 1 + band.y &&
+                (abs(sourceNDC.x) >= 1 - band.x || abs(sourceNDC.y) >= 1 - band.y)
+            if inBand { report.skippedBand += 1; continue }
+            let expected = finite && abs(sourceNDC.x) < 1 - band.x && abs(sourceNDC.y) < 1 - band.y
+            report.eligible += 1
+            if expected != image.mask[i] {
+                if expected { report.missing += 1 } else { report.unexpected += 1 }
+                continue
+            }
+            guard expected else { continue }
+            report.written += 1
+            let depth = image.depth[i]
+            if !depth.isFinite || depth < 0 || depth > 1 { report.invalidDepth += 1 }
+            else if depth != 0 { report.nonzeroDepth += 1 }
+            let uv = SIMD2(sourceNDC.x * 0.5 + 0.5, 0.5 - sourceNDC.y * 0.5)
+            let color = bilinearSourceColor(sourceColors: sourceColors, width: fixture.width, height: fixture.height, uv: uv)
+            let difference = max(abs(Int(image.color[i * 4]) - color.0),
+                                 abs(Int(image.color[i * 4 + 1]) - color.1),
+                                 abs(Int(image.color[i * 4 + 2]) - color.2))
+            report.maximumColorDifference = max(report.maximumColorDifference, difference)
+            if difference > (fixture.scale == 1 && fixture.transform == matrix_identity_float4x4 ? 0 : bilinearColorToleranceLSB) {
+                report.colorMismatches += 1
+            }
+        }
+    }
+    return report
+}
+
 /// Output pixels inside accepted (fan) tiles and within one pixel of a fan/non-fan tile boundary,
 /// on an identity lattice. Seams are judged, never excluded.
 func fanAndSeamMasks(classes: [UInt32], fixture: Fixture, width w: Int, height h: Int) -> (fan: [Bool], seam: [Bool]) {
@@ -867,12 +950,12 @@ func fanAndSeamMasks(classes: [UInt32], fixture: Fixture, width w: Int, height h
     var fan = [Bool](repeating: false, count: w * h), seam = fan
     for y in 0..<h {
         for x in 0..<w {
-            let here = tileClass(x, y) == 1
+            let here = tileClass(x, y).map { $0 == 1 || $0 == 3 } ?? false
             fan[y * w + x] = here
             var boundary = false
             for (dx, dy) in [(-1, 0), (1, 0), (0, -1), (0, 1)] where !boundary {
                 let other = tileClass(x + dx, y + dy)
-                if other == nil { boundary = here } else if (other == 1) != here { boundary = true }
+                if other == nil { boundary = here } else if (other == 1 || other == 3) != here { boundary = true }
             }
             seam[y * w + x] = boundary
         }
@@ -930,10 +1013,32 @@ func runParity(candidatePath: String, baselinePath: String, outDir: String) thro
             if variant == .adaptive {
                 classes = result.classes
                 counters = ["fan_tiles": result.fan ?? 0, "fallback_tiles": result.fallback ?? 0, "tile_count": fixture.tileCount,
-                            "expected_fan_tiles": fixture.expectedFanTiles ?? -1]
+                            "expected_fan_tiles": fixture.expectedFanTiles ?? -1, "expected_sky_tiles": fixture.expectedSkyTiles]
             }
         }
         let original = images[.original]!
+        var skyOptOut = [String: Any]()
+        var skyOptOutProblems = [String]()
+        if case .sky = fixture.field {
+            // Bit zero must preserve the prior exact-clear fallback without
+            // silently selecting the new fan or changing any output byte.
+            rig.skyFanReservedBit = 0
+            let target = try rig.target(width: w, height: h)
+            let result = try rig.render(.adaptive, source: source, target: target, readClasses: true)
+            let optOut = rig.image(target)
+            rig.skyFanReservedBit = 1
+            let comparison = compare(reference: original, candidate: optOut,
+                                     edges: [Bool](repeating: false, count: w * h))
+            skyOptOut = ["fan_tiles": result.fan ?? UInt32.max, "fallback_tiles": result.fallback ?? UInt32.max,
+                         "classes_all_fallback": result.classes?.count == fixture.tileCount &&
+                             (result.classes?.allSatisfy { $0 != 1 && $0 != 3 } ?? false),
+                         "comparison_vs_original": comparison.json]
+            if result.fan != 0 || result.fallback != UInt32(fixture.tileCount) ||
+                result.classes?.count != fixture.tileCount ||
+                result.classes?.allSatisfy({ $0 != 1 && $0 != 3 }) != true || !comparison.bitIdentical {
+                skyOptOutProblems.append("adaptive: sky flag zero changed exact fallback output or classes")
+            }
+        }
         let identityLattice = fixture.transform == matrix_identity_float4x4
         let discontinuities = knownDiscontinuityTexels(fixture, depths: depths(fixture))
         let edges = knownEdgeMask(reference: original, sourceDiscontinuities: discontinuities, sourceWidth: fixture.width,
@@ -948,10 +1053,11 @@ func runParity(candidatePath: String, baselinePath: String, outDir: String) thro
         // Three verdicts: the inherited baseline's own accuracy, the candidates against absolute budgets, and
         // the candidates relative to the baseline. A fixture passes only when baseline and candidates both pass.
         var baselineProblems = [String]()
-        var candidateProblems = [String]()
+        var candidateProblems = skyOptOutProblems
         var relativeProblems = [String]()
         var comparisons = [String: Any]()
         var oracles = [String: Any]()
+        var skyOracles = [String: Any]()
         var fanSeam = [String: Any]()
 
         // 1. Legacy OFF: exact.
@@ -968,8 +1074,16 @@ func runParity(candidatePath: String, baselinePath: String, outDir: String) thro
         } else { candidateProblems.append("fixture lacks a predeclared fan-tile expectation") }
         if let classes {
             if classes.count != fixture.tileCount { candidateProblems.append("adaptive: class readback has \(classes.count) entries, expected \(fixture.tileCount)") }
-            let accepted = classes.filter { $0 == 1 }.count
+            let accepted = classes.filter { $0 == 1 || $0 == 3 }.count
+            let sky = classes.filter { $0 == 3 }.count
+            let plane = classes.filter { $0 == 1 }.count
+            counters["sky_tiles"] = sky
+            counters["plane_tiles"] = plane
             if accepted != fan { candidateProblems.append("adaptive: class readback shows \(accepted) accepted tiles, counters show \(fan)") }
+            if sky != fixture.expectedSkyTiles { candidateProblems.append("adaptive: sky class readback shows \(sky) tiles, predeclared \(fixture.expectedSkyTiles)") }
+            if plane != (fixture.expectedFanTiles ?? -1) - fixture.expectedSkyTiles {
+                candidateProblems.append("adaptive: plane class readback shows \(plane) tiles, predeclared \((fixture.expectedFanTiles ?? -1) - fixture.expectedSkyTiles)")
+            }
         } else { candidateProblems.append("adaptive: tile class readback unavailable") }
 
         // Legacy and classification evidence are prerequisites for both verdicts.
@@ -1009,6 +1123,26 @@ func runParity(candidatePath: String, baselinePath: String, outDir: String) thro
                 let metric = judged.report.maximumMetricMicrons
                 if metric > metricDepthBudgetMicrons { candidateProblems.append("\(variant.rawValue): metric depth error \(metric) um exceeds \(metricDepthBudgetMicrons) um") }
                 if metric > max(metricDepthBudgetMicrons, candidateRelativeMetricFactor * baselineMetric) { relativeProblems.append("\(variant.rawValue): metric depth error \(metric) um exceeds both the budget and \(candidateRelativeMetricFactor)x the baseline's \(baselineMetric) um") }
+            }
+        }
+
+        // Sky uses an independent Double ray homography, exact all-clear depth
+        // and per-pixel bilinear colour. Do not infer coverage from the legacy
+        // render: both the baseline and each candidate get their own verdict.
+        if case .sky = fixture.field {
+            for (variant, image) in images {
+                guard let report = analyticSkyOracle(fixture, image: image, sourceColors: sourceColors) else {
+                    baselineProblems.append("sky oracle unavailable")
+                    continue
+                }
+                skyOracles[variant.rawValue] = report.json
+                var problems = [String]()
+                if report.eligible < w * h / 2 || report.written == 0 { problems.append("\(variant.rawValue): sky oracle judged too few pixels") }
+                if report.missing > 0 || report.unexpected > 0 { problems.append("\(variant.rawValue): sky oracle coverage differs") }
+                if report.invalidDepth > 0 || report.nonzeroDepth > 0 { problems.append("\(variant.rawValue): sky oracle depth is not finite clear zero") }
+                if report.colorMismatches > 0 { problems.append("\(variant.rawValue): sky oracle bilinear colour differs") }
+                if variant == .original { baselineProblems += problems }
+                else { candidateProblems += problems; relativeProblems += problems }
             }
         }
 
@@ -1072,7 +1206,8 @@ func runParity(candidatePath: String, baselinePath: String, outDir: String) thro
                         "copy_fade_oracle_only": fixture.copyFadeOracleOnly, "identity_lattice": identityLattice,
                         "covered_pixels_original": covered, "coverage_required": coverageRequired,
                         "known_discontinuity_texels": discontinuities.filter { $0 }.count,
-                        "comparisons_vs_original": comparisons, "adaptive_counters": counters, "oracle": oracles, "fan_seam": fanSeam,
+                        "comparisons_vs_original": comparisons, "adaptive_counters": counters, "oracle": oracles,
+                        "sky_oracle": skyOracles, "sky_opt_out": skyOptOut, "fan_seam": fanSeam,
                         "image_sha256": hashes, "problems": problems, "baseline_problems": baselineProblems,
                         "candidate_absolute_problems": candidateProblems, "candidate_relative_problems": relativeProblems,
                         "baseline_pass": baselinePass, "candidate_absolute_pass": candidateAbsolutePass,
@@ -1227,6 +1362,10 @@ func selfCheck() -> [String: Any] {
     expect(AdaptiveScratchPool.tileCount(width: 960, height: 540) == SIMD2<UInt32>(120, 68), "Low tile count includes the partial row")
     expect(AdaptiveScratchPool.tileCount(width: 2, height: 2) == nil, "too small rejected")
     expect(AdaptiveScratchPool.tileCount(width: 16_384, height: 16_384) == nil, "metadata bound rejected")
+    expect(MemoryLayout<AdaptiveParams>.size == 20 && MemoryLayout<AdaptiveParams>.stride == 24 &&
+           MemoryLayout<AdaptiveParams>.alignment == 8 &&
+           MemoryLayout<AdaptiveParams>.offset(of: \.reserved) == 16,
+           "adaptive reserved-bit ABI is size 20, stride 24, alignment 8, offset 16")
     // Pose check: identity pose and request agreement pass; mismatches fail for the right reason.
     let stageFromHead = motion(yaw: 12, x: 0.3, y: 1.6)
     let headFromEye = motion(x: -0.032)
@@ -1304,6 +1443,8 @@ func selfCheck() -> [String: Any] {
     expect(!knownDiscontinuityTexels(Fixture(name: "t", field: .plane(Plane(distance: 3, ax: 0.35))), depths: []).contains(true), "a sloping plane has no discontinuities")
     expect(fixtures.allSatisfy { $0.expectedFanTiles != nil }, "every parity fixture predeclares its fan-tile count")
     expect(fixtures.allSatisfy { ($0.expectedFanTiles ?? 0) <= $0.tileCount }, "predeclared fan tiles never exceed the tile count")
+    expect(fixtures.allSatisfy { $0.expectedSkyTiles <= ($0.expectedFanTiles ?? -1) }, "sky tile expectation cannot exceed all accepted tiles")
+    expect(fixtures.contains { $0.name == "sky_only_asymmetric_projection" && $0.squarePixels && $0.expectedSkyTiles == 3 }, "asymmetric sky fixture retains a predeclared sky mask")
     let proj = doubleMatrix(projection(true))
     expect(abs(metricDepth(ndc: ndcDepth(eyePoint: SIMD3(0, 0, -2.5), clipFromEye: proj)!, projection: proj) - 2.5) < 1e-9, "metric depth recovery")
     let border = fixtures.first { $0.name == "borders_37x23_slope_square" }!

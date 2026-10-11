@@ -103,6 +103,8 @@ struct GameWorldAdaptiveParams {
     var tileCount: SIMD2<UInt32>
     var toleranceULPs: UInt32
     var rejectBorderTiles: UInt32
+    /// Bit 0 enables exact-clear sky fan classification; default zero preserves prior output.
+    var reserved: UInt32 = 0
 }
 
 /// Counters read from the shared copy of the indirect arguments after completion.
@@ -126,6 +128,7 @@ final class GameWorldAdaptiveMesh: @unchecked Sendable {
     /// tile and halo, overridable with MUGUET_COMPOSITOR_ADAPTIVE_TOLERANCE_ULP (1...4096).
     let toleranceULPs: UInt32
     let rejectBorderTiles: UInt32 = 1
+    let skyFanEnabled: Bool
 
     init?(device: any MTLDevice, library: any MTLLibrary, colorFormat: MTLPixelFormat, depthFormat: MTLPixelFormat) {
         guard let resetFunction = library.makeFunction(name: "gameWorldAdaptiveReset"),
@@ -158,10 +161,12 @@ final class GameWorldAdaptiveMesh: @unchecked Sendable {
         self.fanIndexBuffer = fanIndexBuffer
         let requested = UInt32(ProcessInfo.processInfo.environment["MUGUET_COMPOSITOR_ADAPTIVE_TOLERANCE_ULP"] ?? "") ?? 16
         toleranceULPs = min(max(requested, 1), 4096)
+        skyFanEnabled = ProcessInfo.processInfo.environment["MUGUET_COMPOSITOR_ADAPTIVE_SKY_FAN"] == "1"
     }
 
     func params(for set: AdaptiveScratchSet) -> GameWorldAdaptiveParams {
-        GameWorldAdaptiveParams(tileCount: set.tileCount, toleranceULPs: toleranceULPs, rejectBorderTiles: rejectBorderTiles)
+        GameWorldAdaptiveParams(tileCount: set.tileCount, toleranceULPs: toleranceULPs,
+                                rejectBorderTiles: rejectBorderTiles, reserved: skyFanEnabled ? 1 : 0)
     }
 
     /// Reset and classification on `commands`, ahead of the eye's render pass.

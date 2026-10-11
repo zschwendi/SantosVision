@@ -296,6 +296,8 @@ struct GameWorldAdaptiveParams {
     uint2 tileCount;
     uint toleranceULPs;
     uint rejectBorderTiles;
+    // Bit 0 opts into exact-clear sky fans. Zero preserves the prior classifier.
+    uint reserved;
 };
 
 // The fan matches MTLDrawIndexedPrimitivesIndirectArguments (20 bytes) in a
@@ -355,8 +357,12 @@ kernel void gameWorldAdaptiveClassify(uint2 tile [[threadgroup_position_in_grid]
     threadgroup float halo[GAME_WORLD_TILE_HALO];
     threadgroup float corners[GAME_WORLD_TILE_CORNERS];
     threadgroup atomic_uint rejectFlags;
+    threadgroup atomic_uint clearHaloSamples;
     if (any(tile >= p.tileCount)) { return; }
-    if (localIndex == 0) { atomic_store_explicit(&rejectFlags, 0u, memory_order_relaxed); }
+    if (localIndex == 0) {
+        atomic_store_explicit(&rejectFlags, 0u, memory_order_relaxed);
+        atomic_store_explicit(&clearHaloSamples, 0u, memory_order_relaxed);
+    }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     const uint tileIndex = tile.y * p.tileCount.x + tile.x;
     const uint2 origin = tile * GAME_WORLD_TILE;
@@ -378,6 +384,9 @@ kernel void gameWorldAdaptiveClassify(uint2 tile [[threadgroup_position_in_grid]
             halo[slot] = z;
             if (!isfinite(z) || z < 0 || z > 1 || z == clearDepth) {
                 atomic_fetch_or_explicit(&rejectFlags, 2u, memory_order_relaxed);
+            }
+            if ((p.reserved & 1u) != 0 && z == clearDepth) {
+                atomic_fetch_add_explicit(&clearHaloSamples, 1u, memory_order_relaxed);
             }
         }
         // All 81 geometric corners through the legacy qualification, plus the
@@ -407,6 +416,31 @@ kernel void gameWorldAdaptiveClassify(uint2 tile [[threadgroup_position_in_grid]
         }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
+    // A fully clear 10x10 halo proves every covered owner is exact-clear and
+    // every neighbouring fine texel at the seam has the same sky-ray rule.
+    // The halo sets reject bit 2 and the still-running legacy corner loop sets
+    // bit 4 for every clear owner, so the exact-clear signature is 2|4 = 6.
+    // A single invalid or foreground sample prevents this branch. All 81
+    // corner rays must also remain finite and in front of the current eye;
+    // otherwise the exact per-texel strips retain ownership of clipping.
+    if ((p.reserved & 1u) != 0 &&
+        atomic_load_explicit(&rejectFlags, memory_order_relaxed) == 6u &&
+        atomic_load_explicit(&clearHaloSamples, memory_order_relaxed) == GAME_WORLD_TILE_HALO) {
+        for (uint c = localIndex; c < GAME_WORLD_TILE_CORNERS; c += GAME_WORLD_TILE_TEXELS) {
+            const uint2 corner = origin + uint2(c % (GAME_WORLD_TILE + 1), c / (GAME_WORLD_TILE + 1));
+            const float2 uv = float2(corner) / float2(u.sourceSize);
+            float4 sourceRay = u.sourceEyeFromClip * float4(uv.x * 2 - 1, 1 - uv.y * 2, clearDepth, 1);
+            const bool finiteSource = all(isfinite(sourceRay));
+            sourceRay.w = 0;
+            const float4 currentEye = u.currentEyeFromSourceEye * sourceRay;
+            const float4 currentClip = u.currentClipFromEye * currentEye;
+            if (!finiteSource || !all(isfinite(currentEye)) || !all(isfinite(currentClip))
+                || currentClip.w <= 1e-6) {
+                atomic_fetch_or_explicit(&rejectFlags, 64u, memory_order_relaxed);
+            }
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
     if (localIndex != 0) { return; }
     uint flags = atomic_load_explicit(&rejectFlags, memory_order_relaxed);
     if (flags == 0) {
@@ -431,10 +465,14 @@ kernel void gameWorldAdaptiveClassify(uint2 tile [[threadgroup_position_in_grid]
             if (abs(halo[h] - (c00 + dx * x + dy * y)) > tolerance) { flags |= 32u; }
         }
     }
-    if (flags == 0) {
+    // Class 1 is the established foreground plane; class 3 is an exact-clear
+    // sky tile. Both use the existing indexed fan and unchanged fragment path.
+    const bool skyFan = (p.reserved & 1u) != 0 && flags == 6u &&
+        atomic_load_explicit(&clearHaloSamples, memory_order_relaxed) == GAME_WORLD_TILE_HALO;
+    if (flags == 0 || skyFan) {
         const uint slot = atomic_fetch_add_explicit(&draws.fan.instanceCount, 1u, memory_order_relaxed);
         fanTiles[slot] = tileIndex;
-        classes[tileIndex] = 1u;
+        classes[tileIndex] = skyFan ? 3u : 1u;
     } else {
         const uint base = atomic_fetch_add_explicit(&draws.fallback.instanceCount, GAME_WORLD_TILE_TEXELS, memory_order_relaxed);
         fallbackTiles[base / GAME_WORLD_TILE_TEXELS] = tileIndex;
