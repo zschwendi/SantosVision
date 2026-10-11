@@ -176,3 +176,301 @@ fragment float4 gameWorldFragment(GameWorldVertex in [[stage_in]],
     }
     return float4(rgb, 1);
 }
+
+// ===========================================================================
+// Experimental paths, all DEFAULT OFF. Everything above this line is the legacy
+// pipeline and is unchanged; the functions below are reached only through the
+// opt-in pipelines GameWorldRenderer creates for the matching environment flag.
+// ===========================================================================
+
+// ---- MUGUET_COMPOSITOR_SOURCE_ANCHOR_COPY: one fullscreen triangle per eye ----
+//
+// The drawable is labelled with the pose the source was rendered at, so the
+// current eye and the source eye share one origin by construction. A viewing
+// direction therefore maps between the two projections independently of depth,
+// and every output pixel reconstructs the source point at its own depth before
+// re-projecting it into the current projection. Nothing here assumes 1 - z.
+struct GameWorldCopyUniforms {
+    float4x4 sourceEyeFromClip;
+    float4x4 sourceClipFromEye;
+    float4x4 currentEyeFromClip;
+    float4x4 currentClipFromEye;
+    // Present head relative to the source eye. Geometry and depth stay source-anchored
+    // (the drawable carries the source anchor); only the near fade is judged from here.
+    float4x4 currentEyeFromSourceEye;
+    uint2 sourceSize;
+    uint sourceDepthReversed;
+    uint colorTransfer;
+    float2 nearFadeDistances;
+    float2 reserved;
+};
+
+struct GameWorldCopyVertex {
+    float4 position [[position]];
+    float2 ndc;
+};
+
+struct GameWorldCopyFragmentOut {
+    float4 color [[color(0)]];
+    float depth [[depth(any)]];
+};
+
+vertex GameWorldCopyVertex gameWorldCopyVertex(uint id [[vertex_id]]) {
+    const float2 corners[3] = { float2(-1, -1), float2(3, -1), float2(-1, 3) };
+    GameWorldCopyVertex out;
+    out.position = float4(corners[id], 0, 1);
+    out.ndc = corners[id];
+    return out;
+}
+
+fragment GameWorldCopyFragmentOut gameWorldSourceCopyFragment(GameWorldCopyVertex in [[stage_in]],
+                                                             constant GameWorldCopyUniforms &u [[buffer(0)]],
+                                                             texture2d<float> color [[texture(0)]],
+                                                             texture2d<float, access::read> depth [[texture(1)]]) {
+    constexpr sampler s(filter::linear, address::clamp_to_edge);
+    // A point on this pixel's viewing ray in eye space, then that ray in source clip space.
+    float4 eyePoint = u.currentEyeFromClip * float4(in.ndc, 0.5, 1);
+    if (!all(isfinite(eyePoint)) || abs(eyePoint.w) <= 1e-7) { discard_fragment(); }
+    eyePoint /= eyePoint.w;
+    const float4 sourceClip = u.sourceClipFromEye * eyePoint;
+    if (!all(isfinite(sourceClip)) || sourceClip.w <= 1e-7) { discard_fragment(); }
+    const float2 sourceNDC = sourceClip.xy / sourceClip.w;
+    // Outside the source image: left uncovered, as the mesh leaves it.
+    if (any(abs(sourceNDC) > 1)) { discard_fragment(); }
+    const float2 uv = float2(sourceNDC.x * 0.5 + 0.5, 0.5 - sourceNDC.y * 0.5);
+    const uint2 texel = min(uint2(uv * float2(u.sourceSize)), u.sourceSize - 1);
+    const float z = depth.read(texel).r;
+    const float clearDepth = u.sourceDepthReversed != 0 ? 0.0 : 1.0;
+    // Non-finite or out-of-range source depth draws nothing, as the mesh clips that texel.
+    if (!isfinite(z) || z < 0 || z > 1) { discard_fragment(); }
+    const bool background = z == clearDepth;
+    float outDepth = 0;
+    float visibility = 1;
+    if (!background) {
+        float4 point = u.sourceEyeFromClip * float4(sourceNDC, z, 1);
+        if (!all(isfinite(point)) || abs(point.w) <= 1e-7) { discard_fragment(); }
+        point /= point.w;
+        const float4 current = u.currentClipFromEye * point;
+        if (!all(isfinite(current)) || current.w <= 1e-7) { discard_fragment(); }
+        outDepth = current.z / current.w;
+        // Outside the current depth range: clipped, as the rasterizer clips the mesh.
+        if (!(outDepth >= 0 && outDepth <= 1)) { discard_fragment(); }
+        const float4 currentEye = u.currentEyeFromSourceEye * point;
+        if (!all(isfinite(currentEye))) { discard_fragment(); }
+        visibility = smoothstep(u.nearFadeDistances.x, u.nearFadeDistances.y, length(currentEye.xyz));
+    }
+    const uint bayer[16] = { 0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5 };
+    const uint2 pixel = uint2(in.position.xy);
+    const float threshold = (float(bayer[(pixel.y & 3) * 4 + (pixel.x & 3)]) + 0.5) / 16;
+    if (visibility <= threshold) { discard_fragment(); }
+    float3 rgb = color.sample(s, uv).rgb;
+    if (u.colorTransfer == 1) {
+        rgb = select(1.055 * pow(max(rgb, 0.0), float3(1.0 / 2.4)) - 0.055,
+                     12.92 * rgb, rgb <= 0.0031308);
+    } else if (u.colorTransfer == 2) {
+        rgb = select(pow((max(rgb, 0.0) + 0.055) / 1.055, float3(2.4)),
+                     rgb / 12.92, rgb <= 0.04045);
+    }
+    GameWorldCopyFragmentOut out;
+    out.color = float4(rgb, 1);
+    out.depth = outDepth;
+    return out;
+}
+
+// ---- MUGUET_COMPOSITOR_ADAPTIVE_MESH: 8x8 tiles, fan or exact per-texel fallback ----
+//
+// A tile is accepted only when every covered depth, its one-texel halo and all
+// 81 of its geometric corners qualify under the legacy corner semantics and lie
+// on one affine NDC plane within the stated tolerance, and no corner is behind
+// the eye or inside the near-fade band. Accepted tiles draw a 32-triangle fan
+// whose perimeter vertices are the same qualified corners the fine neighbours
+// use, so coarse/fine seams share identical vertices. Every other tile draws
+// the legacy four-vertex strip per texel through the same vertex arithmetic.
+constant uint GAME_WORLD_TILE = 8;
+constant uint GAME_WORLD_TILE_TEXELS = GAME_WORLD_TILE * GAME_WORLD_TILE;
+constant uint GAME_WORLD_TILE_CORNERS = (GAME_WORLD_TILE + 1) * (GAME_WORLD_TILE + 1);
+constant uint GAME_WORLD_TILE_HALO = (GAME_WORLD_TILE + 2) * (GAME_WORLD_TILE + 2);
+constant uint GAME_WORLD_FAN_VERTICES = 32 * 3;
+
+struct GameWorldAdaptiveParams {
+    uint2 tileCount;
+    uint toleranceULPs;
+    uint rejectBorderTiles;
+};
+
+// Matches MTLDrawPrimitivesIndirectArguments; instanceCount is the compaction counter.
+struct GameWorldIndirectDraw {
+    uint vertexCount;
+    atomic_uint instanceCount;
+    uint vertexStart;
+    uint baseInstance;
+};
+
+kernel void gameWorldAdaptiveReset(uint id [[thread_position_in_grid]],
+                                   device GameWorldIndirectDraw *draws [[buffer(0)]]) {
+    if (id != 0) { return; }
+    draws[0].vertexCount = GAME_WORLD_FAN_VERTICES;
+    atomic_store_explicit(&draws[0].instanceCount, 0u, memory_order_relaxed);
+    draws[0].vertexStart = 0;
+    draws[0].baseInstance = 0;
+    draws[1].vertexCount = 4;
+    atomic_store_explicit(&draws[1].instanceCount, 0u, memory_order_relaxed);
+    draws[1].vertexStart = 0;
+    draws[1].baseInstance = 0;
+}
+
+static float gameWorldToleranceAt(float magnitude, uint ulps) {
+    return float(ulps) * (nextafter(magnitude, 2.0f) - magnitude);
+}
+
+// One threadgroup of 8x8 threads per tile. Thread (x, y) owns texel (x, y) of
+// the tile; corner work is spread over the first 81 thread slots.
+kernel void gameWorldAdaptiveClassify(uint2 tile [[threadgroup_position_in_grid]],
+                                      uint2 local [[thread_position_in_threadgroup]],
+                                      uint localIndex [[thread_index_in_threadgroup]],
+                                      constant GameWorldUniforms &u [[buffer(0)]],
+                                      constant GameWorldAdaptiveParams &p [[buffer(1)]],
+                                      device uint *fanTiles [[buffer(2)]],
+                                      device uint *fallbackTiles [[buffer(3)]],
+                                      device GameWorldIndirectDraw *draws [[buffer(4)]],
+                                      device uint *classes [[buffer(5)]],
+                                      texture2d<float, access::read> depth [[texture(0)]]) {
+    threadgroup float halo[GAME_WORLD_TILE_HALO];
+    threadgroup float corners[GAME_WORLD_TILE_CORNERS];
+    threadgroup atomic_uint rejectFlags;
+    if (any(tile >= p.tileCount)) { return; }
+    if (localIndex == 0) { atomic_store_explicit(&rejectFlags, 0u, memory_order_relaxed); }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const uint tileIndex = tile.y * p.tileCount.x + tile.x;
+    const uint2 origin = tile * GAME_WORLD_TILE;
+    const float clearDepth = u.sourceDepthReversed != 0 ? 0.0 : 1.0;
+    // Whole tiles only; partial tiles at the image edge always fall back.
+    const bool partial = any(origin + GAME_WORLD_TILE > u.sourceSize);
+    const bool border = p.rejectBorderTiles != 0
+        && (tile.x == 0 || tile.y == 0 || origin.x + GAME_WORLD_TILE >= u.sourceSize.x || origin.y + GAME_WORLD_TILE >= u.sourceSize.y);
+    if (partial || border || any(u.sourceSize < 3)) {
+        if (localIndex == 0) { atomic_fetch_or_explicit(&rejectFlags, 1u, memory_order_relaxed); }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (atomic_load_explicit(&rejectFlags, memory_order_relaxed) == 0) {
+        // Covered texels and the one-texel halo (10x10 window), clamped at the image edge.
+        for (uint slot = localIndex; slot < GAME_WORLD_TILE_HALO; slot += GAME_WORLD_TILE_TEXELS) {
+            const int2 offset = int2(slot % (GAME_WORLD_TILE + 2), slot / (GAME_WORLD_TILE + 2)) - 1;
+            const int2 pixel = clamp(int2(origin) + offset, int2(0), int2(u.sourceSize) - 1);
+            const float z = depth.read(uint2(pixel)).r;
+            halo[slot] = z;
+            if (!isfinite(z) || z < 0 || z > 1 || z == clearDepth) {
+                atomic_fetch_or_explicit(&rejectFlags, 2u, memory_order_relaxed);
+            }
+        }
+        // All 81 geometric corners through the legacy qualification, plus the
+        // current-eye gates the fan would otherwise interpolate across.
+        for (uint c = localIndex; c < GAME_WORLD_TILE_CORNERS; c += GAME_WORLD_TILE_TEXELS) {
+            const uint2 corner = origin + uint2(c % (GAME_WORLD_TILE + 1), c / (GAME_WORLD_TILE + 1));
+            const float shared = qualifiedCornerDepth(corner, u, depth);
+            corners[c] = shared;
+            if (shared < 0) {
+                atomic_fetch_or_explicit(&rejectFlags, 4u, memory_order_relaxed);
+            } else {
+                const float2 uv = float2(corner) / float2(u.sourceSize);
+                float4 point = u.sourceEyeFromClip * float4(uv.x * 2 - 1, 1 - uv.y * 2, shared, 1);
+                const float divisor = max(abs(point.w), 1e-7) * (point.w < 0 ? -1 : 1);
+                point /= divisor;
+                const float4 currentEye = u.currentEyeFromSourceEye * point;
+                const float4 currentPoint = u.currentClipFromEye * currentEye;
+                // Behind or at the eye, inside the fade band, or outside the clip depth
+                // range [0, w]: a large fan triangle would be clipped or faded by
+                // interpolation that the fine quads do per texel, so fall back.
+                if (!all(isfinite(currentPoint)) || currentPoint.w <= 1e-6
+                    || currentPoint.z < 0 || currentPoint.z > currentPoint.w
+                    || length(currentEye.xyz) < u.nearFadeDistances.y) {
+                    atomic_fetch_or_explicit(&rejectFlags, 8u, memory_order_relaxed);
+                }
+            }
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (localIndex != 0) { return; }
+    uint flags = atomic_load_explicit(&rejectFlags, memory_order_relaxed);
+    if (flags == 0) {
+        // One affine NDC plane from three corners; every corner, covered centre
+        // and halo centre must agree with it within the stated tolerance.
+        const float c00 = corners[0];
+        const float c80 = corners[GAME_WORLD_TILE];
+        const float c08 = corners[GAME_WORLD_TILE * (GAME_WORLD_TILE + 1)];
+        const float dx = (c80 - c00) / float(GAME_WORLD_TILE);
+        const float dy = (c08 - c00) / float(GAME_WORLD_TILE);
+        float magnitude = 0;
+        for (uint c = 0; c < GAME_WORLD_TILE_CORNERS; ++c) { magnitude = max(magnitude, abs(corners[c])); }
+        for (uint h = 0; h < GAME_WORLD_TILE_HALO; ++h) { magnitude = max(magnitude, abs(halo[h])); }
+        const float tolerance = gameWorldToleranceAt(magnitude, p.toleranceULPs);
+        for (uint c = 0; c < GAME_WORLD_TILE_CORNERS && flags == 0; ++c) {
+            const float x = float(c % (GAME_WORLD_TILE + 1)), y = float(c / (GAME_WORLD_TILE + 1));
+            if (abs(corners[c] - (c00 + dx * x + dy * y)) > tolerance) { flags |= 16u; }
+        }
+        for (uint h = 0; h < GAME_WORLD_TILE_HALO && flags == 0; ++h) {
+            // Texel centres sit half a texel inside their corner lattice: offset -1 for the halo, +0.5 for the centre.
+            const float x = float(h % (GAME_WORLD_TILE + 2)) - 0.5, y = float(h / (GAME_WORLD_TILE + 2)) - 0.5;
+            if (abs(halo[h] - (c00 + dx * x + dy * y)) > tolerance) { flags |= 32u; }
+        }
+    }
+    if (flags == 0) {
+        const uint slot = atomic_fetch_add_explicit(&draws[0].instanceCount, 1u, memory_order_relaxed);
+        fanTiles[slot] = tileIndex;
+        classes[tileIndex] = 1u;
+    } else {
+        const uint base = atomic_fetch_add_explicit(&draws[1].instanceCount, GAME_WORLD_TILE_TEXELS, memory_order_relaxed);
+        fallbackTiles[base / GAME_WORLD_TILE_TEXELS] = tileIndex;
+        classes[tileIndex] = flags << 1;
+    }
+}
+
+// Perimeter corner s (0..31) of a tile, clockwise from its top-left corner.
+static uint2 gameWorldFanPerimeter(uint s) {
+    if (s < 8) { return uint2(s, 0); }
+    if (s < 16) { return uint2(8, s - 8); }
+    if (s < 24) { return uint2(24 - s, 8); }
+    return uint2(0, 32 - s);
+}
+
+vertex GameWorldVertex gameWorldAdaptiveFanVertex(uint id [[vertex_id]],
+                                                  uint instance [[instance_id]],
+                                                  constant GameWorldUniforms &u [[buffer(0)]],
+                                                  constant GameWorldAdaptiveParams &p [[buffer(1)]],
+                                                  const device uint *fanTiles [[buffer(2)]],
+                                                  texture2d<float, access::read> depth [[texture(0)]]) {
+    const uint tileIndex = fanTiles[instance];
+    const uint2 origin = uint2(tileIndex % p.tileCount.x, tileIndex / p.tileCount.x) * GAME_WORLD_TILE;
+    const uint triangle = id / 3, k = id % 3;
+    const uint2 corner = origin + (k == 0 ? uint2(GAME_WORLD_TILE / 2) : gameWorldFanPerimeter((triangle + (k - 1)) & 31));
+    // The owning texel inside this tile; for an accepted tile every owner is valid
+    // and non-clear, so the owner only fixes `valid` and `background` as the fine path does.
+    const uint2 owner = uint2(corner.x == origin.x + GAME_WORLD_TILE ? corner.x - 1 : corner.x,
+                              corner.y == origin.y + GAME_WORLD_TILE ? corner.y - 1 : corner.y);
+    const float z = depth.read(owner).r;
+    return gameWorldCornerVertex(corner, z, continuousCornerDepth(corner, z, u, depth), u);
+}
+
+vertex GameWorldVertex gameWorldAdaptiveFallbackVertex(uint id [[vertex_id]],
+                                                       uint instance [[instance_id]],
+                                                       constant GameWorldUniforms &u [[buffer(0)]],
+                                                       constant GameWorldAdaptiveParams &p [[buffer(1)]],
+                                                       const device uint *fallbackTiles [[buffer(2)]],
+                                                       texture2d<float, access::read> depth [[texture(0)]]) {
+    const uint tileIndex = fallbackTiles[instance / GAME_WORLD_TILE_TEXELS];
+    const uint texel = instance % GAME_WORLD_TILE_TEXELS;
+    const uint2 pixel = uint2(tileIndex % p.tileCount.x, tileIndex / p.tileCount.x) * GAME_WORLD_TILE
+        + uint2(texel % GAME_WORLD_TILE, texel / GAME_WORLD_TILE);
+    if (any(pixel >= u.sourceSize)) {
+        // Partial edge tile: texels outside the image draw nothing.
+        GameWorldVertex out;
+        out.position = float4(0, 0, -1, 1);
+        out.sourceUVQ = float3(0, 0, 1);
+        out.currentEyePosition = float3(0);
+        out.background = 0;
+        return out;
+    }
+    const uint2 corner = gameWorldCorner(id, pixel);
+    const float z = depth.read(pixel).r;
+    return gameWorldCornerVertex(corner, z, continuousCornerDepth(corner, z, u, depth), u);
+}
