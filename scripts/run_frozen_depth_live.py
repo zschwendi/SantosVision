@@ -189,6 +189,17 @@ def prepare(args: argparse.Namespace) -> None:
     print(out / "freeze.json")
 
 
+def static_eye_bytes(x: float) -> bytes:
+    def f32(value: float) -> float:
+        return struct.unpack("<f", struct.pack("<f", value))[0]
+    near, far = f32(0.05), f32(1000.0)
+    denominator = f32(far - near)
+    head = [1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1., 0., x, 0., 0., 1.]
+    projection = [1., 0., 0., 0., 0., f32(16. / 9.), 0., 0., 0., 0.,
+                  f32(near / denominator), -1., 0., 0., f32(f32(near * far) / denominator), 0.]
+    return struct.pack("<32f", *(head + projection))
+
+
 def check_result(result: dict, frozen: dict, out: Path) -> dict:
     require(result.get("schema") == 1 and result.get("status") == "complete",
             "driver did not complete")
@@ -236,11 +247,8 @@ def check_result(result: dict, frozen: dict, out: Path) -> dict:
             and request_time == source["presentation_time"],
             "consumed request header differs from leased source")
     for index, x in enumerate((-0.032, 0.032)):
-        head, projection = struct.unpack("<16f16f", raw_request[32 + index * 128:160 + index * 128])
-        require(abs(head[12] - x) < 1e-6 and head[13] == 0 and head[14] == 0
-                and abs(projection[0] - 1.) < 1e-6
-                and abs(projection[5] - 16 / 9) < 1e-6 and projection[11] == -1.,
-                f"consumed eye {index} differs from static 64 mm Low request")
+        require(raw_request[32 + index * 128:160 + index * 128] == static_eye_bytes(x),
+                f"consumed eye {index} differs from exact static 64 mm Low request")
     require(result.get("frozen_depth_handoffs", 0) > 0 and result.get("published", 0) > 2
             and result.get("max_slots", 7) <= 6 and result.get("max_leases", 13) <= 12,
             "handoff publication or resource bound absent")
