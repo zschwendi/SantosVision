@@ -864,7 +864,7 @@ pub struct Gpu {
     s: State,
     world_view: Option<crate::xr_view::WorldView>,
     world_depths: HashMap<u32, (crate::xr_view::WorldView, u64)>,
-    world_depth_before_ui: HashMap<u32, (crate::xr_view::WorldView, Texture, u64)>,
+    world_depth_before_ui: HashMap<u32, (crate::xr_view::WorldView, crate::world_frame::FrozenPreUiDepth, u64)>,
     world_depth_snapshot_overflow: bool,
     world_depth_snapshots_this_present: u8,
     world_depth_trace: HashMap<(u32, u64, bool, u32, bool), (u64, [f32; 6])>,
@@ -1125,7 +1125,8 @@ impl Gpu {
             TexelCopyTextureInfo { texture: &snapshot, mip_level: 0, origin: Origin3d::ZERO, aspect: TextureAspect::All },
             Extent3d { width: depth.width(), height: depth.height(), depth_or_array_layers: 1 });
         self.world_depth_snapshots_this_present += 1;
-        self.world_depth_before_ui.insert(id, (view, snapshot, draws));
+        self.world_depth_before_ui.insert(id, (view,
+            crate::world_frame::FrozenPreUiDepth::new_snapshot(snapshot), draws));
         log_once("world-depth-before-ui", "qualified real scene depth copied before GTA's clip-space UI clear; final color must retain the same camera rays");
     }
 
@@ -3871,14 +3872,15 @@ impl Gpu {
         let Some(color) = self.tex(color_id).map(|t| t.tex.clone()) else { return; };
         // Main-world camera provenance plus full-size, single-sample depth must
         // select exactly one target. Ambiguous weapon/reflection targets fail closed.
-        let mut sources: BTreeMap<u32, (crate::xr_view::WorldView, u64, Option<Texture>)> = saved.into_iter()
+        let mut sources: BTreeMap<u32, (crate::xr_view::WorldView, u64, Option<crate::world_frame::FrozenPreUiDepth>)> = saved.into_iter()
             .map(|(id, (view, texture, draws))| (id, (view, draws, Some(texture)))).collect();
         for (id, (view, draws)) in depths { sources.insert(id, (view, draws, None)); }
         let candidates: Vec<_> = sources.into_iter().filter(|(id, (candidate, draws, saved))|
             *draws > 0 && crate::world_frame::shares_screen_rays(&view, candidate)
             && saved.as_ref().map_or_else(|| self.tex(*id).is_some_and(|t|
                 t.desc.w == color.width() && t.desc.h == color.height()),
-                |depth| depth.width() == color.width() && depth.height() == color.height())).collect();
+                |depth| depth.texture().width() == color.width()
+                    && depth.texture().height() == color.height())).collect();
         if snapshot_overflow || candidates.len() != 1 {
             let bindings: Vec<_> = trace.into_iter().map(|((id, sequence, writes, flags, full_viewport), (draws, viewport))| {
                 let texture = self.tex(id).map(|t| format!("{}x{} samples{} layers{} {:?}", t.desc.w, t.desc.h, t.desc.samples, t.desc.d, t.format));
@@ -3888,12 +3890,11 @@ impl Gpu {
                 candidates.iter().map(|(id, (_, draws, _))| (*id, *draws)).collect::<Vec<_>>(), snapshots_this_present, snapshot_overflow, view.camera_sequence, bindings, serde_json::to_string(&anomalies).unwrap_or_default()));
             return;
         }
-        let depth_id = candidates[0].0;
+        let (depth_id, (view, _, frozen_depth)) = candidates.into_iter().next().unwrap();
         // Preserve the opaque pass's actual depth convention. The final
         // lighting pass can have identical screen rays with a different Z row.
-        let view = candidates[0].1.0;
-        let depth = match &candidates[0].1.2 {
-            Some(saved) => saved.clone(),
+        let depth = match &frozen_depth {
+            Some(saved) => saved.texture().clone(),
             None => match self.depth_proxy(depth_id, false) {
                 Some((depth, _)) => depth,
                 None => { crate::world_frame::reject("qualified world depth conversion failed".into()); return; }
@@ -3912,7 +3913,8 @@ impl Gpu {
             game_from_stage: view.game_from_stage, depth_near: near, depth_far: far,
             ..Default::default()
         };
-        crate::world_frame::publish(&self.device, &self.queue, &color, &depth, frame, view.provenance_epoch);
+        crate::world_frame::publish_with_frozen_depth(&self.device, &self.queue, &color,
+            &depth, frozen_depth, frame, view.provenance_epoch);
     }
 
     fn log_fps(&mut self) {

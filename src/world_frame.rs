@@ -50,9 +50,20 @@ const PAIR_ABI_VERSION: u32 = 1;
 const _: () = assert!(std::mem::size_of::<WorldPair>() == 592);
 
 struct Slot { color: Texture, depth: Texture }
+/// Created only for the fresh, pre-UI-clear copy in Gpu::save_world_depth_before_ui.
+/// The game never binds this image as a writable target after that copy.
+pub(crate) struct FrozenPreUiDepth(Texture);
+impl FrozenPreUiDepth {
+    pub(crate) fn new_snapshot(texture: Texture) -> Self { Self(texture) }
+    pub(crate) fn texture(&self) -> &Texture { &self.0 }
+}
 #[derive(Clone)]
 struct Ready { slot: Arc<Slot>, frame: WorldFrame, generation: u64, provenance_epoch: u64,
     pair_epoch: u64, ready_at: Instant }
+impl Ready {
+    #[cfg(test)]
+    fn depth_texture(&self) -> &Texture { &self.slot.depth }
+}
 #[derive(Clone)]
 struct ReadyPair { eyes: [Ready; 2], scene_epoch: u64, ready_at: Instant }
 #[derive(Default)]
@@ -67,6 +78,8 @@ struct Frames {
     acquired: u64,
     pairs_published: u64,
     pairs_acquired: u64,
+    frozen_depth_handoffs: u64,
+    copied_depth_snapshots: u64,
     error: Option<String>,
     generation: u64,
     compositor_frames: u64,
@@ -95,6 +108,8 @@ pub(crate) fn status_json() -> serde_json::Value {
         "storage": "immutable GPU-complete Metal color and real depth",
         "published": frames.published, "dropped": frames.dropped, "acquired": frames.acquired,
         "pairs_published": frames.pairs_published, "pairs_acquired": frames.pairs_acquired,
+        "frozen_depth_handoffs": frames.frozen_depth_handoffs,
+        "copied_depth_snapshots": frames.copied_depth_snapshots,
         "latest_pair_scene_epoch": frames.latest_pair.as_ref().map(|pair| pair.scene_epoch),
         "outstanding_leases": frames.leases.len(), "slots": frames.pool.len(), "error": frames.error,
         "compositor_completed_frames": frames.compositor_frames, "compositor_completed_views": frames.compositor_views,
@@ -112,6 +127,10 @@ pub(crate) fn status_json() -> serde_json::Value {
 /// No legacy rendering path changes when it is off.
 pub(crate) fn paired_render_requested() -> bool {
     std::env::var("MUGUET_XR_PAIRED_RENDER").is_ok_and(|value| value == "1")
+}
+
+fn frozen_depth_transfer_requested() -> bool {
+    std::env::var("MUGUET_TRANSFER_FROZEN_DEPTH").is_ok_and(|value| value == "1")
 }
 
 fn fresh_completed_views(frames: &Frames) -> bool {
@@ -217,13 +236,22 @@ fn validate_pair_textures(eyes: &[PairSource<'_>; 2]) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn reserve_snapshot_slot(frames: &mut Frames, device: &Device, color: &Texture) -> Option<Arc<Slot>> {
+fn reserve_snapshot_slot(frames: &mut Frames, device: &Device, color: &Texture,
+    mut frozen_depth: Option<Texture>) -> Option<Arc<Slot>> {
     frames.pool.retain(|slot| Arc::strong_count(slot) > 1
         || (slot.color.width() == color.width() && slot.color.height() == color.height()
             && slot.color.format() == color.format()));
-    if let Some(slot) = frames.pool.iter().find(|slot| Arc::strong_count(slot) == 1
+    if let Some(index) = frames.pool.iter().position(|slot| Arc::strong_count(slot) == 1
         && slot.color.width() == color.width() && slot.color.height() == color.height()
-        && slot.color.format() == color.format()) { return Some(slot.clone()); }
+        && slot.color.format() == color.format()) {
+        if let Some(depth) = frozen_depth.take() {
+            // This Arc exists only in the pool. Replacing its old depth cannot
+            // affect a queued copy, published Ready, or compositor lease.
+            let Some(slot) = Arc::get_mut(&mut frames.pool[index]) else { return None; };
+            slot.depth = depth;
+        }
+        return Some(frames.pool[index].clone());
+    }
     if frames.pool.len() >= MAX_SLOTS { return None; }
     let size = Extent3d { width: color.width(), height: color.height(), depth_or_array_layers: 1 };
     let make = |format, label| device.create_texture(&TextureDescriptor {
@@ -233,7 +261,8 @@ fn reserve_snapshot_slot(frames: &mut Frames, device: &Device, color: &Texture) 
         view_formats: &[],
     });
     let slot = Arc::new(Slot { color: make(color.format(), "Immersive world color snapshot"),
-        depth: make(TextureFormat::R32Float, "Immersive actual world depth snapshot") });
+        depth: frozen_depth.unwrap_or_else(|| make(TextureFormat::R32Float,
+            "Immersive actual world depth snapshot")) });
     frames.pool.push(slot.clone());
     Some(slot)
 }
@@ -262,9 +291,9 @@ pub(crate) fn publish_pair(device: &Device, queue: &Queue, sources: [PairSource<
             "paired source provenance expired");
         let (slots, generation) = {
             let mut frames = FRAMES.lock().map_err(|_| anyhow::anyhow!("world frame lock poisoned"))?;
-            let left = reserve_snapshot_slot(&mut frames, device, sources[0].color)
+            let left = reserve_snapshot_slot(&mut frames, device, sources[0].color, None)
                 .context("no left-eye snapshot slot")?;
-            let right = reserve_snapshot_slot(&mut frames, device, sources[1].color)
+            let right = reserve_snapshot_slot(&mut frames, device, sources[1].color, None)
                 .context("no right-eye snapshot slot")?;
             ([left, right], frames.generation)
         };
@@ -298,11 +327,13 @@ pub(crate) fn publish_pair(device: &Device, queue: &Queue, sources: [PairSource<
                     || frames.latest_pair.as_ref().is_some_and(|pair| pair.scene_epoch >= scene_epoch) { return; }
                 let ready_at = Instant::now();
                 let eyes = std::array::from_fn(|index| Ready { slot: slots[index].clone(),
-                    frame: published[index], generation, provenance_epoch, pair_epoch: scene_epoch, ready_at });
+                    frame: published[index], generation, provenance_epoch, pair_epoch: scene_epoch,
+                    ready_at });
                 frames.latest = [Some(eyes[0].clone()), Some(eyes[1].clone())];
                 frames.latest_pair = Some(ReadyPair { eyes, scene_epoch, ready_at });
                 frames.published += 2;
                 frames.pairs_published += 1;
+                frames.copied_depth_snapshots += 2;
                 frames.error = None;
             }
         });
@@ -312,7 +343,16 @@ pub(crate) fn publish_pair(device: &Device, queue: &Queue, sources: [PairSource<
     if let Err(error) = result { reject(format!("paired source rejected: {error:#}")); }
 }
 
-pub(crate) fn publish(device: &Device, queue: &Queue, color: &Texture, depth: &Texture, mut frame: WorldFrame, provenance_epoch: u64) {
+pub(crate) fn publish(device: &Device, queue: &Queue, color: &Texture, depth: &Texture,
+    frame: WorldFrame, provenance_epoch: u64) {
+    publish_with_frozen_depth(device, queue, color, depth, None, frame, provenance_epoch);
+}
+
+/// A frozen depth may replace only the second, bridge-owned depth copy. The
+/// producer's pre-UI copy and this color snapshot remain ordered on one queue.
+pub(crate) fn publish_with_frozen_depth(device: &Device, queue: &Queue, color: &Texture,
+    depth: &Texture, frozen_depth: Option<FrozenPreUiDepth>, mut frame: WorldFrame,
+    provenance_epoch: u64) {
     let result = (|| -> anyhow::Result<()> {
         anyhow::ensure!(frame.view_index < frame.view_count && (1..=2).contains(&frame.view_count), "invalid world view count");
         anyhow::ensure!(frame.presentation_time.is_finite() && frame.projection_from_eye.iter()
@@ -324,31 +364,34 @@ pub(crate) fn publish(device: &Device, queue: &Queue, color: &Texture, depth: &T
             "world depth must preserve actual 32-bit NDC depth");
         anyhow::ensure!(color.width() == depth.width() && color.height() == depth.height(), "world color/depth dimensions differ");
         anyhow::ensure!(color.usage().contains(TextureUsages::COPY_SRC) && depth.usage().contains(TextureUsages::COPY_SRC), "world snapshot sources lack COPY_SRC");
+        // A bad or foreign candidate retains the original copy path. The
+        // source and candidate must be the identical native image on the
+        // color target's Metal device; metadata alone cannot prove ownership.
+        let frozen_depth = frozen_depth.filter(|candidate| frozen_depth_transfer_requested() && {
+            let texture = candidate.texture();
+            let native = metal_pointer(texture);
+            let native_device = metal_device_pointer(texture);
+            texture.dimension() == TextureDimension::D2
+                && texture.mip_level_count() == 1
+                && texture.sample_count() == 1
+                && texture.depth_or_array_layers() == 1
+                && texture.format() == TextureFormat::R32Float
+                && texture.width() == color.width()
+                && texture.height() == color.height()
+                && texture.usage().contains(TextureUsages::COPY_SRC
+                    | TextureUsages::COPY_DST | TextureUsages::TEXTURE_BINDING)
+                && native.is_some() && native == metal_pointer(depth)
+                && native_device.is_some() && native_device == metal_device_pointer(color)
+        });
+        let used_frozen_depth = frozen_depth.is_some();
         let (slot, generation) = {
             let mut frames = FRAMES.lock().map_err(|_| anyhow::anyhow!("world frame lock poisoned"))?;
             // A GPU command dequeued before close/recenter must not capture the
             // reopened generation after those operations reset its provenance.
             anyhow::ensure!(crate::xr_view::view_epoch_is_active(provenance_epoch), "world camera provenance expired before snapshot");
-            frames.pool.retain(|slot| Arc::strong_count(slot) > 1
-                || (slot.color.width() == color.width() && slot.color.height() == color.height()
-                    && slot.color.format() == color.format()));
-            let available = frames.pool.iter().find(|slot| Arc::strong_count(slot) == 1
-                && slot.color.width() == color.width() && slot.color.height() == color.height()
-                && slot.color.format() == color.format()).cloned();
-            let slot = match available {
+            let slot = match reserve_snapshot_slot(&mut frames, device, color,
+                frozen_depth.map(|candidate| candidate.0)) {
                 Some(slot) => slot,
-                None if frames.pool.len() < MAX_SLOTS => {
-                    let size = Extent3d { width: color.width(), height: color.height(), depth_or_array_layers: 1 };
-                    let make = |format, label| device.create_texture(&TextureDescriptor {
-                        label: Some(label), size, mip_level_count: 1, sample_count: 1,
-                        dimension: TextureDimension::D2, format,
-                        usage: TextureUsages::COPY_SRC | TextureUsages::COPY_DST | TextureUsages::TEXTURE_BINDING, view_formats: &[],
-                    });
-                    let slot = Arc::new(Slot { color: make(color.format(), "Immersive world color snapshot"),
-                        depth: make(TextureFormat::R32Float, "Immersive actual world depth snapshot") });
-                    frames.pool.push(slot.clone());
-                    slot
-                }
                 None => { frames.dropped += 1; return Ok(()); }
             };
             (slot, frames.generation)
@@ -360,11 +403,13 @@ pub(crate) fn publish(device: &Device, queue: &Queue, color: &Texture, depth: &T
         frame.depth_texture = metal_pointer(&slot.depth).context("native Metal depth unavailable")?;
         let size = Extent3d { width: color.width(), height: color.height(), depth_or_array_layers: 1 };
         let mut commands = device.create_command_encoder(&CommandEncoderDescriptor { label: Some("Immutable immersive world snapshot") });
-        for (source, destination) in [(color, &slot.color), (depth, &slot.depth)] {
+        let mut copy = |source: &Texture, destination: &Texture| {
             commands.copy_texture_to_texture(TexelCopyTextureInfo { texture: source, mip_level: 0,
                 origin: Origin3d::ZERO, aspect: TextureAspect::All }, TexelCopyTextureInfo {
                 texture: destination, mip_level: 0, origin: Origin3d::ZERO, aspect: TextureAspect::All }, size);
-        }
+        };
+        copy(color, &slot.color);
+        if !used_frozen_depth { copy(depth, &slot.depth); }
         queue.submit([commands.finish()]);
         // Separate compositor queues may read only after the producer's copy finishes.
         queue.on_submitted_work_done(move || {
@@ -374,6 +419,8 @@ pub(crate) fn publish(device: &Device, queue: &Queue, color: &Texture, depth: &T
                 frames.latest[index] = Some(Ready { slot, frame, generation, provenance_epoch,
                     pair_epoch: 0, ready_at: Instant::now() });
                 frames.published += 1;
+                if used_frozen_depth { frames.frozen_depth_handoffs += 1; }
+                else { frames.copied_depth_snapshots += 1; }
                 frames.error = None;
             }
         });
@@ -390,6 +437,19 @@ fn metal_pointer(texture: &Texture) -> Option<u64> {
         // The borrowed Objective-C address remains alive through the slot's Texture.
         let metal = unsafe { texture.as_hal::<wgpu::hal::api::Metal>() }?;
         Some(std::ptr::from_ref(metal.raw_handle()).cast::<()>() as usize as u64)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "visionos")))]
+    { let _ = texture; None }
+}
+
+fn metal_device_pointer(texture: &Texture) -> Option<usize> {
+    #[cfg(any(target_os = "macos", target_os = "ios", target_os = "visionos"))]
+    {
+        // MTLTexture.device is a borrowed id<MTLDevice>. Compare identity only;
+        // the producer and compositor already retain their owning devices.
+        let raw = metal_pointer(texture)? as usize as *mut objc2::runtime::AnyObject;
+        let device: *mut objc2::runtime::AnyObject = unsafe { objc2::msg_send![raw, device] };
+        (!device.is_null()).then_some(device as usize)
     }
     #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "visionos")))]
     { let _ = texture; None }
@@ -818,6 +878,149 @@ mod tests {
         assert_eq!(sv_world_acquire_frame(0, &mut frame), 1);
         assert!(FRAMES.lock().unwrap().error.as_deref().unwrap().contains("provenance expired"));
         assert_eq!(crate::xr_view::sv_xr_world_camera_set_enabled(0), 0);
+        *FRAMES.lock().unwrap() = Frames::default();
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    #[ignore = "explicit Metal content and cross-queue lifetime fixture"]
+    fn frozen_pre_ui_depth_is_owned_until_lease_release_and_invalid_handoff_copies() {
+        let _serial = TEST_LOCK.lock().unwrap();
+        let old_flag = std::env::var_os("MUGUET_TRANSFER_FROZEN_DEPTH");
+        std::env::set_var("MUGUET_TRANSFER_FROZEN_DEPTH", "1");
+        *FRAMES.lock().unwrap() = Frames::default();
+        assert_eq!(crate::xr_view::sv_xr_world_camera_set_enabled(1), 0);
+        let epoch = crate::xr_view::view_epoch();
+        let mut descriptor = InstanceDescriptor::new_without_display_handle();
+        descriptor.backends = Backends::METAL;
+        let instance = Instance::new(descriptor);
+        let adapter = pollster::block_on(instance.request_adapter(&RequestAdapterOptions::default())).unwrap();
+        let (device, queue) = pollster::block_on(adapter.request_device(&DeviceDescriptor::default())).unwrap();
+        let make = |format| device.create_texture(&TextureDescriptor {
+            label: Some("Pre-UI depth handoff fixture"),
+            size: Extent3d { width: 2, height: 2, depth_or_array_layers: 1 },
+            mip_level_count: 1, sample_count: 1, dimension: TextureDimension::D2, format,
+            usage: TextureUsages::COPY_SRC | TextureUsages::COPY_DST | TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let upload = |texture: &Texture, pixel: [u8; 4]| {
+            queue.write_texture(TexelCopyTextureInfo { texture, mip_level: 0,
+                origin: Origin3d::ZERO, aspect: TextureAspect::All }, &pixel.repeat(4),
+                TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(8), rows_per_image: Some(2) },
+                Extent3d { width: 2, height: 2, depth_or_array_layers: 1 });
+        };
+        let read_pixel = |texture: &Texture| -> [u8; 4] {
+            let output = device.create_buffer(&BufferDescriptor {
+                label: Some("Frozen native depth readback"), size: 512,
+                usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ, mapped_at_creation: false });
+            let mut encoder = device.create_command_encoder(&CommandEncoderDescriptor::default());
+            encoder.copy_texture_to_buffer(TexelCopyTextureInfo { texture, mip_level: 0,
+                origin: Origin3d::ZERO, aspect: TextureAspect::All }, TexelCopyBufferInfo {
+                buffer: &output, layout: TexelCopyBufferLayout { offset: 0,
+                    bytes_per_row: Some(256), rows_per_image: Some(2) } },
+                Extent3d { width: 2, height: 2, depth_or_array_layers: 1 });
+            let index = queue.submit([encoder.finish()]);
+            let (send, receive) = std::sync::mpsc::channel();
+            output.slice(..).map_async(MapMode::Read, move |result| { let _ = send.send(result); });
+            device.poll(PollType::Wait { submission_index: Some(index),
+                timeout: Some(Duration::from_secs(10)) }).unwrap();
+            receive.recv_timeout(Duration::from_secs(1)).unwrap().unwrap();
+            let mapped = output.slice(..).get_mapped_range().unwrap();
+            let pixel = mapped[..4].try_into().unwrap();
+            drop(mapped); output.unmap();
+            pixel
+        };
+        let copy_depth = |source: &Texture, destination: &Texture| {
+            let mut encoder = device.create_command_encoder(&CommandEncoderDescriptor::default());
+            encoder.copy_texture_to_texture(TexelCopyTextureInfo { texture: source, mip_level: 0,
+                origin: Origin3d::ZERO, aspect: TextureAspect::All }, TexelCopyTextureInfo {
+                texture: destination, mip_level: 0, origin: Origin3d::ZERO,
+                aspect: TextureAspect::All }, Extent3d { width: 2, height: 2, depth_or_array_layers: 1 });
+            queue.submit([encoder.finish()]);
+        };
+        let color = make(TextureFormat::Rgba8Unorm);
+        let game_depth = make(TextureFormat::R32Float);
+        let pre_ui_depth = make(TextureFormat::R32Float);
+        upload(&color, [255, 0, 0, 255]);
+        upload(&game_depth, 0.25f32.to_le_bytes());
+        copy_depth(&game_depth, &pre_ui_depth);
+        upload(&game_depth, 0.75f32.to_le_bytes()); // Simulated UI clear after frozen copy.
+        let base_frame = WorldFrame { view_count: 1, game_frame: 40, request_frame: 39,
+            head_frame: 39, presentation_time: 1., ..Default::default() };
+        publish_with_frozen_depth(&device, &queue, &color, &pre_ui_depth,
+            Some(FrozenPreUiDepth::new_snapshot(pre_ui_depth.clone())), base_frame, epoch);
+        device.poll(PollType::Wait { submission_index: None,
+            timeout: Some(Duration::from_secs(10)) }).unwrap();
+        let mut frame = base_frame;
+        frame.abi_version = 1; frame.byte_size = 288;
+        assert_eq!(sv_world_acquire_frame(0, &mut frame), 0);
+        let first_token = frame.lease;
+        assert_eq!(frame.depth_texture, metal_pointer(&pre_ui_depth).unwrap());
+        assert_eq!(FRAMES.lock().unwrap().pool.len(), 1);
+        let first_slot_ptr = {
+            let mut frames = FRAMES.lock().unwrap();
+            let slot = Arc::as_ptr(&frames.leases[&first_token].slot) as usize;
+            // Remove latest so only the compositor lease can protect this slot.
+            frames.latest[0] = None;
+            slot
+        };
+        drop(pre_ui_depth); // No external handle keeps the frozen image alive.
+        assert_eq!(FRAMES.lock().unwrap().frozen_depth_handoffs, 1);
+
+        // A later world frame cannot reuse the color slot while the compositor
+        // still owns its first lease; the frozen depth also remains unchanged.
+        let next_pre_ui_depth = make(TextureFormat::R32Float);
+        upload(&game_depth, 0.5f32.to_le_bytes());
+        copy_depth(&game_depth, &next_pre_ui_depth);
+        upload(&game_depth, 0.875f32.to_le_bytes());
+        let next_frame = WorldFrame { game_frame: 41, ..base_frame };
+        publish_with_frozen_depth(&device, &queue, &color, &next_pre_ui_depth,
+            Some(FrozenPreUiDepth::new_snapshot(next_pre_ui_depth.clone())), next_frame, epoch);
+        device.poll(PollType::Wait { submission_index: None,
+            timeout: Some(Duration::from_secs(10)) }).unwrap();
+        let second_ready = FRAMES.lock().unwrap().latest[0].as_ref().unwrap().clone();
+        assert_ne!(first_slot_ptr, Arc::as_ptr(&second_ready.slot) as usize);
+        let first_ready = FRAMES.lock().unwrap().leases[&first_token].clone();
+        assert_eq!(first_ready.frame.depth_texture, metal_pointer(&first_ready.slot.depth).unwrap());
+        assert_eq!(f32::from_le_bytes(read_pixel(first_ready.depth_texture())), 0.25);
+        assert_eq!(f32::from_le_bytes(read_pixel(second_ready.depth_texture())), 0.5);
+        assert_eq!(FRAMES.lock().unwrap().frozen_depth_handoffs, 2);
+
+        // A candidate that is not the selected source must take the original
+        // copy path even with the flag on; no foreign pointer reaches the ABI.
+        let invalid_candidate = make(TextureFormat::R32Float);
+        let fallback_frame = WorldFrame { game_frame: 42, ..base_frame };
+        publish_with_frozen_depth(&device, &queue, &color, &game_depth,
+            Some(FrozenPreUiDepth::new_snapshot(invalid_candidate)), fallback_frame, epoch);
+        device.poll(PollType::Wait { submission_index: None,
+            timeout: Some(Duration::from_secs(10)) }).unwrap();
+        let fallback_ready = FRAMES.lock().unwrap().latest[0].as_ref().unwrap().clone();
+        assert_eq!(fallback_ready.frame.depth_texture, metal_pointer(&fallback_ready.slot.depth).unwrap());
+        assert_eq!(f32::from_le_bytes(read_pixel(fallback_ready.depth_texture())), 0.875);
+        assert_eq!(FRAMES.lock().unwrap().copied_depth_snapshots, 1);
+
+        std::env::set_var("MUGUET_TRANSFER_FROZEN_DEPTH", "0");
+        let off_frame = WorldFrame { game_frame: 43, ..base_frame };
+        publish_with_frozen_depth(&device, &queue, &color, &next_pre_ui_depth,
+            Some(FrozenPreUiDepth::new_snapshot(next_pre_ui_depth.clone())), off_frame, epoch);
+        device.poll(PollType::Wait { submission_index: None,
+            timeout: Some(Duration::from_secs(10)) }).unwrap();
+        let off_ready = FRAMES.lock().unwrap().latest[0].as_ref().unwrap().clone();
+        assert_ne!(off_ready.frame.depth_texture, metal_pointer(&next_pre_ui_depth).unwrap());
+        assert_eq!(f32::from_le_bytes(read_pixel(off_ready.depth_texture())), 0.5);
+        assert_eq!(FRAMES.lock().unwrap().copied_depth_snapshots, 2);
+
+        assert_eq!(sv_world_complete_frame(&first_token, 1, 4), 0);
+        drop(first_ready);
+        reset(); // Existing compositor lease still owns its frozen image.
+        let leased_depth = FRAMES.lock().unwrap().leases[&first_token].slot.depth.clone();
+        assert_eq!(f32::from_le_bytes(read_pixel(&leased_depth)), 0.25);
+        drop(leased_depth);
+        assert_eq!(sv_world_release_frame(first_token), 0);
+        assert_eq!(sv_world_release_frame(first_token), -1);
+        assert_eq!(crate::xr_view::sv_xr_world_camera_set_enabled(0), 0);
+        if let Some(value) = old_flag { std::env::set_var("MUGUET_TRANSFER_FROZEN_DEPTH", value); }
+        else { std::env::remove_var("MUGUET_TRANSFER_FROZEN_DEPTH"); }
         *FRAMES.lock().unwrap() = Frames::default();
     }
 }

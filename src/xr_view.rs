@@ -104,7 +104,8 @@ struct RenderThread {
 struct ConsumedRequest { view: WorldView, request: SVXRViewRequest }
 const MAX_CONSUMED_REQUESTS: usize = 96;
 static CAPTURE_CONSUMED_REQUESTS: LazyLock<bool> = LazyLock::new(||
-    std::env::var("MUGUET_GEOMETRY_STEREO_CAPTURE").as_deref() == Ok("1"));
+    std::env::var("MUGUET_GEOMETRY_STEREO_CAPTURE").as_deref() == Ok("1")
+    || std::env::var("MUGUET_TRANSFER_FROZEN_DEPTH_RECEIPT").as_deref() == Ok("1"));
 
 fn push_consumed_request(state: &mut State, view: WorldView, request: SVXRViewRequest) {
     state.consumed_requests.push_back(ConsumedRequest { view, request });
@@ -200,6 +201,55 @@ pub(crate) fn consumed_request_receipt(view: &WorldView) -> Option<serde_json::V
     Some(serde_json::json!({"schema":1,"source":"sv_xr_submit_views",
         "request_bytes_hex":bytes.iter().map(|byte| format!("{byte:02x}")).collect::<String>(),
         "provenance_epoch":view.provenance_epoch,"head_pose_frame":view.head_pose_frame}))
+}
+
+/// Diagnostic proof for an acquired, GPU-complete world lease. Match the
+/// retained request actually consumed at the camera hook, not the newest
+/// submitted request. This is enabled only for an explicit verification run.
+pub fn consumed_world_frame_receipt(frame: &crate::world_frame::WorldFrame) -> Option<serde_json::Value> {
+    if !*CAPTURE_CONSUMED_REQUESTS { return None; }
+    let (view, request) = {
+        let state = lock_world_state();
+        match_world_frame_receipt(&state, frame)?
+    };
+    if !view_epoch_is_active(view.provenance_epoch) { return None; }
+    let bytes = request_bytes(request);
+    Some(serde_json::json!({"schema":1,"source":"consumed_world_frame_receipt",
+        "request_bytes_hex":bytes.iter().map(|byte| format!("{byte:02x}")).collect::<String>(),
+        "provenance_epoch":view.provenance_epoch,"camera_sequence":view.camera_sequence,
+        "headset_applied":view.headset_applied,"depth_reverse_z":view.depth_reverse_z,
+        "frame_abi_version":frame.abi_version,"frame_byte_size":frame.byte_size,
+        "frame_lease":frame.lease,"frame_depth_convention":frame.depth_convention,
+        "game_frame":frame.game_frame,"request_frame":frame.request_frame,
+        "head_frame":frame.head_frame,"presentation_time":frame.presentation_time,
+        "view_index":frame.view_index,"view_count":frame.view_count,
+        "projection_from_eye":frame.projection_from_eye,
+        "game_from_eye":frame.game_from_eye,"game_from_stage":frame.game_from_stage}))
+}
+
+fn match_world_frame_receipt(state: &State, frame: &crate::world_frame::WorldFrame)
+    -> Option<(WorldView, SVXRViewRequest)> {
+    if frame.abi_version != 1
+        || frame.byte_size as usize != std::mem::size_of::<crate::world_frame::WorldFrame>()
+        || frame.lease == 0 || frame.color_texture == 0 || frame.depth_texture == 0
+        || frame.depth_convention != 0 || frame.reserved != 0 { return None; }
+    let matches: Vec<_> = state.consumed_requests.iter().filter(|entry| {
+            let view = &entry.view;
+            view.headset_applied && view.view_count == 2 && frame.view_count == 2
+                && frame.view_index == view.eye_index
+                && frame.request_frame == view.request_frame
+                && frame.head_frame == view.head_pose_frame
+                && frame.presentation_time.to_bits() == view.presentation_time_seconds.to_bits()
+                && same_matrix_bits(&frame.projection_from_eye, &view.projection_from_eye)
+                && same_matrix_bits(&frame.game_from_eye, &view.game_from_eye)
+                && same_matrix_bits(&frame.game_from_stage, &view.game_from_stage)
+                && entry.request.version == 1 && entry.request.size == 288
+                && entry.request.frame == frame.request_frame
+                && entry.request.presentation_time_seconds.to_bits() == frame.presentation_time.to_bits()
+                && entry.request.view_count == frame.view_count
+        }).collect();
+    if matches.len() != 1 { return None; }
+    Some((matches[0].view, matches[0].request))
 }
 
 thread_local! {
@@ -885,6 +935,60 @@ mod tests {
         assert!(find_consumed_request(&state, &latest).is_none());
         invalidate_state(&mut state);
         assert!(state.consumed_requests.is_empty());
+    }
+
+    #[test]
+    fn acquired_world_frame_receipt_requires_exact_consumed_view_and_abi() {
+        let eye = SVXREyeView { head_from_eye: identity(), projection_from_eye: projection() };
+        let request = SVXRViewRequest { version: 1, size: 288, frame: 23,
+            presentation_time_seconds: 23., view_count: 2, reserved: 0, views: [eye; 2] };
+        let mut view = view(1, 42);
+        view.request_frame = 23;
+        view.head_pose_frame = 19;
+        view.presentation_time_seconds = 23.;
+        let mut state = State::default();
+        push_consumed_request(&mut state, view, request);
+        let frame = crate::world_frame::WorldFrame { abi_version: 1,
+            byte_size: std::mem::size_of::<crate::world_frame::WorldFrame>() as u32,
+            lease: 7, game_frame: 24, request_frame: 23, head_frame: 19,
+            presentation_time: 23., color_texture: 100, depth_texture: 101,
+            view_index: 1, view_count: 2, depth_convention: 0,
+            projection_from_eye: view.projection_from_eye,
+            game_from_eye: view.game_from_eye, game_from_stage: view.game_from_stage,
+            ..Default::default() };
+        assert_eq!(match_world_frame_receipt(&state, &frame).map(|(_, r)| r.frame), Some(23));
+        let mut bad = frame; bad.abi_version = 2;
+        assert!(match_world_frame_receipt(&state, &bad).is_none());
+        bad = frame; bad.byte_size -= 1;
+        assert!(match_world_frame_receipt(&state, &bad).is_none());
+        bad = frame; bad.lease = 0;
+        assert!(match_world_frame_receipt(&state, &bad).is_none());
+        bad = frame; bad.depth_convention = 1;
+        assert!(match_world_frame_receipt(&state, &bad).is_none());
+        bad = frame; bad.request_frame += 1;
+        assert!(match_world_frame_receipt(&state, &bad).is_none());
+        bad = frame; bad.head_frame += 1;
+        assert!(match_world_frame_receipt(&state, &bad).is_none());
+        bad = frame; bad.view_index = 0;
+        assert!(match_world_frame_receipt(&state, &bad).is_none());
+        bad = frame; bad.presentation_time += 0.001;
+        assert!(match_world_frame_receipt(&state, &bad).is_none());
+        for matrix in [0, 1, 2] {
+            bad = frame;
+            let values = match matrix { 0 => &mut bad.projection_from_eye,
+                1 => &mut bad.game_from_eye, _ => &mut bad.game_from_stage };
+            values[0] += 0.001;
+            assert!(match_world_frame_receipt(&state, &bad).is_none());
+        }
+        let mut wrong_time = State::default();
+        let mut request_at_other_time = request;
+        request_at_other_time.presentation_time_seconds = 24.;
+        push_consumed_request(&mut wrong_time, view, request_at_other_time);
+        assert!(match_world_frame_receipt(&wrong_time, &frame).is_none());
+        push_consumed_request(&mut state, view, request);
+        assert!(match_world_frame_receipt(&state, &frame).is_none());
+        invalidate_state(&mut state);
+        assert!(match_world_frame_receipt(&state, &frame).is_none());
     }
 
     #[test]
