@@ -41,8 +41,7 @@ pub(crate) fn uniform_stage_pack_enabled() -> bool {
     flag(UNIFORM_STAGE_PACK_ENV)
 }
 
-/// Integration hook: pending `src/bind_group_prepare.rs::from_environment`
-/// should call this instead of reading its flag directly after root merges it.
+/// Resolve the same saved request for the cache-hit preparation experiment.
 pub(crate) fn bind_group_prepare_enabled() -> bool {
     flag(BIND_GROUP_PREPARE_ENV)
 }

@@ -250,6 +250,9 @@ fn main() {
     #[cfg(target_os = "macos")]
     fn fixture(g: &mut Gpu, rows: u32) -> (Program, (BindGroupLayout, u64), ComputePipeline) {
         g.create_buffer(1, rows * 80, BIND_UAV, 0, 16);
+        // The control CB must retain its guest object generation across
+        // dispatches; only its shadow contents change in cache-hit fixtures.
+        g.create_buffer(9, 16, 4, 0, 0);
         g.set_obj(2, Obj::Uav(ViewObj { res: 1, is_buf: true, fmt: 28, vdim: 4, a: 0, b: rows * 5, c: 0, d: 0, views: HashMap::new() }));
         g.s.uav[2][0] = 2;
         let output = g.buf(1).unwrap().gpu.clone().unwrap();
@@ -285,7 +288,7 @@ fn main() {
 
     #[cfg(target_os = "macos")]
     fn control(g: &mut Gpu, row: u32, a: u32, b: u32, c: u32) {
-        put(g, 9, 16, 0, &[row, a, b, c]); g.s.cb[2][2] = Cb { buf: 9, first: 0 };
+        overwrite(g, 9, 0, &[row, a, b, c]); g.s.cb[2][2] = Cb { buf: 9, first: 0 };
     }
 
     #[cfg(target_os = "macos")]
@@ -320,11 +323,12 @@ fn main() {
         let (p, bgl, pipeline) = fixture(&mut g, 2);
         put(&mut g, 3, 48, 1, &[101, 102, 103, 104, 105, 106, 107, 108]);
         put(&mut g, 4, 48, 1, &[201, 202, 203, 204, 205, 206, 207, 208]);
+        g.create_buffer(5, 64, 4, 0, 0);
         g.s.cb[2][0] = Cb { buf: 3, first: 1 }; g.s.cb[2][1] = Cb { buf: 4, first: 1 };
         control(&mut g, 0, 301, 302, 303);
         let a = dispatch(&mut g, &p, &bgl, &pipeline); let saved = g.ubo_slots[0][0].stage[..80].to_vec();
         overwrite(&mut g, 3, 1, &[401, 402, 403, 404, 405, 406, 407, 408]);
-        put(&mut g, 5, 64, 2, &[501, 502, 503, 504, 505, 506, 507, 508]);
+        overwrite(&mut g, 5, 2, &[501, 502, 503, 504, 505, 506, 507, 508]);
         g.s.cb[2][1] = Cb { buf: 5, first: 2 }; control(&mut g, 1, 601, 602, 603);
         let b = dispatch(&mut g, &p, &bgl, &pipeline);
         assert_eq!(g.submits, 0); assert_eq!(a.uid, b.uid); assert_eq!(a.dyn_off, Some(0)); assert_eq!(b.dyn_off, Some(256));
@@ -346,16 +350,18 @@ fn main() {
         let (p, bgl, pipeline) = fixture(&mut g, 4);
         put(&mut g, 3, 48, 1, &[101,102,103,104,105,106,107,108]);
         put(&mut g, 4, 48, 1, &[201,202,203,204,205,206,207,208]);
+        g.create_buffer(5, 64, 4, 0, 0);
+        g.create_buffer(6, 24, 4, 0, 0);
         g.s.cb[2][0] = Cb { buf: 3, first: 1 }; g.s.cb[2][1] = Cb { buf: 4, first: 1 }; control(&mut g, 0, 301,302,303);
         let a = dispatch(&mut g, &p, &bgl, &pipeline); let chunk_uid = g.ubo_slots[0][0].id;
         assert_eq!(a.dyn_off, Some(0)); g.present(0);
         assert!(g.frame_slot_done[0].is_some()); assert_eq!(g.ubo_slot, 1);
         overwrite(&mut g, 3, 1, &[401,402,403,404,405,406,407,408]);
-        put(&mut g, 5, 64, 2, &[501,502,503,504,505,506,507,508]);
+        overwrite(&mut g, 5, 2, &[501,502,503,504,505,506,507,508]);
         g.s.cb[2][1] = Cb { buf: 5, first: 2 }; control(&mut g, 1, 601,602,603);
         let b = dispatch(&mut g, &p, &bgl, &pipeline); assert_eq!(b.dyn_off, Some(RING_CHUNK as u32)); g.present(0);
         assert!(g.frame_slot_done[0].is_some() && g.frame_slot_done[1].is_some()); assert_eq!(g.ubo_slot, 2);
-        g.s.cb[2][0] = Cb::default(); put(&mut g, 6, 24, 1, &[701,702]);
+        g.s.cb[2][0] = Cb::default(); overwrite(&mut g, 6, 1, &[701,702]);
         g.s.cb[2][1] = Cb { buf: 6, first: 1 }; control(&mut g, 2, 801,802,803);
         let c = dispatch(&mut g, &p, &bgl, &pipeline); assert_eq!(c.dyn_off, Some((2 * RING_CHUNK) as u32));
         // Third consumed slot has real work. Production present submits it,

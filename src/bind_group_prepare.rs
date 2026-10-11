@@ -111,7 +111,7 @@ pub(super) struct BindGroupPrepare {
 
 impl BindGroupPrepare {
     pub(super) fn from_environment() -> Self {
-        Self::new(std::env::var("MUGUET_BIND_GROUP_PREPARE_OPT").as_deref() == Ok("1"))
+        Self::new(crate::draw_setup::bind_group_prepare_enabled())
     }
 
     pub(super) fn new(enabled: bool) -> Self {
