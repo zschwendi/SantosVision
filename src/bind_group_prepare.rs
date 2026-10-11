@@ -5,6 +5,15 @@ use std::time::Duration;
 pub(super) const KEY_INLINE: usize = 32;
 pub(super) const ENTRIES_INLINE: usize = 12;
 
+#[derive(Clone, Copy)]
+pub(super) enum NonBindingKind { Query, Layout, Shader, State }
+
+impl NonBindingKind {
+    fn index(self) -> usize {
+        match self { Self::Query => 0, Self::Layout => 1, Self::Shader => 2, Self::State => 3 }
+    }
+}
+
 pub(super) struct KeyScratch {
     inline: [u64; KEY_INLINE],
     len: usize,
@@ -104,6 +113,8 @@ pub(super) struct BindGroupPrepare {
     owned_entry_materializations: u64,
     entry_items_on_miss: u64,
     cache_invalidations: u64,
+    skipped_set_obj_invalidations: [u64; 4],
+    skipped_destroy_invalidations: [u64; 4],
     sampled_calls: u64,
     sampled_wall_ns: u64,
     sampled_max_ns: u64,
@@ -119,6 +130,7 @@ impl BindGroupPrepare {
             inline_key_lookups: 0, key_spills: 0, entry_spills: 0,
             owned_key_materializations: 0, owned_entry_materializations: 0,
             entry_items_on_miss: 0, cache_invalidations: 0,
+            skipped_set_obj_invalidations: [0; 4], skipped_destroy_invalidations: [0; 4],
             sampled_calls: 0, sampled_wall_ns: 0, sampled_max_ns: 0 }
     }
 
@@ -157,6 +169,20 @@ impl BindGroupPrepare {
         if self.enabled { self.cache_invalidations = self.cache_invalidations.saturating_add(1); }
     }
 
+    pub(super) fn skipped_set_obj(&mut self, kind: NonBindingKind) {
+        if self.enabled {
+            let count = &mut self.skipped_set_obj_invalidations[kind.index()];
+            *count = (*count).saturating_add(1);
+        }
+    }
+
+    pub(super) fn skipped_destroy(&mut self, kind: NonBindingKind) {
+        if self.enabled {
+            let count = &mut self.skipped_destroy_invalidations[kind.index()];
+            *count = (*count).saturating_add(1);
+        }
+    }
+
     pub(super) fn metrics(&self) -> serde_json::Value {
         serde_json::json!({"schema":1,"enabled":self.enabled,
             "calls":self.calls,"lookups":self.lookups,"hits":self.hits,"misses":self.misses,
@@ -166,6 +192,14 @@ impl BindGroupPrepare {
             "owned_entry_materializations":self.owned_entry_materializations,
             "entry_items_on_miss":self.entry_items_on_miss,
             "cache_invalidations":self.cache_invalidations,
+            "skipped_nonbinding_set_obj":{"query":self.skipped_set_obj_invalidations[0],
+                "layout":self.skipped_set_obj_invalidations[1],
+                "shader":self.skipped_set_obj_invalidations[2],
+                "non_sampler_state":self.skipped_set_obj_invalidations[3]},
+            "skipped_nonbinding_destroy":{"query":self.skipped_destroy_invalidations[0],
+                "layout":self.skipped_destroy_invalidations[1],
+                "shader":self.skipped_destroy_invalidations[2],
+                "non_sampler_state":self.skipped_destroy_invalidations[3]},
             "sample_stride":64,"sampled_calls":self.sampled_calls,
             "sampled_cpu_wall_ns":self.sampled_wall_ns,"sampled_cpu_max_ns":self.sampled_max_ns,
             "scope":"source-site lookup and sampled CPU wall; no GPU timing or FPS claim"})
@@ -176,6 +210,34 @@ impl BindGroupPrepare {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    #[test]
+    fn pure_invalidation_relevance_covers_nonbinding_replacements_and_missing_resources() {
+        use super::super::*;
+        let query = Obj::Query(QueryObj { qtype: 1, life: QueryLife::new(0), slots: vec![] });
+        let layout = Obj::Layout(Rc::new(LayoutObj { els: vec![], slots: vec![] }));
+        let shader = Obj::Shader(ShaderObj { stage: 0, hash: String::new(), sig: vec![], program: None });
+        let blend_state = Obj::State(Rc::new(StateObj { words: vec![], sampler: None }));
+        let view = Obj::Uav(ViewObj { res: 9, is_buf: true, fmt: 28, vdim: 4,
+            a: 0, b: 0, c: 0, d: 0, views: HashMap::new() });
+        for nonbinding in [&query, &layout, &shader, &blend_state] {
+            assert!(!nonbinding.bind_group_relevant());
+            assert!(!binding_cache_needs_invalidation(None, Some(nonbinding)));
+            assert!(!binding_cache_needs_invalidation(Some(nonbinding), None));
+            assert!(!binding_cache_needs_invalidation(Some(&query), Some(nonbinding)));
+            assert!(nonbinding.nonbinding_kind().is_some());
+            // Reusing a guest ID previously holding a binding must still clear.
+            assert!(binding_cache_needs_invalidation(Some(&view), Some(nonbinding)));
+        }
+        assert!(binding_cache_needs_invalidation(None, Some(&view)));
+        assert!(binding_cache_needs_invalidation(Some(&view), None));
+        assert!(binding_cache_needs_invalidation(Some(&view), Some(&view)));
+        let mut metrics = BindGroupPrepare::new(true);
+        metrics.skipped_set_obj(NonBindingKind::Layout);
+        metrics.skipped_destroy(NonBindingKind::Query);
+        assert_eq!(metrics.metrics()["skipped_nonbinding_set_obj"]["layout"], 1);
+        assert_eq!(metrics.metrics()["skipped_nonbinding_destroy"]["query"], 1);
+    }
 
     #[test]
     fn stack_key_matches_vec_lookup_and_preserves_full_ordered_identity() {
@@ -275,6 +337,21 @@ mod tests {
         assert_eq!(&stage[first.dyn_off.unwrap() as usize..first.dyn_off.unwrap() as usize + 4], &7u32.to_le_bytes());
         assert_eq!(&stage[hit.dyn_off.unwrap() as usize..hit.dyn_off.unwrap() as usize + 4], &11u32.to_le_bytes());
 
+        // Creating and replacing an unrelated nonbinding object, then
+        // destroying it, cannot change the cached native bind group.
+        gpu.set_obj(90, Obj::Layout(Rc::new(LayoutObj { els: vec![], slots: vec![] })));
+        assert_eq!(gpu.stage_bind_group(2, &program, 0, &layout).unwrap().uid, hit.uid);
+        gpu.set_obj(90, Obj::Query(QueryObj { qtype: 1, life: QueryLife::new(0), slots: vec![] }));
+        assert_eq!(gpu.stage_bind_group(2, &program, 0, &layout).unwrap().uid, hit.uid);
+        gpu.destroy(90);
+        assert_eq!(gpu.stage_bind_group(2, &program, 0, &layout).unwrap().uid, hit.uid);
+
+        // The opposite replacement direction matters too: a nonbinding
+        // object taking a live view's ID must discard its old native binding.
+        gpu.set_obj(2, Obj::Layout(Rc::new(LayoutObj { els: vec![], slots: vec![] })));
+        let missing = gpu.stage_bind_group(2, &program, 0, &layout).unwrap();
+        assert_ne!(missing.uid, hit.uid);
+
         // Rebind the same guest view ID to a different native resource. The
         // borrowed lookup key is intentionally identical, but the cache must
         // have been invalidated before binding it.
@@ -353,10 +430,13 @@ mod tests {
         assert_eq!(words[12], 19);
         drop(bytes); output.unmap();
         let metrics = gpu.bind_group_prepare.metrics();
-        assert_eq!(metrics["hits"], 1);
-        assert_eq!(metrics["misses"], 6);
-        assert_eq!(metrics["owned_entry_materializations"], 6);
+        assert_eq!(metrics["hits"], 4);
+        assert_eq!(metrics["misses"], 7);
+        assert_eq!(metrics["owned_entry_materializations"], 7);
         assert!(metrics["cache_invalidations"].as_u64().unwrap() >= 1);
+        assert_eq!(metrics["skipped_nonbinding_set_obj"]["layout"], 1);
+        assert_eq!(metrics["skipped_nonbinding_set_obj"]["query"], 1);
+        assert_eq!(metrics["skipped_nonbinding_destroy"]["query"], 1);
         assert_eq!(metrics["key_spills"], 0);
         assert_eq!(metrics["entry_spills"], 0);
         let error = pollster::block_on(scope.pop());

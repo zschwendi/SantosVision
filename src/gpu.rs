@@ -23,7 +23,7 @@ use uniform_pack::UniformPack;
 
 #[path = "bind_group_prepare.rs"]
 mod bind_group_prepare;
-use bind_group_prepare::{BindGroupPrepare, EntryScratch, KeyScratch};
+use bind_group_prepare::{BindGroupPrepare, EntryScratch, KeyScratch, NonBindingKind};
 
 #[cfg(all(test, target_os = "macos"))]
 #[path = "guest_write_tests.rs"]
@@ -719,6 +719,33 @@ enum Obj {
     Query(QueryObj),
 }
 
+impl Obj {
+    // stage_bind_group can observe these objects directly, or reach a Tex/Buf
+    // through a view whose guest ID has not changed. Non-sampler states do not
+    // supply a native sampler; shader/layout identity is in the program/BGL key.
+    fn bind_group_relevant(&self) -> bool {
+        match self {
+            Self::Tex(_) | Self::Buf(_) | Self::Srv(_) | Self::Uav(_) => true,
+            Self::State(state) => state.sampler.is_some(),
+            Self::Shader(_) | Self::Layout(_) | Self::Query(_) => false,
+        }
+    }
+
+    fn nonbinding_kind(&self) -> Option<NonBindingKind> {
+        match self {
+            Self::Query(_) => Some(NonBindingKind::Query),
+            Self::Layout(_) => Some(NonBindingKind::Layout),
+            Self::Shader(_) => Some(NonBindingKind::Shader),
+            Self::State(state) if state.sampler.is_none() => Some(NonBindingKind::State),
+            _ => None,
+        }
+    }
+}
+
+fn binding_cache_needs_invalidation(old: Option<&Obj>, new: Option<&Obj>) -> bool {
+    old.is_some_and(Obj::bind_group_relevant) || new.is_some_and(Obj::bind_group_relevant)
+}
+
 #[derive(Clone, Default)]
 struct Vb { buf: u32, stride: u32, offset: u32 }
 #[derive(Clone, Default)]
@@ -1152,12 +1179,16 @@ impl Gpu {
         if self.objs.len() <= i {
             self.objs.resize_with(i + 1, || None);
         }
-        // Even a previously empty ID can be referenced by an existing view.
-        // That view may currently cache a dummy native binding under its own
-        // unchanged ID, so every successful insertion must invalidate it.
+        // A previously empty resource ID may already be referenced by a view
+        // whose unchanged ID cached a dummy binding. An old binding-relevant
+        // object also requires invalidation when replaced by a nonbinding one.
         if self.bind_group_prepare.enabled {
-            self.bind_groups.clear();
-            self.bind_group_prepare.invalidated();
+            if binding_cache_needs_invalidation(self.objs[i].as_ref(), Some(&o)) {
+                self.bind_groups.clear();
+                self.bind_group_prepare.invalidated();
+            } else if let Some(kind) = o.nonbinding_kind() {
+                self.bind_group_prepare.skipped_set_obj(kind);
+            }
         }
         self.invalidate_world_depth(id, serde_json::json!("set_obj"));
         if self.occlusion_active == Some(id) { self.end_active_occlusion(); }
@@ -1463,8 +1494,12 @@ impl Gpu {
         if self.obj(id).is_none() { return; }
         if self.used(id) { self.flush(); }
         if self.bind_group_prepare.enabled {
-            self.bind_groups.clear();
-            self.bind_group_prepare.invalidated();
+            if binding_cache_needs_invalidation(self.obj(id), None) {
+                self.bind_groups.clear();
+                self.bind_group_prepare.invalidated();
+            } else if let Some(kind) = self.obj(id).and_then(Obj::nonbinding_kind) {
+                self.bind_group_prepare.skipped_destroy(kind);
+            }
         }
         if self.occlusion_active == Some(id) { self.end_active_occlusion(); }
         if let Some(o) = self.objs.get_mut(id as usize).and_then(|o| o.take()) {
