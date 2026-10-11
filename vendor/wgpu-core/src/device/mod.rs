@@ -26,6 +26,7 @@ mod life;
 pub mod queue;
 pub mod ray_tracing;
 pub mod resource;
+pub(crate) mod staging_pool;
 mod surface_config;
 #[cfg(any(feature = "trace", feature = "replay"))]
 pub mod trace;
@@ -175,6 +176,7 @@ pub type BufferMapPendingClosure = (BufferMapOperation, BufferAccessResult);
 
 #[derive(Default)]
 pub struct UserClosures {
+    pub(crate) upload_retirements: Vec<staging_pool::RetirementPublication>,
     pub mappings: Vec<BufferMapPendingClosure>,
     pub blas_compact_ready: Vec<BlasCompactReadyPendingClosure>,
     pub submissions: SmallVec<[queue::SubmittedWorkDoneClosure; 1]>,
@@ -183,6 +185,7 @@ pub struct UserClosures {
 
 impl UserClosures {
     fn extend(&mut self, other: Self) {
+        self.upload_retirements.extend(other.upload_retirements);
         self.mappings.extend(other.mappings);
         self.blas_compact_ready.extend(other.blas_compact_ready);
         self.submissions.extend(other.submissions);
@@ -193,6 +196,10 @@ impl UserClosures {
     fn fire(self) {
         // Note: this logic is specifically moved out of `handle_mapping()` in order to
         // have nothing locked by the time we execute users callback code.
+
+        // Fixed internal work publishes only fence-retired, reset sources.
+        // All callers must release core/registry guards before this point.
+        for publication in self.upload_retirements { publication.dispatch(); }
 
         // Mappings _must_ be fired before submissions, as the spec requires all mapping callbacks that are registered before
         // a on_submitted_work_done callback to be fired before the on_submitted_work_done callback.

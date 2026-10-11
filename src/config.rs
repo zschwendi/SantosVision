@@ -9,6 +9,7 @@ pub struct Startup {
     pub cache_dir: PathBuf,
 
     pub engine_args: Vec<String>,
+    pub native_graphics: Option<NativeGraphicsLaunch>,
 }
 
 const DEFAULT_CONFIG: &str = r#"{
@@ -28,7 +29,7 @@ const DEFAULT_CONFIG: &str = r#"{
 
 fn support_dir() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-    if cfg!(target_os = "ios") {
+    if cfg!(any(target_os = "ios", target_os = "visionos")) {
         return PathBuf::from(home).join("Documents");
     }
     PathBuf::from(home).join("Library/Application Support/Muguet")
@@ -65,7 +66,7 @@ fn redirect_logs_if_detached() {
         fn dup2(old: i32, new: i32) -> i32;
     }
 
-    if cfg!(target_os = "ios") {
+    if cfg!(any(target_os = "ios", target_os = "visionos")) {
         return;
     }
     let in_bundle = std::env::current_exe().map(|p| p.to_string_lossy().contains(".app/Contents/MacOS/")).unwrap_or(false);
@@ -101,7 +102,7 @@ pub fn setup() -> anyhow::Result<Startup> {
     let build = build?;
     #[cfg(target_os = "ios")]
     let build = build.unwrap_or_default();
-    Ok(Startup { wasm_path: build.join("game.wasm"), cache_dir: support, engine_args })
+    Ok(Startup { wasm_path: build.join("game.wasm"), cache_dir: support, engine_args, native_graphics: None })
 }
 
 fn locate() -> anyhow::Result<PathBuf> {
@@ -185,5 +186,412 @@ fn fix_settings(texture_quality: Option<i64>) {
     set("MSAA", &|v| if v > 4 { v.min(crate::gpu::max_msaa() as i64) } else { v });
     if new != xml {
         let _ = std::fs::write(&path, new.as_bytes());
+    }
+}
+
+/// Configure a native shell using explicit sandbox paths, without the desktop launcher.
+pub fn setup_native(game_root: &Path, save_root: &Path) -> anyhow::Result<Startup> {
+    anyhow::ensure!(game_root.join("data/manifest.json").is_file(), "game root has no data/manifest.json: {}", game_root.display());
+    let build = build_dir(game_root).ok_or_else(|| anyhow::anyhow!("game root has no b/<build>/shaders/index.json"))?;
+    std::fs::create_dir_all(save_root)?;
+    let native_graphics = prepare_native_graphics(save_root)?;
+    let cache_dir = save_root.join("cache");
+    std::fs::create_dir_all(&cache_dir)?;
+    std::env::set_var("MUGUET_FSROOT", save_root);
+    std::env::set_var("MUGUET_DATA", game_root.join("data"));
+    std::env::set_var("MUGUET_SHADERS", build.join("shaders"));
+    let frame_limit = if native_graphics.config.fps_limit == 30 { 2 } else { 1 };
+    Ok(Startup { wasm_path: build.join("game.wasm"), cache_dir,
+        engine_args: vec![format!("-frameLimit={frame_limit}"), "-wasmstartchoice=2".into()],
+        native_graphics: Some(native_graphics) })
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NativeGraphics {
+    pub width: u32,
+    pub height: u32,
+    pub fps_limit: u32,
+}
+
+impl Default for NativeGraphics {
+    fn default() -> Self { Self { width: 960, height: 540, fps_limit: 60 } }
+}
+
+impl NativeGraphics {
+    fn parse(text: &str) -> anyhow::Result<Self> {
+        use anyhow::{ensure, Context};
+        let value: serde_json::Value = serde_json::from_str(text).context("parse native-graphics.json")?;
+        let object = value.as_object().ok_or_else(|| anyhow::anyhow!("native graphics config must be an object"))?;
+        ensure!(object.len() == 4 && ["width", "height", "fps_limit", "graphics_preset"].iter().all(|key| object.contains_key(*key)),
+            "native graphics config requires exactly width, height, fps_limit and graphics_preset");
+        let integer = |key: &str| -> anyhow::Result<u32> {
+            let number = object[key].as_u64().ok_or_else(|| anyhow::anyhow!("{key} must be an unsigned integer"))?;
+            u32::try_from(number).with_context(|| format!("{key} is out of range"))
+        };
+        let config = Self { width: integer("width")?, height: integer("height")?, fps_limit: integer("fps_limit")? };
+        ensure!(matches!((config.width, config.height),
+            (640, 360) | (960, 540) | (1280, 720) | (1920, 1080) | (2560, 1440) | (3840, 2160)),
+            "native resolution must be 640x360, 960x540, 1280x720, 1920x1080, 2560x1440 or 3840x2160");
+        ensure!(matches!(config.fps_limit, 30 | 60), "native fps_limit must be 30 or 60");
+        ensure!(object["graphics_preset"].as_str() == Some("low"), "native graphics_preset must be low");
+        Ok(config)
+    }
+}
+
+pub struct NativeGraphicsLaunch {
+    pub config: NativeGraphics,
+    config_path: PathBuf,
+    config_source: &'static str,
+    settings_path: PathBuf,
+    settings_action: &'static str,
+    changed_tags: Vec<String>,
+    backup_path: Option<PathBuf>,
+}
+
+impl NativeGraphicsLaunch {
+    pub fn status_json(&self) -> serde_json::Value {
+        serde_json::json!({"width":self.config.width, "height":self.config.height,
+            "fps_limit":self.config.fps_limit,"graphics_preset":"low", "config_source":self.config_source,
+            "config_path":self.config_path,"settings_path":self.settings_path,
+            "settings_action":self.settings_action,"changed_tags":self.changed_tags,"backup_path":self.backup_path,
+            "settings_scope":"saved XML applied before engine startup; runtime may normalize individual fields"})
+    }
+}
+
+const LOW_GRAPHICS: &[(&str, &str)] = &[
+    ("TextureQuality", "0"), ("ShaderQuality", "1"), ("ShadowQuality", "0"),
+    ("ReflectionQuality", "0"), ("GrassQuality", "0"), ("WaterQuality", "0"),
+    ("ParticleQuality", "0"), ("PostFX", "0"), ("Tessellation", "0"),
+    ("ReflectionMSAA", "0"), ("SSAO", "0"), ("AnisotropicFiltering", "0"),
+    ("MSAA", "0"), ("MSAAFragments", "0"), ("MSAAQuality", "0"), ("SamplingMode", "0"),
+    ("FXAA_Enabled", "false"), ("TXAA_Enabled", "false"), ("DoF", "false"),
+    ("MotionBlurStrength", "0.000000"), ("Lighting_FogVolumes", "false"), ("Shader_SSA", "false"),
+    ("UltraShadows_Enabled", "false"), ("Shadow_ParticleShadows", "false"),
+    ("Shadow_LongShadows", "false"), ("Shadow_SoftShadows", "0"), ("Reflection_MipBlur", "false"),
+    ("LodScale", "0.000000"), ("MaxLodScale", "0.000000"), ("PedLodBias", "0.000000"),
+    ("VehicleLodBias", "0.000000"), ("CityDensity", "0.000000"),
+];
+
+// Same root/version/system/audio/video shape as the actual game-generated file.
+// The graphics values and video dimensions are inserted by the scoped updater.
+const NATIVE_DEFAULT_SETTINGS: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<Settings>
+  <version value="27" />
+  <configSource>SMC_AUTO</configSource>
+  <graphics>
+    <Shadow_Distance value="1.000000" />
+    <Shadow_SplitZStart value="0.930000" />
+    <Shadow_SplitZEnd value="0.890000" />
+    <Shadow_aircraftExpWeight value="0.990000" />
+    <Shadow_DisableScreenSizeCheck value="false" />
+    <DX_Version value="2" />
+    <PedVarietyMultiplier value="1.000000" />
+    <VehicleVarietyMultiplier value="1.000000" />
+    <HdStreamingInFlight value="false" />
+  </graphics>
+  <system>
+    <numBytesPerReplayBlock value="9000000" />
+    <numReplayBlocks value="36" />
+    <maxSizeOfStreamingReplay value="1024" />
+    <maxFileStoreSize value="65536" />
+  </system>
+  <audio><Audio3d value="false" /></audio>
+  <video>
+    <AdapterIndex value="0" />
+    <OutputIndex value="0" />
+    <Windowed value="1" />
+    <Stereo value="0" />
+    <Convergence value="0.100000" />
+    <Separation value="1.000000" />
+    <PauseOnFocusLoss value="1" />
+    <AspectRatio value="0" />
+  </video>
+  <VideoCardDescription>N</VideoCardDescription>
+</Settings>
+"#;
+
+/// Edit only value attributes in the graphics/video children of Settings.
+/// Comments, CDATA, audio/system settings and unknown tags remain byte-for-byte.
+fn low_settings_xml(xml: &str, config: &NativeGraphics) -> anyhow::Result<(String, Vec<String>)> {
+    use anyhow::{ensure, Context};
+    use std::collections::{BTreeMap, BTreeSet};
+    let mut wanted: BTreeMap<(&str, &str), String> = LOW_GRAPHICS.iter()
+        .map(|(tag, value)| (("graphics", *tag), (*value).into())).collect();
+    for (tag, value) in [("ScreenWidth", config.width), ("ScreenHeight", config.height),
+                         ("RefreshRate", config.fps_limit), ("VSync", 1)] {
+        wanted.insert(("video", tag), value.to_string());
+    }
+    let value_attribute = regex::Regex::new(r#"\bvalue\s*=\s*(?:"([^"]*)"|'([^']*)')"#)?;
+    let mut stack: Vec<&str> = Vec::new();
+    let mut sections = BTreeMap::new();
+    let mut seen = BTreeSet::new();
+    let mut edits: Vec<(usize, usize, String)> = Vec::new();
+    let mut changed = Vec::new();
+    let mut root_end = None;
+    let mut roots = 0;
+    let mut cursor = 0;
+    while let Some(relative) = xml[cursor..].find('<') {
+        let start = cursor + relative;
+        let special = if xml[start..].starts_with("<!--") { Some(("<!--", "-->")) }
+            else if xml[start..].starts_with("<![CDATA[") { Some(("<![CDATA[", "]]>")) }
+            else if xml[start..].starts_with("<?") { Some(("<?", "?>")) } else { None };
+        if let Some((prefix, suffix)) = special {
+            cursor = start + prefix.len() + xml[start + prefix.len()..].find(suffix)
+                .with_context(|| format!("unterminated XML {prefix}"))? + suffix.len();
+            continue;
+        }
+        ensure!(!xml[start..].starts_with("<!"), "unsupported settings XML declaration");
+        let mut quote = None;
+        let mut end = None;
+        for (index, byte) in xml.as_bytes()[start + 1..].iter().copied().enumerate() {
+            if let Some(q) = quote { if byte == q { quote = None; } }
+            else if matches!(byte, b'\'' | b'"') { quote = Some(byte); }
+            else if byte == b'>' { end = Some(start + 1 + index); break; }
+            else { ensure!(byte != b'<', "malformed settings XML tag"); }
+        }
+        let end = end.context("unterminated settings XML tag")?;
+        let body = xml[start + 1..end].trim();
+        let closing = body.starts_with('/');
+        let named = if closing { body[1..].trim() } else { body };
+        let name_end = named.find(|c: char| c.is_whitespace() || c == '/').unwrap_or(named.len());
+        let name = &named[..name_end];
+        ensure!(!name.is_empty() && name.bytes().all(|c| c.is_ascii_alphanumeric() || matches!(c, b'_' | b':' | b'-')), "invalid settings XML tag");
+        if closing {
+            ensure!(named[name_end..].trim().is_empty() && stack.pop() == Some(name), "unbalanced settings XML at {name}");
+            if stack == ["Settings"] && matches!(name, "graphics" | "video") { sections.insert(name, start); }
+            if stack.is_empty() { root_end = Some(start); }
+        } else {
+            let self_closing = body.ends_with('/');
+            if stack.is_empty() {
+                ensure!(name == "Settings" && !self_closing && roots == 0, "settings XML must have one Settings root");
+                roots += 1;
+            }
+            if stack.len() == 2 && stack[0] == "Settings" {
+                if let Some(value) = wanted.get(&(stack[1], name)) {
+                    ensure!(self_closing && seen.insert((stack[1], name)), "duplicate or non-value graphics tag {name}");
+                    let captures = value_attribute.captures(&xml[start..end + 1])
+                        .with_context(|| format!("settings tag {name} has no value attribute"))?;
+                    let field = captures.get(1).or_else(|| captures.get(2)).unwrap();
+                    if field.as_str() != value {
+                        edits.push((start + field.start(), start + field.end(), value.clone()));
+                        changed.push(name.into());
+                    }
+                }
+            }
+            if !self_closing { stack.push(name); }
+        }
+        cursor = end + 1;
+    }
+    ensure!(stack.is_empty() && roots == 1, "unbalanced settings XML");
+    let root_end = root_end.context("settings XML has no closing Settings tag")?;
+    for section in ["graphics", "video"] {
+        let mut missing = String::new();
+        for ((parent, tag), value) in &wanted {
+            if *parent == section && !seen.contains(&(*parent, *tag)) {
+                missing.push_str(&format!("    <{tag} value=\"{value}\" />\n"));
+                changed.push((*tag).into());
+            }
+        }
+        if !missing.is_empty() {
+            if let Some(end) = sections.get(section) { edits.push((*end, *end, missing)); }
+            else { edits.push((root_end, root_end, format!("  <{section}>\n{missing}  </{section}>\n"))); }
+        }
+    }
+    edits.sort_by_key(|edit| edit.0);
+    let mut result = xml.to_owned();
+    for (start, end, value) in edits.into_iter().rev() { result.replace_range(start..end, &value); }
+    changed.sort();
+    Ok((result, changed))
+}
+
+fn prepare_native_graphics(save_root: &Path) -> anyhow::Result<NativeGraphicsLaunch> {
+    use anyhow::{ensure, Context};
+    use std::io::Write;
+    let config_path = save_root.join("native-graphics.json");
+    let (config, config_source) = match std::fs::read_to_string(&config_path) {
+        Ok(text) => { ensure!(text.len() <= 4096, "native graphics config exceeds 4096 bytes"); (NativeGraphics::parse(&text)?, "file") }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            eprintln!("[config] {} missing; using native low 960x540 at 60 fps", config_path.display());
+            (NativeGraphics::default(), "built_in_default")
+        }
+        Err(error) => return Err(error).with_context(|| format!("read {}", config_path.display())),
+    };
+    let settings_path = save_root.join("userdata/Documents/Rockstar Games/GTA V/settings.xml");
+    let (original, existed) = match std::fs::read_to_string(&settings_path) {
+        Ok(xml) => { ensure!(xml.len() <= 512 << 10, "settings.xml exceeds 512 KiB"); (xml, true) }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => (NATIVE_DEFAULT_SETTINGS.into(), false),
+        Err(error) => return Err(error).with_context(|| format!("read {}", settings_path.display())),
+    };
+    let (xml, changed_tags) = low_settings_xml(&original, &config).context("apply native low graphics preset")?;
+    let mut backup_path = None;
+    let settings_action = if existed && xml == original { "unchanged" } else {
+        let parent = settings_path.parent().unwrap();
+        std::fs::create_dir_all(parent).context("create native graphics settings directory")?;
+        let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_nanos();
+        if existed {
+            let backup = parent.join(format!("settings.xml.native-low-backup.{stamp}.{}", std::process::id()));
+            let mut file = std::fs::OpenOptions::new().write(true).create_new(true).open(&backup).context("create settings.xml backup")?;
+            file.write_all(original.as_bytes()).context("write settings.xml backup")?;
+            file.sync_all().context("flush settings.xml backup")?;
+            backup_path = Some(backup);
+        }
+        let temporary = parent.join(format!(".settings.xml.native-low.{stamp}.{}.tmp", std::process::id()));
+        let result = (|| -> anyhow::Result<()> {
+            let mut file = std::fs::OpenOptions::new().write(true).create_new(true).open(&temporary).context("create temporary settings.xml")?;
+            if existed { file.set_permissions(std::fs::metadata(&settings_path)?.permissions())?; }
+            file.write_all(xml.as_bytes()).context("write native graphics settings.xml")?;
+            file.sync_all().context("flush native graphics settings.xml")?;
+            std::fs::rename(&temporary, &settings_path).context("replace native graphics settings.xml")?;
+            Ok(())
+        })();
+        if result.is_err() { let _ = std::fs::remove_file(&temporary); }
+        result?;
+        if existed { "updated_with_backup" } else { "created_low_defaults" }
+    };
+    let launch = NativeGraphicsLaunch { config, config_path, config_source, settings_path, settings_action, changed_tags, backup_path };
+    eprintln!("[config] native graphics {}", launch.status_json());
+    Ok(launch)
+}
+
+#[cfg(test)]
+mod native_graphics_tests {
+    use super::*;
+    struct Fixture(PathBuf);
+    impl Fixture {
+        fn new() -> Self {
+            let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+            let root = std::env::temp_dir().join(format!("muguet-native-graphics-test.{}.{stamp}", std::process::id()));
+            std::fs::create_dir(&root).unwrap();
+            Self(root)
+        }
+        fn config(&self, width: u32, height: u32, fps: u32) {
+            std::fs::write(self.0.join("native-graphics.json"), format!(r#"{{"width":{width},"height":{height},"fps_limit":{fps},"graphics_preset":"low"}}"#)).unwrap();
+        }
+        fn settings(&self) -> PathBuf { self.0.join("userdata/Documents/Rockstar Games/GTA V/settings.xml") }
+    }
+    impl Drop for Fixture { fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); } }
+
+    #[test]
+    fn native_graphics_accepts_only_safe_resolution_and_frame_caps() {
+        for (width, height) in [(640, 360), (960, 540), (1280, 720), (1920, 1080), (2560, 1440), (3840, 2160)] {
+            for fps in [30, 60] {
+                let value = format!(r#"{{"width":{width},"height":{height},"fps_limit":{fps},"graphics_preset":"low"}}"#);
+                assert_eq!(NativeGraphics::parse(&value).unwrap(), NativeGraphics { width, height, fps_limit: fps });
+            }
+        }
+        assert_eq!(NativeGraphics::default(), NativeGraphics { width: 960, height: 540, fps_limit: 60 });
+    }
+
+    #[test]
+    fn native_graphics_rejects_malformed_or_unsupported_configuration() {
+        for value in ["{", "[]", "{}",
+            r#"{"width":-1,"height":540,"fps_limit":60,"graphics_preset":"low"}"#,
+            r#"{"width":960.5,"height":540,"fps_limit":60,"graphics_preset":"low"}"#,
+            r#"{"width":960,"height":720,"fps_limit":60,"graphics_preset":"low"}"#,
+            r#"{"width":3840,"height":1440,"fps_limit":60,"graphics_preset":"low"}"#,
+            r#"{"width":7680,"height":4320,"fps_limit":60,"graphics_preset":"low"}"#,
+            r#"{"width":960,"height":540,"fps_limit":90,"graphics_preset":"low"}"#,
+            r#"{"width":960,"height":540,"fps_limit":60,"graphics_preset":"high"}"#,
+            r#"{"width":960,"height":540,"fps_limit":60,"graphics_preset":"low","extra_args":[]}"#] {
+            assert!(NativeGraphics::parse(value).is_err(), "accepted {value}");
+        }
+    }
+
+    #[test]
+    fn native_low_xml_preserves_unrelated_sections_attributes_and_comments() {
+        let xml = r#"<?xml version="1.0"?><Settings><version value="27"/><configSource>SMC_AUTO</configSource>
+<graphics><!-- <TextureQuality value="2" /> --><TextureQuality custom="keep" value='2' /><ShaderQuality value="0" />
+<CustomQuality value="7" /><custom><TextureQuality value="2" /></custom></graphics>
+<system><maxFileStoreSize value="65536" /></system><audio><Audio3d value="true" /></audio>
+<video><ScreenWidth value="1280"/><ScreenHeight value="720"/><RefreshRate value="60"/><VSync value="2"/>
+<AdapterIndex value="9" /></video><VideoCardDescription>KEEP</VideoCardDescription></Settings>"#;
+        let config = NativeGraphics { width: 640, height: 360, fps_limit: 30 };
+        let (new, tags) = low_settings_xml(xml, &config).unwrap();
+        for exact in ["<!-- <TextureQuality value=\"2\" /> -->", "<CustomQuality value=\"7\" />",
+            "<custom><TextureQuality value=\"2\" /></custom>", "<system><maxFileStoreSize value=\"65536\" /></system>",
+            "<audio><Audio3d value=\"true\" /></audio>", "<AdapterIndex value=\"9\" />", "<VideoCardDescription>KEEP</VideoCardDescription>"] {
+            assert!(new.contains(exact), "changed unrelated XML {exact}");
+        }
+        assert!(new.contains("<TextureQuality custom=\"keep\" value='0' />"));
+        assert!(new.contains("<ShaderQuality value=\"1\" />"));
+        assert!(new.contains("<ScreenWidth value=\"640\"/>"));
+        assert!(new.contains("<ScreenHeight value=\"360\"/>"));
+        assert!(new.contains("<RefreshRate value=\"30\"/>"));
+        assert!(tags.contains(&"TextureQuality".into()));
+        let (again, changed) = low_settings_xml(&new, &config).unwrap();
+        assert_eq!(again, new);
+        assert!(changed.is_empty());
+    }
+
+    #[test]
+    fn native_graphics_first_launch_creates_low_file_and_preserves_saves() {
+        let fixture = Fixture::new();
+        let save = fixture.0.join("SGTA50000");
+        std::fs::write(&save, [0, 255, 22, 31]).unwrap();
+        let launch = prepare_native_graphics(&fixture.0).unwrap();
+        assert_eq!(launch.config_source, "built_in_default");
+        assert_eq!(launch.settings_action, "created_low_defaults");
+        assert!(launch.backup_path.is_none());
+        let xml = std::fs::read_to_string(fixture.settings()).unwrap();
+        assert!(xml.contains("<version value=\"27\" />"));
+        assert!(xml.contains("<TextureQuality value=\"0\" />"));
+        assert!(xml.contains("<ShaderQuality value=\"1\" />"));
+        assert!(xml.contains("<ScreenWidth value=\"960\" />"));
+        assert_eq!(std::fs::read(save).unwrap(), [0, 255, 22, 31]);
+        assert_eq!(prepare_native_graphics(&fixture.0).unwrap().settings_action, "unchanged");
+    }
+
+    #[test]
+    fn native_graphics_backs_up_existing_xml_before_atomic_update() {
+        let fixture = Fixture::new();
+        fixture.config(1280, 720, 30);
+        let path = fixture.settings();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, NATIVE_DEFAULT_SETTINGS).unwrap();
+        let launch = prepare_native_graphics(&fixture.0).unwrap();
+        assert_eq!(launch.config_source, "file");
+        assert_eq!(launch.settings_action, "updated_with_backup");
+        assert_eq!(std::fs::read_to_string(launch.backup_path.unwrap()).unwrap(), NATIVE_DEFAULT_SETTINGS);
+        assert!(std::fs::read_to_string(path).unwrap().contains("<RefreshRate value=\"30\" />"));
+    }
+
+    #[test]
+    fn native_4k_settings_reach_game_xml_without_changing_save_or_default() {
+        let fixture = Fixture::new();
+        fixture.config(3840, 2160, 60);
+        let path = fixture.settings();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, NATIVE_DEFAULT_SETTINGS).unwrap();
+        let save = fixture.0.join("SGTA50000");
+        std::fs::write(&save, [9, 0, 255, 32]).unwrap();
+        let launch = prepare_native_graphics(&fixture.0).unwrap();
+        assert_eq!(launch.config, NativeGraphics { width: 3840, height: 2160, fps_limit: 60 });
+        let xml = std::fs::read_to_string(&path).unwrap();
+        assert!(xml.contains("<ScreenWidth value=\"3840\" />"));
+        assert!(xml.contains("<ScreenHeight value=\"2160\" />"));
+        assert!(xml.contains("<RefreshRate value=\"60\" />"));
+        assert_eq!(std::fs::read(save).unwrap(), [9, 0, 255, 32]);
+        assert_eq!(std::fs::read_to_string(launch.backup_path.unwrap()).unwrap(), NATIVE_DEFAULT_SETTINGS);
+        assert_eq!(prepare_native_graphics(&fixture.0).unwrap().settings_action, "unchanged");
+        assert_eq!(NativeGraphics::default(), NativeGraphics { width: 960, height: 540, fps_limit: 60 });
+    }
+
+    #[test]
+    fn native_graphics_errors_do_not_overwrite_existing_xml() {
+        let fixture = Fixture::new();
+        let path = fixture.settings();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, NATIVE_DEFAULT_SETTINGS).unwrap();
+        std::fs::write(fixture.0.join("native-graphics.json"), "bad JSON").unwrap();
+        assert!(prepare_native_graphics(&fixture.0).is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), NATIVE_DEFAULT_SETTINGS);
+        fixture.config(960, 540, 60);
+        std::fs::write(&path, "<Settings><graphics>").unwrap();
+        assert!(prepare_native_graphics(&fixture.0).is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "<Settings><graphics>");
+        std::fs::remove_file(path).unwrap();
+        std::fs::remove_dir_all(fixture.0.join("userdata")).unwrap();
+        std::fs::write(fixture.0.join("userdata"), "directory blocked").unwrap();
+        assert!(prepare_native_graphics(&fixture.0).is_err());
     }
 }

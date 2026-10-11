@@ -113,6 +113,24 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("IsPlayerFreeAiming", "player_commands::CommandIsPlayerFreeAiming(int)"),
     ("GetGameplayCamCoord", "camera_commands::CommandGetGameplayCamCoord()"),
     ("GetGameplayCamRot", "camera_commands::CommandGetGameplayCamRot(int)"),
+    ("GetGameplayCamRelativeHeading", "camera_commands::CommandGetGameplayCamRelativeHeading()"),
+    ("GetGameplayCamRelativePitch", "camera_commands::CommandGetGameplayCamRelativePitch()"),
+    ("SetGameplayCamRelativeHeading", "camera_commands::CommandSetGameplayCamRelativeHeading(float)"),
+    ("SetGameplayCamRelativePitch", "camera_commands::CommandSetGameplayCamRelativePitch(float, float)"),
+    ("SetFollowPedCamViewMode", "camera_commands::CommandSetFollowPedCamViewMode(int)"),
+    ("SetFollowVehicleCamViewMode", "camera_commands::CommandSetFollowVehicleCamViewMode(int)"),
+    ("GetFollowPedCamViewMode", "camera_commands::CommandGetFollowPedCamViewMode()"),
+    ("GetFollowVehicleCamViewMode", "camera_commands::CommandGetFollowVehicleCamViewMode()"),
+    ("IsGameplayCamRendering", "camera_commands::CommandIsGameplayCamRendering()"),
+    ("CreateCam", "camera_commands::CommandCreateCam(char const*, bool)"),
+    ("DestroyCam", "camera_commands::CommandDestroyCam(int, bool)"),
+    ("SetCamActive", "camera_commands::CommandSetCamActive(int, bool)"),
+    ("SetCamCoord", "camera_commands::CommandSetCamCoord(int, rage::scrVector const&)"),
+    ("SetCamRotation", "camera_commands::CommandSetCamRotation(int, rage::scrVector const&, int)"),
+    ("RenderScriptCams", "camera_commands::CommandRenderScriptCams(bool, bool, int, bool, bool, int)"),
+    ("XRSetViewportCameraMtx", "rage::grcViewport::SetCameraMtx(rage::Mat34V const&)"),
+    ("XRSetViewportProjection", "rage::grcViewport::SetProjection(rage::Mat44V const&)"),
+    ("XRSetCurrentViewport", "rage::grcViewport::SetCurrent(rage::grcViewport const*, bool)"),
     ("TaskGoToCoordWhileAimingAtCoord", "task_commands::CommandTaskGoToCoordWhileAimingAtCoord(int, rage::scrVector const&, rage::scrVector const&, float, bool, float, float, bool, int, bool, int)"),
     ("GetVehicleExtraColours", "vehicle_commands::CommandGetVehicleExtraColours(int, int&, int&)"),
     ("SetVehicleExtraColours", "vehicle_commands::CommandSetVehicleExtraColours(int, int, int)"),
@@ -878,6 +896,8 @@ pub fn script_tick(caller: &mut Caller<'_, HostState>, thread: u64, tls: u64) ->
             more_bullets(&mut c);
         }
 
+        apply_native_head_pose(&mut c);
+
         if crate::pad::ACTIVE.load(Ordering::Relaxed) || cfg!(target_os = "ios") {
             let ped = c.i("PlayerPedId", &[]);
             let in_car = ped != 0 && c.exists(ped) && c.i("IsPedInAnyVehicle", &[i(ped), b(false)]) != 0;
@@ -900,6 +920,32 @@ pub fn script_tick(caller: &mut Caller<'_, HostState>, thread: u64, tls: u64) ->
     }
     write_u64(mem, active, saved);
     Ok(())
+}
+
+/// Optional native camera diagnostics. Pose consumption and rigid offsets run
+/// in primary-camera propagation, including cinematics without script updates.
+/// Never change the game's chosen camera mode, controller look or cutscene.
+fn apply_native_head_pose(c: &mut Cmd<'_, '_>) {
+    if !crate::xr_view::world_camera_enabled() { return; }
+    // Getter diagnostics are optional. A cinematic camera may render without a
+    // gameplay camera/player; it still receives the consumed head transform.
+    let ped = c.i("PlayerPedId", &[]);
+    if ped != 0 && c.exists(ped) && c.i("IsGameplayCamRendering", &[]) != 0 {
+        if let Some(readback) = read_native_camera(c) {
+            crate::xr::record_camera_readback(readback, true);
+            crate::xr::record_camera_readback(readback, false);
+        }
+    }
+}
+
+fn read_native_camera(c: &mut Cmd<'_, '_>) -> Option<crate::xr::CameraReadback> {
+    let Val::I32(ped_view_mode) = call(c.caller, "mp:GetFollowPedCamViewMode", &[])? else { return None; };
+    let Val::I32(vehicle_view_mode) = call(c.caller, "mp:GetFollowVehicleCamViewMode", &[])? else { return None; };
+    let Val::F32(heading) = call(c.caller, "mp:GetGameplayCamRelativeHeading", &[])? else { return None; };
+    let Val::F32(pitch) = call(c.caller, "mp:GetGameplayCamRelativePitch", &[])? else { return None; };
+    let (heading_degrees, pitch_degrees) = (f32::from_bits(heading), f32::from_bits(pitch));
+    if !heading_degrees.is_finite() || !pitch_degrees.is_finite() { return None; }
+    Some(crate::xr::CameraReadback { ped_view_mode, vehicle_view_mode, heading_degrees, pitch_degrees })
 }
 
 fn call(caller: &mut Caller<'_, HostState>, name: &str, args: &[Val]) -> Option<Val> {
@@ -1052,7 +1098,7 @@ fn more_bullets(c: &mut Cmd) {
 }
 
 fn play_sound(name: &str) {
-    if std::env::var("MUGUET_MUTE").map(|v| v == "1").unwrap_or(false) {
+    if std::env::var("MUGUET_MUTE").map(|v| v == "1").unwrap_or(false) || crate::audio::master_volume() == 0.0 {
         return;
     }
     let mut places: Vec<std::path::PathBuf> = crate::config::bundled_resources().into_iter().map(|r| r.join(name)).collect();

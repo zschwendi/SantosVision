@@ -245,6 +245,9 @@ pub struct Device {
     /// sites where we check it are areas that should be revisited if we start
     /// using ref-counted references for internal access.
     pub(crate) valid: AtomicBool,
+    // Closing-only state cannot retain Queue/Device or invoke teardown under a
+    // snatch/registry guard. Pool ownership remains exclusively queue-side.
+    pub(crate) internal_upload_pool_closed: Arc<AtomicBool>,
 
     /// Closure to be called on "lose the device". This is invoked directly by
     /// device.lose or by the UserCallbacks returned from maintain when the device
@@ -540,6 +543,7 @@ impl Device {
             fence: ManuallyDrop::new(fence),
             snatchable_lock: unsafe { SnatchLock::new(rank::DEVICE_SNATCHABLE_LOCK) },
             valid: AtomicBool::new(true),
+            internal_upload_pool_closed: Arc::new(AtomicBool::new(false)),
             device_lost_closure: Mutex::new(rank::DEVICE_LOST_CLOSURE, None),
             trackers: Mutex::new(
                 rank::DEVICE_TRACKERS,
@@ -915,12 +919,17 @@ impl Device {
         let mut queue_empty = false;
         if let Some(queue) = self.get_queue() {
             let queue_result = queue.maintain(current_finished_submission, &snatch_guard);
+            let retired;
             (
                 user_closures.submissions,
                 user_closures.mappings,
                 user_closures.blas_compact_ready,
                 queue_empty,
+                retired,
             ) = queue_result;
+            if let Some(publication) = queue.upload_publication(retired) {
+                user_closures.upload_retirements.push(publication);
+            }
             // DEADLOCK PREVENTION: We must drop `snatch_guard` before `queue` goes out of scope.
             //
             // `Queue::drop` acquires the snatch guard. If we still hold it when `queue` is dropped
@@ -5193,7 +5202,13 @@ impl Device {
             unsafe { self.raw().wait(self.fence.as_ref(), submission_index, None) }
                 .map_err(|e| self.handle_hal_error(e))?;
             if let Some(queue) = self.get_queue() {
-                let closures = queue.lock_life().triage_submissions(submission_index);
+                let (closures, retired) = {
+                    let mut life = queue.lock_life();
+                    life.triage_submissions(submission_index)
+                };
+                if let Some(publication) = queue.upload_publication(retired) {
+                    publication.dispatch();
+                }
                 assert!(
                     closures.is_empty(),
                     "wait_for_submit is not expected to work with closures"
@@ -5417,10 +5432,12 @@ impl Device {
 
         // Mark the device explicitly as invalid. This is checked in various
         // places to prevent new work from being submitted.
+        self.internal_upload_pool_closed.store(true, Ordering::Release);
         self.valid.store(false, Ordering::Release);
 
         // 1) Resolve the GPUDevice device.lost promise.
-        if let Some(device_lost_closure) = self.device_lost_closure.lock().take() {
+        let device_lost_closure = self.device_lost_closure.lock().take();
+        if let Some(device_lost_closure) = device_lost_closure {
             device_lost_closure(DeviceLostReason::Unknown, message.to_string());
         }
 
@@ -5443,17 +5460,15 @@ impl Device {
         // "destroy" on all the resources we know about.
 
         // During these iterations, we discard all errors. We don't care!
-        let trackers = self.trackers.lock();
-        for buffer in trackers.buffers.used_resources() {
-            if let Some(buffer) = Weak::upgrade(buffer) {
-                buffer.destroy();
-            }
-        }
-        for texture in trackers.textures.used_resources() {
-            if let Some(texture) = Weak::upgrade(texture) {
-                texture.destroy();
-            }
-        }
+        let (buffers, textures): (Vec<_>, Vec<_>) = {
+            let trackers = self.trackers.lock();
+            (trackers.buffers.used_resources().filter_map(Weak::upgrade).collect(),
+             trackers.textures.used_resources().filter_map(Weak::upgrade).collect())
+        };
+        // destroy acquires snatch, which precedes trackers in the rank graph.
+        // Strong snapshots preserve the exact identities after releasing it.
+        for buffer in buffers { buffer.destroy(); }
+        for texture in textures { texture.destroy(); }
     }
 
     pub(crate) fn new_usage_scope(&self) -> UsageScope<'_> {

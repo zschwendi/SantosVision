@@ -156,6 +156,17 @@ pub(crate) fn fixup_discarded_surfaces<InitIter: Iterator<Item = TextureSurfaceD
 }
 
 impl BakedCommands {
+    /// Conservative predicate: even a NeedsInitializedMemory action whose
+    /// ranges may already be initialized keeps the existing Transit path.
+    /// Implicit initialization and discard state must still be processed.
+    pub(crate) fn can_skip_empty_metal_transit(&self) -> bool {
+        !self.buffer_memory_init_actions.iter().any(|action| {
+            matches!(action.kind, MemoryInitKind::NeedsInitializedMemory)
+        }) && !self.texture_memory_actions.init_actions.iter().any(|action| {
+            matches!(action.kind, MemoryInitKind::NeedsInitializedMemory)
+        })
+    }
+
     // inserts all buffer initializations that are going to be needed for
     // executing the commands and updates resource init states accordingly
     pub(crate) fn initialize_buffer_memory(

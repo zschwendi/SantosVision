@@ -103,6 +103,11 @@ pub fn call(mut caller: Caller<'_, HostState>, idx: usize, params: &[Val], resul
         "muguet_script" => crate::mp::script_tick(&mut caller, int(params, 0) as u64, int(params, 1) as u64)?,
         "muguet_explosion" => crate::mp::explosion(int(params, 0) as u64),
         "muguet_timewarp" => set_int(results, crate::mp::time_warp(int(params, 0))),
+        "muguet_xr_camera_post" => crate::xr_view::camera_post(&mut caller, int(params, 0) as u64, int(params, 1) as u64)?,
+        "muguet_xr_scene_post" => crate::xr_view::scene_post(&mut caller, int(params, 0) as u64)?,
+        "muguet_xr_viewport_command" => crate::xr_view::viewport_command(&mut caller, int(params, 0) as u64)?,
+        "muguet_xr_current_view" => crate::xr_view::current_view(&mut caller, int(params, 0) as u64, int(params, 1) as u64)?,
+        "muguet_xr_gpu_command" => crate::xr_view::gpu_command(&mut caller, int(params, 0) as u64)?,
         "__pthread_create_js" => {
             let r = spawn_pthread(int(params, 0) as u64, int(params, 2) as u64, int(params, 3) as u64);
             set_int(results, r as i64);
@@ -121,11 +126,21 @@ pub fn call(mut caller: Caller<'_, HostState>, idx: usize, params: &[Val], resul
         "_emscripten_throw_longjmp" => { PENDING_LONGJMP.with(|c| c.set(true)); return Err(LongJmp.into()); }
         "exit" | "proc_exit" => {
             eprintln!("[host] engine exit({})", int(params, 0));
+            #[cfg(not(target_os = "visionos"))]
             std::process::exit(int(params, 0) as i32);
+            #[cfg(target_os = "visionos")]
+            {
+                crate::native::record_exit(int(params, 0) as i32);
+                anyhow::bail!("game requested exit({})", int(params, 0));
+            }
         }
         "_abort_js" => anyhow::bail!("engine called abort()"),
         "emscripten_num_logical_cores" => set_int(results, std::thread::available_parallelism().map(|n| n.get() as i64).unwrap_or(8)),
-        "emscripten_get_heap_max" => set_int(results, 17_179_869_184),
+        "emscripten_get_heap_max" => {
+            let ty = mem.ty();
+            let maximum = ty.maximum().unwrap_or(17_179_869_184 >> ty.page_size_log2());
+            set_int(results, (maximum << ty.page_size_log2()) as i64);
+        },
         "emscripten_resize_heap" => set_int(results, resize_heap(mem, int(params, 0) as u64) as i64),
         "_emscripten_system" => set_int(results, if int(params, 0) == 0 { 0 } else { -52 }),
         "emscripten_stack_snapshot" | "emscripten_stack_unwind_buffer" => set_int(results, 0),

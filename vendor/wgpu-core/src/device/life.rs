@@ -7,6 +7,7 @@ use crate::{
     device::{
         queue::{EncoderInFlight, SubmittedWorkDoneClosure, TempResource},
         DeviceError,
+        staging_pool::RetiredStaging,
     },
     ray_tracing::BlasCompactReadyPendingClosure,
     resource::{Blas, Buffer, QuerySet, Texture, Trackable},
@@ -328,25 +329,42 @@ impl LifetimeTracker {
     pub fn triage_submissions(
         &mut self,
         last_done: SubmissionIndex,
-    ) -> SmallVec<[SubmittedWorkDoneClosure; 1]> {
+    ) -> (SmallVec<[SubmittedWorkDoneClosure; 1]>, Vec<RetiredStaging>) {
         profiling::scope!("triage_submissions");
 
         debug_assert!(self.active.is_sorted_by_key(|a| a.index));
         let done_count = self.active.partition_point(|a| a.index <= last_done);
 
         let mut work_done_closures: SmallVec<_> = self.work_done_closures.drain(..).collect();
+        let mut retired = Vec::new();
         for a in self.active.drain(..done_count) {
             self.ready_to_map.extend(a.mapped);
             self.ready_to_compact.extend(a.compact_read_back);
-            for encoder in a.encoders {
+            for mut encoder in a.encoders {
                 // This involves actually decrementing the ref count of all command buffer
                 // resources, so can be _very_ expensive.
                 profiling::scope!("drop command buffer trackers");
+                let mut candidates = Vec::new();
+                // Keep retained sources alive across reset_all/release_encoder.
+                // All nonpool resources follow their original encoder cleanup.
+                if encoder.temp_resources.iter().any(|resource| matches!(resource,
+                    TempResource::StagingBuffer(buffer) if buffer.is_retained())) {
+                    let resources = core::mem::take(&mut encoder.temp_resources);
+                    for resource in resources {
+                        match resource {
+                            TempResource::StagingBuffer(buffer) if buffer.is_retained() => candidates.push(buffer),
+                            other => encoder.temp_resources.push(other),
+                        }
+                    }
+                }
                 drop(encoder);
+                for buffer in candidates {
+                    retired.push(RetiredStaging::after_completed_encoder_reset(buffer, a.index));
+                }
             }
             work_done_closures.extend(a.work_done_closures);
         }
-        work_done_closures
+        (work_done_closures, retired)
     }
 
     pub fn schedule_resource_destruction(

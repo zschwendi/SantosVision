@@ -1090,6 +1090,23 @@ impl CommandEncoder {
         }
     }
 
+    /// Merge submission state on Metal without issuing HAL barrier calls.
+    /// The caller must separately establish that no initialization commands
+    /// require an open encoder. Metal's transition methods emit no GPU work;
+    /// calling them on a closed encoder would still violate the HAL contract.
+    pub(crate) fn merge_device_tracker_without_hal_barriers(
+        base: &mut DeviceTracker,
+        head: &Tracker,
+        snatch_guard: &SnatchGuard,
+    ) {
+        base.buffers
+            .set_from_tracker_and_drain_transitions(&head.buffers, snatch_guard)
+            .for_each(drop);
+        base.textures
+            .set_from_tracker_and_drain_transitions(&head.textures, snatch_guard)
+            .for_each(drop);
+    }
+
     fn encode_commands(
         device: &Arc<Device>,
         cmd_buf_data: &mut CommandBufferMutable,

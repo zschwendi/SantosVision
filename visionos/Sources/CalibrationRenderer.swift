@@ -2,6 +2,7 @@ import ARKit
 import CompositorServices
 import Foundation
 import Metal
+import OSLog
 import SwiftUI
 import simd
 
@@ -44,7 +45,8 @@ enum CalibrationEvent: Sendable {
     case ended
 }
 
-/// Owns one diagnostic renderer. No GTA engine or game symbols are linked.
+/// Owns one calibration renderer. A game build also publishes predicted head
+/// poses to the native mailbox; the geometry here remains the calibration world.
 /// Only the render thread touches frame state and calibration geometry.
 final class CalibrationRenderer: @unchecked Sendable {
     private let layer: LayerRenderer
@@ -62,6 +64,8 @@ final class CalibrationRenderer: @unchecked Sendable {
     private var originFromCalibration: simd_float4x4?
     private var hasReportedTracking = false
     private var lastMissingPoseReport: TimeInterval = 0
+    private var hasReportedCompositorFrame = false
+    private let log = Logger(subsystem: "com.zephyrstudios.santosvision", category: "Compositor")
 
     init(layer: LayerRenderer, report: @escaping @Sendable (CalibrationEvent) -> Void) throws {
         self.layer = layer
@@ -100,12 +104,16 @@ final class CalibrationRenderer: @unchecked Sendable {
     }
 
     func start() async throws {
-        guard WorldTrackingProvider.isSupported else { throw DiagnosticError.unsupportedTracking }
         try Task.checkCancellation()
-        try await session.run([tracking])
+        if SimulatorPoseFixture.shared == nil {
+            guard WorldTrackingProvider.isSupported else { throw DiagnosticError.unsupportedTracking }
+            try await session.run([tracking])
+        }
         try Task.checkCancellation()
         guard !isStopped else { session.stop(); return }
-        report(.status("Waiting for a tracked headset pose. Calibration scene only."))
+        report(.status(SimulatorPoseFixture.shared == nil
+                       ? "Waiting for a tracked headset pose. Calibration scene only."
+                       : "Explicit simulator pose fixture active. Calibration scene only; real head tracking is not being tested."))
         let thread = Thread { [self] in renderLoop() }
         thread.name = "SantosVision immersive calibration renderer"
         thread.qualityOfService = .userInteractive
@@ -148,6 +156,11 @@ final class CalibrationRenderer: @unchecked Sendable {
     }
 
     private func renderFrame() {
+        // Reserve GPU capacity before taking a compositor frame from its finite
+        // pool. A timeout must never strand an already-acquired frame.
+        guard inFlight.wait(timeout: .now() + 0.1) == .success else { return }
+        var ownsSlot = true
+        defer { if ownsSlot { inFlight.signal() } }
         guard let frame = layer.queryNextFrame() else {
             Thread.sleep(forTimeInterval: 0.001)
             return
@@ -157,18 +170,14 @@ final class CalibrationRenderer: @unchecked Sendable {
         guard let timing = frame.predictTiming() else { return }
         LayerRenderer.Clock().wait(until: timing.optimalInputTime)
         guard !isStopped, layer.state == .running else { return }
-        // A finite wait bounds shutdown; no allocation changes while GPU reads it.
-        guard inFlight.wait(timeout: .now() + 0.1) == .success else { return }
         frame.startSubmission()
         let drawables = frame.queryDrawables()
         // An empty query invalidates the frame; never access it again, even to end submission.
         guard !drawables.isEmpty else {
-            inFlight.signal()
             return
         }
         defer { frame.endSubmission() }
         guard let commands = queue.makeCommandBuffer() else {
-            inFlight.signal()
             return
         }
         commands.label = "SantosVision calibration frame"
@@ -181,22 +190,42 @@ final class CalibrationRenderer: @unchecked Sendable {
                 ? tracking.queryDeviceAnchor(atTimestamp: timestamp) : nil
             let trackedAnchor = anchor?.isTracked == true ? anchor : nil
             drawable.deviceAnchor = trackedAnchor
-            if let trackedAnchor, originFromCalibration == nil {
+            let originFromHead = SimulatorPoseFixture.shared?.pose(at: timestamp)
+                ?? trackedAnchor?.originFromAnchorTransform
+            XRHeadTracking.shared.submit(timestamp: timestamp,
+                                         stageFromHead: originFromHead,
+                                         tracked: originFromHead != nil)
+            if let originFromHead, originFromCalibration == nil {
                 var transform = matrix_identity_float4x4
                 // Place the test world around the first tracked head position.
-                transform.columns.3 = trackedAnchor.originFromAnchorTransform.columns.3
+                transform.columns.3 = originFromHead.columns.3
                 originFromCalibration = transform
             }
-            if trackedAnchor != nil, !hasReportedTracking {
-                report(.status("Headset pose acquired. Rendering the stereo calibration world with depth."))
+            if originFromHead != nil, !hasReportedTracking {
+                let viewDescription = "\(drawable.views.count) compositor \(drawable.views.count == 1 ? "view" : "views")"
+                report(.status(SimulatorPoseFixture.shared == nil
+                               ? "Headset pose acquired. Rendering \(viewDescription) with depth."
+                               : "Rendering \(viewDescription) with depth from an explicit simulator pose fixture."))
                 hasReportedTracking = true
-            } else if trackedAnchor == nil, timestamp - lastMissingPoseReport > 2 {
+            } else if originFromHead == nil, timestamp - lastMissingPoseReport > 2 {
                 report(.status("Headset pose unavailable; scene drawing is suspended until tracking returns."))
                 lastMissingPoseReport = timestamp
                 hasReportedTracking = false
             }
-            encode(drawable: drawable, anchor: trackedAnchor, commands: commands)
+            encode(drawable: drawable, originFromHead: originFromHead, commands: commands)
             drawable.encodePresent(commandBuffer: commands)
+            if originFromHead != nil, !hasReportedCompositorFrame {
+                hasReportedCompositorFrame = true
+                log.info("Encoded compositor calibration frame: views=\(drawable.views.count) color=\(drawable.colorTextures.count) depth=\(drawable.depthTextures.count) simulator_fixture=\(SimulatorPoseFixture.shared != nil)")
+                for (index, view) in drawable.views.enumerated() {
+                    let projection = drawable.computeProjection(convention: .rightUpBack, viewIndex: index)
+                    let map = view.textureMap
+                    log.info("Calibration eye \(index): eye_x=\(view.transform.columns.3.x) projection_x=\(projection.columns.2.x) texture=\(map.textureIndex) slice=\(map.sliceIndex) viewport=\(map.viewport.width)x\(map.viewport.height)")
+                }
+                commands.addCompletedHandler { [log] command in
+                    log.info("First calibration compositor command completed: status=\(command.status.rawValue)")
+                }
+            }
         }
         commands.addCompletedHandler { [inFlight, report] buffer in
             inFlight.signal()
@@ -204,11 +233,12 @@ final class CalibrationRenderer: @unchecked Sendable {
                 report(.status("Metal frame failed: \(buffer.error?.localizedDescription ?? "unknown GPU error")"))
             }
         }
+        ownsSlot = false // The completion handler now owns the reservation.
         commands.commit()
     }
 
     private func encode(drawable: LayerRenderer.Drawable,
-                        anchor: DeviceAnchor?, commands: MTLCommandBuffer) {
+                        originFromHead: simd_float4x4?, commands: MTLCommandBuffer) {
         var clearedTextures = Set<String>()
         for (eyeIndex, view) in drawable.views.enumerated() {
             let map = view.textureMap
@@ -228,8 +258,8 @@ final class CalibrationRenderer: @unchecked Sendable {
             guard let encoder = commands.makeRenderCommandEncoder(descriptor: pass) else { continue }
             encoder.label = "Calibration eye \(eyeIndex)"
             encoder.setViewport(map.viewport)
-            if let anchor, let world = originFromCalibration {
-                let originFromEye = anchor.originFromAnchorTransform * view.transform
+            if let originFromHead, let world = originFromCalibration {
+                let originFromEye = originFromHead * view.transform
                 var mvp = drawable.computeProjection(convention: .rightUpBack, viewIndex: eyeIndex)
                     * simd_inverse(originFromEye) * world
                 encoder.setRenderPipelineState(pipeline)

@@ -1,36 +1,74 @@
-# Proposed game rendering bridge
+# Native immersive world bridge
 
-Status: **unimplemented**. `ImmersiveBridge.h` declares a proposed future C ABI; it is not compiled or imported by the diagnostic. No game FFI symbol is called or linked. A passing diagnostic build does not establish that the existing Muguet runtime can satisfy this contract.
+The implemented ABI is [RuntimeBridge.h](RuntimeBridge.h) plus [WorldBridge.h](WorldBridge.h). The older `ImmersiveBridge.h` borrowed-command-buffer proposal is retained as historical design material and is not used. A passing calibration build is separate from qualified GTA world publication and compositor completion.
 
-The desired GTA experience requires the engine to render surrounding 3D world geometry from the player's first-person position. Both camera orientation and position must incorporate the predicted headset pose, with independent stereo eye offsets, projections, color targets and matching depth. Displaying the existing flat game image on a screen or panorama cannot satisfy this contract.
+## Camera and frame ownership
 
-## Frame ownership and timing
+Swift owns `ARKitSession`, `WorldTrackingProvider`, `LayerRenderer`, presentation timing, the compositor command queue and final presentation. It queries a tracked device anchor after `optimalInputTime` at the drawable's predicted presentation timestamp, assigns that same anchor to `drawable.deviceAnchor`, and publishes `SVXRHeadPose`. Explicit simulator fixtures leave the device anchor unset and are labeled synthetic.
 
-1. Swift owns the `ARKitSession`, `WorldTrackingProvider`, `LayerRenderer`, frame lifecycle, command queue and final presentation. It stops submitting when paused or invalidated and stops ARKit when the test closes or app backgrounds.
-2. After `optimalInputTime`, query a tracked device anchor at the drawable's `frameTiming.presentationTime`. Convert `LayerRenderer.Clock.Instant.epoch.duration(to:)` to seconds. Set that same anchor as `drawable.deviceAnchor`. Do not reuse an untracked or stale pose to claim head tracking.
-3. Advance game simulation once per frame, before eye encoding. Every eye and recording target must read the same simulation snapshot. A second eye render must not run a second simulation step or consume input again.
-4. The Swift host creates and owns the command buffer. All texture and command-buffer addresses in the C struct are borrowed Objective-C object pointers valid only for this synchronous call. The engine may encode into the supplied buffer but must not retain resources for a later frame, present, commit, or wait for it. Swift calls `drawable.encodePresent(commandBuffer:)`, commits, and balances `startSubmission` / `endSubmission`.
-5. The bridge must reject unknown `abi_version`, incompatible `byte_size`, unsupported pixel formats, missing depth, or too many views. A nonzero result keeps game launch unavailable and supplies an actionable error to the UI. No fake success fallback.
+`SVXRViewRequest` carries the built-in drawable's actual one or two `head_from_eye` transforms and reverse-Z projections. Recording/capture drawables cannot overwrite the headset mailbox with a different view count. The guest camera hook runs on the game thread and preserves the game's current primary camera, including third-person and cutscenes, with recentered headset movement relative to that camera. The player selects camera modes through ordinary game controls. With two requested views it alternates independent eye cameras on natural game updates (AER); it does not replay simulation for the second eye. This entails temporal differences between stereo eyes and requires headset qualification.
 
-## Coordinate and destination contract
+The native GPU path must match a qualified active gameplay camera and its baked GPU viewport before publishing any world snapshot. Source color and real scene depth must come from the same qualified game presentation. The native publisher copies both into immutable Metal resources and publishes only after their GPU copy completes. It bounds the pool and at most twelve outstanding leases. Missing or ambiguous world/depth qualification keeps acquisition pending; loading/menu images are not accepted as immersive world proof.
 
-Matrices are column-major `simd_float4x4`, multiplied by column vectors. `stage_from_head` is the ARKit `originFromAnchorTransform`, in meters. Its convention is right-handed: +X right, +Y up, -Z forward. `game_from_stage` must explicitly combine player position, locomotion orientation, recenter offset, engine axis conversion and unit scale; do not overwrite a rendered game camera with raw headset translation. The bridge should expose first-person camera control without changing simulation state per eye.
+Swift acquires distinct view-index leases, verifies version/size, supported color format, dimensions, projection matrices and Metal device identity. A two-view compositor never receives duplicated mono content. The compositor command keeps the native leases and strong texture references alive until GPU completion. `sv_world_complete_frame` verifies a complete set of distinct eye tokens and current generation before counting an actual world presentation, then Swift releases the leases. Closing immersion and app lifecycle changes invalidate old acknowledgements.
 
-For a drawable view, compute `stage_from_eye = stage_from_head * view.transform`, then `game_from_eye = game_from_stage * stage_from_eye` and `eye_from_game = inverse(game_from_eye)`. The projection is the actual `drawable.computeProjection(convention: .rightUpBack, viewIndex:)`. Engine eye-space conventions must agree with that projection. There is no hardcoded IPD or assumed symmetric field of view.
+## Coordinate and depth reconstruction
 
-Use each view's `textureMap.textureIndex`, `sliceIndex` and `viewport` rather than assuming separate 2D textures. Support dedicated, layered, and shared layouts, or negotiate one supported layout before launch. Shared texture passes clear a texture once and load it for the second viewport. Layered passes target the assigned array slice. The current diagnostic disables foveation; a future game implementation must negotiate and handle rasterization-rate maps before enabling it.
+All matrices are column-major floats multiplied by column vectors. ARKit stage coordinates are right-handed meters: +X right, +Y up, -Z forward. `view.transform` is `head_from_eye`; it comes from CompositorServices, with no invented IPD. Each immutable snapshot contains its actual source `projection_from_eye`, `game_from_eye` and `game_from_stage`, including the native recenter and player locomotion basis.
 
-Color and depth refer to the exact compositor textures. The depth range is reverse-Z: near is `depthRange.y`, far is `depthRange.x`; clear depth to zero, compare greater-or-equal, write actual scene depth in the projection's convention, and store it for compositor reprojection. A flat-depth approximation does not meet the surrounding world requirement.
+Swift computes the current eye as:
 
-`SV_IMMERSIVE_MAX_VIEWS` is a versioned upper bound, not a promise of two views. Each drawable may target the headset or recording output. Handle supported targets separately and reject unsupported view counts explicitly. The header's proposed `target` values are bridge-defined, not raw CompositorServices enum values.
+```
+game_from_current_eye = game_from_stage * predicted_stage_from_head * view.transform
+```
 
-## Remaining implementation
+The GPU reconstructs actual scene vertices from the R32Float source NDC depth:
 
-The Rust/game runtime still needs native visionOS compilation, compatible Metal destination import, an immutable frame snapshot, camera override hooks inside the loaded game, per-eye world rendering and depth export. A compatible game ZIP is also required. None of those game capabilities is supplied by the calibration app.
+```
+source_eye = inverse(source_projection) * source_clip
+game_point = source_game_from_eye * source_eye
+current_clip = compositor_projection * inverse(game_from_current_eye) * game_point
+```
 
-Primary references: [Apple's Metal immersive rendering guide](https://developer.apple.com/documentation/compositorservices/drawing-fully-immersive-content-using-metal), [predicted device pose](https://developer.apple.com/documentation/arkit/worldtrackingprovider/querydeviceanchor(attimestamp:)), and [per-view projection](https://developer.apple.com/documentation/compositorservices/layerrenderer/drawable/computeprojection(convention:viewindex:)). API names were also checked against the installed Xcode 27 SDK interfaces and headers.
+Swift combines `inverse(game_from_current_eye) * source_game_from_eye` in Double before uploading a relative Float matrix, avoiding subtraction of large GTA world coordinates in the vertex shader. Source texture coordinates are interpolated projectively (`uv * source_clip_w`, `source_clip_w`, then divided in the fragment), which preserves the source image when the two camera transforms match even across changing vertex depths.
 
-## Native Rust library feasibility — October 10, 2026
+It rasterizes this depth mesh into the current full viewport rather than drawing a screen plane. Shared texture passes clear each texture/slice once and preserve the other eye viewport; layered passes use each assigned array slice. Foveation is disabled. Destination depth is reverse-Z, cleared to zero, compared greater-or-equal and stored for compositor reprojection. Source depth uses its actual projection convention, without assuming it is reverse-Z.
+
+Depth edges reject triangles that would stretch foreground pixels across background surfaces. The verified simulator images show black silhouette outlines, disocclusion holes and uncovered regions; visual cleanup and headset qualification remain open. The compositor color format is negotiated from its supported formats. Already encoded GTA unorm final color is decoded before an sRGB destination; native sRGB source formats are re-encoded only for a plain unorm destination. This avoids applying the transfer function twice.
+
+Near geometry uses its reconstructed current-eye distance: visibility is zero at 0.15 m, one at 0.45 m, and follows `smoothstep` between them. Stable 4×4 ordered coverage discards fragments while preserving the actual depth of surviving geometry. This is a camera-distance comfort fade, not tracked body collision. Hidden background is absent from the source depth image, so fading can expose empty pixels; it cannot reveal geometry that the game did not render.
+
+## Acceptance evidence
+
+On October 10, 2026, the **v5i simulator run passed the actual immersive world prototype**. The signed AOT game published qualified 1280×720 native color and real scene depth. Readback from the normal production compositor command recorded the actual source textures and its 3840×2160 output, with 7,781,704 of 8,294,400 output pixels nonblack, finite output depth and a successful native compositor acknowledgement. The simulator screenshot visibly showed the third-person game world surrounding the app panel under synthetic yaw, pitch, roll and translation. This supersedes the earlier v5e checkpoint where depth qualification stalled and actual compositor pixels were still unproven.
+
+`target/verification/native-shell-world-v5i-acceptance.json` records source game frame 600, request frame 1711, head frame 1714, the nonidentity eye transform and real depth checks. `live-world-v5i-source.png`, `live-world-v5i-output.png` and `live-world-v5i-simulator.png` preserve source, production output and simulator appearance. The nearest sampled geometry in this capture was 2.78 m away, so its prominent black edge holes were outside the 15–45 cm comfort-fade range. Missing source pixels remain a reprojection limitation.
+
+This proof uses **one simulator compositor view and explicitly synthetic poses**. It does not establish stereo, physical tracking or headset performance. The finite run later ended with OS termination following a simulator Metal-host failure; it does not establish sustained stability. Later low-graphics measurements below remained connected through their finite observations, but 60 FPS has not been achieved.
+
+An offscreen Apple M4 run of the actual world shader also passed unchanged-camera identity with varying source depths (3,600 pixels byte-exact), near-fade coverage with no mismatches, and preserved surviving depth within 8×10⁻⁸. Its receipt is `target/verification/world-shader-check.json`. Swift game and diagnostic typechecks and the linked simulator build passed. The app's connected flag requires successful compositor completion plus fresh native publication, fresh compositor completion and the active lifecycle generation; historical counters remain separate evidence and do not keep a stalled renderer marked connected.
+
+## Low graphics launch configuration
+
+The launcher now has native graphics controls and persists the exact configuration to `<save_root>/native-graphics.json` before starting the Rust engine:
+
+```json
+{"width":960,"height":540,"fps_limit":60,"graphics_preset":"low"}
+```
+
+Only the Low preset is supported. Allowed game source resolutions are 640×360, 960×540 and 1280×720; frame caps are 30 or 60. The default is Low at 960×540 with a 60 FPS cap. Rust validates these values before engine startup, applies the launch dimensions/frame limit, and reports the accepted configuration, saved graphics XML action and backup path through `status.graphics`. Existing saves are preserved. Unsupported or malformed settings fail startup explicitly. Controls lock once startup is accepted; quit and reopen the app to change graphics, since the engine cannot restart in-process.
+
+The exact automated low launch arguments are `--sv-probe-runtime --sv-start-runtime --sv-open-game --sv-resolution 960x540 --sv-fps-limit 60 --sv-graphics-preset low`. Game builds use Swift `-O` by default; `MUGUET_SWIFT_OPTIMIZATION=-Onone` enables Swift debugging. Simulator and device link receipts are `target/verification/native-shell-low-simulator-link.json` and `native-shell-low-device-link.json`, including all 15 native symbols and `__GAME` read/execute protection. The device result is an unsigned cross-build, not a physical-headset execution result.
+
+Smooth 60 FPS is the first performance target. A configured cap does not demonstrate the achieved frame rate. The completed Mac mini simulator observations measured **18.45 game source FPS at 960×540** over 22 warm intervals in about six minutes, and **29.81 game source FPS at 640×360** over seven warm intervals in about three minutes. Their receipts are `target/verification/native-low540-v2-performance.json` and `native-low360-v1-performance.json`.
+
+Both runs used the Low preset and 60 FPS cap, omitted full world debug readback and concurrent builds, and retained other host applications and simulators. The 540p CPU profiling interval was excluded. Both remained connected with fresh one-view immersive frames and no native/world error through their final samples; root intentionally terminated them for the next comparison. The earlier assertion did not recur during these finite observations, which do not prove a crash fix or sustained headset stability. These measured game source rates are separate from compositor completion/reprojection rates and remain below the 60 FPS target. Upload timing instrumentation is the next profiling checkpoint; it is not a rendering optimization by itself.
+
+Primary references: [Apple's Metal immersive rendering guide](https://developer.apple.com/documentation/compositorservices/drawing-fully-immersive-content-using-metal), [predicted device pose](https://developer.apple.com/documentation/arkit/worldtrackingprovider/querydeviceanchor(attimestamp:)), [per-view projection](https://developer.apple.com/documentation/compositorservices/layerrenderer/drawable/computeprojection(convention:viewindex:)), and [GTA V REAL mod's alternating-eye rendering](https://github.com/LukeRoss00/gta5-real-mod). API names and `view.transform` semantics were also checked against the installed Xcode 27 SDK interfaces and headers.
+
+## Historical native Rust baseline — October 10, 2026
+
+The findings below describe the earlier baseline before the current shared-library and Swift runtime-bridge implementation. Their failing dependency check remains useful evidence for why the refactor was necessary; it is not the current simulator compilation result.
 
 The real `game.wasm` has now been retrieved and independently inventoried: 63,201,802 bytes, SHA256 `11ca8d2c04c5e843d18ff4aea4899d72c86973c6b031df334e67c446b2ae83e0`. The full release-part acquisition and assembled ZIP validation are separate work. The local inventory has 91,111 named functions, the three hooks required by Muguet's current patcher, and 21 exported functions. None of those exports is a native stereo/headset camera API. Internal `rage::grcViewport::SetCameraMtx` (function 9636, two i64 parameters) is a research lead, not a verified camera-control contract or memory layout.
 

@@ -131,3 +131,10 @@ fn release(st: State) {
     if st.buttons & 1 != 0 { input::button(0, false); }
     if st.buttons & 2 != 0 { input::button(2, false); }
 }
+
+/// Release held controller input when the native application's scene deactivates.
+pub fn suspend() {
+    if let Some(state) = STATE.lock().unwrap().take() { release(state); }
+    ACTIVE.store(false, Ordering::Relaxed);
+    HORN_PAD.store(false, Ordering::Relaxed);
+}

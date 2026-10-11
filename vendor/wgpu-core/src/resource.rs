@@ -1244,16 +1244,52 @@ unsafe impl Sync for StagingBuffer {}
 /// [`Device::pending_writes`]: crate::device::Device
 #[derive(Debug)]
 pub struct StagingBuffer {
-    raw: Box<dyn hal::DynBuffer>,
-    device: Arc<Device>,
+    allocation: RawStagingAllocation,
     pub(crate) size: wgt::BufferSize,
     is_coherent: bool,
     ptr: NonNull<u8>,
 }
 
 impl StagingBuffer {
+    #[cfg(test)]
+    pub(crate) fn allocation_id(&self) -> u64 { self.allocation.allocation_id() }
+    #[cfg(test)]
+    pub(crate) fn is_retained(&self) -> bool {
+        self.allocation.accounting.as_ref().is_some_and(|a| a.is_retained())
+    }
     pub(crate) fn new(device: &Arc<Device>, size: wgt::BufferSize) -> Result<Self, DeviceError> {
+        RawStagingAllocation::new(device, size, None)?.map()
+    }
+
+    pub(crate) fn with_accounting(device: &Arc<Device>, size: wgt::BufferSize,
+        accounting: crate::device::staging_pool::StagingAccounting) -> Result<Self, DeviceError>
+    {
+        RawStagingAllocation::new(device, size, Some(accounting))?.map()
+    }
+}
+
+/// Unique HAL ownership. Cleanup never publishes/recycles and never takes a
+/// core/pool lock. A successful map is paired with exactly one unmap, including
+/// early cleanup; accounting is released only after raw destruction.
+#[derive(Debug)]
+pub(crate) struct RawStagingAllocation {
+    raw: Option<Box<dyn hal::DynBuffer>>,
+    device: Arc<Device>,
+    size: wgt::BufferSize,
+    mapped: bool,
+    recyclable: bool,
+    accounting: Option<crate::device::staging_pool::StagingAccounting>,
+}
+
+impl RawStagingAllocation {
+    fn new(device: &Arc<Device>, size: wgt::BufferSize,
+        mut accounting: Option<crate::device::staging_pool::StagingAccounting>) -> Result<Self, DeviceError>
+    {
         profiling::scope!("StagingBuffer::new");
+        #[cfg(test)]
+        if accounting.as_ref().is_some_and(|a| a.take_test_fault(1)) {
+            return Err(device.handle_hal_error(hal::DeviceError::OutOfMemory));
+        }
         let stage_desc = hal::BufferDescriptor {
             label: hal_label(Some("(wgpu internal) Staging"), device.instance_flags),
             size: size.get(),
@@ -1263,19 +1299,46 @@ impl StagingBuffer {
 
         let raw = unsafe { device.raw().create_buffer(&stage_desc) }
             .map_err(|e| device.handle_hal_error(e))?;
-        let mapping = unsafe { device.raw().map_buffer(raw.as_ref(), 0..size.get()) }
-            .map_err(|e| device.handle_hal_error(e))?;
-
-        let staging_buffer = StagingBuffer {
-            raw,
-            device: device.clone(),
-            size,
-            is_coherent: mapping.is_coherent,
-            ptr: mapping.ptr,
-        };
-
-        Ok(staging_buffer)
+        if let Some(token) = accounting.as_mut() { token.created(); }
+        Ok(Self { raw: Some(raw), device: device.clone(), size, mapped: false, recyclable: true, accounting })
     }
+
+    pub(crate) fn map(mut self) -> Result<StagingBuffer, DeviceError> {
+        assert!(!self.mapped);
+        #[cfg(test)]
+        if self.accounting.as_ref().is_some_and(|a| a.take_test_fault(2)) {
+            return Err(self.device.handle_hal_error(hal::DeviceError::OutOfMemory));
+        }
+        let mapping = unsafe { self.device.raw().map_buffer(self.raw(), 0..self.size.get()) }
+            .map_err(|e| self.device.handle_hal_error(e))?;
+        self.mapped = true;
+        Ok(StagingBuffer { size: self.size, allocation: self,
+            is_coherent: mapping.is_coherent, ptr: mapping.ptr })
+    }
+
+    fn raw(&self) -> &dyn hal::DynBuffer { self.raw.as_ref().unwrap().as_ref() }
+    pub(crate) fn size(&self) -> wgt::BufferSize { self.size }
+    pub(crate) fn belongs_to(&self, counters: &Arc<crate::device::staging_pool::Counters>) -> bool {
+        !self.mapped && self.recyclable && self.accounting.as_ref().is_some_and(|a| a.belongs_to(counters))
+    }
+    #[cfg(test)]
+    pub(crate) fn allocation_id(&self) -> u64 { self.accounting.as_ref().unwrap().id() }
+}
+
+impl Drop for RawStagingAllocation {
+    fn drop(&mut self) {
+        let raw = self.raw.take().unwrap();
+        // SAFETY: This owner is unique. Retained sources only return here after
+        // completed encoder disposal, or follow the original one-shot cleanup.
+        unsafe {
+            if self.mapped { self.device.raw().unmap_buffer(raw.as_ref()); }
+            self.device.raw().destroy_buffer(raw);
+        }
+        drop(self.accounting.take());
+    }
+}
+
+impl StagingBuffer {
 
     /// SAFETY: You must not call any functions of `self`
     /// until you stopped using the returned pointer.
@@ -1329,23 +1392,23 @@ impl StagingBuffer {
         }
     }
 
-    pub(crate) fn flush(self) -> FlushedStagingBuffer {
-        let device = self.device.raw();
+    pub(crate) fn flush(mut self) -> FlushedStagingBuffer {
+        let device = self.allocation.device.raw();
         if !self.is_coherent {
             #[allow(clippy::single_range_in_vec_init)]
             unsafe {
-                device.flush_mapped_ranges(self.raw.as_ref(), &[0..self.size.get()])
+                device.flush_mapped_ranges(self.allocation.raw(), &[0..self.size.get()])
             };
         }
-        unsafe { device.unmap_buffer(self.raw.as_ref()) };
+        unsafe { device.unmap_buffer(self.allocation.raw()) };
+        self.allocation.mapped = false;
 
         let StagingBuffer {
-            raw, device, size, ..
+            allocation, size, ..
         } = self;
 
         FlushedStagingBuffer {
-            raw: ManuallyDrop::new(raw),
-            device,
+            allocation,
             size,
         }
     }
@@ -1356,23 +1419,25 @@ crate::impl_storage_item!(StagingBuffer);
 
 #[derive(Debug)]
 pub struct FlushedStagingBuffer {
-    raw: ManuallyDrop<Box<dyn hal::DynBuffer>>,
-    device: Arc<Device>,
+    allocation: RawStagingAllocation,
     pub(crate) size: wgt::BufferSize,
 }
 
 impl FlushedStagingBuffer {
     pub(crate) fn raw(&self) -> &dyn hal::DynBuffer {
-        self.raw.as_ref()
+        self.allocation.raw()
     }
-}
-
-impl Drop for FlushedStagingBuffer {
-    fn drop(&mut self) {
-        resource_log!("Destroy raw StagingBuffer");
-        // SAFETY: We are in the Drop impl and we don't use self.raw anymore after this point.
-        let raw = unsafe { ManuallyDrop::take(&mut self.raw) };
-        unsafe { self.device.raw().destroy_buffer(raw) };
+    pub(crate) fn is_retained(&self) -> bool {
+        self.allocation.recyclable && self.allocation.accounting.as_ref().is_some_and(|a| a.is_retained())
+    }
+    pub(crate) fn disallow_reuse(&mut self) -> bool {
+        let retained = self.is_retained();
+        self.allocation.recyclable = false;
+        retained
+    }
+    pub(crate) fn into_allocation(self) -> RawStagingAllocation { self.allocation }
+    pub(crate) fn record_retired(&self) {
+        self.allocation.accounting.as_ref().unwrap().record_retired();
     }
 }
 

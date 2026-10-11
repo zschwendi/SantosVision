@@ -1824,10 +1824,14 @@ impl Global {
 
         let hub = &self.hub;
         let mut all_queue_empty = true;
-        {
+        let devices: Vec<_> = {
             let device_guard = hub.devices.read();
-
-            for (_id, device) in device_guard.iter() {
+            device_guard.iter().map(|(_id, device)| device.clone()).collect()
+        };
+        // Retain the captured identities, but release the registry rank before
+        // polling acquires snatch. Callbacks still fire once after all polls.
+        {
+            for device in devices {
                 let poll_type = if force_wait {
                     // TODO(#8286): Should expose timeout to poll_all.
                     wgt::PollType::wait_indefinitely()
@@ -1963,6 +1967,7 @@ impl Global {
         // check for empty queues and a DeviceLostClosure. At that time,
         // the DeviceLostClosure will be called with "destroyed" as the
         // reason.
+        device.internal_upload_pool_closed.store(true, Ordering::Release);
         device.valid.store(false, Ordering::Release);
     }
 

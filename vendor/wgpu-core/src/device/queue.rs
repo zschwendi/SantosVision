@@ -47,10 +47,86 @@ use crate::{
 };
 use crate::{device::resource::CommandIndices, resource::RawResourceAccess};
 
+#[cfg(supports_64bit_atomics)]
+use core::sync::atomic::AtomicU64;
+#[cfg(not(supports_64bit_atomics))]
+use portable_atomic::AtomicU64;
+
+/// Diagnostics use atomics only while core guards are held. Output is emitted
+/// from the public submit path after guards and callbacks have been released.
+/// Counts distinguish preparation attempts from successful HAL submissions.
+struct MetalTransitControl {
+    is_metal: bool,
+    enabled: bool,
+    skipped: AtomicU64,
+    retained: AtomicU64,
+    successful_submissions: AtomicU64,
+    hal_input_command_buffers: AtomicU64,
+    #[cfg(feature = "std")]
+    epoch: std::time::Instant,
+    #[cfg(feature = "std")]
+    last_report_ns: AtomicU64,
+}
+
+impl MetalTransitControl {
+    fn new(backend: wgt::Backend) -> Self {
+        let is_metal = backend == wgt::Backend::Metal;
+        #[cfg(feature = "std")]
+        let enabled = is_metal
+            && std::env::var_os("MUGUET_METAL_SKIP_EMPTY_TRANSIT")
+                .as_deref() == Some(std::ffi::OsStr::new("1"));
+        #[cfg(not(feature = "std"))]
+        let enabled = false;
+        Self {
+            is_metal, enabled,
+            skipped: AtomicU64::new(0), retained: AtomicU64::new(0),
+            successful_submissions: AtomicU64::new(0),
+            hal_input_command_buffers: AtomicU64::new(0),
+            #[cfg(feature = "std")]
+            epoch: std::time::Instant::now(),
+            #[cfg(feature = "std")]
+            last_report_ns: AtomicU64::new(0),
+        }
+    }
+
+    fn record_transit(&self, skipped: bool) {
+        if self.is_metal {
+            let counter = if skipped { &self.skipped } else { &self.retained };
+            counter.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn record_successful_hal_submit(&self, command_buffers: usize) {
+        if self.is_metal {
+            self.successful_submissions.fetch_add(1, Ordering::Relaxed);
+            self.hal_input_command_buffers.fetch_add(command_buffers as u64, Ordering::Relaxed);
+        }
+    }
+
+    fn maybe_report(&self) {
+        #[cfg(feature = "std")]
+        if self.is_metal {
+            let now = self.epoch.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+            let last = self.last_report_ns.load(Ordering::Relaxed);
+            // First successful public submit confirms the runtime option;
+            // subsequent summaries have a minimum ten-second backend cadence.
+            if last != 0 && now.saturating_sub(last) < 10_000_000_000 { return; }
+            if self.last_report_ns.compare_exchange(last, now.max(1), Ordering::Relaxed, Ordering::Relaxed).is_err() { return; }
+            std::eprintln!("[wgpu] metal transit: {{\"schema\":1,\"enabled\":{},\"interval_s\":{:.6},\"transit_skipped_attempts\":{},\"transit_retained_attempts\":{},\"successful_hal_submissions\":{},\"hal_input_command_buffers\":{},\"scope\":\"core HAL input count; backend-added waits/signals excluded; not GPU time; preparation counters can include failed attempts\"}}",
+                self.enabled, now.saturating_sub(last) as f64 / 1e9,
+                self.skipped.swap(0, Ordering::Relaxed), self.retained.swap(0, Ordering::Relaxed),
+                self.successful_submissions.swap(0, Ordering::Relaxed),
+                self.hal_input_command_buffers.swap(0, Ordering::Relaxed));
+        }
+    }
+}
+
 pub struct Queue {
     raw: Box<dyn hal::DynQueue>,
     pub(crate) pending_writes: Mutex<PendingWrites>,
     life_tracker: Mutex<LifetimeTracker>,
+    metal_transit: MetalTransitControl,
+    pub(super) upload_pool: Arc<super::staging_pool::StagingPool>,
     // The device needs to be dropped last (`Device.zero_buffer` might be referenced by the encoder in pending writes).
     pub(crate) device: Arc<Device>,
 }
@@ -101,7 +177,11 @@ impl Queue {
                 }]);
         }
 
+        let metal_transit = MetalTransitControl::new(device.backend());
+        let upload_pool = super::staging_pool::StagingPool::new(&device);
         Ok(Queue {
+            metal_transit,
+            upload_pool,
             raw,
             device,
             pending_writes: Mutex::new(rank::QUEUE_PENDING_WRITES, pending_writes),
@@ -244,9 +324,10 @@ impl Queue {
         Vec<super::BufferMapPendingClosure>,
         Vec<BlasCompactReadyPendingClosure>,
         bool,
+        Vec<super::staging_pool::RetiredStaging>,
     ) {
         let mut life_tracker = self.lock_life();
-        let submission_closures = life_tracker.triage_submissions(submission_index);
+        let (submission_closures, retired) = life_tracker.triage_submissions(submission_index);
 
         let mapping_closures = life_tracker.handle_mapping(snatch_guard);
         let blas_closures = life_tracker.handle_compact_read_back();
@@ -258,7 +339,25 @@ impl Queue {
             mapping_closures,
             blas_closures,
             queue_empty,
+            retired,
         )
+    }
+
+    pub(super) fn upload_publication(&self, retired: Vec<super::staging_pool::RetiredStaging>)
+        -> Option<super::staging_pool::RetirementPublication>
+    {
+        self.upload_pool.publication(retired)
+    }
+
+    // Behavioral tests use the real pending encoder/HAL submit without the
+    // usual immediate maintenance, so completion/publication can be observed
+    // separately. This introduces no alternate production submission path.
+    #[cfg(test)]
+    pub(super) fn test_submit_pending_without_maintenance(&self) -> Result<SubmissionIndex, (SubmissionIndex, DeviceError)> {
+        let submission = self.allocate_submission(self.device.snatchable_lock.read())?;
+        let index = submission.index;
+        drop(submission.submit(self.pending_writes.lock()).map_err(|error| (index, error))?);
+        Ok(index)
     }
 }
 
@@ -275,6 +374,7 @@ crate::impl_storage_item!(Queue);
 impl Drop for Queue {
     fn drop(&mut self) {
         resource_log!("Drop {}", self.error_ident());
+        self.upload_pool.close();
 
         // On Vulkan, pending presents are not tracked by fences.
         // wait_for_idle covers both fence-tracked submissions and pending presents.
@@ -294,13 +394,17 @@ impl Drop for Queue {
             .load(Ordering::Acquire);
 
         let snatch_guard = self.device.snatchable_lock.read();
-        let (submission_closures, mapping_closures, blas_compact_ready_closures, queue_empty) =
+        let (submission_closures, mapping_closures, blas_compact_ready_closures, queue_empty, retired) =
             self.maintain(last_successful_submission_index, &snatch_guard);
         drop(snatch_guard);
+        // Queue last-Arc teardown may itself run under a registry guard. It
+        // destroys the proof batch, never locks/publishes into the pool.
+        drop(retired);
 
         assert!(queue_empty);
 
         let closures = crate::device::UserClosures {
+            upload_retirements: Vec::new(),
             mappings: mapping_closures,
             blas_compact_ready: blas_compact_ready_closures,
             submissions: submission_closures,
@@ -659,9 +763,9 @@ impl Queue {
         // Platform validation requires that the staging buffer always be
         // freed, even if an error occurs. All paths from here must call
         // `device.pending_writes.consume`.
-        let mut staging_buffer = StagingBuffer::new(&self.device, data_size)?;
+        let mut staging_buffer = self.upload_pool.stage(&self.device, data_size)?;
 
-        let staging_buffer = {
+        let mut staging_buffer = {
             profiling::scope!("copy");
             staging_buffer.write(data);
             staging_buffer.flush()
@@ -678,11 +782,15 @@ impl Queue {
             buffer_offset,
         );
 
-        drop(snatch_guard);
-
+        if result.is_err() && staging_buffer.disallow_reuse() {
+            self.upload_pool.counters.quarantined_write_sources.fetch_add(1, Ordering::Relaxed);
+        }
         pending_writes.consume(staging_buffer);
 
         drop(pending_writes);
+        // Release in reverse acquisition order. Previously snatch was released
+        // under PendingWrites, which violates the existing ranked-lock stack.
+        drop(snatch_guard);
 
         result
     }
@@ -1445,12 +1553,19 @@ impl Queue {
                             break 'error Err(e.into());
                         }
 
-                        // execute resource transitions
-                        if let Err(e) = baked.encoder.open_pass(hal_label(
-                            Some("(wgpu internal) Transit"),
-                            self.device.instance_flags,
-                        )) {
-                            break 'error Err(e.into());
+                        // Metal needs no HAL barriers. Only skip a Transit
+                        // encoder when initialization cannot emit GPU work.
+                        // Deferred query resolves above remain unconditional.
+                        let skip_transit = self.metal_transit.enabled
+                            && baked.can_skip_empty_metal_transit();
+                        self.metal_transit.record_transit(skip_transit);
+                        if !skip_transit {
+                            if let Err(e) = baked.encoder.open_pass(hal_label(
+                                Some("(wgpu internal) Transit"),
+                                self.device.instance_flags,
+                            )) {
+                                break 'error Err(e.into());
+                            }
                         }
 
                         //Note: locking the trackers has to be done after the storages
@@ -1470,15 +1585,22 @@ impl Queue {
 
                         //Note: stateless trackers are not merged:
                         // device already knows these resources exist.
-                        CommandEncoder::insert_barriers_from_device_tracker(
-                            baked.encoder.raw.as_mut(),
-                            &mut trackers,
-                            &baked.trackers,
-                            &submission.snatch_guard,
-                        );
-
-                        if let Err(e) = baked.encoder.close_and_push_front() {
-                            break 'error Err(e.into());
+                        if skip_transit {
+                            CommandEncoder::merge_device_tracker_without_hal_barriers(
+                                &mut trackers,
+                                &baked.trackers,
+                                &submission.snatch_guard,
+                            );
+                        } else {
+                            CommandEncoder::insert_barriers_from_device_tracker(
+                                baked.encoder.raw.as_mut(),
+                                &mut trackers,
+                                &baked.trackers,
+                                &submission.snatch_guard,
+                            );
+                            if let Err(e) = baked.encoder.close_and_push_front() {
+                                break 'error Err(e.into());
+                            }
                         }
 
                         // Transition surface textures into `Present` state.
@@ -1565,6 +1687,8 @@ impl Queue {
         callbacks.fire();
 
         self.device.lose_if_oom();
+        self.metal_transit.maybe_report();
+        self.upload_pool.maybe_report();
 
         api_log!("Queue::submit returned submit index {submit_index}");
 
@@ -1697,6 +1821,7 @@ impl Queue {
             .iter()
             .flat_map(|e| e.inner.list.iter().map(|b| b.as_ref()))
             .collect::<Vec<_>>();
+        let hal_command_buffer_count = hal_command_buffers.len();
 
         {
             let mut submit_surface_textures =
@@ -1709,14 +1834,41 @@ impl Queue {
                 submit_surface_textures.push(raw);
             }
 
-            unsafe {
-                self.raw().submit(
-                    &hal_command_buffers,
-                    &submit_surface_textures,
-                    (self.device.fence.as_ref(), submit_index),
-                )
+            // Test-only failure occurs after pre_submit moved pending sources
+            // into prepared executions, immediately before any HAL input commit.
+            #[cfg(test)]
+            let injected_failure = self.upload_pool.take_submission_test_fault();
+            #[cfg(not(test))]
+            let injected_failure = false;
+            let submit_result = if injected_failure {
+                Err(hal::DeviceError::Lost)
+            } else {
+                unsafe {
+                    self.raw().submit(
+                        &hal_command_buffers,
+                        &submit_surface_textures,
+                        (self.device.fence.as_ref(), submit_index),
+                    )
+                }
+            };
+            if let Err(error) = submit_result {
+                // Prevent a new submission before releasing index protection.
+                // Loss callbacks and prepared encoder/resource disposal must not
+                // run under PendingWrites, the index lock, or the snatch guard.
+                self.device.internal_upload_pool_closed.store(true, Ordering::Release);
+                self.device.valid.store(false, Ordering::Release);
+                drop(submit_surface_textures);
+                drop(hal_command_buffers);
+                drop(pending_writes);
+                drop(command_index_guard);
+                drop(snatch_guard);
+                // Reset unsubmitted encoders before destroying their sources,
+                // and finish disposal before a reentrant user loss callback.
+                drop(executions);
+                drop(surface_textures);
+                drop(used_surface_textures);
+                return Err(self.device.handle_hal_error(error));
             }
-            .map_err(|e| self.device.handle_hal_error(e))?;
 
             // Submissions must have strictly increasing indices, so we must hold the
             // command index guard until we have submitted, to prevent another submission
@@ -1738,6 +1890,7 @@ impl Queue {
         // after a device is lost. This requires `command_index_guard` to be
         // held over `self.lock_life()`
         drop(command_index_guard);
+        self.metal_transit.record_successful_hal_submit(hal_command_buffer_count);
 
         Ok(SubmissionResult { snatch_guard })
     }

@@ -13,6 +13,25 @@ use std::time::{Duration, Instant};
 use wasmtime::SharedMemory;
 use wgpu::*;
 
+#[path = "render_prepare.rs"]
+mod render_prepare;
+use render_prepare::{PassKey, RenderPrepare};
+
+#[path = "uniform_pack.rs"]
+mod uniform_pack;
+use uniform_pack::UniformPack;
+
+#[cfg(all(test, target_os = "macos"))]
+#[path = "guest_write_tests.rs"]
+mod guest_write_tests;
+
+// Test-only: adapter features withheld from the next Gpu::new on this thread,
+// so fixtures can reach the paths of devices that lack them.
+#[cfg(test)]
+thread_local! {
+    static TEST_WITHHELD_FEATURES: std::cell::Cell<Features> = std::cell::Cell::new(Features::empty());
+}
+
 const RING_DATA: u64 = 64;
 const BIND_SRV: u32 = 0x8;
 const BIND_RT: u32 = 0x20;
@@ -25,11 +44,116 @@ const ZERO_VB_SIZE: u64 = 4096;
 const OCCLUSION_CAPACITY: u32 = 2048;
 const OCCLUSION_VISIBLE_COUNT: u64 = 65536;
 const BG_LIMIT: usize = 24000;
+const UPLOAD_OP12: usize = 0;
+const UPLOAD_OP47: usize = 1;
+const UPLOAD_UNIFORMS: usize = 2;
+const UPLOAD_SHADER_CONSTS: usize = 3;
+const UPLOAD_UAV_CLEAR: usize = 4;
+const UPLOAD_UAV_COUNTER: usize = 5;
+const UPLOAD_SOURCE_COUNT: usize = 6;
+const THREAD_REPLAY: usize = 0;
+const THREAD_UNIFORM_WAIT: usize = 1;
+const THREAD_GUEST_WAIT: usize = 2;
+const THREAD_MAP_PROCESS: usize = 3;
+const THREAD_QUERY_POLL: usize = 4;
+const THREAD_PRODUCER_IDLE: usize = 5;
+const THREAD_SUSPEND_WAIT: usize = 6;
+const THREAD_SUSPEND_SLEEP: usize = 7;
+const THREAD_PRESENT_BEFORE_WAIT: usize = 8;
+const THREAD_WORLD_PUBLICATION: usize = 9;
+const THREAD_PIPELINE_COLLECTION: usize = 10;
+const THREAD_TIMING_COUNT: usize = 11;
+const API_WALL_NS_BOUNDS: [u64; 4] = [10_000, 100_000, 1_000_000, 10_000_000];
+const UPLOAD_BYTE_BOUNDS: [u64; 4] = [256, 4096, 65536, 1048576];
+
+#[derive(Clone, Copy, Default)]
+struct ApiWallStats {
+    calls: u64,
+    total_ns: u64,
+    max_ns: u64,
+    buckets: [u64; 5],
+}
+
+impl ApiWallStats {
+    #[inline]
+    fn record(&mut self, elapsed: Duration) {
+        let nanos = elapsed.as_nanos().min(u64::MAX as u128) as u64;
+        self.calls = self.calls.saturating_add(1);
+        self.total_ns = self.total_ns.saturating_add(nanos);
+        self.max_ns = self.max_ns.max(nanos);
+        let bucket = API_WALL_NS_BOUNDS.iter().position(|bound| nanos <= *bound).unwrap_or(4);
+        self.buckets[bucket] = self.buckets[bucket].saturating_add(1);
+    }
+
+    fn metrics(&self) -> serde_json::Value {
+        serde_json::json!({"calls": self.calls, "wall_ns": self.total_ns, "max_wall_ns": self.max_ns,
+            "wall_ns_bins_le_10000_100000_1000000_10000000_inf": self.buckets})
+    }
+
+    fn accumulate(&mut self, other: &Self) {
+        self.calls = self.calls.saturating_add(other.calls);
+        self.total_ns = self.total_ns.saturating_add(other.total_ns);
+        self.max_ns = self.max_ns.max(other.max_ns);
+        for index in 0..self.buckets.len() {
+            self.buckets[index] = self.buckets[index].saturating_add(other.buckets[index]);
+        }
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+struct BufferUploadStats {
+    bytes: u64,
+    byte_buckets: [u64; 5],
+    api_wall: ApiWallStats,
+}
+
+impl BufferUploadStats {
+    #[inline]
+    fn record(&mut self, bytes: usize, elapsed: Duration) {
+        let bytes = bytes as u64;
+        self.bytes = self.bytes.saturating_add(bytes);
+        let bucket = UPLOAD_BYTE_BOUNDS.iter().position(|bound| bytes <= *bound).unwrap_or(4);
+        self.byte_buckets[bucket] = self.byte_buckets[bucket].saturating_add(1);
+        self.api_wall.record(elapsed);
+    }
+
+    fn accumulate(&mut self, other: &Self) {
+        self.bytes = self.bytes.saturating_add(other.bytes);
+        self.api_wall.accumulate(&other.api_wall);
+        for index in 0..self.byte_buckets.len() {
+            self.byte_buckets[index] = self.byte_buckets[index].saturating_add(other.byte_buckets[index]);
+        }
+    }
+}
+
+#[derive(Default)]
+struct IndirectReadStats {
+    attempts: u64,
+    successes: u64,
+    poll_errors: u64,
+    map_errors: u64,
+    wait_wall: ApiWallStats,
+}
+
+// Fixed-size GPU-thread-owned route timer. Queue mode times queue.write_buffer;
+// pool mode includes source allocation/copy and prelude recording. The guest
+// Vec snapshot and any earlier flush remain outside this timer. Not GPU time.
+#[inline]
+fn measured_write_buffer(uploads: &mut crate::buffer_upload::BufferUploads, device: &Device, queue: &Queue, stats: &mut BufferUploadStats, buffer: &Buffer, offset: u64, data: &[u8]) {
+    let started = Instant::now();
+    uploads.write(device, queue, buffer, offset, data);
+    stats.record(data.len(), started.elapsed());
+}
+
+#[cfg(not(target_os = "visionos"))]
+type SurfaceWindow = Arc<winit::window::Window>;
+#[cfg(target_os = "visionos")]
+type SurfaceWindow = ();
 
 pub struct SurfaceHandoff {
     pub instance: Instance,
     pub surface: Surface<'static>,
-    pub window: Arc<winit::window::Window>,
+    pub window: SurfaceWindow,
 }
 pub static SURFACE: Mutex<Option<SurfaceHandoff>> = Mutex::new(None);
 pub static STARTED: AtomicBool = AtomicBool::new(false);
@@ -55,6 +179,8 @@ pub fn start(mem: &SharedMemory, ring: u64, size: u64, dbg: u64) {
                 Ok(g) => g,
                 Err(e) => {
                     log(&format!("init failed: {e:#}"));
+                    #[cfg(target_os = "visionos")]
+                    crate::native::report_error(format!("native GPU initialization failed: {e:#}"));
                     drain_forever(&mem, ring);
                 }
             };
@@ -160,6 +286,21 @@ fn texel_bytes(f: TextureFormat) -> u32 {
 }
 
 static LOGGED: LazyLock<Mutex<std::collections::HashSet<String>>> = LazyLock::new(|| Mutex::new(Default::default()));
+/// Keeps a readback inside the guest destination. `rows` are (source offset,
+/// guest address, byte count); the guest sends the destination subresource's
+/// own byte size, laid out in the guest's format. Returns the rows that fit
+/// and the number of bytes withheld.
+fn bounded_readback_rows(rows: Vec<(u64, u64, u64)>, addr: u64, size: u64, memory: u64) -> (Vec<(u64, u64, u64)>, u64) {
+    let limit = addr.saturating_add(size).min(memory);
+    let mut withheld = 0u64;
+    let kept = rows.into_iter().filter_map(|(from, to, n)| {
+        let fits = if to < addr { 0 } else { n.min(limit.saturating_sub(to)) };
+        withheld += n - fits;
+        (fits != 0).then_some((from, to, fits))
+    }).collect();
+    (kept, withheld)
+}
+
 fn log_once(key: &str, msg: &str) {
     if LOGGED.lock().unwrap().insert(key.to_string()) {
         log(msg);
@@ -233,6 +374,7 @@ struct Binding {
 struct Info {
     bindings: Vec<Binding>,
     outputs: Vec<u32>,
+    writes_fragment_depth: bool,
 }
 
 static RE_DECL: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"@group\((\d+)u?\)\s*@binding\((\d+)u?\)\s*var(?:<([^>]*)>)?\s+(\w+)\s*:\s*([^;]+);").unwrap());
@@ -342,10 +484,14 @@ fn parse_wgsl(text: &str) -> Info {
             }
         }
     }
-    Info { bindings, outputs }
+    // Conservative: any frag_depth token disables far-background retention,
+    // including unused helpers or comments, rather than risking an override.
+    Info { bindings, outputs, writes_fragment_depth: text.contains("frag_depth") }
 }
 
+#[derive(Clone)]
 struct PackMember { binding: u32, size: u64, offset: u64 }
+#[derive(Clone)]
 struct Pack { members: Vec<PackMember>, size: u64 }
 
 fn pack_uniforms(text: &str) -> (String, Option<Pack>) {
@@ -431,6 +577,8 @@ struct Tex {
     tex: Texture,
     desc: TexDesc,
     format: TextureFormat,
+    // Original compressed format when the adapter uses decoded storage.
+    bc_source: Option<TextureFormat>,
     views: HashMap<(TextureFormat, u32, u32), TextureView>,
     a8: bool,
     enc: u64,
@@ -492,7 +640,35 @@ struct ViewObj {
     d: u32,
     views: HashMap<String, TextureView>,
 }
-struct QueryObj { qtype: u32, addr: u64, slots: Vec<u32> }
+/// Lifetime of one guest query's result record. Queued completions hold this
+/// token, never an object id or a raw address, so work left over from a query
+/// that was destroyed or replaced can neither write the old record nor be
+/// redirected to a newer query that reuses the id.
+struct QueryLife(Mutex<Option<u64>>);
+impl QueryLife {
+    fn new(addr: u64) -> Arc<Self> { Arc::new(QueryLife(Mutex::new(Some(addr)))) }
+    fn record(&self) -> std::sync::MutexGuard<'_, Option<u64>> { self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner) }
+    fn is_live(&self) -> bool { self.record().is_some() }
+    /// Ends the lifetime. Returns only after any completion in progress has finished.
+    fn retire(&self) { *self.record() = None; }
+    /// Publishes a result to the guest unless the query is gone. The lock is
+    /// held across the liveness check and every store, so a completion on
+    /// another thread cannot write after `retire` has returned.
+    fn complete(&self, mem: &SharedMemory, result: u64, seq: u32) -> bool {
+        let record = self.record();
+        let Some(addr) = *record else { return false };
+        atomic(mem, addr + 8).store(result as u32 as i32, Ordering::SeqCst);
+        atomic(mem, addr + 12).store((result >> 32) as u32 as i32, Ordering::SeqCst);
+        atomic(mem, addr).store(seq as i32, Ordering::SeqCst);
+        let _ = mem.atomic_notify(addr, u32::MAX);
+        true
+    }
+}
+struct QueryObj { qtype: u32, life: Arc<QueryLife>, slots: Vec<u32> }
+// Destroying or replacing the object in any way ends its lifetime.
+impl Drop for QueryObj {
+    fn drop(&mut self) { self.life.retire(); }
+}
 
 enum Obj {
     Tex(Tex),
@@ -631,7 +807,7 @@ struct PendingMap {
 }
 enum MapKind {
     Readback { flag: u64, rows: Vec<(u64, u64, u64)> },
-    Occlusion { list: Vec<(u64, u32, u64, bool, usize)> },
+    Occlusion { list: Vec<(u64, u32, Arc<QueryLife>, bool, usize)> },
 }
 
 pub struct Gpu {
@@ -641,23 +817,35 @@ pub struct Gpu {
     device: Device,
     queue: Queue,
     adapter: Adapter,
-    surface: Option<(Surface<'static>, Arc<winit::window::Window>)>,
+    surface: Option<(Surface<'static>, SurfaceWindow)>,
     surface_format: TextureFormat,
     surface_size: (u32, u32),
     objs: Vec<Option<Obj>>,
     enc: Option<CommandEncoder>,
     enc_epoch: u64,
     pass: Option<RenderPass<'static>>,
-    pass_key: Option<Vec<u32>>,
+    pass_key: Option<PassKey>,
     pass_info: Option<PassInfo>,
     pass_st: PassSt,
     s: State,
+    world_view: Option<crate::xr_view::WorldView>,
+    world_depths: HashMap<u32, (crate::xr_view::WorldView, u64)>,
+    world_depth_before_ui: HashMap<u32, (crate::xr_view::WorldView, Texture, u64)>,
+    world_depth_snapshot_overflow: bool,
+    world_depth_snapshots_this_present: u8,
+    world_depth_trace: HashMap<(u32, u64, bool, u32, bool), (u64, [f32; 6])>,
+    world_depth_anomalies: Vec<serde_json::Value>,
     pdirty: bool,
     last_pl: Option<Rc<Pl>>,
+    last_program_uids: Option<(u64, u64)>,
+    float_programs: HashMap<(u64, Vec<u32>), Option<Rc<Program>>>,
     shader_index: HashMap<String, serde_json::Value>,
     shader_dir: PathBuf,
     next_uid: u64,
     bgl_cache: HashMap<(String, u32, u32), (BindGroupLayout, u64)>,
+    numeric_bgl_cache: HashMap<(u64, u32, u32), (BindGroupLayout, u64)>,
+    render_prepare: RenderPrepare,
+    uniform_pack: UniformPack,
     empty_bgl: Option<(BindGroupLayout, u64)>,
     pipelines: HashMap<Vec<i64>, PipeEntry>,
     pipe_jobs: Option<std::sync::mpsc::Sender<(u64, PipeJob)>>,
@@ -688,8 +876,8 @@ pub struct Gpu {
     occlusion_next: u32,
     occlusion_active: Option<u32>,
     occlusion_pass_slot: Option<u32>,
-    pending_resolve: Vec<(u32, u32, Vec<u32>)>,
-    pending_events: Vec<(u32, u32, u64)>,
+    pending_resolve: Vec<(Arc<QueryLife>, u32, Vec<u32>)>,
+    pending_events: Vec<(Arc<QueryLife>, u32, u64)>,
     pending_maps: Vec<PendingMap>,
     counter_src: Option<Buffer>,
     counter_slot: u32,
@@ -705,6 +893,10 @@ pub struct Gpu {
     fps_t0: Instant,
     fps_n0: u64,
     fps_d0: u64,
+    buffer_uploads: [BufferUploadStats; UPLOAD_SOURCE_COUNT],
+    uploads: crate::buffer_upload::BufferUploads,
+    indirect_reads: IndirectReadStats,
+    thread_wall: [ApiWallStats; THREAD_TIMING_COUNT],
     errors: Arc<AtomicU64>,
 
     inflight: Arc<AtomicU64>,
@@ -750,6 +942,8 @@ impl Gpu {
 
             | Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES;
         let features = want & adapter.features();
+        #[cfg(test)]
+        let features = features.difference(TEST_WITHHELD_FEATURES.with(|withheld| withheld.get()));
         let (device, queue) = pollster::block_on(adapter.request_device(&DeviceDescriptor {
             label: Some("muguet"),
             required_features: features,
@@ -806,12 +1000,18 @@ impl Gpu {
             }
             Some(job_tx)
         };
+        let render_prepare = RenderPrepare::from_environment();
+        log(&format!("render prepare: {}", render_prepare.metrics(0, 0, 0, 0, 0)));
+        let uniform_pack = UniformPack::from_environment();
+        log(&format!("uniform stage pack: {}", uniform_pack.metrics(0, 0, 0, 0)));
         Ok(Gpu {
             instance: instance.clone(), pending_clears: HashMap::new(), clears_folded: 0, pipe_jobs, pipe_results, pipe_pending: HashMap::new(), pending_skips: 0, pending_skips0: 0,
             base, mem, ring, device, queue, adapter, surface, surface_format, surface_size: (0, 0),
             objs: Vec::new(), enc: None, enc_epoch: 1, pass: None, pass_key: None, pass_info: None, pass_st: PassSt::default(),
-            s: State::new(), pdirty: true, last_pl: None, shader_index, shader_dir, next_uid: 1,
+            s: State::new(), world_view: None, world_depths: HashMap::new(), world_depth_before_ui: HashMap::new(), world_depth_snapshot_overflow: false, world_depth_snapshots_this_present: 0, world_depth_trace: HashMap::new(), world_depth_anomalies: Vec::new(), pdirty: true, last_pl: None, last_program_uids: None,
+            float_programs: HashMap::new(), shader_index, shader_dir, next_uid: 1,
             bgl_cache: HashMap::new(), empty_bgl: None, pipelines: HashMap::new(), compute: HashMap::new(), bind_groups: HashMap::new(),
+            numeric_bgl_cache: HashMap::new(), render_prepare, uniform_pack,
             ubo_slots: (0..FRAME_SLOTS).map(|_| Vec::new()).collect(), ubo_shared: Vec::new(), ubo_slot: 0, ubo_chunk: 0, ubo_off: 0,
             dummy_tex: HashMap::new(), dummy_smp: None, dummy_cmp: None, dummy_bufs: HashMap::new(), zero_vb: None, zero_src: None, scratch: None,
             proxy_pipelines: HashMap::new(), f2d_pipeline: None, blit: None, mip_pipelines: HashMap::new(), mip_sampler: None,
@@ -819,7 +1019,11 @@ impl Gpu {
             pending_resolve: Vec::new(), pending_events: Vec::new(), pending_maps: Vec::new(), counter_src: None, counter_slot: 0,
             frame_slot_done: (0..FRAME_SLOTS).map(|_| None).collect(), last_submit: None, vb_avail: [0; 16],
             dbg_idx: if dbg != 0 { dbg + 424 } else { 0 },
-            draws: 0, skipped: 0, presents: 0, pipe_creates: 0, fps_t0: Instant::now(), fps_n0: 0, fps_d0: 0, errors, inflight: Arc::new(AtomicU64::new(0)), submits: 0, submits0: 0, passes: 0, passes0: 0,
+            draws: 0, skipped: 0, presents: 0, pipe_creates: 0, fps_t0: Instant::now(), fps_n0: 0, fps_d0: 0,
+            buffer_uploads: [BufferUploadStats::default(); UPLOAD_SOURCE_COUNT], indirect_reads: IndirectReadStats::default(),
+            uploads: crate::buffer_upload::BufferUploads::from_environment(),
+            thread_wall: [ApiWallStats::default(); THREAD_TIMING_COUNT],
+            errors, inflight: Arc::new(AtomicU64::new(0)), submits: 0, submits0: 0, passes: 0, passes0: 0,
         })
     }
 
@@ -842,6 +1046,49 @@ impl Gpu {
         self.next_uid
     }
 
+    fn invalidate_world_depth(&mut self, id: u32, reason: serde_json::Value) {
+        self.invalidate_world_depth_inner(id, reason, false);
+    }
+
+    fn invalidate_world_depth_inner(&mut self, id: u32, reason: serde_json::Value, keep_ui_snapshot: bool) {
+        let live = self.world_depths.remove(&id);
+        let saved = if keep_ui_snapshot { None } else { self.world_depth_before_ui.remove(&id) };
+        let previous = live.or_else(|| saved.map(|(view, _, draws)| (view, draws)));
+        if let Some((view, draws)) = previous {
+            if self.world_depth_anomalies.len() >= 8 { self.world_depth_anomalies.remove(0); }
+            self.world_depth_anomalies.push(serde_json::json!({"depth":id,"invalidation":reason,
+                "previous_sequence":view.camera_sequence,"previous_draws":draws,
+                "ui_snapshot_retained":keep_ui_snapshot && self.world_depth_before_ui.contains_key(&id)}));
+        }
+    }
+
+    fn save_world_depth_before_ui(&mut self, id: u32) {
+        let Some((view, draws)) = self.world_depths.get(&id).copied() else { return };
+        if self.world_depth_snapshots_this_present >= 4
+            || (self.world_depth_before_ui.len() >= 2 && !self.world_depth_before_ui.contains_key(&id)) {
+            self.world_depth_snapshot_overflow = true; return;
+        }
+        // End all scene writes and preserve real raster depth before the
+        // clip-space UI clear. The reusable depth proxy is never leased here.
+        self.end_pass();
+        let Some((depth, _)) = self.depth_proxy(id, false) else { return };
+        let snapshot = self.device.create_texture(&TextureDescriptor {
+            label: Some("Qualified GTA scene depth before UI clear"),
+            size: Extent3d { width: depth.width(), height: depth.height(), depth_or_array_layers: 1 },
+            mip_level_count: 1, sample_count: 1, dimension: TextureDimension::D2,
+            format: TextureFormat::R32Float,
+            usage: TextureUsages::COPY_DST | TextureUsages::COPY_SRC | TextureUsages::TEXTURE_BINDING,
+            view_formats: &[] });
+        self.end_pass();
+        self.encoder().copy_texture_to_texture(
+            TexelCopyTextureInfo { texture: &depth, mip_level: 0, origin: Origin3d::ZERO, aspect: TextureAspect::All },
+            TexelCopyTextureInfo { texture: &snapshot, mip_level: 0, origin: Origin3d::ZERO, aspect: TextureAspect::All },
+            Extent3d { width: depth.width(), height: depth.height(), depth_or_array_layers: 1 });
+        self.world_depth_snapshots_this_present += 1;
+        self.world_depth_before_ui.insert(id, (view, snapshot, draws));
+        log_once("world-depth-before-ui", "qualified real scene depth copied before GTA's clip-space UI clear; final color must retain the same camera rays");
+    }
+
     fn obj(&self, id: u32) -> Option<&Obj> {
         self.objs.get(id as usize).and_then(|o| o.as_ref())
     }
@@ -857,6 +1104,8 @@ impl Gpu {
         if self.objs.len() <= i {
             self.objs.resize_with(i + 1, || None);
         }
+        self.invalidate_world_depth(id, serde_json::json!("set_obj"));
+        if self.occlusion_active == Some(id) { self.end_active_occlusion(); }
         self.objs[i] = Some(o);
     }
     fn tex(&self, id: u32) -> Option<&Tex> {
@@ -930,8 +1179,8 @@ impl Gpu {
         self.end_pass();
         self.flush_uniforms();
         let resolves = if self.pending_resolve.is_empty() { None } else { self.record_resolves() };
-        if let Some(enc) = self.enc.take() {
-            let idx = self.queue.submit([enc.finish()]);
+        let main = self.enc.take().map(CommandEncoder::finish);
+        if let Some(idx) = self.uploads.submit(&self.queue, main) {
             self.last_submit = Some(idx);
             self.submits += 1;
             self.on_submitted();
@@ -950,12 +1199,19 @@ impl Gpu {
         log("running");
         loop {
             if SUSPENDED.load(Ordering::Relaxed) {
+                let started = Instant::now();
                 let _ = self.device.poll(PollType::Wait { submission_index: None, timeout: None });
+                self.thread_wall[THREAD_SUSPEND_WAIT].record(started.elapsed());
+                let started = Instant::now();
                 while SUSPENDED.load(Ordering::Relaxed) { std::thread::sleep(Duration::from_millis(50)); }
+                self.thread_wall[THREAD_SUSPEND_SLEEP].record(started.elapsed());
             }
             self.process_maps(false);
+            self.uploads.poll(&self.device);
             if self.inflight.load(Ordering::SeqCst) > 0 {
+                let started = Instant::now();
                 let _ = self.device.poll(PollType::Poll);
+                self.thread_wall[THREAD_QUERY_POLL].record(started.elapsed());
             }
             let head = self.hdr(0).load(Ordering::SeqCst);
             if head == tail {
@@ -967,12 +1223,16 @@ impl Gpu {
                     self.hdr(5).store(0, Ordering::SeqCst);
                     continue;
                 }
-                let timeout = if self.pending_maps.is_empty() && self.inflight.load(Ordering::SeqCst) == 0 { 100 } else { 1 };
+                let timeout = if self.pending_maps.is_empty() && self.inflight.load(Ordering::SeqCst) == 0 && !self.uploads.has_pending_callbacks() { 100 } else { 1 };
+                let started = Instant::now();
                 let _ = self.mem.atomic_wait32(self.ring, tail as u32, Some(Duration::from_millis(timeout)));
+                self.thread_wall[THREAD_PRODUCER_IDLE].record(started.elapsed());
                 self.hdr(5).store(0, Ordering::SeqCst);
                 continue;
             }
+            let started = Instant::now();
             tail = self.run_commands(tail, head);
+            self.thread_wall[THREAD_REPLAY].record(started.elapsed());
             self.hdr(1).store(tail, Ordering::SeqCst);
             let _ = self.mem.atomic_notify(self.ring + 4, u32::MAX);
         }
@@ -986,6 +1246,7 @@ impl Gpu {
             let base = ring_w + (tail as u64 >> 2);
             let op = self.u(base);
             let n = self.u(base + 1) as u64;
+            if let Some(view) = crate::xr_view::take_command_view(base * 4) { self.world_view = view; }
             if op == 1 {
                 tail = RING_DATA as i32;
                 continue;
@@ -1002,7 +1263,12 @@ impl Gpu {
                 self.hdr(1).store(tail, Ordering::SeqCst);
                 let _ = self.mem.atomic_notify(self.ring + 4, u32::MAX);
                 self.process_maps(false);
-                if self.inflight.load(Ordering::SeqCst) > 0 { let _ = self.device.poll(PollType::Poll); }
+                self.uploads.poll(&self.device);
+                if self.inflight.load(Ordering::SeqCst) > 0 {
+                    let started = Instant::now();
+                    let _ = self.device.poll(PollType::Poll);
+                    self.thread_wall[THREAD_QUERY_POLL].record(started.elapsed());
+                }
             }
         }
         self.hdr(3).fetch_add(executed, Ordering::Relaxed);
@@ -1021,7 +1287,9 @@ impl Gpu {
             7 => self.present(u(0)),
             8 => {
                 self.flush();
+                let started = Instant::now();
                 let _ = self.device.poll(PollType::Wait { submission_index: None, timeout: None });
+                self.thread_wall[THREAD_GUEST_WAIT].record(started.elapsed());
                 let addr = u(0) as u64 + u(1) as u64 * 4294967296;
                 atomic(&self.mem, addr).store(u(2) as i32, Ordering::SeqCst);
                 let _ = self.mem.atomic_notify(addr, u32::MAX);
@@ -1135,13 +1403,15 @@ impl Gpu {
 
     fn destroy(&mut self, id: u32) {
         self.pending_clears.remove(&id);
+        self.invalidate_world_depth(id, serde_json::json!("destroy"));
         if self.is_bound(id) { self.pdirty = true; }
         if self.obj(id).is_none() { return; }
         if self.used(id) { self.flush(); }
+        if self.occlusion_active == Some(id) { self.end_active_occlusion(); }
         if let Some(o) = self.objs.get_mut(id as usize).and_then(|o| o.take()) {
             match o {
                 Obj::Tex(t) => t.tex.destroy(),
-                Obj::Buf(b) => { if let Some(g) = b.gpu { g.destroy(); } }
+                Obj::Buf(b) => { if let Some(g) = b.gpu { self.uploads.destroy(g); } }
                 _ => {}
             }
         }
@@ -1153,7 +1423,14 @@ impl Gpu {
 
     #[allow(clippy::too_many_arguments)]
     fn create_texture(&mut self, id: u32, dim: u32, w: u32, h: u32, d: u32, mips: u32, array: u32, dxgi: u32, bind: u32, samples: u32) {
-        let m = map_format(dxgi, bind);
+        let mut m = map_format(dxgi, bind);
+        let bc_source = if is_bc(m.format) && !self.device.features().contains(Features::TEXTURE_COMPRESSION_BC) {
+            let source = m.format;
+            m.format = crate::bc::decoded_format(source).expect("known BC format");
+            m.views = m.views.iter().filter_map(|f| crate::bc::decoded_format(*f)).collect();
+            log_once("bc_decode", "adapter has no BC compression; decoding texture uploads on CPU (including HDR and signed formats)");
+            Some(source)
+        } else { None };
         let mut usage = TextureUsages::COPY_SRC | TextureUsages::COPY_DST;
         if bind & BIND_SRV != 0 { usage |= TextureUsages::TEXTURE_BINDING; }
         if bind & (BIND_RT | BIND_DS) != 0 { usage |= TextureUsages::RENDER_ATTACHMENT | TextureUsages::TEXTURE_BINDING; }
@@ -1173,7 +1450,7 @@ impl Gpu {
         let tex = match self.scoped(&format!("createTexture id={id} dim={dim} {}x{}x{} mips={mips} dxgi={dxgi} bind=0x{bind:x} samples={samples} -> {:?} usage {:?}", size.width, size.height, size.depth_or_array_layers, m.format, usage), |d| d.create_texture(&desc)) { Some(t) => t, None => return };
         self.set_obj(id, Obj::Tex(Tex {
             tex, desc: TexDesc { w: size.width, h: size.height, d: size.depth_or_array_layers, mips: mips.max(1), samples, dim: dimension },
-            format: m.format, views: HashMap::new(), a8: m.a8, enc: 0, in_bg: false, proxy_depth: None, proxy_stencil: None,
+            format: m.format, bc_source, views: HashMap::new(), a8: m.a8, enc: 0, in_bg: false, proxy_depth: None, proxy_stencil: None,
             proxy_fdepth: None, blit_bg: None, mip_passes: None,
         }));
     }
@@ -1186,7 +1463,9 @@ impl Gpu {
         if bind & 1 != 0 { usage |= BufferUsages::VERTEX; }
         if bind & 2 != 0 { usage |= BufferUsages::INDEX; }
         if bind & (8 | 0x80) != 0 { usage |= BufferUsages::STORAGE; }
-        if misc & 0x10 != 0 { usage |= BufferUsages::INDIRECT; }
+        if misc & 0x10 != 0 && self.adapter.get_downlevel_capabilities().flags.contains(DownlevelFlags::INDIRECT_EXECUTION) {
+            usage |= BufferUsages::INDIRECT;
+        }
         if bind & (1 | 2 | 8 | 0x80) != 0 || misc & 0x10 != 0 {
             b.bytes = ((size + 3) & !3).max(4);
             b.gpu = Some(self.device.create_buffer(&BufferDescriptor { label: None, size: b.bytes, usage, mapped_at_creation: false }));
@@ -1205,26 +1484,40 @@ impl Gpu {
         }
         let Some(g) = b.gpu.clone() else { return };
         if !no_overwrite && used { self.flush(); }
+        let source = if no_overwrite { UPLOAD_OP47 } else { UPLOAD_OP12 };
         let n = size & !3;
-        if n > 0 { self.queue.write_buffer(&g, offset, &data[..n as usize]); }
+        if n > 0 { measured_write_buffer(&mut self.uploads, &self.device, &self.queue, &mut self.buffer_uploads[source], &g, offset, &data[..n as usize]); }
         if size & 3 != 0 {
             let mut tail = [0u8; 4];
             tail[..(size - n) as usize].copy_from_slice(&data[n as usize..]);
-            self.queue.write_buffer(&g, offset + n, &tail);
+            measured_write_buffer(&mut self.uploads, &self.device, &self.queue, &mut self.buffer_uploads[source], &g, offset + n, &tail);
         }
     }
 
     #[allow(clippy::too_many_arguments)]
     fn upload_texture(&mut self, id: u32, mip: u32, slice: u32, x: u32, y: u32, z: u32, w: u32, h: u32, d: u32, bpr: u32, rows: u32, size: u64, data_addr: u64) {
         if self.tex(id).is_none() { return; }
+        self.invalidate_world_depth(id, serde_json::json!("upload_texture"));
         if self.pending_clears.contains_key(&id) { self.materialize_clears(id); self.flush(); }
         if self.used(id) { self.flush(); }
         let t = self.tex_mut(id).unwrap();
         if let Some(p) = t.proxy_fdepth.as_mut() { p.dirty = true; }
         let three = t.desc.dim == TextureDimension::D3;
-        let (tex, a8) = (t.tex.clone(), t.a8);
+        let (tex, a8, bc_source, desc) = (t.tex.clone(), t.a8, t.bc_source, t.desc);
         let mut data = self.bytes(data_addr, size).to_vec();
         let mut bpr = bpr;
+        let mut rows = rows;
+        let (mut w, mut h) = (w, h);
+        if let Some(format) = bc_source {
+            // BC uploads describe complete 4x4 blocks even for 1x1/2x2 mips.
+            // Decoded textures have logical texel bounds, so crop the padding.
+            w = w.min((desc.w >> mip).max(1).saturating_sub(x));
+            h = h.min((desc.h >> mip).max(1).saturating_sub(y));
+            match crate::bc::decode(format, &data, w, h, d.max(1), bpr, rows) {
+                Ok(decoded) => { data = decoded.bytes; bpr = decoded.bytes_per_row; rows = decoded.rows_per_image; }
+                Err(error) => { log(&format!("BC texture {id} upload failed: {error:#}")); return; }
+            }
+        }
         if a8 {
             let mut out = vec![0u8; (w * h * 4) as usize];
             for r in 0..h as usize {
@@ -1354,7 +1647,7 @@ impl Gpu {
                 }
                 let bytes: Vec<u8> = data.iter().flat_map(|x| x.to_le_bytes()).collect();
                 let b = self.device.create_buffer(&BufferDescriptor { label: None, size: (bytes.len() as u64).max(16), usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST, mapped_at_creation: false });
-                self.queue.write_buffer(&b, 0, &bytes);
+                measured_write_buffer(&mut self.uploads, &self.device, &self.queue, &mut self.buffer_uploads[UPLOAD_SHADER_CONSTS], &b, 0, &bytes);
                 consts = Some(b);
             }
         }
@@ -1378,6 +1671,75 @@ impl Gpu {
         let m = self.scoped(&format!("shader variant {label}"), |d| d.create_shader_module(ShaderModuleDescriptor { label: Some(&label), source: ShaderSource::Wgsl(text.as_str().into()) }));
         prog.variants.borrow_mut().insert(key.to_string(), m.clone());
         m
+    }
+
+    fn float_sampling_program(&mut self, prog: Rc<Program>, stage: usize) -> Option<Rc<Program>> {
+        if self.device.features().contains(Features::FLOAT32_FILTERABLE) { return Some(prog); }
+        let selected: Vec<(u32, u32)> = prog.info.bindings.iter().filter_map(|binding| {
+            if binding.kind != Kind::Texture || binding.sample != Sample::Float
+                || !matches!(binding.dim, TextureViewDimension::D2 | TextureViewDimension::D3) || binding.ms { return None; }
+            let id = *self.s.srv[stage].get((binding.binding as usize).wrapping_sub(32))?;
+            let view = self.view_obj(id)?;
+            if view.is_buf { return None; }
+            let texture = self.tex(view.res)?;
+            let format = if is_depth(texture.format) { TextureFormat::R32Float } else { texture.format };
+            matches!(format, TextureFormat::R32Float | TextureFormat::Rg32Float | TextureFormat::Rgba32Float)
+                .then_some((binding.group, binding.binding))
+        }).collect();
+        if selected.is_empty() { return Some(prog); }
+
+        let samplers: Vec<_> = prog.info.bindings.iter().filter(|binding| binding.kind == Kind::Sampler).map(|binding| {
+            let sid = *self.s.smp[stage].get((binding.binding as usize).wrapping_sub(16)).unwrap_or(&0);
+            let state = self.state(sid);
+            // Match stage_bind_group's fallback sampler: clamp/nearest and LOD
+            // range 0..32. A comparison sampler is rejected there for this slot.
+            let words = state.filter(|state| state.words.first().copied().unwrap_or(0) & 0x80 == 0)
+                .map(|state| state.words.clone()).unwrap_or_else(|| {
+                    let mut words = vec![0; 13];
+                    words[1] = 3; words[2] = 3; words[3] = 3; words[12] = 32.0f32.to_bits();
+                    words
+                });
+            crate::float_sampling::SamplerState { group: binding.group, binding: binding.binding, words }
+        }).collect();
+        let mut state_key = Vec::new();
+        for &(group, binding) in &selected { state_key.extend([group, binding]); }
+        state_key.push(u32::MAX);
+        for sampler in &samplers {
+            state_key.extend([sampler.group, sampler.binding, sampler.words.len() as u32]);
+            state_key.extend_from_slice(&sampler.words);
+        }
+        let key = (prog.uid, state_key);
+        if let Some(cached) = self.float_programs.get(&key) { return cached.clone(); }
+        let result = (|| {
+            let rewritten = match crate::float_sampling::rewrite(&prog.text, &selected, &samplers) {
+                Ok(rewritten) => rewritten,
+                Err(error) => {
+                    log_once(&format!("float32{}{:?}", prog.uid, key.1), &format!("{}: float32 sampling fallback failed: {error:#}", prog.label));
+                    return None;
+                }
+            };
+            let label = format!("{} [float32 textureLoad]", prog.label);
+            let module = self.scoped(&format!("shader variant {label}"), |device| device.create_shader_module(ShaderModuleDescriptor {
+                label: Some(&label), source: ShaderSource::Wgsl(rewritten.text.as_str().into()),
+            }))?;
+            let mut info = parse_wgsl(&rewritten.text);
+            info.bindings.retain(|binding| !rewritten.removed_samplers.contains(&(binding.group, binding.binding)));
+            for binding in &mut info.bindings {
+                if selected.contains(&(binding.group, binding.binding)) { binding.sample = Sample::Unfilterable; }
+            }
+            let mut groups: BTreeMap<u32, Vec<Binding>> = BTreeMap::new();
+            for binding in &info.bindings { groups.entry(binding.group).or_default().push(binding.clone()); }
+            for bindings in groups.values_mut() { bindings.sort_by_key(|binding| binding.binding); }
+            log_once(&format!("float32variant{}{:?}", prog.uid, key.1), &format!("{}: {} float32 sample call(s) use textureLoad; bindings {:?}", prog.label, rewritten.rewritten_calls, selected));
+            Some(Rc::new(Program {
+                module, info, consts: prog.consts.clone(), pack: prog.pack.clone(), text: rewritten.text,
+                flat: prog.flat.clone(), group_bindings: groups, variants: RefCell::new(HashMap::new()),
+                label, uid: self.uid(), vid: prog.vid, iid: prog.iid,
+                out_locs: prog.out_locs.clone(), in_locs: prog.in_locs.clone(), clip: prog.clip,
+            }))
+        })();
+        self.float_programs.insert(key, result.clone());
+        result
     }
 
     fn inter_stage_remap(&self, vs: &Program, ps: Option<&Program>) -> Option<(HashMap<u32, u32>, String, bool)> {
@@ -1450,12 +1812,18 @@ impl Gpu {
     }
 
     fn bgl_for(&mut self, prog: &Program, stage: u32, group: u32) -> (BindGroupLayout, u64) {
-        let key = (prog.label.clone() + "#" + &prog.uid.to_string(), stage, group);
-        if let Some(b) = self.bgl_cache.get(&key) { return b.clone(); }
+        let numeric_key = (prog.uid, stage, group);
+        let legacy_key = if self.render_prepare.enabled { None }
+            else { Some((prog.label.clone() + "#" + &prog.uid.to_string(), stage, group)) };
+        let cached = if self.render_prepare.enabled { self.numeric_bgl_cache.get(&numeric_key) }
+            else { self.bgl_cache.get(legacy_key.as_ref().unwrap()) };
+        self.render_prepare.bgl_lookup(cached.is_some());
+        if let Some(b) = cached { return b.clone(); }
         let entries: Vec<_> = prog.info.bindings.iter().filter(|b| b.group == group).map(|b| Self::layout_entry(b, stage)).collect();
         let bgl = self.device.create_bind_group_layout(&BindGroupLayoutDescriptor { label: None, entries: &entries });
         let uid = self.uid();
-        self.bgl_cache.insert(key, (bgl.clone(), uid));
+        if self.render_prepare.enabled { self.numeric_bgl_cache.insert(numeric_key, (bgl.clone(), uid)); }
+        else { self.bgl_cache.insert(legacy_key.unwrap(), (bgl.clone(), uid)); }
         (bgl, uid)
     }
     fn empty_bgl(&mut self) -> BindGroupLayout {
@@ -1469,7 +1837,10 @@ impl Gpu {
 
     fn target_view(&mut self, id: u32, dxgi: u32, mip: u32, slice: u32) -> Option<(TextureView, TextureFormat)> {
         let t = self.tex(id)?;
-        let fmt = if dxgi != 0 { map_format(dxgi, 0).format } else { t.format };
+        let fmt = if dxgi != 0 {
+            let original = map_format(dxgi, 0).format;
+            if t.bc_source.is_some() { crate::bc::decoded_format(original).unwrap_or(original) } else { original }
+        } else { t.format };
         let fmt = if is_depth(t.format) { t.format } else { fmt };
         if let Some(v) = t.views.get(&(fmt, mip, slice)) { return Some((v.clone(), fmt)); }
         let three = t.desc.dim == TextureDimension::D3;
@@ -1494,11 +1865,11 @@ impl Gpu {
     }
 
     fn ensure_pass(&mut self) -> bool {
-        let mut key = Vec::with_capacity(37);
-        for r in &self.s.rt { key.extend([r.tex, r.mip, r.slice, r.fmt]); }
-        let d = &self.s.ds;
-        key.extend([d.tex, d.mip, d.slice, d.fmt, d.flags]);
-        if self.pass.is_some() && self.pass_key.as_ref() == Some(&key) { return true; }
+        let key = self.render_prepare.pass_key(&self.s.rt, &self.s.ds);
+        if self.pass.is_some() && self.pass_key.as_ref() == Some(&key) {
+            self.render_prepare.pass_reused();
+            return true;
+        }
         self.end_pass();
         let mut colors: Vec<Option<(TextureView, TextureFormat)>> = Vec::new();
         let mut samples = 1;
@@ -1528,7 +1899,12 @@ impl Gpu {
         let (ro_d, ro_s) = (ds.flags & 1 != 0, ds.flags & 2 != 0);
         if ds.tex != 0 && self.tex(ds.tex).is_some() {
             if let Some((v, f)) = self.target_view(ds.tex, 0, ds.mip, ds.slice) {
-                if !ro_d && !ro_s { self.mark_depth_dirty(ds.tex); }
+                // Each aspect can change independently. A depth-writing pass
+                // often has read-only stencil, and must invalidate its proxy.
+                if let Some(t) = self.tex_mut(ds.tex) {
+                    if !ro_d { if let Some(proxy) = &mut t.proxy_depth { proxy.dirty = true; } }
+                    if !ro_s { if let Some(proxy) = &mut t.proxy_stencil { proxy.dirty = true; } }
+                }
                 let t = self.tex(ds.tex).unwrap();
                 ds_format = Some(f);
                 samples = t.desc.samples;
@@ -1634,7 +2010,7 @@ impl Gpu {
             let fmt = if stencil { STENCIL_PROXY } else { TextureFormat::R32Float };
             let ptex = dev.create_texture(&TextureDescriptor {
                 label: None, size: Extent3d { width: desc.w, height: desc.h, depth_or_array_layers: desc.d }, mip_level_count: desc.mips, sample_count: 1,
-                dimension: TextureDimension::D2, format: fmt, usage: TextureUsages::TEXTURE_BINDING | TextureUsages::RENDER_ATTACHMENT, view_formats: &[],
+                dimension: TextureDimension::D2, format: fmt, usage: TextureUsages::TEXTURE_BINDING | TextureUsages::RENDER_ATTACHMENT | TextureUsages::COPY_SRC, view_formats: &[],
             });
             let mut passes = Vec::new();
             for mip in 0..desc.mips {
@@ -1774,7 +2150,8 @@ impl Gpu {
             vd.array_layer_count = Some(cnt.min(layers.saturating_sub(c)).max(1));
         }
         if fmt != 0 && !is_depth(format) && !proxied {
-            let mf = map_format(fmt, 0).format;
+            let original = map_format(fmt, 0).format;
+            let mf = if self.tex(res)?.bc_source.is_some() { crate::bc::decoded_format(original).unwrap_or(original) } else { original };
             if mf != format && mf.is_srgb() != format.is_srgb() && mf.remove_srgb_suffix() == format.remove_srgb_suffix() { vd.format = Some(mf); }
         }
         if is_depth(format) && !proxied {
@@ -1814,7 +2191,7 @@ impl Gpu {
             for c in slot.iter_mut() {
                 if c.lo >= c.hi { continue; }
                 let hi = ((c.hi + 3) & !3).min(c.stage.len() as u64);
-                self.queue.write_buffer(&c.buf, c.base + c.lo, &c.stage[c.lo as usize..hi as usize]);
+                measured_write_buffer(&mut self.uploads, &self.device, &self.queue, &mut self.buffer_uploads[UPLOAD_UNIFORMS], &c.buf, c.base + c.lo, &c.stage[c.lo as usize..hi as usize]);
                 c.lo = u64::MAX;
                 c.hi = 0;
             }
@@ -1824,27 +2201,45 @@ impl Gpu {
     fn pack_copy(&mut self, prog: &Program, stage: usize) -> Option<(usize, u64)> {
         let pack = prog.pack.as_ref()?;
         if pack.size > UBO_WINDOW {
+            self.uniform_pack.rejected_oversize();
             log_once(&format!("packbig{}", prog.label), &format!("{}: constant buffers total {} bytes (> 64 KB)", prog.label, pack.size));
             return None;
         }
         let (ci, off) = self.uniform_alloc(pack.size);
-        let mut block = vec![0u8; pack.size as usize];
-        for m in &pack.members {
-            let cb = self.s.cb[stage].get(m.binding as usize).cloned().unwrap_or_default();
-            if let Some(Buf { shadow: Some(sh), size, .. }) = self.buf(cb.buf) {
-                let from = cb.first as u64 * 16;
-                let len = m.size.min(size.saturating_sub(from));
-                if len > 0 {
-                    block[m.offset as usize..(m.offset + len) as usize].copy_from_slice(&sh[from as usize..(from + len) as usize]);
+        let (copied, grew) = if self.uniform_pack.enabled {
+            // These fields are disjoint. No Gpu method, guest callback, wait or
+            // submit can mutate the host shadows while this snapshot is taken.
+            let objects = &self.objs;
+            let bindings: &[Cb] = if pack.members.is_empty() { &[] } else { &self.s.cb[stage] };
+            let chunk = &mut self.ubo_slots[self.ubo_slot][ci];
+            uniform_pack::direct_copy(pack, objects, bindings, off, &mut chunk.stage)
+        } else {
+            // Reference path: keep the temporary block and member loop order.
+            let mut block = vec![0u8; pack.size as usize];
+            let mut copied = 0u64;
+            for m in &pack.members {
+                let cb = self.s.cb[stage].get(m.binding as usize).cloned().unwrap_or_default();
+                if let Some(Buf { shadow: Some(sh), size, .. }) = self.buf(cb.buf) {
+                    let from = cb.first as u64 * 16;
+                    let len = m.size.min(size.saturating_sub(from));
+                    if len > 0 {
+                        block[m.offset as usize..(m.offset + len) as usize].copy_from_slice(&sh[from as usize..(from + len) as usize]);
+                        copied = copied.saturating_add(len);
+                    }
                 }
             }
-        }
+            let chunk = &mut self.ubo_slots[self.ubo_slot][ci];
+            let end = (off + pack.size) as usize;
+            let grew = chunk.stage.len() < end;
+            if grew { chunk.stage.resize((end.max(262144)).next_power_of_two().min(RING_CHUNK as usize), 0); }
+            chunk.stage[off as usize..end].copy_from_slice(&block);
+            (copied, grew)
+        };
         let chunk = &mut self.ubo_slots[self.ubo_slot][ci];
         let end = (off + pack.size) as usize;
-        if chunk.stage.len() < end { chunk.stage.resize((end.max(262144)).next_power_of_two().min(RING_CHUNK as usize), 0); }
-        chunk.stage[off as usize..end].copy_from_slice(&block);
         chunk.lo = chunk.lo.min(off);
         chunk.hi = chunk.hi.max(end as u64);
+        self.uniform_pack.record(pack, copied, grew);
         Some((ci, off))
     }
 
@@ -1883,11 +2278,11 @@ impl Gpu {
 
     fn stage_bind_group(&mut self, stage: usize, prog: &Program, group: u32, bgl: &(BindGroupLayout, u64)) -> Option<BgResult> {
         enum Res { Buf(Buffer, u64, Option<u64>), View(TextureView), Smp(Sampler) }
-        let bindings = prog.group_bindings.get(&group).cloned().unwrap_or_default();
+        let bindings = self.render_prepare.bindings(prog.group_bindings.get(&group).map(Vec::as_slice).unwrap_or(&[]));
         let mut entries: Vec<(u32, Res)> = Vec::new();
         let mut key: Vec<u64> = vec![bgl.1, prog.uid, stage as u64];
         let mut dyn_off = None;
-        for b in &bindings {
+        for b in bindings.as_ref() {
             match b.kind {
                 Kind::Uniform => {
                     if b.binding == 15 {
@@ -1998,7 +2393,9 @@ impl Gpu {
                 }
             }
         }
-        if let Some((bg, uid)) = self.bind_groups.get(&key) {
+        let cached = self.bind_groups.get(&key);
+        self.render_prepare.bind_group_lookup(cached.is_some());
+        if let Some((bg, uid)) = cached {
             return Some(BgResult { bg: bg.clone(), uid: *uid, dyn_off });
         }
         let wentries: Vec<BindGroupEntry> = entries.iter().map(|(binding, r)| BindGroupEntry {
@@ -2147,6 +2544,46 @@ impl Gpu {
         self.skipped += 1;
     }
 
+    fn read_indirect_arguments(&mut self, buffer_id: u32, offset: u64, indexed: bool) -> Option<Vec<u32>> {
+        self.indirect_reads.attempts = self.indirect_reads.attempts.saturating_add(1);
+        let count = if indexed { 5 } else { 4 };
+        let length = count * 4;
+        let buffer = self.buf(buffer_id)?.gpu.clone()?;
+        if offset & 3 != 0 || offset.checked_add(length)? > buffer.size() {
+            log_once("indirect-arguments-range", "indirect argument buffer range is invalid");
+            return None;
+        }
+        // The arguments may have been written by a compute shader. Read them
+        // from the actual ordered GPU stream, never from an old CPU shadow.
+        let readback = self.device.create_buffer(&BufferDescriptor {
+            label: Some("indirect draw fallback arguments"), size: length,
+            usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ, mapped_at_creation: false,
+        });
+        self.end_pass();
+        self.encoder().copy_buffer_to_buffer(&buffer, offset, &readback, 0, length);
+        self.flush();
+        let (send, receive) = std::sync::mpsc::sync_channel(1);
+        readback.slice(..).map_async(MapMode::Read, move |result| { let _ = send.send(result); });
+        let wait_started = Instant::now();
+        let poll = self.device.poll(PollType::Wait { submission_index: self.last_submit.clone(), timeout: Some(Duration::from_secs(5)) });
+        let mapped = receive.try_recv();
+        self.indirect_reads.wait_wall.record(wait_started.elapsed());
+        if poll.is_err() { self.indirect_reads.poll_errors = self.indirect_reads.poll_errors.saturating_add(1); }
+        if !matches!(mapped, Ok(Ok(()))) { self.indirect_reads.map_errors = self.indirect_reads.map_errors.saturating_add(1); }
+        if poll.is_err() || !matches!(mapped, Ok(Ok(()))) {
+            log_once("indirect-arguments-map", &format!("indirect GPU argument readback failed: poll {poll:?}; map {mapped:?}"));
+            return None;
+        }
+        let arguments = {
+            let Ok(view) = readback.slice(..).get_mapped_range() else { return None; };
+            view.chunks_exact(4).map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap())).collect()
+        };
+        readback.unmap();
+        self.indirect_reads.successes = self.indirect_reads.successes.saturating_add(1);
+        log_once("indirect-fallback", "adapter lacks INDIRECT_EXECUTION: draws use synchronized GPU argument readback and direct draw calls");
+        Some(arguments)
+    }
+
     fn do_draw(&mut self, p: u64) {
         if self.dbg_idx != 0 {
             let lim = atomic(&self.mem, self.dbg_idx).load(Ordering::Relaxed);
@@ -2154,12 +2591,39 @@ impl Gpu {
         }
         let mb = self.base;
         let u = move |w: u64| unsafe { std::ptr::read_volatile(mb.add(((p + w) * 4) as usize) as *const u32) };
-        let (kind, count, inst, start, base_vertex, start_instance) = (u(0), u(1), u(2), u(3), u(4) as i32, u(5));
+        let (mut kind, mut count, mut inst, mut start, mut base_vertex, mut start_instance) = (u(0), u(1), u(2), u(3), u(4) as i32, u(5));
+        if kind >= 4 && !self.adapter.get_downlevel_capabilities().flags.contains(DownlevelFlags::INDIRECT_EXECUTION) {
+            let indexed = kind == 4;
+            let Some(arguments) = self.read_indirect_arguments(u(1), u(2) as u64, indexed) else { self.skip(); return };
+            count = arguments[0]; inst = arguments[1]; start = arguments[2];
+            base_vertex = if indexed { arguments[3] as i32 } else { 0 };
+            start_instance = arguments[if indexed { 4 } else { 3 }];
+            kind = if indexed { 1 } else { 0 };
+        }
         self.collect_pipelines();
         let vs_id = self.s.shader[0];
         let ps_id = self.s.shader[1];
-        let Some(vs) = self.shader_program(vs_id) else { self.skip(); return };
-        let ps = if ps_id != 0 { match self.shader_program(ps_id) { Some(p) => Some(p), None => { self.skip(); return } } } else { None };
+        let Some(vs) = self.shader_program(vs_id).and_then(|program| self.float_sampling_program(program, 0)) else { self.skip(); return };
+        let ps = if ps_id != 0 { match self.shader_program(ps_id).and_then(|program| self.float_sampling_program(program, 1)) { Some(p) => Some(p), None => { self.skip(); return } } } else { None };
+        let ui_depth_clear = self.world_view.is_none()
+            && vs.label == "billboard_nobump::VS_Blit"
+            && ps.as_ref().is_some_and(|program| program.label == "im::PS_Clear"
+                && !program.info.writes_fragment_depth)
+            && self.s.ds.mip == 0 && self.s.ds.slice == 0 && self.s.ds.flags & 1 == 0
+            && self.state(self.s.dss.0).is_some_and(|state|
+                state.words.first() == Some(&1) && state.words.get(1) == Some(&1) && state.words.get(2) == Some(&8))
+            && self.tex(self.s.ds.tex).is_some_and(|texture| {
+                let expected = [0., 0., texture.desc.w as f32, texture.desc.h as f32, 0., 1.];
+                let viewport = self.s.viewports.first().copied().unwrap_or(expected);
+                viewport.iter().zip(expected).all(|(&actual, expected)|
+                    actual.is_finite() && (actual - expected).abs() <= 0.00002)
+            });
+        if ui_depth_clear { self.save_world_depth_before_ui(self.s.ds.tex); }
+        let program_uids = (vs.uid, ps.as_ref().map(|program| program.uid).unwrap_or(0));
+        if self.last_program_uids != Some(program_uids) {
+            self.pdirty = true;
+            self.last_program_uids = Some(program_uids);
+        }
         let layout = match self.obj(self.s.layout) { Some(Obj::Layout(l)) => l.clone(), _ => { self.skip(); return } };
         self.prepare_depth_proxies(&vs, 0);
         if let Some(p) = &ps { self.prepare_depth_proxies(p, 1); }
@@ -2229,17 +2693,17 @@ impl Gpu {
                 self.use_buf(ibid);
             }
         }
-        let pi = self.pass_info.clone().unwrap();
+        let (pass_width, pass_height, pass_ro_depth) = self.render_prepare.dimensions(self.pass_info.as_ref().unwrap());
         let rs_scissor = self.s.rs != 0 && self.state(self.s.rs).map(|r| r.words.get(7).copied().unwrap_or(0) != 0).unwrap_or(false);
         let scissor = if rs_scissor && !self.s.scissors.is_empty() {
             let c = self.s.scissors[0];
-            let x0 = pi.width.min(c[0]);
-            let y0 = pi.height.min(c[1]);
-            let x1 = pi.width.min(x0.max(c[2]));
-            let y1 = pi.height.min(y0.max(c[3]));
+            let x0 = pass_width.min(c[0]);
+            let y0 = pass_height.min(c[1]);
+            let x1 = pass_width.min(x0.max(c[2]));
+            let y1 = pass_height.min(y0.max(c[3]));
             [x0, y0, x1 - x0, y1 - y0]
         } else {
-            [0, 0, pi.width, pi.height]
+            [0, 0, pass_width, pass_height]
         };
         let viewport = self.s.viewports.first().copied();
         let bf = self.s.blend.1;
@@ -2309,11 +2773,90 @@ impl Gpu {
             }
         }
         self.draws += 1;
+        // Camera context arrives with this exact GPU command, not from a newer
+        // game-thread camera. Only record the qualified world's real depth.
+        let ds = &self.s.ds;
+        let actual_viewport = viewport.unwrap_or([0., 0., pass_width as f32, pass_height as f32, 0., 1.]);
+        let full_world_viewport = self.tex(ds.tex).is_some_and(|t| {
+            let expected = [0., 0., t.desc.w as f32, t.desc.h as f32, 0., 1.];
+            actual_viewport.iter().zip(expected).all(|(&actual, expected)| actual.is_finite() && (actual - expected).abs() <= 0.00002)
+        });
+        let writes_depth = !pass_ro_depth && self.state(self.s.dss.0).is_some_and(|state|
+            state.words.first().copied().unwrap_or(0) != 0 && state.words.get(1) == Some(&1));
+        if writes_depth && !full_world_viewport && ds.tex != 0
+            && self.world_view.is_some_and(|view| view.headset_applied) && self.world_depth_anomalies.len() < 8 {
+            let depth_state = self.state(self.s.dss.0).map(|state| state.words.clone());
+            self.world_depth_anomalies.push(serde_json::json!({"depth":ds.tex,"viewport":actual_viewport,
+                "vertex":vs.label,"pixel":ps.as_ref().map(|program|program.label.as_str()),
+                "depth_state":depth_state,"world":self.world_view.map(|view|serde_json::json!({
+                    "sequence":view.camera_sequence,"reverse_z":view.depth_reverse_z,"headset_applied":view.headset_applied}))}));
+        }
+        if let Some(view) = self.world_view.filter(|view| view.headset_applied) {
+            let key = (ds.tex, view.camera_sequence, writes_depth, ds.flags, full_world_viewport);
+            if self.world_depth_trace.len() < 32 || self.world_depth_trace.contains_key(&key) {
+                self.world_depth_trace.entry(key).or_insert((0, actual_viewport)).0 += 1;
+            }
+        }
+        // GTA's far water and fog passes compress raster depth into two f32
+        // epsilons at reverse-Z far. With clipped vertices, no depth bias, no
+        // fragment depth override and Greater[Equal], those writes cannot touch
+        // nearer scene depth. Preserve an already-qualified target only when
+        // its camera/rays still match; the actual far values remain in the copy.
+        let preserves_world_depth = self.world_view.is_some_and(|view|
+            view.headset_applied && view.depth_reverse_z
+            && self.world_depths.get(&ds.tex).is_some_and(|(previous, draws)|
+                *draws > 0 && previous.depth_reverse_z
+                && crate::world_frame::shares_screen_rays(&view, previous))
+            && self.tex(ds.tex).is_some_and(|texture| {
+                let expected = [0., 0., texture.desc.w as f32, texture.desc.h as f32];
+                actual_viewport[..4].iter().zip(expected).all(|(&actual, expected)|
+                    actual.is_finite() && (actual - expected).abs() <= 0.00002)
+            })
+            && actual_viewport[4].is_finite() && actual_viewport[5].is_finite()
+            && actual_viewport[4] >= 0. && actual_viewport[4] <= actual_viewport[5]
+            && actual_viewport[5] <= 2. * f32::EPSILON
+            && self.state(self.s.dss.0).is_some_and(|state| matches!(state.words.get(2), Some(5 | 7)))
+            && !ps.as_ref().is_some_and(|program| program.info.writes_fragment_depth)
+            && self.state(self.s.rs).is_none_or(|state|
+                state.words.get(3).copied().unwrap_or(0) == 0
+                && wf(state.words.get(4).copied().unwrap_or(0)) == 0.
+                && wf(state.words.get(5).copied().unwrap_or(0)) == 0.
+                && (state.words.get(6).copied() != Some(0)
+                    || !self.device.features().contains(Features::DEPTH_CLIP_CONTROL))));
+        if writes_depth && preserves_world_depth {
+            let pixel_label = ps.as_ref().map(|program| program.label.as_str()).unwrap_or("-");
+            log_once(&format!("worldfar{}+{}", vs.label, pixel_label), &format!(
+                "qualified far-background depth retained: {} + {}; viewport {:?}; depth state {:?}; rasterizer {:?}; reverse-Z same-camera depth already qualified",
+                vs.label, pixel_label, actual_viewport,
+                self.state(self.s.dss.0).map(|state| state.words.clone()),
+                self.state(self.s.rs).map(|state| state.words.clone())));
+        }
+        if writes_depth && ds.mip == 0 && ds.slice == 0 {
+            if let Some(view) = self.world_view.filter(|view| view.headset_applied && full_world_viewport && self.tex(ds.tex).is_some_and(|t|
+                is_depth(t.format) && t.desc.samples == 1 && t.desc.d == 1)) {
+                self.world_depth_before_ui.remove(&ds.tex); // A newer qualified scene supersedes the saved image.
+                let entry = self.world_depths.entry(ds.tex).or_insert((view, 0));
+                if entry.0.camera_sequence != view.camera_sequence { *entry = (view, 0); }
+                entry.1 += 1;
+            } else if !preserves_world_depth {
+                // A later weapon/reflection pass cannot inherit a prior world's
+                // projection merely because it writes the same-sized target.
+                if self.world_depths.contains_key(&ds.tex) || self.world_depth_before_ui.contains_key(&ds.tex) {
+                    let reason = serde_json::json!({"operation":"unqualified depth draw", "vertex":vs.label,
+                        "pixel":ps.as_ref().map(|program|program.label.as_str()), "viewport":actual_viewport,
+                        "depth_state":self.state(self.s.dss.0).map(|state|state.words.clone()),
+                        "rasterizer":self.state(self.s.rs).map(|state|state.words.clone()),
+                        "world":self.world_view.map(|view|serde_json::json!({"sequence":view.camera_sequence,
+                            "reverse_z":view.depth_reverse_z,"headset_applied":view.headset_applied}))});
+                    self.invalidate_world_depth_inner(ds.tex, reason, ui_depth_clear);
+                }
+            }
+        }
     }
 
     fn do_dispatch(&mut self, x: u32, y: u32, z: u32) {
         let cs_id = self.s.shader[2];
-        let Some(prog) = self.shader_program(cs_id) else { self.skipped += 1; return };
+        let Some(prog) = self.shader_program(cs_id).and_then(|program| self.float_sampling_program(program, 2)) else { self.skipped += 1; return };
         self.prepare_depth_proxies(&prog, 2);
         self.end_pass();
 
@@ -2337,7 +2880,13 @@ impl Gpu {
                 let label = format!("{} [uav formats]", prog.label);
                 match self.scoped("compute variant", |d| d.create_shader_module(ShaderModuleDescriptor { label: Some(&label), source: ShaderSource::Wgsl(text.as_str().into()) })) {
                     Some(module) => {
-                        let info = parse_wgsl(&text);
+                        let mut info = parse_wgsl(&text);
+                        for binding in &mut info.bindings {
+                            if prog.info.bindings.iter().any(|original| original.group == binding.group
+                                && original.binding == binding.binding && original.sample == Sample::Unfilterable) {
+                                binding.sample = Sample::Unfilterable;
+                            }
+                        }
                         let mut gb: BTreeMap<u32, Vec<Binding>> = BTreeMap::new();
                         for b in &info.bindings { gb.entry(b.group).or_default().push(b.clone()); }
                         for v in gb.values_mut() { v.sort_by_key(|b| b.binding); }
@@ -2375,7 +2924,7 @@ impl Gpu {
     }
 
     fn in_open_pass(&self, id: u32) -> bool {
-        self.pass.is_some() && self.pass_key.as_ref().map(|k| (0..9).any(|i| k[i * 4] == id)).unwrap_or(false)
+        self.pass.is_some() && self.pass_key.as_ref().map(|k| (0..9).any(|i| k.words()[i * 4] == id)).unwrap_or(false)
     }
     fn clear_rt(&mut self, id: u32, mip: u32, slice: u32, c: [f32; 4]) {
         let Some(three) = self.tex(id).map(|t| t.desc.dim == TextureDimension::D3) else { return };
@@ -2393,6 +2942,7 @@ impl Gpu {
         let Some((fmt, three)) = self.tex(id).map(|t| (t.format, t.desc.dim == TextureDimension::D3)) else { return };
         self.mark_depth_dirty(id);
         let d = (flags & 1 != 0).then(|| depth.clamp(0.0, 1.0));
+        if d.is_some() && mip == 0 && slice == 0 { self.invalidate_world_depth(id, serde_json::json!("clear_ds")); }
         let st = (flags & 2 != 0 && has_stencil(fmt)).then_some(stencil);
         if d.is_none() && st.is_none() { return; }
         if three { self.materialize_clears(id); self.clear_ds_now(id, mip, slice, d, st); return; }
@@ -2425,6 +2975,7 @@ impl Gpu {
     }
     fn clear_ds_now(&mut self, id: u32, mip: u32, slice: u32, depth: Option<f32>, stencil: Option<u32>) {
         let Some(fmt) = self.tex(id).map(|t| t.format) else { return };
+        if depth.is_some() && mip == 0 && slice == 0 { self.invalidate_world_depth(id, serde_json::json!("clear_ds_now")); }
         self.end_pass();
         let Some(view) = self.clear_view(id, mip, slice) else { return };
         self.use_tex(id);
@@ -2449,7 +3000,7 @@ impl Gpu {
             } else {
                 self.flush();
                 let data: Vec<u8> = (0..bytes / 4).flat_map(|i| values[(i & 3) as usize].to_le_bytes()).collect();
-                self.queue.write_buffer(&g, 0, &data);
+                measured_write_buffer(&mut self.uploads, &self.device, &self.queue, &mut self.buffer_uploads[UPLOAD_UAV_CLEAR], &g, 0, &data);
             }
             self.use_buf(res);
             return;
@@ -2521,6 +3072,7 @@ impl Gpu {
         let three = s.desc.dim == TextureDimension::D3;
         let d3 = d.desc.dim == TextureDimension::D3;
         let (stex, dtex, sf, df) = (s.tex.clone(), d.tex.clone(), s.format, d.format);
+        self.invalidate_world_depth(dst, serde_json::json!("copy_region"));
         if sf != df && !three && !d3 && (block_bytes(sf) != 0) != (block_bytes(df) != 0) && block_bytes(sf).max(block_bytes(df)) == texel_bytes(sf).max(texel_bytes(df)) {
             let bytes = block_bytes(sf).max(block_bytes(df));
             let s_bc = block_bytes(sf) != 0;
@@ -2561,6 +3113,7 @@ impl Gpu {
         if self.buf(src).is_some() { self.copy_region(dst, 0, 0, 0, 0, src, 0, false, 0, 0, 0, 0, 0, 0); return; }
         let (Some(s), Some(d)) = (self.tex(src), self.tex(dst)) else { return };
         let (stex, dtex, sd, dd) = (s.tex.clone(), d.tex.clone(), s.desc, d.desc);
+        self.invalidate_world_depth(dst, serde_json::json!("copy_resource"));
         self.end_pass();
         let enc = self.encoder();
         for mip in 0..sd.mips.min(dd.mips) {
@@ -2668,10 +3221,18 @@ impl Gpu {
             let copy = padded.min(g.size().saturating_sub(from)) & !3;
             if copy > 0 { self.encoder().copy_buffer_to_buffer(&g, from, &rb, 0, copy); }
             self.flush();
-            self.map_pending(rb, MapKind::Readback { flag, rows: vec![(0, addr, n)] });
+            let rows = self.bound_readback(vec![(0, addr, n)], addr, size, "a buffer");
+            self.map_pending(rb, MapKind::Readback { flag, rows });
             return;
         }
-        let Some((tex, fmt, desc)) = self.tex(src).map(|x| (x.tex.clone(), x.format, x.desc)) else { done(self); return };
+        let Some((tex, fmt, desc, decoded)) = self.tex(src).map(|x| (x.tex.clone(), x.format, x.desc, x.bc_source)) else { done(self); return };
+        if let Some(source) = decoded {
+            // The guest destination is laid out in BC blocks, but this device
+            // holds the texture as decoded RGBA: different row count and pitch.
+            log_once(&format!("rbbc{source:?}"), &format!("readback of software-decoded {source:?} texture skipped; the guest destination is not written"));
+            done(self);
+            return;
+        }
         if desc.samples > 1 || is_depth(fmt) { log_once(&format!("rbfmt{fmt:?}"), &format!("readback of {fmt:?} not supported")); done(self); return; }
         let (mip, layer) = (sub % desc.mips, sub / desc.mips);
         let (mw, mh) = ((desc.w >> mip).max(1), (desc.h >> mip).max(1));
@@ -2699,7 +3260,17 @@ impl Gpu {
                 rows.push(((z * by as u64 + row) * bpr, addr + z * slice_pitch + row * row_pitch, row_bytes));
             }
         }
+        let rows = self.bound_readback(rows, addr, size, &format!("{fmt:?} {bx}x{by}"));
         self.map_pending(rb, MapKind::Readback { flag, rows });
+    }
+
+    /// A readback never writes outside the guest's destination subresource.
+    fn bound_readback(&self, rows: Vec<(u64, u64, u64)>, addr: u64, size: u64, what: &str) -> Vec<(u64, u64, u64)> {
+        let (rows, withheld) = bounded_readback_rows(rows, addr, size, self.mem.data_size() as u64);
+        if withheld != 0 {
+            log_once(&format!("rbbound{what}"), &format!("readback of {what} exceeds the guest's {size}-byte destination at 0x{addr:x}; {withheld} bytes not written"));
+        }
+        rows
     }
 
     fn map_pending(&mut self, buf: Buffer, kind: MapKind) {
@@ -2711,6 +3282,7 @@ impl Gpu {
 
     fn process_maps(&mut self, wait: bool) {
         if self.pending_maps.is_empty() { return; }
+        let started = Instant::now();
         let _ = self.device.poll(if wait { PollType::Wait { submission_index: None, timeout: None } } else { PollType::Poll });
         let mut i = 0;
         while i < self.pending_maps.len() {
@@ -2726,13 +3298,13 @@ impl Gpu {
                         }
                     }
                     MapKind::Occlusion { list } => {
-                        for &(byte, cnt, addr, consecutive, seq) in list {
+                        for (byte, cnt, life, consecutive, seq) in list {
                             let mut sum = 0u64;
-                            for k in 0..cnt as u64 {
-                                let at = (byte + k * if consecutive { 8 } else { 256 }) as usize;
+                            for k in 0..*cnt as u64 {
+                                let at = (byte + k * if *consecutive { 8 } else { 256 }) as usize;
                                 if at + 8 <= range.len() { sum += u64::from_le_bytes(range[at..at + 8].try_into().unwrap()); }
                             }
-                            self.query_store(addr, if sum != 0 { OCCLUSION_VISIBLE_COUNT } else { 0 }, seq as u32);
+                            life.complete(&self.mem, if sum != 0 { OCCLUSION_VISIBLE_COUNT } else { 0 }, *seq as u32);
                         }
                     }
                 }
@@ -2742,16 +3314,17 @@ impl Gpu {
                 if flag != 0 { atomic(&self.mem, flag).store(0, Ordering::SeqCst); let _ = self.mem.atomic_notify(flag, u32::MAX); }
             }
         }
+        self.thread_wall[THREAD_MAP_PROCESS].record(started.elapsed());
     }
 
-    fn query_store(&self, addr: u64, result: u64, seq: u32) {
-        atomic(&self.mem, addr + 8).store(result as u32 as i32, Ordering::SeqCst);
-        atomic(&self.mem, addr + 12).store((result >> 32) as u32 as i32, Ordering::SeqCst);
-        atomic(&self.mem, addr).store(seq as i32, Ordering::SeqCst);
-        let _ = self.mem.atomic_notify(addr, u32::MAX);
+    /// Closes the occlusion query open in the current pass, if any, and
+    /// forgets which query is active.
+    fn end_active_occlusion(&mut self) {
+        if self.occlusion_pass_slot.take().is_some() { if let Some(p) = self.pass.as_mut() { p.end_occlusion_query(); } }
+        self.occlusion_active = None;
     }
     fn create_query(&mut self, id: u32, qtype: u32, addr: u64) {
-        self.set_obj(id, Obj::Query(QueryObj { qtype, addr, slots: vec![] }));
+        self.set_obj(id, Obj::Query(QueryObj { qtype, life: QueryLife::new(addr), slots: vec![] }));
         if self.occlusion_set.is_none() {
             self.occlusion_set = Some(self.device.create_query_set(&QuerySetDescriptor { label: None, ty: QueryType::Occlusion, count: OCCLUSION_CAPACITY }));
         }
@@ -2759,6 +3332,7 @@ impl Gpu {
     fn is_occlusion(t: u32) -> bool { t == 1 || t == 5 }
     fn begin_occlusion_in_pass(&mut self) {
         let Some(q) = self.occlusion_active else { return };
+        if !matches!(self.obj(q), Some(Obj::Query(_))) { self.end_active_occlusion(); return; }
         if self.pass.is_none() || self.occlusion_pass_slot.is_some() { return; }
         if self.occlusion_next >= OCCLUSION_CAPACITY { log_once("qfull", "occlusion query set exhausted"); return; }
         let slot = self.occlusion_next;
@@ -2775,29 +3349,26 @@ impl Gpu {
         self.begin_occlusion_in_pass();
     }
     fn end_query(&mut self, id: u32, seq: u32) {
-        let Some((qtype, addr)) = (match self.obj(id) { Some(Obj::Query(q)) => Some((q.qtype, q.addr)), _ => None }) else { return };
+        // The result belongs to this query instance, whatever later holds its id.
+        let Some((qtype, life)) = (match self.obj(id) { Some(Obj::Query(q)) => Some((q.qtype, q.life.clone())), _ => None }) else { return };
         if Self::is_occlusion(qtype) {
-            if self.occlusion_active == Some(id) {
-                if self.occlusion_pass_slot.take().is_some() { if let Some(p) = self.pass.as_mut() { p.end_occlusion_query(); } }
-                self.occlusion_active = None;
-            }
+            if self.occlusion_active == Some(id) { self.end_active_occlusion(); }
             let slots = match self.obj_mut(id) { Some(Obj::Query(q)) => std::mem::take(&mut q.slots), _ => vec![] };
-            self.pending_resolve.push((id, seq, slots));
+            self.pending_resolve.push((life, seq, slots));
         } else {
             let t = Instant::now().duration_since(*START).as_nanos() as u64;
-            self.pending_events.push((id, seq, if qtype == 2 { t } else { 1 }));
-            let _ = addr;
+            self.pending_events.push((life, seq, if qtype == 2 { t } else { 1 }));
         }
     }
     fn record_resolves(&mut self) -> Option<PendingMap> {
         let list = std::mem::take(&mut self.pending_resolve);
         let mut layout = Vec::new();
         let mut bytes = 0u64;
-        for (id, seq, slots) in list {
-            let Some(addr) = (match self.obj(id) { Some(Obj::Query(q)) => Some(q.addr), _ => None }) else { continue };
-            if slots.is_empty() { self.query_store(addr, 0, seq); continue; }
+        for (life, seq, slots) in list {
+            if !life.is_live() { continue; }
+            if slots.is_empty() { life.complete(&self.mem, 0, seq); continue; }
             let consecutive = slots.windows(2).all(|w| w[1] == w[0] + 1);
-            layout.push((slots, bytes, addr, consecutive, seq));
+            layout.push((slots, bytes, life, consecutive, seq));
             bytes += if consecutive { (layout.last().unwrap().0.len() as u64 * 8).div_ceil(256) * 256 } else { layout.last().unwrap().0.len() as u64 * 256 };
         }
         if self.occlusion_next > OCCLUSION_CAPACITY - 256 && self.occlusion_active.is_none() { self.occlusion_next = 0; }
@@ -2808,13 +3379,13 @@ impl Gpu {
         let set = self.occlusion_set.clone()?;
         let enc = self.encoder();
         let mut out = Vec::new();
-        for (slots, at, addr, consecutive, seq) in &layout {
+        for (slots, at, life, consecutive, seq) in &layout {
             if *consecutive {
                 enc.resolve_query_set(&set, slots[0]..slots[0] + slots.len() as u32, &rb, *at);
             } else {
                 for (i, s) in slots.iter().enumerate() { enc.resolve_query_set(&set, *s..*s + 1, &rb, at + i as u64 * 256); }
             }
-            out.push((*at, slots.len() as u32, *addr, *consecutive, *seq as usize));
+            out.push((*at, slots.len() as u32, life.clone(), *consecutive, *seq as usize));
         }
         enc.copy_buffer_to_buffer(&rb, 0, &map, 0, bytes);
         let done = Arc::new(AtomicBool::new(false));
@@ -2828,14 +3399,8 @@ impl Gpu {
             let mem = self.mem.clone();
             let inflight = self.inflight.clone();
             inflight.fetch_add(1, Ordering::SeqCst);
-            let addrs: Vec<(u64, u64, u32)> = evs.iter().filter_map(|(id, seq, v)| match self.obj(*id) { Some(Obj::Query(q)) => Some((q.addr, *v, *seq)), _ => None }).collect();
             self.queue.on_submitted_work_done(move || {
-                for (addr, v, seq) in addrs {
-                    atomic(&mem, addr + 8).store(v as u32 as i32, Ordering::SeqCst);
-                    atomic(&mem, addr + 12).store((v >> 32) as u32 as i32, Ordering::SeqCst);
-                    atomic(&mem, addr).store(seq as i32, Ordering::SeqCst);
-                    let _ = mem.atomic_notify(addr, u32::MAX);
-                }
+                for (life, seq, v) in evs { life.complete(&mem, v, seq); }
                 inflight.fetch_sub(1, Ordering::SeqCst);
             });
         }
@@ -2851,7 +3416,7 @@ impl Gpu {
         let slot = self.counter_slot as u64;
         self.counter_slot += 1;
         let src = self.counter_src.clone().unwrap();
-        self.queue.write_buffer(&src, slot * 4, &value.to_le_bytes());
+        measured_write_buffer(&mut self.uploads, &self.device, &self.queue, &mut self.buffer_uploads[UPLOAD_UAV_COUNTER], &src, slot * 4, &value.to_le_bytes());
         self.end_pass();
         let Some(cb) = self.counter_buffer(res) else { return };
         self.encoder().copy_buffer_to_buffer(&src, slot * 4, &cb, 0, 4);
@@ -2868,6 +3433,7 @@ impl Gpu {
     }
 
     fn present(&mut self, id: u32) {
+        let present_started = Instant::now();
         self.materialize_clears(id);
         let visible = !OCCLUDED.load(Ordering::Relaxed);
         if let (Some(t), Some(_), true) = (self.tex(id), self.surface.as_ref(), visible) {
@@ -2890,7 +3456,10 @@ impl Gpu {
                 });
                 self.surface_size = (w, h);
                 log(&format!("surface configured {w}x{h} {:?}", self.surface_format));
+                #[cfg(not(target_os = "visionos"))]
                 window.request_redraw();
+                #[cfg(target_os = "visionos")]
+                let _ = window;
             }
             if self.blit.is_none() {
                 let module = self.device.create_shader_module(ShaderModuleDescriptor { label: Some("blit"), source: ShaderSource::Wgsl(
@@ -2934,7 +3503,16 @@ impl Gpu {
         } else {
             self.flush();
         }
+        if let Some(texture) = self.tex(id) {
+            crate::capture::on_present(&self.device, &self.queue, &texture.tex, self.presents + 1);
+        }
+        let started = Instant::now();
+        self.publish_world_frame(id);
+        self.thread_wall[THREAD_WORLD_PUBLICATION].record(started.elapsed());
+        let started = Instant::now();
         self.collect_pipelines();
+        self.thread_wall[THREAD_PIPELINE_COLLECTION].record(started.elapsed());
+        self.thread_wall[THREAD_PRESENT_BEFORE_WAIT].record(present_started.elapsed());
         self.presents += 1;
         PRESENTS.store(self.presents, Ordering::Relaxed);
         self.log_fps();
@@ -2944,9 +3522,68 @@ impl Gpu {
         self.ubo_chunk = 0;
         self.ubo_off = 0;
         if let Some(idx) = self.frame_slot_done[self.ubo_slot].take() {
+            let started = Instant::now();
             let _ = self.device.poll(PollType::Wait { submission_index: Some(idx), timeout: None });
+            self.thread_wall[THREAD_UNIFORM_WAIT].record(started.elapsed());
         }
         self.process_maps(false);
+    }
+
+    fn publish_world_frame(&mut self, color_id: u32) {
+        // Consume every presentation, including loading, to preserve queue order.
+        let present_view = crate::xr_view::take_present_view();
+        let depths = std::mem::take(&mut self.world_depths);
+        let saved = std::mem::take(&mut self.world_depth_before_ui);
+        let snapshot_overflow = std::mem::replace(&mut self.world_depth_snapshot_overflow, false);
+        let snapshots_this_present = std::mem::replace(&mut self.world_depth_snapshots_this_present, 0);
+        let trace = std::mem::take(&mut self.world_depth_trace);
+        let anomalies = std::mem::take(&mut self.world_depth_anomalies);
+        let Some(view) = present_view.filter(|view| view.headset_applied) else { return; };
+        let Some(color) = self.tex(color_id).map(|t| t.tex.clone()) else { return; };
+        // Main-world camera provenance plus full-size, single-sample depth must
+        // select exactly one target. Ambiguous weapon/reflection targets fail closed.
+        let mut sources: BTreeMap<u32, (crate::xr_view::WorldView, u64, Option<Texture>)> = saved.into_iter()
+            .map(|(id, (view, texture, draws))| (id, (view, draws, Some(texture)))).collect();
+        for (id, (view, draws)) in depths { sources.insert(id, (view, draws, None)); }
+        let candidates: Vec<_> = sources.into_iter().filter(|(id, (candidate, draws, saved))|
+            *draws > 0 && crate::world_frame::shares_screen_rays(&view, candidate)
+            && saved.as_ref().map_or_else(|| self.tex(*id).is_some_and(|t|
+                t.desc.w == color.width() && t.desc.h == color.height()),
+                |depth| depth.width() == color.width() && depth.height() == color.height())).collect();
+        if snapshot_overflow || candidates.len() != 1 {
+            let bindings: Vec<_> = trace.into_iter().map(|((id, sequence, writes, flags, full_viewport), (draws, viewport))| {
+                let texture = self.tex(id).map(|t| format!("{}x{} samples{} layers{} {:?}", t.desc.w, t.desc.h, t.desc.samples, t.desc.d, t.format));
+                (id, sequence, writes, flags, full_viewport, viewport, draws, texture)
+            }).collect();
+            crate::world_frame::reject(format!("qualified world depth selection needs one target, found {:?}; pre-UI snapshots {} overflow {}; present_sequence {}; world depth bindings {:?}; nonstandard depth writes {}",
+                candidates.iter().map(|(id, (_, draws, _))| (*id, *draws)).collect::<Vec<_>>(), snapshots_this_present, snapshot_overflow, view.camera_sequence, bindings, serde_json::to_string(&anomalies).unwrap_or_default()));
+            return;
+        }
+        let depth_id = candidates[0].0;
+        // Preserve the opaque pass's actual depth convention. The final
+        // lighting pass can have identical screen rays with a different Z row.
+        let view = candidates[0].1.0;
+        let depth = match &candidates[0].1.2 {
+            Some(saved) => saved.clone(),
+            None => match self.depth_proxy(depth_id, false) {
+                Some((depth, _)) => depth,
+                None => { crate::world_frame::reject("qualified world depth conversion failed".into()); return; }
+            },
+        };
+        self.flush();
+        let p = view.projection_from_eye;
+        let (near_denominator, far_denominator) = if view.depth_reverse_z { (p[10] + 1., p[10]) }
+            else { (p[10], p[10] + 1.) };
+        let near = p[14] / near_denominator;
+        let far = if far_denominator == 0. { f32::INFINITY } else { p[14] / far_denominator };
+        let frame = crate::world_frame::WorldFrame {
+            game_frame: self.presents + 1, request_frame: view.request_frame, head_frame: view.head_pose_frame,
+            presentation_time: view.presentation_time_seconds, view_index: view.eye_index, view_count: view.view_count,
+            projection_from_eye: view.projection_from_eye, game_from_eye: view.game_from_eye,
+            game_from_stage: view.game_from_stage, depth_near: near, depth_far: far,
+            ..Default::default()
+        };
+        crate::world_frame::publish(&self.device, &self.queue, &color, &depth, frame, view.provenance_epoch);
     }
 
     fn log_fps(&mut self) {
@@ -2959,6 +3596,9 @@ impl Gpu {
                 frames as f64 / dt, crate::footprint_mb(), crate::RT.get().map(|r| r.mem.data_size() >> 20).unwrap_or(0), frames, self.clears_folded, (self.draws - self.fps_d0) / frames.max(1), self.pending_skips - self.pending_skips0, (self.submits - self.submits0) as f64 / frames.max(1) as f64,
                 (self.passes - self.passes0) as f64 / frames.max(1) as f64, self.skipped, self.pipe_creates, self.bind_groups.len(), self.errors.load(Ordering::Relaxed)
             ));
+            self.log_upload_timing(dt);
+            log(&format!("render prepare: {}", self.render_prepare.metrics(self.presents, self.draws, self.passes, self.submits, self.errors.load(Ordering::Relaxed))));
+            log(&format!("uniform stage pack: {}", self.uniform_pack.metrics(self.presents, self.draws, self.submits, self.errors.load(Ordering::Relaxed))));
             if let Some(r) = self.instance.generate_report() {
                 let h = &r.hub;
                 log(&format!("live wgpu objects: buffers {} textures {} views {} bind groups {} samplers {} pipelines {} | engine objects {}",
@@ -2972,7 +3612,39 @@ impl Gpu {
             self.fps_t0 = now;
             self.fps_n0 = self.presents;
             self.fps_d0 = self.draws;
+            self.buffer_uploads = [BufferUploadStats::default(); UPLOAD_SOURCE_COUNT];
+            self.indirect_reads = IndirectReadStats::default();
+            self.uploads.reset_interval();
+            self.thread_wall = [ApiWallStats::default(); THREAD_TIMING_COUNT];
         }
+    }
+    fn log_upload_timing(&self, seconds: f64) {
+        let mut other = BufferUploadStats::default();
+        for stats in &self.buffer_uploads[UPLOAD_UNIFORMS..] { other.accumulate(stats); }
+        for (source, stats) in [("op12", self.buffer_uploads[UPLOAD_OP12]), ("op47", self.buffer_uploads[UPLOAD_OP47]), ("other", other)] {
+            log(&format!("buffer upload timing: source {source}, interval_s {seconds:.3}, calls {}, bytes {}, API_wall_ms {:.3}, API_wall_max_ms {:.3}, wall_ns_bins_le[10000,100000,1000000,10000000,inf] {:?}, byte_bins_le[256,4096,65536,1048576,inf] {:?} (CPU-thread route wall time including blocking; not GPU time; bytes include padded tails; mode {})",
+                stats.api_wall.calls, stats.bytes, stats.api_wall.total_ns as f64 / 1e6, stats.api_wall.max_ns as f64 / 1e6, stats.api_wall.buckets, stats.byte_buckets, self.uploads.mode()));
+        }
+        let sources = &self.buffer_uploads;
+        log(&format!("buffer upload other calls/bytes: uniforms {}/{}, shader_consts {}/{}, uav_clear {}/{}, uav_counter {}/{}",
+            sources[UPLOAD_UNIFORMS].api_wall.calls, sources[UPLOAD_UNIFORMS].bytes,
+            sources[UPLOAD_SHADER_CONSTS].api_wall.calls, sources[UPLOAD_SHADER_CONSTS].bytes,
+            sources[UPLOAD_UAV_CLEAR].api_wall.calls, sources[UPLOAD_UAV_CLEAR].bytes,
+            sources[UPLOAD_UAV_COUNTER].api_wall.calls, sources[UPLOAD_UAV_COUNTER].bytes));
+        let indirect = &self.indirect_reads;
+        log(&format!("indirect fallback timing: attempts {}, poll_calls {}, successful_reads {}, poll_errors {}, map_errors {}, wait_wall_ms {:.3}, wait_wall_max_ms {:.3}, wall_ns_bins_le[10000,100000,1000000,10000000,inf] {:?} (CPU-thread poll plus callback-result check wall time; not GPU time)",
+            indirect.attempts, indirect.wait_wall.calls, indirect.successes, indirect.poll_errors, indirect.map_errors,
+            indirect.wait_wall.total_ns as f64 / 1e6, indirect.wait_wall.max_ns as f64 / 1e6, indirect.wait_wall.buckets));
+        log(&format!("buffer upload pool: {}", self.uploads.metrics(seconds)));
+        let t = &self.thread_wall;
+        log(&format!("gpu thread timing: {}", serde_json::json!({"schema": 1, "mode": self.uploads.mode(), "interval_s": seconds,
+            "segments": {"uniform_slot_wait": t[THREAD_UNIFORM_WAIT].metrics(), "guest_completion_wait": t[THREAD_GUEST_WAIT].metrics(),
+                "readback_processing": t[THREAD_MAP_PROCESS].metrics(), "query_event_poll": t[THREAD_QUERY_POLL].metrics(),
+                "producer_idle_wait": t[THREAD_PRODUCER_IDLE].metrics(), "suspended_gpu_wait": t[THREAD_SUSPEND_WAIT].metrics(),
+                "suspended_sleep": t[THREAD_SUSPEND_SLEEP].metrics(), "world_publication": t[THREAD_WORLD_PUBLICATION].metrics(),
+                "pipeline_collection": t[THREAD_PIPELINE_COLLECTION].metrics()},
+            "inclusive": {"command_replay": t[THREAD_REPLAY].metrics(), "present_before_slot_wait": t[THREAD_PRESENT_BEFORE_WAIT].metrics()},
+            "timing_scope": "CPU-thread wall including waits/callbacks; not GPU execution time. Inclusive parent spans contain child/manager segments and must not be summed. Replay/slot spans crossing a ten-second report finish in the following interval."})));
     }
     fn log_stats(&self) {
         log(&format!("stats: draws {} (skipped {}), presents {}, objects {}, pipelines {}", self.draws, self.skipped, self.presents, self.objs.iter().filter(|o| o.is_some()).count(), self.pipelines.len()));
@@ -3011,4 +3683,118 @@ fn error_chain(e: &dyn std::error::Error) -> String {
         cur = c.source();
     }
     s
+}
+
+#[cfg(test)]
+mod readback_bound_tests {
+    use super::bounded_readback_rows;
+
+    const ADDR: u64 = 0x1_0000;
+    const MEMORY: u64 = 0x10_0000;
+    fn rows(count: u64, pitch: u64, bytes: u64) -> Vec<(u64, u64, u64)> {
+        (0..count).map(|row| (row * 256, ADDR + row * pitch, bytes)).collect()
+    }
+    fn end(rows: &[(u64, u64, u64)]) -> u64 { rows.iter().map(|(_, to, n)| to + n).max().unwrap_or(ADDR) }
+
+    #[test]
+    fn matching_layout_is_untouched() {
+        // 4x4 RGBA8: four 16-byte rows into a 64-byte destination.
+        let wanted = rows(4, 16, 16);
+        assert_eq!(bounded_readback_rows(wanted.clone(), ADDR, 64, MEMORY), (wanted, 0));
+        assert_eq!(bounded_readback_rows(vec![(0, ADDR, 100)], ADDR, 100, MEMORY), (vec![(0, ADDR, 100)], 0));
+    }
+
+    #[test]
+    fn decoded_rgba_rows_never_pass_a_bc_sized_destination() {
+        // 64x64 BC1 in the guest: 16 block rows of 128 bytes = 2048 bytes.
+        // The same texture decoded on the host: 64 rows of 256 bytes.
+        let (kept, withheld) = bounded_readback_rows(rows(64, 128, 256), ADDR, 2048, MEMORY);
+        assert_eq!(kept.len(), 16);
+        assert_eq!(end(&kept), ADDR + 2048);
+        assert_eq!(kept[15], (15 * 256, ADDR + 15 * 128, 128));
+        assert_eq!(kept.iter().map(|row| row.2).sum::<u64>() + withheld, 64 * 256);
+    }
+
+    #[test]
+    fn oversized_box_zero_size_and_memory_end_are_bounded() {
+        assert_eq!(bounded_readback_rows(vec![(0, ADDR, 4096)], ADDR, 1024, MEMORY), (vec![(0, ADDR, 1024)], 3072));
+        assert_eq!(bounded_readback_rows(rows(4, 16, 16), ADDR, 0, MEMORY), (vec![], 64));
+        let (kept, withheld) = bounded_readback_rows(vec![(0, MEMORY - 8, 64)], MEMORY - 8, 64, MEMORY);
+        assert_eq!((kept, withheld), (vec![(0, MEMORY - 8, 8)], 56));
+        assert_eq!(bounded_readback_rows(vec![(0, MEMORY + 8, 64)], MEMORY + 8, 64, MEMORY), (vec![], 64));
+        assert_eq!(bounded_readback_rows(vec![(0, u64::MAX - 4, 64)], u64::MAX - 4, u64::MAX, MEMORY), (vec![], 64));
+        assert_eq!(bounded_readback_rows(vec![(0, ADDR - 16, 64)], ADDR, 64, MEMORY), (vec![], 64));
+    }
+}
+
+#[cfg(test)]
+mod query_life_tests {
+    use super::*;
+
+    const RECORD: u64 = 64;
+    fn memory() -> SharedMemory {
+        let mut config = wasmtime::Config::new(); config.wasm_threads(true); config.shared_memory(true);
+        let engine = wasmtime::Engine::new(&config).unwrap();
+        let memory = SharedMemory::new(&engine, wasmtime::MemoryType::shared(1, 1)).unwrap();
+        assert!(crate::write_bytes(&memory, RECORD - 16, &[0xa5; 48]));
+        memory
+    }
+    fn record(memory: &SharedMemory) -> Vec<u8> { crate::read_bytes(memory, RECORD - 16, 48) }
+
+    #[test]
+    fn completion_writes_sequence_and_result_only() {
+        let memory = memory();
+        let life = QueryLife::new(RECORD);
+        assert!(life.is_live() && life.complete(&memory, 0x1122_3344_5566_7788, 9));
+        let mut wanted = vec![0xa5u8; 48];
+        wanted[16..20].copy_from_slice(&9u32.to_le_bytes());
+        wanted[24..32].copy_from_slice(&0x1122_3344_5566_7788u64.to_le_bytes());
+        assert_eq!(record(&memory), wanted, "bytes 4..8 of the record and both neighbours stay untouched");
+    }
+
+    #[test]
+    fn retired_life_does_not_write_and_dropping_the_query_retires_it() {
+        let memory = memory();
+        let query = QueryObj { qtype: 1, life: QueryLife::new(RECORD), slots: vec![] };
+        let life = query.life.clone();
+        drop(query);
+        assert!(!life.is_live() && !life.complete(&memory, 1, 1));
+        assert_eq!(record(&memory), vec![0xa5u8; 48]);
+        let other = QueryLife::new(RECORD);
+        other.retire();
+        other.retire();
+        assert!(!other.complete(&memory, 1, 1));
+        assert_eq!(record(&memory), vec![0xa5u8; 48]);
+    }
+
+    #[test]
+    fn retire_excludes_a_completion_running_on_another_thread() {
+        let memory = memory();
+        let life = QueryLife::new(RECORD);
+        let stop = Arc::new(AtomicBool::new(false));
+        let writer = {
+            let (memory, life, stop) = (memory.clone(), life.clone(), stop.clone());
+            std::thread::spawn(move || {
+                let mut n = 1u64;
+                // The same n goes into the result and the sequence word.
+                while !stop.load(Ordering::Relaxed) { life.complete(&memory, n, n as u32); n += 1; }
+            })
+        };
+        while crate::read_u32(&memory, RECORD).is_none_or(|sequence| sequence < 1000 || sequence == 0xa5a5_a5a5) { std::thread::yield_now(); }
+        life.retire();
+        // From here the writer keeps calling complete(); nothing may change again.
+        let frozen = record(&memory);
+        for _ in 0..2000 {
+            std::thread::yield_now();
+            assert_eq!(record(&memory), frozen, "a completion wrote after retire() returned");
+        }
+        stop.store(true, Ordering::Relaxed);
+        writer.join().unwrap();
+        assert_eq!(record(&memory), frozen);
+        // The last completion finished as a whole: both words come from one n.
+        let sequence = u32::from_le_bytes(frozen[16..20].try_into().unwrap());
+        let result = u64::from_le_bytes(frozen[24..32].try_into().unwrap());
+        assert_eq!(result as u32, sequence);
+        assert!(result >= 1000);
+    }
 }

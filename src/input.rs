@@ -24,7 +24,8 @@ const TAIL: u64 = 9;
 fn base() -> Option<*mut u8> {
     let b = BLOCK.load(Ordering::Acquire);
     if b == 0 { return None; }
-    let (p, _) = crate::mem_base_len(&RT.get()?.mem);
+    let (p, length) = crate::mem_base_len(&RT.get()?.mem);
+    if b & 3 != 0 || b.checked_add(444)? > length as u64 { return None; }
     Some(unsafe { p.add(b as usize) })
 }
 fn word(i: u64) -> Option<&'static AtomicI32> {
@@ -38,6 +39,14 @@ fn key_byte(vk: u8) -> Option<&'static AtomicU8> {
 }
 
 pub fn publish(block: u64) {
+    let valid = RT.get().is_some_and(|runtime| block != 0 && block & 3 == 0
+        && block.checked_add(444).is_some_and(|end| end <= runtime.mem.data_size() as u64));
+    if !valid {
+        eprintln!("[input] invalid engine input block 0x{block:x}");
+        #[cfg(target_os = "visionos")]
+        crate::native::report_error(format!("engine published invalid input block 0x{block:x}"));
+        return;
+    }
     BLOCK.store(block, Ordering::Release);
     let (w, h) = *SIZE.lock().unwrap();
     if let Some(e) = ext(2) { e.store(w, Ordering::SeqCst); }
@@ -50,6 +59,8 @@ pub fn publish(block: u64) {
             unsafe { &*(p.add(440) as *const AtomicI32) }.store(m, Ordering::SeqCst);
         }
     }
+    #[cfg(target_os = "visionos")]
+    crate::native::refresh_input_state();
     eprintln!("[input] engine input block at 0x{block:x}");
 }
 

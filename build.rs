@@ -9,9 +9,13 @@ fn main() {
     if std::env::var("MUGUET_GAME_CODE").is_ok_and(|p| std::path::Path::new(&p).is_file()) {
         println!("cargo:rustc-cfg=game_code");
     }
-    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("ios") {
+    let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    if target_os == "visionos" {
+        // Static archives cannot set the final Swift executable segment protections.
+        // make-visionos.sh passes -Wl,-segprot,__GAME,rx,rx at the final link.
         return;
     }
+    if target_os != "ios" { return; }
     println!("cargo:rustc-link-arg-bins=-Wl,-segprot,__GAME,rx,rx");
 
     println!("cargo:rerun-if-changed=ios/Launcher.swift");
