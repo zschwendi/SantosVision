@@ -1,5 +1,6 @@
 import Combine
 import Foundation
+import GameController
 import Metal
 import OSLog
 import QuartzCore
@@ -104,6 +105,7 @@ final class NativeRuntimeModel: ObservableObject {
     @Published private(set) var frozenDepthHandoffEnabled = RenderingOptimizations.storedFrozenDepth
     @Published private(set) var drawSetupOverheadEnabled = RenderingOptimizations.storedDrawSetup
     @Published private(set) var windowSurfaceReady = false
+    @Published private(set) var controllerSummary = "Controller not connected"
     let windowGameMode: Bool
     let isLinked = NativeRuntime.isLinked
     let gameRoot: URL
@@ -202,7 +204,8 @@ final class NativeRuntimeModel: ObservableObject {
     }
 
     func start() async {
-        guard !isBusy, isLinked, probePassed, !hasStarted, isActive else { return }
+        guard !isBusy, isLinked, probePassed, !hasStarted, isActive,
+              !windowGameMode || windowSurfaceReady else { return }
         guard hasGameData else {
             status = "Game data is missing from this app’s game folder."
             recordReport()
@@ -485,6 +488,9 @@ final class NativeRuntimeModel: ObservableObject {
         }
         let nativeStatus = lastStatus?.payload.data(using: .utf8)
             .flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }
+        let controllers = GCController.controllers().filter { $0.extendedGamepad != nil }
+        let controllerNames = controllers.map { $0.vendorName ?? "Game controller" }
+        controllerSummary = controllerNames.first.map { "\($0) connected" } ?? "Controller not connected"
         // A historical completion is evidence, but the native publisher also
         // verifies a fresh ready frame and current lifecycle epoch.
         let currentWorldConnected = isActive && compositorOwnsHeadTracking && worldPresentation != nil
@@ -495,6 +501,7 @@ final class NativeRuntimeModel: ObservableObject {
             "native_runtime_linked": isLinked, "game_root": gameRoot.path,
             "presentation_mode": windowGameMode ? "window" : "immersive",
             "window_surface_ready": windowSurfaceReady,
+            "controllers": ["connected": !controllers.isEmpty, "names": controllerNames],
             "save_root": saveRoot.path, "has_game_data": hasGameData,
             "graphics_requested": graphicsSettings.reportValue,
             "graphics_config_path": graphicsConfigURL.path,

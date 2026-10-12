@@ -1,4 +1,5 @@
 import Darwin
+import GameController
 import QuartzCore
 import SwiftUI
 import UIKit
@@ -21,6 +22,12 @@ private final class GameMetalView: UIView {
         metalLayer.isOpaque = true
         metalLayer.contentsScale = 1
         metalLayer.framebufferOnly = true
+        // visionOS otherwise translates controller actions into window/pinch
+        // interactions instead of delivering them to the game's input poller.
+        let controllerEvents = GCEventInteraction()
+        controllerEvents.handledEventTypes = .gamepad
+        controllerEvents.receivesEventsInView = false
+        addInteraction(controllerEvents)
     }
     required init?(coder: NSCoder) { fatalError("GameMetalView uses programmatic initialization") }
 }
@@ -71,6 +78,7 @@ struct WindowGameView: View {
                 .overlay {
                     RoundedRectangle(cornerRadius: 18)
                         .stroke(SantosTheme.accent.opacity(0.45), lineWidth: 1)
+                        .allowsHitTesting(false)
                 }
                 .overlay {
                     if !runtime.hasStarted {
@@ -93,7 +101,7 @@ struct WindowGameView: View {
                 Circle().fill(runtime.hasStarted ? Color.green : SantosTheme.glow).frame(width: 6, height: 6)
                 Text(shortStatus).font(.caption).foregroundStyle(.secondary)
                 Spacer()
-                Label("Controller", systemImage: "gamecontroller").font(.caption).foregroundStyle(.secondary)
+                Label(runtime.controllerSummary, systemImage: "gamecontroller").font(.caption).foregroundStyle(.secondary)
             }
         }
         .padding(20)

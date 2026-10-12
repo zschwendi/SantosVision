@@ -28,3 +28,4 @@ targets:
       - sdk: CompositorServices.framework
       - sdk: ARKit.framework
       - sdk: Metal.framework
+      - sdk: GameController.framework
