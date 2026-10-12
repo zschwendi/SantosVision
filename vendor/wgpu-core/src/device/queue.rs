@@ -71,12 +71,7 @@ struct MetalTransitControl {
 impl MetalTransitControl {
     fn new(backend: wgt::Backend) -> Self {
         let is_metal = backend == wgt::Backend::Metal;
-        #[cfg(feature = "std")]
-        let enabled = is_metal
-            && std::env::var_os("MUGUET_METAL_SKIP_EMPTY_TRANSIT")
-                .as_deref() == Some(std::ffi::OsStr::new("1"));
-        #[cfg(not(feature = "std"))]
-        let enabled = false;
+        let enabled = is_metal && crate::rendering_overhead::metal_transit_requested();
         Self {
             is_metal, enabled,
             skipped: AtomicU64::new(0), retained: AtomicU64::new(0),
@@ -103,21 +98,25 @@ impl MetalTransitControl {
         }
     }
 
-    fn maybe_report(&self) {
+    /// Returns whether a summary was printed, so the per-pass pre-pass
+    /// summary can share this cadence.
+    fn maybe_report(&self) -> bool {
         #[cfg(feature = "std")]
         if self.is_metal {
             let now = self.epoch.elapsed().as_nanos().min(u64::MAX as u128) as u64;
             let last = self.last_report_ns.load(Ordering::Relaxed);
             // First successful public submit confirms the runtime option;
             // subsequent summaries have a minimum ten-second backend cadence.
-            if last != 0 && now.saturating_sub(last) < 10_000_000_000 { return; }
-            if self.last_report_ns.compare_exchange(last, now.max(1), Ordering::Relaxed, Ordering::Relaxed).is_err() { return; }
+            if last != 0 && now.saturating_sub(last) < 10_000_000_000 { return false; }
+            if self.last_report_ns.compare_exchange(last, now.max(1), Ordering::Relaxed, Ordering::Relaxed).is_err() { return false; }
             std::eprintln!("[wgpu] metal transit: {{\"schema\":1,\"enabled\":{},\"interval_s\":{:.6},\"transit_skipped_attempts\":{},\"transit_retained_attempts\":{},\"successful_hal_submissions\":{},\"hal_input_command_buffers\":{},\"scope\":\"core HAL input count; backend-added waits/signals excluded; not GPU time; preparation counters can include failed attempts\"}}",
                 self.enabled, now.saturating_sub(last) as f64 / 1e9,
                 self.skipped.swap(0, Ordering::Relaxed), self.retained.swap(0, Ordering::Relaxed),
                 self.successful_submissions.swap(0, Ordering::Relaxed),
                 self.hal_input_command_buffers.swap(0, Ordering::Relaxed));
+            return true;
         }
+        false
     }
 }
 
@@ -1687,7 +1686,9 @@ impl Queue {
         callbacks.fire();
 
         self.device.lose_if_oom();
-        self.metal_transit.maybe_report();
+        if self.metal_transit.maybe_report() {
+            self.device.metal_prepass.report();
+        }
         self.upload_pool.maybe_report();
 
         api_log!("Queue::submit returned submit index {submit_index}");

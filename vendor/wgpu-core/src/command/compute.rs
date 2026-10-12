@@ -927,6 +927,30 @@ pub(super) fn encode_compute_pass(
     // Stop the current command encoder.
     parent_state.raw_encoder.close().map_pass_err(pass_scope)?;
 
+    // Opt-in, Metal only: a compute pre-pass holds discard clears and barriers
+    // and nothing else. With no discarded surface to clear it would be empty,
+    // since Metal's barrier calls are, so only the tracker merge is kept. The
+    // pass's own command buffer is already last in the list and the hal
+    // encoder stays closed.
+    let skip_pre_pass = device.metal_prepass.decide(
+        true,
+        crate::device::metal_prepass::PrePassWork {
+            discard_fixups: !pending_discard_init_fixups.is_empty(),
+            query_resets: false,
+            indirect_validation: false,
+            indirect_batch_empty: true,
+        },
+    );
+    if skip_pre_pass {
+        CommandEncoder::merge_tracker_without_hal_barriers(
+            parent_state.tracker,
+            &intermediate_trackers,
+            parent_state.snatch_guard,
+        );
+
+        return Ok(());
+    }
+
     // Create a new command encoder, which we will insert _before_ the body of the compute pass.
     //
     // Use that buffer to insert barriers and clear discarded images.

@@ -281,7 +281,7 @@ private struct LauncherView: View {
             Toggle("Reduce rendering overhead (experimental)", isOn: Binding(
                 get: { runtime.drawSetupOverheadEnabled },
                 set: { runtime.setDrawSetupOverhead($0) }))
-            Text("Rendering overhead reductions preserve your graphics settings. Frame-copy reduction starts on; the experimental options start off. Choose before starting the game, then quit and reopen SantosVision to change these settings.")
+            Text("Rendering overhead reductions reuse unchanged setup work and avoid empty GPU work while preserving your graphics settings. Frame-copy reduction starts on; the experimental options start off. Choose before starting the game, then quit and reopen SantosVision to change these settings.")
                 .font(.caption).foregroundStyle(.secondary)
         }
         .disabled(!runtime.canChangeRenderingOptimizations)

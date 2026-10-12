@@ -75,6 +75,12 @@ impl QueryResetMap {
         }
     }
 
+    /// True when no query has been registered, so `reset_queries` would
+    /// issue nothing.
+    pub fn is_empty(&self) -> bool {
+        self.map.is_empty()
+    }
+
     pub fn use_query_set(&mut self, query_set: &Arc<QuerySet>, query: u32) -> bool {
         let vec_pair = self
             .map

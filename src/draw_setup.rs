@@ -1,4 +1,4 @@
-//! Pre-start app choice for five independent, default-off rendering experiments.
+//! Pre-start app choice for seven independent, default-off rendering experiments.
 //! The app calls the typed setter before runtime startup. Diagnostic environment
 //! values override each flag individually; no process environment is mutated.
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -11,6 +11,7 @@ const UNIFORM_SNAPSHOT_ENV: &str = "MUGUET_UNIFORM_SNAPSHOT_CACHE";
 pub(crate) const XR_EMISSION_ENV: &str = "MUGUET_XR_EMISSION_FASTPATH";
 
 pub(crate) fn set_app_requested(enabled: bool) {
+    wgpu::wgc::rendering_overhead::set_app_requested(enabled);
     APP_REQUESTED.store(enabled, Ordering::Release);
 }
 
@@ -67,6 +68,8 @@ pub(crate) fn status_json() -> serde_json::Value {
         "uniform_stage_pack": uniform_stage_pack_enabled(),
         "bind_group_prepare": bind_group_prepare_enabled(),
         "uniform_snapshot": uniform_snapshot_enabled(),
+        "metal_skip_empty_transit": wgpu::wgc::rendering_overhead::metal_transit_requested(),
+        "metal_skip_empty_prepass": wgpu::wgc::rendering_overhead::metal_prepass_requested(),
     })
 }
 
@@ -74,6 +77,19 @@ pub(crate) fn status_json() -> serde_json::Value {
 mod tests {
     use super::{flag_with, resolve, BIND_GROUP_PREPARE_ENV, RENDER_PREPARE_ENV,
                 UNIFORM_STAGE_PACK_ENV, UNIFORM_SNAPSHOT_ENV, XR_EMISSION_ENV};
+    use wgpu::wgc::rendering_overhead::{resolve_request, METAL_TRANSIT_ENVIRONMENT, METAL_PREPASS_ENVIRONMENT};
+
+    #[test]
+    fn metal_backend_resolution_matches_the_prestart_launcher_contract() {
+        for requested in [false, true] {
+            for value in [None, Some(""), Some("true"), Some("2"), Some("0"), Some("1"), Some(" 1"), Some("1 ")] {
+                assert_eq!(resolve_request(value, requested), resolve(value, requested));
+            }
+        }
+        assert!(!resolve_request(None, false));
+        assert_eq!(METAL_TRANSIT_ENVIRONMENT, "MUGUET_METAL_SKIP_EMPTY_TRANSIT");
+        assert_eq!(METAL_PREPASS_ENVIRONMENT, "MUGUET_METAL_SKIP_EMPTY_PREPASS");
+    }
 
     #[test]
     fn exact_environment_values_override_prestart_app_choice() {
@@ -104,8 +120,10 @@ mod tests {
         assert_eq!(RENDER_PREPARE_ENV, "MUGUET_RENDER_PREPARE_OPT");
         assert_eq!(UNIFORM_STAGE_PACK_ENV, "MUGUET_UNIFORM_STAGE_PACK_OPT");
         assert_eq!(BIND_GROUP_PREPARE_ENV, "MUGUET_BIND_GROUP_PREPARE_OPT");
-        for flag in [RENDER_PREPARE_ENV, UNIFORM_STAGE_PACK_ENV, BIND_GROUP_PREPARE_ENV, UNIFORM_SNAPSHOT_ENV, XR_EMISSION_ENV] {
-            for target in [RENDER_PREPARE_ENV, UNIFORM_STAGE_PACK_ENV, BIND_GROUP_PREPARE_ENV, UNIFORM_SNAPSHOT_ENV, XR_EMISSION_ENV] {
+        for flag in [RENDER_PREPARE_ENV, UNIFORM_STAGE_PACK_ENV, BIND_GROUP_PREPARE_ENV, UNIFORM_SNAPSHOT_ENV, XR_EMISSION_ENV,
+                     METAL_TRANSIT_ENVIRONMENT, METAL_PREPASS_ENVIRONMENT] {
+            for target in [RENDER_PREPARE_ENV, UNIFORM_STAGE_PACK_ENV, BIND_GROUP_PREPARE_ENV, UNIFORM_SNAPSHOT_ENV, XR_EMISSION_ENV,
+                           METAL_TRANSIT_ENVIRONMENT, METAL_PREPASS_ENVIRONMENT, "MUGUET_OP47_UPLOAD_DEDUP", "MUGUET_BUFFER_UPLOAD_MODE"] {
                 assert_eq!(flag_with(flag, false, |name| (name == target).then(|| "1".into())),
                            flag == target);
                 assert_eq!(flag_with(flag, true, |name| (name == target).then(|| "0".into())),

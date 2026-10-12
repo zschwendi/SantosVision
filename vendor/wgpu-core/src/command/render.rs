@@ -2720,6 +2720,34 @@ pub(super) fn encode_render_pass(
     let encoder = &mut parent_state.raw_encoder;
     let tracker = &mut parent_state.tracker;
 
+    // Opt-in, Metal only: when nothing below would encode anything, do not
+    // create the pre-pass command buffer at all. With no discarded surface to
+    // clear, no query to reset and no indirect draw batched for validation
+    // (`inject_validation_pass` returns at once on an empty batch), the
+    // block's only remaining effect is the tracker merge, and Metal's barrier
+    // calls are empty. The pass's own command buffer was pushed by `close()`
+    // above and is already last in the list, so there is nothing to swap and
+    // the hal encoder stays closed. Every other case takes the block as is.
+    let skip_pre_pass = device.metal_prepass.decide(
+        false,
+        crate::device::metal_prepass::PrePassWork {
+            discard_fixups: !pending_discard_init_fixups.is_empty(),
+            query_resets: !pending_query_resets.is_empty(),
+            indirect_validation: device.indirect_validation.is_some(),
+            indirect_batch_empty: indirect_draw_validation_batcher.is_empty(),
+        },
+    );
+
+    if skip_pre_pass {
+        CommandEncoder::merge_scope_without_hal_barriers(
+            tracker,
+            &scope,
+            parent_state.snatch_guard,
+        );
+
+        return Ok(());
+    }
+
     {
         let transit = encoder
             .open_pass(hal_label(

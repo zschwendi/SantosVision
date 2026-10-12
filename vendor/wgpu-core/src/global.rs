@@ -8,10 +8,30 @@ use crate::{
     resource_log,
 };
 
+/// Cumulative decisions of the opt-in Metal empty Pre Pass skip, summed over
+/// this instance's devices. One skipped decision is one HAL command buffer
+/// that was not created. Command-buffer counts, not GPU time.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MetalPrePassReport {
+    /// Some Metal device of this instance has the switch on.
+    pub enabled: bool,
+    pub render_skipped: u64,
+    pub compute_skipped: u64,
+    pub retained_disabled: u64,
+    pub retained_discard_fixups: u64,
+    pub retained_query_resets: u64,
+    /// Passes that batched an indirect draw on a device that validates them.
+    pub retained_indirect_validation: u64,
+    /// Of `render_skipped`, passes on a device that validates indirect draws
+    /// which batched none.
+    pub render_skipped_empty_indirect_batch: u64,
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub struct GlobalReport {
     pub surfaces: RegistryReport,
     pub hub: HubReport,
+    pub metal_prepass: MetalPrePassReport,
 }
 
 impl GlobalReport {
@@ -77,9 +97,14 @@ impl Global {
     }
 
     pub fn generate_report(&self) -> GlobalReport {
+        let mut metal_prepass = MetalPrePassReport::default();
+        for (_, device) in self.hub.devices.read().iter() {
+            device.metal_prepass.add_to(&mut metal_prepass);
+        }
         GlobalReport {
             surfaces: self.surfaces.generate_report(),
             hub: self.hub.generate_report(),
+            metal_prepass,
         }
     }
 }

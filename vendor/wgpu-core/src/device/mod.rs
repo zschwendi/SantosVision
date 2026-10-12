@@ -23,6 +23,7 @@ use wgt::{
 pub(crate) mod bgl;
 pub mod global;
 mod life;
+pub(crate) mod metal_prepass;
 pub mod queue;
 pub mod ray_tracing;
 pub mod resource;

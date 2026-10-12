@@ -30,6 +30,8 @@ mod server;
 #[cfg(target_os = "ios")]
 mod touch;
 mod upload_dedup;
+#[cfg(all(test, target_os = "macos"))]
+mod metal_prepass_tests;
 
 #[cfg(all(target_os = "visionos", feature = "jit"))]
 compile_error!("visionOS must use --no-default-features and an embedded signed AOT module");
