@@ -16,12 +16,18 @@ struct SantosVisionApp: App {
 
     var body: some Scene {
         WindowGroup {
-            LauncherView(model: model, runtime: runtime)
             #if SV_GAME_RUNTIME
+            if runtime.windowGameMode {
+                WindowGameView(runtime: runtime)
+            } else {
+            LauncherView(model: model, runtime: runtime)
                 .environmentObject(world)
+            }
+            #else
+            LauncherView(model: model, runtime: runtime)
             #endif
         }
-        .defaultSize(width: 650, height: 720)
+        .defaultSize(width: 1000, height: 680)
         .onChange(of: scenePhase, initial: true) { _, phase in
             runtime.setActive(phase == .active)
             #if SV_GAME_RUNTIME

@@ -2,6 +2,7 @@ import Combine
 import Foundation
 import Metal
 import OSLog
+import QuartzCore
 
 private let runtimeLog = Logger(subsystem: "com.zephyrstudios.santosvision", category: "NativeRuntime")
 
@@ -102,6 +103,8 @@ final class NativeRuntimeModel: ObservableObject {
     @Published private(set) var adaptiveRenderingEnabled = RenderingOptimizations.storedAdaptive
     @Published private(set) var frozenDepthHandoffEnabled = RenderingOptimizations.storedFrozenDepth
     @Published private(set) var drawSetupOverheadEnabled = RenderingOptimizations.storedDrawSetup
+    @Published private(set) var windowSurfaceReady = false
+    let windowGameMode: Bool
     let isLinked = NativeRuntime.isLinked
     let gameRoot: URL
     let saveRoot: URL
@@ -131,6 +134,7 @@ final class NativeRuntimeModel: ObservableObject {
     var canChangeRenderingOptimizations: Bool { isLinked && !startupAttempted && !hasStarted && !isBusy }
 
     init(arguments: [String] = ProcessInfo.processInfo.arguments) {
+        windowGameMode = !arguments.contains("--sv-open-game") && !arguments.contains("--sv-open-tracking")
         let documents = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
         func value(_ flag: String) -> String? {
             guard let index = arguments.firstIndex(of: flag), index + 1 < arguments.count else { return nil }
@@ -157,6 +161,22 @@ final class NativeRuntimeModel: ObservableObject {
     var hasGameData: Bool {
         FileManager.default.fileExists(atPath: gameRoot.appendingPathComponent("data/manifest.json").path)
             && FileManager.default.fileExists(atPath: gameRoot.appendingPathComponent("b").path)
+    }
+
+    func attachWindowLayer(_ layer: CAMetalLayer) -> Bool {
+        guard windowGameMode, !windowSurfaceReady, !startupAttempted else { return false }
+        #if SV_GAME_RUNTIME
+        let code = sv_runtime_set_window_layer(Unmanaged.passUnretained(layer).toOpaque())
+        guard code == 0 else {
+            status = "The game window could not start (\(code)). Quit and reopen to retry."
+            recordReport()
+            return false
+        }
+        windowSurfaceReady = true
+        return true
+        #else
+        return false
+        #endif
     }
 
     func bootstrap() async {
@@ -309,6 +329,13 @@ final class NativeRuntimeModel: ObservableObject {
 
     func resumeHeadTracking() {
         guard isActive else { return }
+        guard !windowGameMode else {
+            suspendHeadTracking()
+            #if SV_GAME_RUNTIME
+            _ = sv_xr_world_camera_set_enabled(0)
+            #endif
+            return
+        }
         XRHeadTracking.shared.resume()
         guard !compositorOwnsHeadTracking, hasStarted, simulatedPoseTask == nil,
               let fixture = SimulatorPoseFixture.shared else { return }
@@ -466,6 +493,8 @@ final class NativeRuntimeModel: ObservableObject {
             "schema": 1, "timestamp": ISO8601DateFormatter().string(from: Date()),
             "report_system_uptime_seconds": ProcessInfo.processInfo.systemUptime,
             "native_runtime_linked": isLinked, "game_root": gameRoot.path,
+            "presentation_mode": windowGameMode ? "window" : "immersive",
+            "window_surface_ready": windowSurfaceReady,
             "save_root": saveRoot.path, "has_game_data": hasGameData,
             "graphics_requested": graphicsSettings.reportValue,
             "graphics_config_path": graphicsConfigURL.path,
@@ -488,7 +517,7 @@ final class NativeRuntimeModel: ObservableObject {
                 "metal_skip_empty_prepass": RenderingOptimizations.metalSkipEmptyPrepassEnabled
             ],
             "probe": payload(lastProbe), "start": payload(lastStart), "status": payload(lastStatus),
-            "head_pose_source": SimulatorPoseFixture.shared == nil ? "ARKit" : "simulator_fixture",
+            "head_pose_source": windowGameMode ? "disabled_in_window" : (SimulatorPoseFixture.shared == nil ? "ARKit" : "simulator_fixture"),
             "simulator_pose_fixture": SimulatorPoseFixture.shared?.reportValue ?? [:],
             "capture_request_return_code": captureReturnCode.map { $0 as Any } ?? NSNull(),
             "capture_requests": captureRequests,
