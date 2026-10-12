@@ -4,6 +4,7 @@ import GameController
 import Metal
 import OSLog
 import QuartzCore
+import UIKit
 
 private let runtimeLog = Logger(subsystem: "com.zephyrstudios.santosvision", category: "NativeRuntime")
 
@@ -501,6 +502,8 @@ final class NativeRuntimeModel: ObservableObject {
             "native_runtime_linked": isLinked, "game_root": gameRoot.path,
             "presentation_mode": windowGameMode ? "window" : "immersive",
             "window_surface_ready": windowSurfaceReady,
+            "window_scene_policy": "single_instance_main",
+            "connected_window_scene_count": UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.count,
             "controllers": ["connected": !controllers.isEmpty, "names": controllerNames],
             "save_root": saveRoot.path, "has_game_data": hasGameData,
             "graphics_requested": graphicsSettings.reportValue,

@@ -8,6 +8,7 @@ import SwiftUI
 struct SantosVisionApp: App {
     @StateObject private var model = DiagnosticModel()
     @StateObject private var runtime = NativeRuntimeModel()
+    @StateObject private var windowSurface = WindowGameSurface()
     #if SV_GAME_RUNTIME
     @StateObject private var world = GameWorldModel()
     #endif
@@ -15,10 +16,10 @@ struct SantosVisionApp: App {
     @Environment(\.dismissImmersiveSpace) private var dismissImmersiveSpace
 
     var body: some Scene {
-        WindowGroup {
+        Window("SantosVision", id: "main") {
             #if SV_GAME_RUNTIME
             if runtime.windowGameMode {
-                WindowGameView(runtime: runtime)
+                WindowGameView(runtime: runtime, surface: windowSurface)
             } else {
             LauncherView(model: model, runtime: runtime)
                 .environmentObject(world)
@@ -28,6 +29,7 @@ struct SantosVisionApp: App {
             #endif
         }
         .defaultSize(width: 1000, height: 680)
+        .restorationBehavior(.disabled)
         .onChange(of: scenePhase, initial: true) { _, phase in
             runtime.setActive(phase == .active)
             #if SV_GAME_RUNTIME

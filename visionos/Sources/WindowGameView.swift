@@ -32,23 +32,34 @@ private final class GameMetalView: UIView {
     required init?(coder: NSCoder) { fatalError("GameMetalView uses programmatic initialization") }
 }
 
+/// The app, rather than a window's view tree, owns this single drawable. Closing
+/// and reopening the window reattaches the same layer to the one-shot runtime.
+@MainActor
+final class WindowGameSurface: ObservableObject {
+    let view: UIView = GameMetalView(frame: .zero)
+    var metalLayer: CAMetalLayer { view.layer as! CAMetalLayer }
+}
+
 private struct GameCanvas: UIViewRepresentable {
     let runtime: NativeRuntimeModel
+    let surface: WindowGameSurface
     func makeUIView(context: Context) -> UIView {
-        let view = GameMetalView(frame: .zero)
         // Defer observable-state changes until SwiftUI finishes constructing
         // this view. Attachment still completes before any engine startup.
         Task { @MainActor in
-            guard runtime.attachWindowLayer(view.metalLayer) else { return }
+            if !runtime.windowSurfaceReady {
+                guard runtime.attachWindowLayer(surface.metalLayer) else { return }
+            }
             await runtime.bootstrap()
         }
-        return view
+        return surface.view
     }
     func updateUIView(_ view: UIView, context: Context) {}
 }
 
 struct WindowGameView: View {
     @ObservedObject var runtime: NativeRuntimeModel
+    @ObservedObject var surface: WindowGameSurface
     @State private var showingSettings = false
 
     private var shortStatus: String {
@@ -59,7 +70,50 @@ struct WindowGameView: View {
     }
 
     var body: some View {
-        VStack(spacing: 16) {
+        ZStack {
+            // Keep this view mounted across launcher/play transitions. The
+            // native renderer continues to own this exact CAMetalLayer.
+            GameCanvas(runtime: runtime, surface: surface)
+                .aspectRatio(16 / 9, contentMode: .fit)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .ignoresSafeArea()
+            if !runtime.startupAttempted {
+                launcher
+            } else if !runtime.hasStarted || runtime.engineFailed {
+                VStack(spacing: 16) {
+                    if runtime.isBusy { ProgressView() }
+                    Text(runtime.engineFailed ? "Game stopped" : (runtime.isBusy ? "Starting Los Santos…" : "Game could not start"))
+                        .font(.title2)
+                    Text(runtime.status).font(.caption).foregroundStyle(.secondary)
+                    if !runtime.isBusy {
+                        Button("Quit game", systemImage: "power", role: .destructive) { quitGame() }
+                    }
+                }
+                .padding(28)
+                .glassBackgroundEffect()
+            }
+        }
+        .frame(minWidth: 640, minHeight: 360)
+        .background(.black)
+        .background(GameWindowGeometry(isGameplay: runtime.startupAttempted))
+        .preferredColorScheme(.dark)
+        .tint(SantosTheme.accent)
+        .ornament(visibility: runtime.startupAttempted ? .visible : .hidden,
+                  attachmentAnchor: .scene(.bottom), contentAlignment: .top) {
+            HStack(spacing: 18) {
+                Button("Settings", systemImage: "gearshape") { showingSettings = true }
+                Button("Quit game", systemImage: "power", role: .destructive) { quitGame() }
+            }
+            .padding(.horizontal, 18)
+            .padding(.vertical, 12)
+            .glassBackgroundEffect()
+            .padding(.top, 12)
+        }
+        .sheet(isPresented: $showingSettings) { settings }
+    }
+
+    private var launcher: some View {
+        VStack(spacing: 24) {
             HStack(spacing: 12) {
                 Image(systemName: "sparkles").foregroundStyle(SantosTheme.glow)
                 Text("SantosVision").font(.title3.bold())
@@ -72,31 +126,23 @@ struct WindowGameView: View {
                     quitGame()
                 }
             }
-            GameCanvas(runtime: runtime)
-                .aspectRatio(16 / 9, contentMode: .fit)
-                .clipShape(RoundedRectangle(cornerRadius: 18))
-                .overlay {
-                    RoundedRectangle(cornerRadius: 18)
-                        .stroke(SantosTheme.accent.opacity(0.45), lineWidth: 1)
-                        .allowsHitTesting(false)
+            VStack(spacing: 18) {
+                Image(systemName: "building.2.crop.circle")
+                    .font(.system(size: 58, weight: .light))
+                    .foregroundStyle(SantosTheme.glow)
+                Text("Los Santos").font(.largeTitle.weight(.semibold))
+                Text("GTA V").font(.headline).foregroundStyle(.secondary)
+                if runtime.isBusy {
+                    ProgressView()
+                } else {
+                    Button("Play", systemImage: "play.fill") { Task { await runtime.start() } }
+                        .buttonStyle(.borderedProminent)
+                        .disabled(!runtime.probePassed || !runtime.hasGameData || !runtime.windowSurfaceReady)
                 }
-                .overlay {
-                    if !runtime.hasStarted {
-                        VStack(spacing: 16) {
-                            Text("Los Santos").font(.largeTitle.weight(.semibold))
-                            if runtime.isBusy {
-                                ProgressView()
-                            } else {
-                                Button("Play", systemImage: "play.fill") {
-                                    Task { await runtime.start() }
-                                }
-                                .buttonStyle(.borderedProminent)
-                                .disabled(!runtime.probePassed || !runtime.hasGameData || !runtime.windowSurfaceReady)
-                            }
-                            Text(shortStatus).font(.subheadline).foregroundStyle(.secondary)
-                        }
-                    }
-                }
+                Text(shortStatus).font(.subheadline).foregroundStyle(.secondary)
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .background(SantosTheme.surface.opacity(0.45), in: RoundedRectangle(cornerRadius: 22))
             HStack {
                 Circle().fill(runtime.hasStarted ? Color.green : SantosTheme.glow).frame(width: 6, height: 6)
                 Text(shortStatus).font(.caption).foregroundStyle(.secondary)
@@ -104,11 +150,8 @@ struct WindowGameView: View {
                 Label(runtime.controllerSummary, systemImage: "gamecontroller").font(.caption).foregroundStyle(.secondary)
             }
         }
-        .padding(20)
+        .padding(28)
         .background(SantosTheme.background)
-        .preferredColorScheme(.dark)
-        .tint(SantosTheme.accent)
-        .sheet(isPresented: $showingSettings) { settings }
     }
 
     private var settings: some View {
@@ -160,5 +203,49 @@ struct WindowGameView: View {
         // The engine has process-wide Wasm/GPU threads and one-shot runtime
         // state. Exiting guarantees all threads/audio stop; reopening is fresh.
         Darwin.exit(EXIT_SUCCESS)
+    }
+}
+
+/// Match Dark Eco's uniform game-window resizing while keeping the launcher
+/// freeform. This changes window geometry, never the renderer's drawable size.
+private struct GameWindowGeometry: UIViewRepresentable {
+    let isGameplay: Bool
+    func makeUIView(context: Context) -> GameWindowGeometryHost {
+        let view = GameWindowGeometryHost()
+        view.update(isGameplay)
+        return view
+    }
+    func updateUIView(_ view: GameWindowGeometryHost, context: Context) { view.update(isGameplay) }
+}
+
+private final class GameWindowGeometryHost: UIView {
+    private var isGameplay = false
+    private weak var appliedScene: UIWindowScene?
+    private var appliedGameplay: Bool?
+
+    init() {
+        super.init(frame: .zero)
+        isUserInteractionEnabled = false
+    }
+    required init?(coder: NSCoder) { fatalError("GameWindowGeometryHost uses programmatic initialization") }
+    override func didMoveToWindow() {
+        super.didMoveToWindow()
+        applyPolicy()
+    }
+    func update(_ isGameplay: Bool) {
+        self.isGameplay = isGameplay
+        applyPolicy()
+    }
+    private func applyPolicy() {
+        guard let window, let scene = window.windowScene,
+              scene !== appliedScene || appliedGameplay != isGameplay else { return }
+        let bounds = window.bounds.size
+        guard bounds.width > 0, bounds.height > 0 else { return }
+        let size: CGSize? = isGameplay ? CGSize(width: bounds.width, height: bounds.width * 9 / 16) : nil
+        appliedScene = scene
+        appliedGameplay = isGameplay
+        scene.requestGeometryUpdate(.Vision(size: size, resizingRestrictions: isGameplay ? .uniform : .freeform)) { error in
+            NSLog("SantosVision window geometry: %@", error.localizedDescription)
+        }
     }
 }
