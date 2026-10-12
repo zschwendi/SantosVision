@@ -310,9 +310,11 @@ static EMISSION_TOKEN_EXHAUSTED: AtomicBool = AtomicBool::new(false);
 static EMISSION_FAST_ENABLED: LazyLock<bool> = LazyLock::new(||
     std::env::var("MUGUET_XR_EMISSION_FASTPATH").as_deref() == Ok("1"));
 
+fn next_token_value(value: u64) -> Option<u64> { value.checked_add(1) }
+
 fn next_emission_token() -> u64 {
     if EMISSION_TOKEN_EXHAUSTED.load(Ordering::Acquire) { return 0; }
-    match NEXT_EMISSION_TOKEN.fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| value.checked_add(1)) {
+    match NEXT_EMISSION_TOKEN.fetch_update(Ordering::AcqRel, Ordering::Acquire, next_token_value) {
         Ok(token) => token,
         Err(_) => { EMISSION_TOKEN_EXHAUSTED.store(true, Ordering::Release); 0 }
     }
@@ -798,7 +800,9 @@ pub fn current_view(caller: &mut Caller<'_, HostState>, viewport: u64, _set_wind
         let epoch = EPOCH.load(Ordering::Acquire);
         if thread.epoch != epoch { *thread = RenderThread { epoch, ..Default::default() }; }
         thread.current = view;
-        thread.emission_token = if view.is_some() && *EMISSION_FAST_ENABLED { next_emission_token() } else { 0 };
+        if *EMISSION_FAST_ENABLED {
+            thread.emission_token = if view.is_some() { next_emission_token() } else { 0 };
+        }
     });
     Ok(())
 }
@@ -809,6 +813,20 @@ pub fn gpu_command(_caller: &mut Caller<'_, HostState>, command: u64) -> Result<
     if !TRACE_ENABLED.load(Ordering::Acquire) { return Ok(()); }
     let mem = &RT.get().context("missing runtime")?.mem;
     let Some(opcode) = read_u32(mem, command) else { return Ok(()); };
+    if !*EMISSION_FAST_ENABLED {
+        // Preserve the flag-off path's original lock/TLS/record publication
+        // ordering exactly, including its epoch and current-view filtering.
+        let mut state = lock_world_state();
+        RENDER_THREAD.with(|thread| {
+            let mut thread = thread.borrow_mut();
+            let epoch = EPOCH.load(Ordering::Acquire);
+            if thread.epoch != epoch { *thread = RenderThread { epoch, ..Default::default() }; }
+            let current = thread.current.filter(|view| !view.headset_applied || view_epoch_is_active(view.provenance_epoch));
+            record_emission(&mut state, command, opcode, current);
+            MARKER_COUNT.store(state.markers.len() as u64, Ordering::Release);
+        });
+        return Ok(());
+    }
     // wasm_gpu::Emit serializes producers while this callback runs. The token
     // comparison therefore observes the immediately preceding emitted command.
     // Draws/presents and every binding transition still use the legacy mutex.
@@ -820,7 +838,7 @@ pub fn gpu_command(_caller: &mut Caller<'_, HostState>, command: u64) -> Result<
         let token = if current.is_some() { thread.emission_token } else { 0 };
         (current, token, thread.epoch)
     });
-    if *EMISSION_FAST_ENABLED && !EMISSION_TOKEN_EXHAUSTED.load(Ordering::Acquire)
+    if !EMISSION_TOKEN_EXHAUSTED.load(Ordering::Acquire)
         && thread_epoch == EPOCH.load(Ordering::Acquire)
         && can_skip_emission(opcode, token, LAST_EMITTED_TOKEN.load(Ordering::Acquire))
         && current.is_some_and(|view| !view.headset_applied || view_epoch_is_active(view.provenance_epoch)) {
@@ -828,8 +846,7 @@ pub fn gpu_command(_caller: &mut Caller<'_, HostState>, command: u64) -> Result<
         return Ok(());
     }
     let mut state = lock_world_state();
-    let epoch = EPOCH.load(Ordering::Acquire);
-    let current = current.filter(|view| !view.headset_applied || view.provenance_epoch == epoch);
+    let current = current.filter(|view| !view.headset_applied || view_epoch_is_active(view.provenance_epoch));
     let token = if current.is_some() { token } else { 0 };
     record_emission(&mut state, command, opcode, current);
     LAST_EMITTED_TOKEN.store(token_after_slow_emission(&state, current, token), Ordering::Release);
@@ -1280,6 +1297,28 @@ mod tests {
         assert!(!can_skip_emission(7, 4, 4));
         assert!(!can_skip_emission(26, 5, 4));
         assert!(can_skip_emission(26, 4, 4));
+    }
+    #[test]
+    fn emission_token_allocator_never_reuses_a_token_or_wraps_to_zero() {
+        let next = AtomicU64::new(1);
+        let mut issued = std::collections::BTreeSet::new();
+        for _ in 0..4096 {
+            let token = next.fetch_update(Ordering::AcqRel, Ordering::Acquire, next_token_value)
+                .expect("token space remains");
+            assert_ne!(token, 0);
+            assert!(issued.insert(token), "binding token reused");
+        }
+        assert_eq!(issued.len(), 4096);
+        let last_allocatable = u64::MAX - 1;
+        next.store(last_allocatable, Ordering::Release);
+        assert_eq!(next.fetch_update(Ordering::AcqRel, Ordering::Acquire, next_token_value), Ok(last_allocatable));
+        assert_eq!(next.load(Ordering::Acquire), u64::MAX);
+        assert_eq!(next.fetch_update(Ordering::AcqRel, Ordering::Acquire, next_token_value), Err(u64::MAX));
+        assert_eq!(next.load(Ordering::Acquire), u64::MAX);
+        assert_eq!(next_token_value(last_allocatable), Some(u64::MAX));
+        assert_eq!(next_token_value(u64::MAX), None);
+        // The production allocator latches the failed update and returns zero
+        // only as a disabled shortcut sentinel; zero is never issued as a token.
     }
     #[test]
     fn exact_native_stage_mapping_reproduces_eye_without_latest_pose() {
