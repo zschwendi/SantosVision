@@ -36,6 +36,8 @@ type Counts = [u64; 7];
 #[track_caller]
 fn assert_counts(f: &Fixture, on: Counts, passes: u64) {
     let report = f.instance.generate_report().expect("wgpu-core backend").metal_prepass;
+    let requested = std::env::var("MUGUET_METAL_SKIP_EMPTY_PREPASS").ok().as_deref() == Some("1");
+    assert_eq!(report.enabled, requested, "the real Metal device must exercise the requested pre-pass mode");
     let counts: Counts = [report.render_skipped, report.compute_skipped, report.retained_disabled,
         report.retained_discard_fixups, report.retained_query_resets,
         report.retained_indirect_validation, report.render_skipped_empty_indirect_batch];
