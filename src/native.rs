@@ -240,6 +240,7 @@ pub extern "C" fn sv_runtime_status(out: *mut c_char, capacity: usize) -> i32 {
         "gpu_started": crate::gpu::STARTED.load(Ordering::Relaxed),
         "frozen_depth_transfer_requested": frozen_depth_transfer_requested(),
         "draw_setup": crate::draw_setup::status_json(),
+        "diagnostic_scene": crate::host::benchmark::status_json(),
         "presents": crate::gpu::PRESENTS.load(Ordering::Relaxed),
         "geometry_capture_diagnostics": crate::gpu::geometry_capture_diagnostics_json(),
         "immersive_game_renderer_connected": crate::world_frame::renderer_connected(),
