@@ -29,9 +29,12 @@ private struct GameCanvas: UIViewRepresentable {
     let runtime: NativeRuntimeModel
     func makeUIView(context: Context) -> UIView {
         let view = GameMetalView(frame: .zero)
-        // Attach synchronously before startup can create the GPU device.
-        let attached = runtime.attachWindowLayer(view.metalLayer)
-        if attached { Task { await runtime.bootstrap() } }
+        // Defer observable-state changes until SwiftUI finishes constructing
+        // this view. Attachment still completes before any engine startup.
+        Task { @MainActor in
+            guard runtime.attachWindowLayer(view.metalLayer) else { return }
+            await runtime.bootstrap()
+        }
         return view
     }
     func updateUIView(_ view: UIView, context: Context) {}
