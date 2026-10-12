@@ -2,7 +2,7 @@
 //! trailing NUL. Success is 0; -1 is a runtime/input error; -2 is a short buffer.
 use anyhow::{Context, Result};
 use serde_json::json;
-use std::ffi::{c_char, CStr};
+use std::ffi::{c_char, c_void, CStr};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{LazyLock, Mutex};
@@ -17,6 +17,7 @@ struct Status {
 }
 static ACTIVE: AtomicBool = AtomicBool::new(true);
 static APP_FROZEN_DEPTH_REQUESTED: AtomicBool = AtomicBool::new(false);
+static WINDOW_SURFACE_REQUESTED: AtomicBool = AtomicBool::new(false);
 static INPUT_LIFECYCLE: Mutex<()> = Mutex::new(());
 
 static STATUS: LazyLock<Mutex<Status>> = LazyLock::new(|| Mutex::new(Status { state: "idle", ..Default::default() }));
@@ -61,6 +62,44 @@ pub(crate) fn frozen_depth_transfer_requested() -> bool {
 
 fn can_configure_before_start(state: &str, runtime_initialized: bool) -> bool {
     !runtime_initialized && matches!(state, "idle" | "failed")
+}
+
+fn can_configure_window(state: &str, runtime_initialized: bool, gpu_started: bool, requested: bool) -> bool {
+    can_configure_before_start(state, runtime_initialized) && !gpu_started && !requested
+}
+
+/// Bind the live window's CAMetalLayer before native engine/GPU startup.
+/// Metal retains the layer, but Swift must keep its UIView alive and attached
+/// for the lifetime of presentation. There is no layer replacement after start.
+///
+/// # Safety
+/// A non-null pointer must identify a live CAMetalLayer owned by the Swift view.
+#[no_mangle]
+pub unsafe extern "C" fn sv_runtime_set_window_layer(layer: *mut c_void) -> i32 {
+    if layer.is_null() { return -1; }
+    #[cfg(target_os = "visionos")]
+    {
+        // start holds the same lock while it changes idle/failed to initializing.
+        let Ok(status) = STATUS.lock() else { return -1; };
+        if !can_configure_window(status.state, crate::RT.get().is_some(),
+            crate::gpu::STARTED.load(Ordering::Acquire), WINDOW_SURFACE_REQUESTED.load(Ordering::Acquire)) {
+            return -1;
+        }
+        let Ok(mut handoff) = crate::gpu::SURFACE.lock() else { return -1; };
+        if handoff.is_some() { return -1; }
+        let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
+        descriptor.backends = wgpu::Backends::METAL;
+        let instance = wgpu::Instance::new(descriptor);
+        let surface = match unsafe { instance.create_surface_unsafe(wgpu::SurfaceTargetUnsafe::CoreAnimationLayer(layer)) } {
+            Ok(surface) => surface,
+            Err(error) => { eprintln!("[native] window surface creation failed: {error}"); return -1; }
+        };
+        *handoff = Some(crate::gpu::SurfaceHandoff { instance, surface, window: () });
+        WINDOW_SURFACE_REQUESTED.store(true, Ordering::Release);
+        0
+    }
+    #[cfg(not(target_os = "visionos"))]
+    { -1 }
 }
 
 #[no_mangle]
@@ -239,6 +278,7 @@ pub extern "C" fn sv_runtime_status(out: *mut c_char, capacity: usize) -> i32 {
         "heap_bytes": crate::RT.get().map(|runtime| runtime.mem.data_size()).unwrap_or(0),
         "gpu_started": crate::gpu::STARTED.load(Ordering::Relaxed),
         "frozen_depth_transfer_requested": frozen_depth_transfer_requested(),
+        "window_surface_requested": WINDOW_SURFACE_REQUESTED.load(Ordering::Acquire),
         "draw_setup": crate::draw_setup::status_json(),
         "diagnostic_scene": crate::host::benchmark::status_json(),
         "presents": crate::gpu::PRESENTS.load(Ordering::Relaxed),
@@ -250,6 +290,22 @@ pub extern "C" fn sv_runtime_status(out: *mut c_char, capacity: usize) -> i32 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn window_layer_guard_rejects_repeated_initialized_and_started_requests() {
+        use super::can_configure_window as allowed;
+        for state in ["idle", "failed"] {
+            assert!(allowed(state, false, false, false));
+            assert!(!allowed(state, true, false, false));
+            assert!(!allowed(state, false, true, false));
+            assert!(!allowed(state, false, false, true));
+        }
+        for state in ["initializing", "starting", "running", "returned", "exited", "panicked", "unknown"] {
+            assert!(!allowed(state, false, false, false));
+        }
+        // Null returns before touching any GPU API or global runtime state.
+        assert_eq!(unsafe { super::sv_runtime_set_window_layer(std::ptr::null_mut()) }, -1);
+    }
+
     #[test]
     fn depth_request_configuration_requires_uninitialized_runtime_and_prestart_state() {
         use super::can_configure_before_start as allowed;
