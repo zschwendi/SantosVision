@@ -24,12 +24,19 @@ struct MemberKey {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub(super) struct Key {
+struct Key {
     program: u64,
     stage: usize,
     size: u64,
     len: usize,
     members: [MemberKey; MEMBERS],
+}
+
+// Intentionally neither Clone nor Copy: one miss can authorize one insertion.
+// Fields stay private so callers cannot mint or renew a stale authorization.
+pub(super) struct MissToken {
+    key: Key,
+    serial: u64,
 }
 
 impl Hash for Key {
@@ -86,6 +93,7 @@ struct Counts {
     evictions: u64,
     present_clears: u64,
     version_wrap_clears: u64,
+    stale_insertions: u64,
 }
 
 pub(super) struct UniformSnapshot {
@@ -93,6 +101,8 @@ pub(super) struct UniformSnapshot {
     entries: HashMap<Key, (usize, u64)>,
     order: VecDeque<Key>,
     counts: Counts,
+    probe_serial: u64,
+    serial_exhausted: bool,
 }
 
 impl UniformSnapshot {
@@ -101,14 +111,19 @@ impl UniformSnapshot {
     }
 
     pub(super) fn new(enabled: bool) -> Self {
-        Self { enabled, entries: HashMap::new(), order: VecDeque::new(), counts: Counts::default() }
+        Self { enabled, entries: HashMap::new(), order: VecDeque::new(), counts: Counts::default(),
+            probe_serial: 0, serial_exhausted: false }
     }
 
-    pub(super) fn probe(&mut self, program: u64, stage: usize, pack: &Pack, objects: &[Option<Obj>], bindings: &[Cb]) -> (Option<Key>, Option<(usize, u64)>) {
+    // This cache has one GPU-worker owner. Production pack_copy proceeds from
+    // miss to synchronous immutable-ring copy to insert without a callback,
+    // wait, flush or intervening probe. Tokens also fail closed if a future
+    // caller interleaves another probe or a metadata clear.
+    pub(super) fn probe(&mut self, program: u64, stage: usize, pack: &Pack, objects: &[Option<Obj>], bindings: &[Cb]) -> (Option<MissToken>, Option<(usize, u64)>) {
         if !self.enabled { return (None, None); }
         let started = Instant::now();
         self.counts.requests += 1;
-        let key = key(program, stage, pack, objects, bindings);
+        let key = if self.advance_serial() { key(program, stage, pack, objects, bindings) } else { None };
         let location = key.as_ref().and_then(|key| self.entries.get(key)).copied();
         if let Some(key) = &key {
             if location.is_some() {
@@ -120,12 +135,21 @@ impl UniformSnapshot {
         let ns = started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
         self.counts.key_check_cpu_ns = self.counts.key_check_cpu_ns.saturating_add(ns);
         self.counts.key_check_cpu_max_ns = self.counts.key_check_cpu_max_ns.max(ns);
-        (key, location)
+        let token = if location.is_none() {
+            key.map(|key| MissToken { key, serial: self.probe_serial })
+        } else { None };
+        (token, location)
     }
 
-    pub(super) fn insert(&mut self, key: Option<Key>, location: (usize, u64)) {
-        let Some(key) = key else { return };
-        if self.entries.contains_key(&key) { return; }
+    pub(super) fn insert(&mut self, token: Option<MissToken>, location: (usize, u64)) {
+        let Some(token) = token else { return };
+        // Reject before eviction or insertion: stale tokens cannot duplicate
+        // FIFO entries, consume capacity, or publish an obsolete ring offset.
+        if self.serial_exhausted || token.serial != self.probe_serial {
+            self.counts.stale_insertions = self.counts.stale_insertions.saturating_add(1);
+            return;
+        }
+        let key = token.key;
         if self.entries.len() == LIMIT {
             if let Some(old) = self.order.pop_front() { self.entries.remove(&old); }
             self.counts.evictions += 1;
@@ -134,7 +158,26 @@ impl UniformSnapshot {
         self.order.push_back(key);
     }
 
-    fn clear(&mut self) { self.entries.clear(); self.order.clear(); }
+    fn clear_entries(&mut self) { self.entries.clear(); self.order.clear(); }
+
+    fn advance_serial(&mut self) -> bool {
+        if self.serial_exhausted { return false; }
+        if let Some(serial) = self.probe_serial.checked_add(1) {
+            self.probe_serial = serial;
+            true
+        } else {
+            // Never recycle a serial. Keep the opt-in state visible, but all
+            // subsequent requests use the original fresh-packing path.
+            self.serial_exhausted = true;
+            self.clear_entries();
+            false
+        }
+    }
+
+    fn clear(&mut self) {
+        self.clear_entries();
+        if self.enabled { self.advance_serial(); }
+    }
 
     pub(super) fn present(&mut self) {
         self.clear();
@@ -153,6 +196,7 @@ impl UniformSnapshot {
             "saved_bytes":c.saved_bytes, "saved_aligned_bytes":c.saved_aligned_bytes,
             "key_check_cpu_ns":c.key_check_cpu_ns, "key_check_cpu_max_ns":c.key_check_cpu_max_ns,
             "evictions":c.evictions, "present_clears":c.present_clears, "version_wrap_clears":c.version_wrap_clears,
+            "stale_insertions":c.stale_insertions, "serial_exhausted":self.serial_exhausted,
             "entries":self.entries.len(), "entry_limit":LIMIT, "member_limit":MEMBERS,
             "scope":"enabled pack_copy probes; saved logical/aligned snapshot bytes, not actual queue-write savings or GPU time"})
     }
@@ -247,5 +291,77 @@ mod tests {
         assert!(cache.probe(1, 0, &bad, &objects, &bindings).0.is_none());
         let mut off = UniformSnapshot::new(false); assert!(off.probe(1, 0, &pack, &objects, &bindings).0.is_none());
         assert_eq!(off.metrics()["requests"], 0);
+    }
+
+    #[test]
+    fn cpu_repeated_probes_only_allow_latest_owned_miss_token() {
+        let mut cache = UniformSnapshot::new(true); let pack = fixture_pack();
+        let objects = vec![None, object(1, 0, &[1; 32])]; let bindings = [Cb { buf: 1, first: 0 }];
+        let (old, _) = cache.probe(1, 0, &pack, &objects, &bindings);
+        let (latest, _) = cache.probe(1, 0, &pack, &objects, &bindings);
+        cache.insert(old, (0, 0));
+        assert!(cache.entries.is_empty()); assert!(cache.order.is_empty());
+        cache.insert(latest, (1, 256));
+        assert_eq!(cache.entries.len(), 1); assert_eq!(cache.order.len(), 1);
+        let (token, location) = cache.probe(1, 0, &pack, &objects, &bindings);
+        assert!(token.is_none()); assert_eq!(location, Some((1, 256)));
+        cache.insert(token, (9, 999));
+        assert_eq!(cache.order.len(), 1); assert_eq!(cache.metrics()["stale_insertions"], 1);
+        // insert consumes latest; reusing it would be a Rust move error. The
+        // opaque token provides no Clone/Copy or caller-visible constructor.
+    }
+
+    #[test]
+    fn cpu_intervening_hit_rejects_stale_miss_before_fifo_eviction() {
+        let mut cache = UniformSnapshot::new(true); let pack = fixture_pack();
+        let objects = vec![None, object(1, 0, &[1; 32])]; let bindings = [Cb { buf: 1, first: 0 }];
+        for program in 0..LIMIT as u64 {
+            let (token, _) = cache.probe(program, 0, &pack, &objects, &bindings);
+            cache.insert(token, (0, program * 256));
+        }
+        let (stale, _) = cache.probe(999, 0, &pack, &objects, &bindings);
+        let (hit_token, location) = cache.probe(0, 0, &pack, &objects, &bindings);
+        assert!(hit_token.is_none()); assert_eq!(location, Some((0, 0)));
+        let order = cache.order.clone();
+        cache.insert(stale, (3, 0));
+        assert!(cache.order == order); assert_eq!(cache.entries.len(), LIMIT);
+        assert_eq!(cache.metrics()["evictions"], 0); assert_eq!(cache.metrics()["stale_insertions"], 1);
+        assert_eq!(cache.probe(0, 0, &pack, &objects, &bindings).1, Some((0, 0)));
+    }
+
+    #[test]
+    fn cpu_present_and_version_wrap_invalidate_pending_miss_tokens() {
+        let mut cache = UniformSnapshot::new(true); let pack = fixture_pack();
+        let objects = vec![None, object(1, 0, &[1; 32])]; let bindings = [Cb { buf: 1, first: 0 }];
+        let (stale, _) = cache.probe(1, 0, &pack, &objects, &bindings);
+        cache.present(); cache.insert(stale, (0, 0));
+        assert!(cache.entries.is_empty()); assert!(cache.order.is_empty());
+        let (stale, _) = cache.probe(1, 0, &pack, &objects, &bindings);
+        cache.version_wrapped(); cache.insert(stale, (0, 256));
+        assert!(cache.entries.is_empty()); assert!(cache.order.is_empty());
+        let (valid, _) = cache.probe(1, 0, &pack, &objects, &bindings); cache.insert(valid, (2, 0));
+        assert_eq!(cache.probe(1, 0, &pack, &objects, &bindings).1, Some((2, 0)));
+        assert_eq!(cache.metrics()["stale_insertions"], 2);
+    }
+
+    #[test]
+    fn cpu_serial_exhaustion_clears_entries_and_latches_fresh_pack_fallback() {
+        let mut cache = UniformSnapshot::new(true); let pack = fixture_pack();
+        let objects = vec![None, object(1, 0, &[1; 32])]; let bindings = [Cb { buf: 1, first: 0 }];
+        let (valid, _) = cache.probe(1, 0, &pack, &objects, &bindings); cache.insert(valid, (0, 0));
+        cache.probe_serial = u64::MAX - 1;
+        let (last_token, _) = cache.probe(2, 0, &pack, &objects, &bindings);
+        assert!(last_token.is_some()); assert_eq!(cache.probe_serial, u64::MAX);
+        let (none, hit) = cache.probe(1, 0, &pack, &objects, &bindings);
+        assert!(none.is_none() && hit.is_none()); assert!(cache.entries.is_empty() && cache.order.is_empty());
+        cache.insert(last_token, (0, 256));
+        cache.present(); cache.version_wrapped();
+        for _ in 0..3 {
+            let (none, hit) = cache.probe(1, 0, &pack, &objects, &bindings);
+            assert!(none.is_none() && hit.is_none());
+        }
+        assert!(cache.enabled); assert!(cache.serial_exhausted); assert_eq!(cache.probe_serial, u64::MAX);
+        assert_eq!(cache.metrics()["serial_exhausted"], true); assert_eq!(cache.metrics()["stale_insertions"], 1);
+        assert!(cache.entries.is_empty() && cache.order.is_empty());
     }
 }
