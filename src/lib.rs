@@ -29,6 +29,7 @@ mod proto;
 mod server;
 #[cfg(target_os = "ios")]
 mod touch;
+mod upload_dedup;
 
 #[cfg(all(target_os = "visionos", feature = "jit"))]
 compile_error!("visionOS must use --no-default-features and an embedded signed AOT module");

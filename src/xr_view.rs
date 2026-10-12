@@ -95,6 +95,7 @@ struct UnmatchedViewport {
 struct RenderThread {
     epoch: u64,
     current: Option<WorldView>,
+    emission_token: u64,
 }
 
 // Only an opt-in proof run retains the request actually used by a successful
@@ -300,6 +301,42 @@ static ENABLED: AtomicBool = AtomicBool::new(false);
 static EPOCH: AtomicU64 = AtomicU64::new(1);
 static MARKER_COUNT: AtomicU64 = AtomicU64::new(0);
 static TRACE_ENABLED: AtomicBool = AtomicBool::new(cfg!(target_os = "visionos"));
+// Tokens describe a binding, not the view's matrix/value. A second binding of
+// the same view deliberately takes a different token. Zero means no shortcut.
+static NEXT_EMISSION_TOKEN: AtomicU64 = AtomicU64::new(1);
+static LAST_EMITTED_TOKEN: AtomicU64 = AtomicU64::new(0);
+static EMISSION_FAST_COMMANDS: AtomicU64 = AtomicU64::new(0);
+static EMISSION_TOKEN_EXHAUSTED: AtomicBool = AtomicBool::new(false);
+// Resolve the diagnostic override once. The pre-start app request remains an
+// atomic read: a status probe may run before the launcher applies its choice.
+static EMISSION_FAST_OVERRIDE: LazyLock<Option<bool>> = LazyLock::new(||
+    crate::draw_setup::xr_emission_override(std::env::var(crate::draw_setup::XR_EMISSION_ENV).ok().as_deref()));
+
+fn emission_fast_enabled() -> bool {
+    crate::draw_setup::xr_emission_requested(*EMISSION_FAST_OVERRIDE)
+}
+
+fn next_token_value(value: u64) -> Option<u64> { value.checked_add(1) }
+
+fn next_emission_token() -> u64 {
+    if EMISSION_TOKEN_EXHAUSTED.load(Ordering::Acquire) { return 0; }
+    match NEXT_EMISSION_TOKEN.fetch_update(Ordering::AcqRel, Ordering::Acquire, next_token_value) {
+        Ok(token) => token,
+        Err(_) => { EMISSION_TOKEN_EXHAUSTED.store(true, Ordering::Release); 0 }
+    }
+}
+
+fn can_skip_emission(opcode: u32, token: u64, previous_token: u64) -> bool {
+    token != 0 && token == previous_token && opcode != 32 && opcode != 7
+}
+
+fn token_after_slow_emission(state: &State, current: Option<WorldView>, token: u64) -> u64 {
+    if !state.correlation_failed && state.last_emitted == current { token } else { 0 }
+}
+
+fn emission_binding_for_epoch(current: Option<WorldView>, token: u64, thread_epoch: u64, epoch: u64) -> (Option<WorldView>, u64) {
+    if thread_epoch != epoch { (None, 0) } else { (current, if current.is_some() { token } else { 0 }) }
+}
 
 fn lock_world_state() -> std::sync::MutexGuard<'static, State> {
     STATE.lock().unwrap_or_else(|poison| poison.into_inner())
@@ -319,6 +356,7 @@ pub fn set_active(_active: bool) {
     EPOCH.fetch_add(1, Ordering::AcqRel);
     let mut state = lock_world_state();
     invalidate_state(&mut state);
+    LAST_EMITTED_TOKEN.store(0, Ordering::Release);
 }
 
 fn invalidate_state(state: &mut State) {
@@ -772,6 +810,9 @@ pub fn current_view(caller: &mut Caller<'_, HostState>, viewport: u64, _set_wind
         let epoch = EPOCH.load(Ordering::Acquire);
         if thread.epoch != epoch { *thread = RenderThread { epoch, ..Default::default() }; }
         thread.current = view;
+        if emission_fast_enabled() {
+            thread.emission_token = if view.is_some() { next_emission_token() } else { 0 };
+        }
     });
     Ok(())
 }
@@ -782,15 +823,52 @@ pub fn gpu_command(_caller: &mut Caller<'_, HostState>, command: u64) -> Result<
     if !TRACE_ENABLED.load(Ordering::Acquire) { return Ok(()); }
     let mem = &RT.get().context("missing runtime")?.mem;
     let Some(opcode) = read_u32(mem, command) else { return Ok(()); };
-    let mut state = lock_world_state();
-    RENDER_THREAD.with(|thread| {
+    if !emission_fast_enabled() {
+        // Preserve the flag-off path's original lock/TLS/record publication
+        // ordering exactly, including its epoch and current-view filtering.
+        let mut state = lock_world_state();
+        RENDER_THREAD.with(|thread| {
+            let mut thread = thread.borrow_mut();
+            let epoch = EPOCH.load(Ordering::Acquire);
+            if thread.epoch != epoch { *thread = RenderThread { epoch, ..Default::default() }; }
+            let current = thread.current.filter(|view| !view.headset_applied || view_epoch_is_active(view.provenance_epoch));
+            record_emission(&mut state, command, opcode, current);
+            MARKER_COUNT.store(state.markers.len() as u64, Ordering::Release);
+        });
+        return Ok(());
+    }
+    // wasm_gpu::Emit serializes producers while this callback runs. The token
+    // comparison therefore observes the immediately preceding emitted command.
+    // Draws/presents and every binding transition still use the legacy mutex.
+    let (current, token, thread_epoch) = RENDER_THREAD.with(|thread| {
         let mut thread = thread.borrow_mut();
         let epoch = EPOCH.load(Ordering::Acquire);
         if thread.epoch != epoch { *thread = RenderThread { epoch, ..Default::default() }; }
         let current = thread.current.filter(|view| !view.headset_applied || view_epoch_is_active(view.provenance_epoch));
-        record_emission(&mut state, command, opcode, current);
-        MARKER_COUNT.store(state.markers.len() as u64, Ordering::Release);
+        let token = if current.is_some() { thread.emission_token } else { 0 };
+        (current, token, thread.epoch)
     });
+    if !EMISSION_TOKEN_EXHAUSTED.load(Ordering::Acquire)
+        && thread_epoch == EPOCH.load(Ordering::Acquire)
+        && can_skip_emission(opcode, token, LAST_EMITTED_TOKEN.load(Ordering::Acquire))
+        && current.is_some_and(|view| !view.headset_applied || view_epoch_is_active(view.provenance_epoch)) {
+        // If reset wins immediately after these checks, skipping still cannot
+        // republish its old binding: this branch changes diagnostics only.
+        // Draws, presents and the next binding always take the locked path.
+        EMISSION_FAST_COMMANDS.fetch_add(1, Ordering::Relaxed);
+        return Ok(());
+    }
+    let mut state = lock_world_state();
+    // Reset may have completed while this callback waited for STATE. Reject
+    // the entire TLS snapshot, including non-headset views, under that lock.
+    // If reset starts after this epoch read, its subsequent locked invalidation
+    // clears our metadata, matching the legacy path's ordering.
+    let (current, token) = emission_binding_for_epoch(current, token, thread_epoch, EPOCH.load(Ordering::Acquire));
+    let current = current.filter(|view| !view.headset_applied || view_epoch_is_active(view.provenance_epoch));
+    let token = if current.is_some() { token } else { 0 };
+    record_emission(&mut state, command, opcode, current);
+    LAST_EMITTED_TOKEN.store(token_after_slow_emission(&state, current, token), Ordering::Release);
+    MARKER_COUNT.store(state.markers.len() as u64, Ordering::Release);
     Ok(())
 }
 
@@ -870,7 +948,13 @@ pub fn status_json() -> serde_json::Value {
         "camera_calls":state.camera_calls,"main_camera_calls":state.main_camera_calls,"qualified_camera_calls":state.qualified_camera_calls,
         "overrides_applied":state.overrides_applied,"overrides_failed":state.overrides_failed,"scene_calls":state.scene_calls,
         "main_scene_calls":state.main_scene_calls,"viewport_commands":state.viewport_commands,"current_view_calls":state.current_calls,
-        "matched_current_view_calls":state.matched_current_calls,"gpu_commands_marked":state.emitted_commands,"view_marker_changes":state.marker_changes,
+        "matched_current_view_calls":state.matched_current_calls,
+        "gpu_commands_marked":state.emitted_commands.saturating_add(EMISSION_FAST_COMMANDS.load(Ordering::Relaxed)),
+        "emission_mutex_commands":state.emitted_commands,
+        "emission_fast_commands":EMISSION_FAST_COMMANDS.load(Ordering::Relaxed),
+        "emission_fastpath_enabled":emission_fast_enabled(),
+        "emission_token_exhausted":EMISSION_TOKEN_EXHAUSTED.load(Ordering::Acquire),
+        "view_marker_changes":state.marker_changes,
         "projection_clone_updates":state.projection_clone_updates,"projection_clone_failures":state.projection_clone_failures,
         "presents_enqueued":state.emitted_presents,"presents_consumed":state.consumed_presents,"world_presents":state.world_presents,
         "conflicting_presents":state.conflicting_presents,"pending_presents":state.presents.len(),"pending_markers":state.markers.len(),
@@ -1168,6 +1252,162 @@ mod tests {
         assert_eq!(state.markers.len(),2);
         assert!(state.markers.values().all(Option::is_none));
         assert_eq!(state.presents,VecDeque::from([None,None]));
+    }
+    #[test]
+    fn emission_fallback_rejects_snapshot_taken_before_concurrent_reset() {
+        use std::sync::Barrier;
+        // No global runtime state or environment mutation: barriers force the
+        // real ordering of a producer snapshot, completed reset, then fallback.
+        for headset_applied in [false, true] {
+            let mut old = view(0, 3); old.headset_applied = headset_applied;
+            let mut new = view(0, 4); new.provenance_epoch = old.provenance_epoch + 1;
+            let state = Mutex::new(State::default());
+            record_emission(&mut state.lock().unwrap(), 100, 32, Some(old));
+            let epoch = AtomicU64::new(old.provenance_epoch);
+            let snapshot_ready = Barrier::new(2);
+            let reset_complete = Barrier::new(2);
+            std::thread::scope(|scope| {
+                let producer = scope.spawn(|| {
+                    let thread_epoch = epoch.load(Ordering::Acquire);
+                    let current = Some(old);
+                    snapshot_ready.wait();
+                    reset_complete.wait();
+                    let mut state = state.lock().unwrap();
+                    let (current, token) = emission_binding_for_epoch(current, 1, thread_epoch, epoch.load(Ordering::Acquire));
+                    assert!(current.is_none()); assert_eq!(token, 0);
+                    record_emission(&mut state, 200, 32, current);
+                    assert_eq!(token_after_slow_emission(&state, current, token), 0);
+                    assert!(state.frame_world.is_none());
+                    record_emission(&mut state, 300, 32, Some(new));
+                    record_emission(&mut state, 320, 7, None);
+                });
+                snapshot_ready.wait();
+                epoch.fetch_add(1, Ordering::AcqRel);
+                invalidate_state(&mut state.lock().unwrap());
+                reset_complete.wait();
+                producer.join().unwrap();
+            });
+            // The legacy locked TLS check resets the old binding to None.
+            let mut legacy = State::default();
+            record_emission(&mut legacy, 100, 32, Some(old));
+            invalidate_state(&mut legacy);
+            record_emission(&mut legacy, 200, 32, None);
+            record_emission(&mut legacy, 300, 32, Some(new));
+            record_emission(&mut legacy, 320, 7, None);
+            let state = state.into_inner().unwrap();
+            assert_eq!(state.markers, legacy.markers);
+            assert_eq!(state.presents, legacy.presents);
+            assert_eq!(state.presents, VecDeque::from([Some(new)]));
+            assert_eq!(state.conflicting_presents, 0);
+            assert!(!state.frame_conflict && !state.correlation_failed);
+            assert_eq!(emission_binding_for_epoch(Some(new), 2, new.provenance_epoch, new.provenance_epoch), (Some(new), 2));
+            assert_eq!(emission_binding_for_epoch(None, 2, new.provenance_epoch, new.provenance_epoch), (None, 0));
+        }
+    }
+    #[test]
+    fn emission_fast_skip_crossing_reset_cannot_restore_old_binding() {
+        let old = view(0, 3);
+        let mut new = view(0, 4); new.provenance_epoch = old.provenance_epoch + 1;
+        let mut state = State::default();
+        record_emission(&mut state, 100, 32, Some(old));
+        // Producer has already passed the shortcut checks when reset wins.
+        assert!(can_skip_emission(23, 1, 1));
+        invalidate_state(&mut state);
+        // The shortcut only increments its diagnostic counter; no emission is
+        // recorded. The following draw cannot shortcut and uses the new epoch.
+        assert!(!can_skip_emission(32, 2, 0));
+        let (current, token) = emission_binding_for_epoch(Some(new), 2, new.provenance_epoch, new.provenance_epoch);
+        record_emission(&mut state, 200, 32, current);
+        assert_eq!(token_after_slow_emission(&state, current, token), 2);
+        record_emission(&mut state, 220, 7, None);
+        assert_eq!(state.markers.get(&100), Some(&None));
+        assert_eq!(state.presents, VecDeque::from([Some(new)]));
+        assert_eq!(state.conflicting_presents, 0);
+    }
+    #[test]
+    fn emission_tokens_match_legacy_ring_state_across_producers_ui_and_epoch_reset() {
+        // Tokens 1 and 2 are different SetCurrent bindings, even though their
+        // view values are equal. Token 3 belongs to another producer. The
+        // ordered sequence models the certified guest Emit producer mutex.
+        let left = view(0, 3);
+        let right = view(1, 4);
+        let mut after_reset = left;
+        after_reset.provenance_epoch = 2;
+        let events: &[(u64, u32, Option<WorldView>, u64)] = &[
+            (100, 26, Some(left), 1), (120, 23, Some(left), 1),
+            (140, 32, Some(left), 1), (160, 23, Some(left), 1),
+            (180, 26, Some(left), 2), (200, 7, Some(left), 2),
+            (220, 26, Some(right), 3), (240, 32, Some(right), 3),
+            (260, 23, Some(right), 3), (280, 7, None, 0),
+            (300, 23, None, 0), (320, 26, Some(after_reset), 4),
+            (340, 23, Some(after_reset), 4), (360, 32, Some(after_reset), 4),
+            (380, 7, None, 0),
+        ];
+        let mut legacy = State::default();
+        let mut optimized = State::default();
+        let mut previous_token = 0;
+        let mut fast_count = 0u64;
+        for (index, &(address, opcode, current, token)) in events.iter().enumerate() {
+            if index == 11 {
+                invalidate_state(&mut legacy);
+                invalidate_state(&mut optimized);
+                previous_token = 0;
+            }
+            record_emission(&mut legacy, address, opcode, current);
+            if can_skip_emission(opcode, token, previous_token) {
+                fast_count += 1;
+            } else {
+                record_emission(&mut optimized, address, opcode, current);
+                previous_token = token_after_slow_emission(&optimized, current, token);
+            }
+            assert_eq!(optimized.markers, legacy.markers, "marker step {index}");
+            assert_eq!(optimized.presents, legacy.presents, "present step {index}");
+            assert_eq!(optimized.last_emitted, legacy.last_emitted, "view step {index}");
+            assert_eq!(optimized.frame_world, legacy.frame_world, "draw step {index}");
+            assert_eq!(optimized.frame_conflict, legacy.frame_conflict, "conflict step {index}");
+            assert_eq!(optimized.correlation_failed, legacy.correlation_failed, "error step {index}");
+            assert_eq!(optimized.marker_changes, legacy.marker_changes, "marker count step {index}");
+            assert_eq!(optimized.emitted_presents, legacy.emitted_presents, "present count step {index}");
+            assert_eq!(optimized.emitted_commands + fast_count, legacy.emitted_commands, "command count step {index}");
+        }
+        assert!(fast_count > 0);
+        assert_eq!(legacy.presents, VecDeque::from([None, None, Some(after_reset)]));
+    }
+    #[test]
+    fn emission_fast_path_stops_after_marker_overrun_and_never_uses_zero_token() {
+        let left = view(0, 3);
+        let mut state = State::default();
+        state.markers = (0..MAX_MARKERS as u64).map(|address| (address, None)).collect();
+        record_emission(&mut state, MAX_MARKERS as u64 + 1, 26, Some(left));
+        assert!(state.correlation_failed);
+        assert_eq!(token_after_slow_emission(&state, Some(left), 4), 0);
+        assert!(!can_skip_emission(26, 0, 0));
+        assert!(!can_skip_emission(32, 4, 4));
+        assert!(!can_skip_emission(7, 4, 4));
+        assert!(!can_skip_emission(26, 5, 4));
+        assert!(can_skip_emission(26, 4, 4));
+    }
+    #[test]
+    fn emission_token_allocator_never_reuses_a_token_or_wraps_to_zero() {
+        let next = AtomicU64::new(1);
+        let mut issued = std::collections::BTreeSet::new();
+        for _ in 0..4096 {
+            let token = next.fetch_update(Ordering::AcqRel, Ordering::Acquire, next_token_value)
+                .expect("token space remains");
+            assert_ne!(token, 0);
+            assert!(issued.insert(token), "binding token reused");
+        }
+        assert_eq!(issued.len(), 4096);
+        let last_allocatable = u64::MAX - 1;
+        next.store(last_allocatable, Ordering::Release);
+        assert_eq!(next.fetch_update(Ordering::AcqRel, Ordering::Acquire, next_token_value), Ok(last_allocatable));
+        assert_eq!(next.load(Ordering::Acquire), u64::MAX);
+        assert_eq!(next.fetch_update(Ordering::AcqRel, Ordering::Acquire, next_token_value), Err(u64::MAX));
+        assert_eq!(next.load(Ordering::Acquire), u64::MAX);
+        assert_eq!(next_token_value(last_allocatable), Some(u64::MAX));
+        assert_eq!(next_token_value(u64::MAX), None);
+        // The production allocator latches the failed update and returns zero
+        // only as a disabled shortcut sentinel; zero is never issued as a token.
     }
     #[test]
     fn exact_native_stage_mapping_reproduces_eye_without_latest_pose() {

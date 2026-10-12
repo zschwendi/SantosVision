@@ -74,7 +74,7 @@ pub extern "C" fn sv_world_set_frozen_depth_transfer(enabled: u32) -> i32 {
     0
 }
 
-/// Typed pre-start request for the three draw-setup experiments. The status
+/// Typed pre-start request for the rendering-overhead experiments. The status
 /// lock is also held by `start` while it changes idle/failed to initializing.
 #[no_mangle]
 pub extern "C" fn sv_runtime_set_draw_setup_overhead(enabled: u32) -> i32 {
@@ -240,6 +240,7 @@ pub extern "C" fn sv_runtime_status(out: *mut c_char, capacity: usize) -> i32 {
         "gpu_started": crate::gpu::STARTED.load(Ordering::Relaxed),
         "frozen_depth_transfer_requested": frozen_depth_transfer_requested(),
         "draw_setup": crate::draw_setup::status_json(),
+        "diagnostic_scene": crate::host::benchmark::status_json(),
         "presents": crate::gpu::PRESENTS.load(Ordering::Relaxed),
         "geometry_capture_diagnostics": crate::gpu::geometry_capture_diagnostics_json(),
         "immersive_game_renderer_connected": crate::world_frame::renderer_connected(),

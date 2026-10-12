@@ -325,9 +325,11 @@ mod tests {
             pass.set_bind_group(0, &bg.bg, bg.dyn_off.as_ref().map(std::slice::from_ref).unwrap_or(&[]));
             pass.dispatch_workgroups(1, 1, 1);
         };
+        gpu.buf_mut(3).unwrap().version += 1;
         gpu.buf_mut(3).unwrap().shadow.as_mut().unwrap()[..8].copy_from_slice(&[7, 0, 0, 0, 0, 0, 0, 0]);
         let first = gpu.stage_bind_group(2, &program, 0, &layout).unwrap();
         dispatch(&mut gpu, &first);
+        gpu.buf_mut(3).unwrap().version += 1;
         gpu.buf_mut(3).unwrap().shadow.as_mut().unwrap()[..8].copy_from_slice(&[11, 0, 0, 0, 1, 0, 0, 0]);
         let hit = gpu.stage_bind_group(2, &program, 0, &layout).unwrap();
         dispatch(&mut gpu, &hit);
@@ -357,6 +359,7 @@ mod tests {
         // have been invalidated before binding it.
         gpu.set_obj(2, Obj::Uav(ViewObj { res: 4, is_buf: true, fmt: 28, vdim: 4,
             a: 0, b: 4, c: 0, d: 0, views: HashMap::new() }));
+        gpu.buf_mut(3).unwrap().version += 1;
         gpu.buf_mut(3).unwrap().shadow.as_mut().unwrap()[..8].copy_from_slice(&[13, 0, 0, 0, 0, 0, 0, 0]);
         let replaced = gpu.stage_bind_group(2, &program, 0, &layout).unwrap();
         dispatch(&mut gpu, &replaced);
@@ -369,6 +372,7 @@ mod tests {
         gpu.s.uav[2][0] = 5;
         let dummy = gpu.stage_bind_group(2, &program, 0, &layout).unwrap();
         gpu.create_buffer(6, 16, BIND_UAV, 0, 4);
+        gpu.buf_mut(3).unwrap().version += 1;
         gpu.buf_mut(3).unwrap().shadow.as_mut().unwrap()[..8].copy_from_slice(&[17, 0, 0, 0, 0, 0, 0, 0]);
         let resolved = gpu.stage_bind_group(2, &program, 0, &layout).unwrap();
         assert_ne!(dummy.uid, resolved.uid);
