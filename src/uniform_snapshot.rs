@@ -45,7 +45,7 @@ fn key(program: u64, stage: usize, pack: &Pack, objects: &[Option<Obj>], binding
     if pack.size == 0 || pack.members.len() > MEMBERS { return None; }
     let mut key = Key { program, stage, size: pack.size, len: pack.members.len(), members: [MemberKey::default(); MEMBERS] };
     for (at, member) in pack.members.iter().enumerate() {
-        let cb = bindings.get(member.binding as usize).copied().unwrap_or_default();
+        let cb = bindings.get(member.binding as usize).cloned().unwrap_or_default();
         let mut m = MemberKey { binding: member.binding, offset: member.offset, size: member.size,
             buf: cb.buf, first: cb.first, ..Default::default() };
         if let Some(Obj::Buf(buffer)) = objects.get(cb.buf as usize).and_then(Option::as_ref) {
