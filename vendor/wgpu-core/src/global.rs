@@ -20,9 +20,11 @@ pub struct MetalPrePassReport {
     pub retained_disabled: u64,
     pub retained_discard_fixups: u64,
     pub retained_query_resets: u64,
+    /// Passes that batched an indirect draw on a device that validates them.
     pub retained_indirect_validation: u64,
-    /// Of `retained_indirect_validation`, passes that batched no indirect draw.
-    pub retained_indirect_validation_empty_batch: u64,
+    /// Of `render_skipped`, passes on a device that validates indirect draws
+    /// which batched none.
+    pub render_skipped_empty_indirect_batch: u64,
 }
 
 #[derive(Debug, PartialEq, Eq)]

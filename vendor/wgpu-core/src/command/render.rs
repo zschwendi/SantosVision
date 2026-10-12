@@ -2722,7 +2722,8 @@ pub(super) fn encode_render_pass(
 
     // Opt-in, Metal only: when nothing below would encode anything, do not
     // create the pre-pass command buffer at all. With no discarded surface to
-    // clear, no query to reset and no indirect validation on the device, the
+    // clear, no query to reset and no indirect draw batched for validation
+    // (`inject_validation_pass` returns at once on an empty batch), the
     // block's only remaining effect is the tracker merge, and Metal's barrier
     // calls are empty. The pass's own command buffer was pushed by `close()`
     // above and is already last in the list, so there is nothing to swap and

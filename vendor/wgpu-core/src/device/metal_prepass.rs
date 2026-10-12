@@ -5,7 +5,9 @@
 //! clears of discarded surfaces, query resets, an indirect-draw validation
 //! pass and resource barriers. Metal has no barriers (its HAL transition
 //! methods are empty), so when none of the other work exists that second
-//! command buffer is empty. `MUGUET_METAL_SKIP_EMPTY_PREPASS=1` stops creating
+//! command buffer is empty. Indirect validation counts as work only when the
+//! pass batched an indirect draw: with an empty batch the validation call
+//! returns before it encodes or changes anything. `MUGUET_METAL_SKIP_EMPTY_PREPASS=1` stops creating
 //! it in exactly that case and nowhere else. It is separate from the
 //! per-submit Transit switch in `queue.rs`.
 //!
@@ -40,7 +42,7 @@ pub(crate) struct MetalPrePassControl {
     retained_discard_fixups: AtomicU64,
     retained_query_resets: AtomicU64,
     retained_indirect_validation: AtomicU64,
-    retained_indirect_validation_empty_batch: AtomicU64,
+    render_skipped_empty_indirect_batch: AtomicU64,
 }
 
 impl MetalPrePassControl {
@@ -59,16 +61,17 @@ impl MetalPrePassControl {
             retained_discard_fixups: AtomicU64::new(0),
             retained_query_resets: AtomicU64::new(0),
             retained_indirect_validation: AtomicU64::new(0),
-            retained_indirect_validation_empty_batch: AtomicU64::new(0),
+            render_skipped_empty_indirect_batch: AtomicU64::new(0),
         }
     }
 
     /// Decides, and counts, whether one pass goes without a pre-pass command
     /// buffer. True only on Metal with the switch on and nothing to encode
-    /// into it. The indirect term is deliberately the conservative one:
-    /// validation merely being enabled on the device keeps the buffer, even
-    /// when this pass batched no indirect draw. The caller must then take the
-    /// HAL-free tracker merge and must not open or swap an encoder.
+    /// into it. A device that validates indirect draws keeps the buffer for
+    /// every pass that batched one; a pass with an empty batch does not need
+    /// it, because `Draw::inject_validation_pass` returns on that same test
+    /// before doing anything. The caller must then take the HAL-free tracker
+    /// merge and must not open or swap an encoder.
     pub(crate) fn decide(&self, compute: bool, work: PrePassWork) -> bool {
         if !self.is_metal {
             return false;
@@ -79,14 +82,14 @@ impl MetalPrePassControl {
             &self.retained_discard_fixups
         } else if work.query_resets {
             &self.retained_query_resets
-        } else if work.indirect_validation {
-            if work.indirect_batch_empty {
-                self.retained_indirect_validation_empty_batch.fetch_add(1, Ordering::Relaxed);
-            }
+        } else if work.indirect_validation && !work.indirect_batch_empty {
             &self.retained_indirect_validation
         } else {
             let skipped = if compute { &self.compute_skipped } else { &self.render_skipped };
             skipped.fetch_add(1, Ordering::Relaxed);
+            if work.indirect_validation {
+                self.render_skipped_empty_indirect_batch.fetch_add(1, Ordering::Relaxed);
+            }
             return true;
         };
         retained.fetch_add(1, Ordering::Relaxed);
@@ -103,7 +106,7 @@ impl MetalPrePassControl {
         report.retained_discard_fixups += load(&self.retained_discard_fixups);
         report.retained_query_resets += load(&self.retained_query_resets);
         report.retained_indirect_validation += load(&self.retained_indirect_validation);
-        report.retained_indirect_validation_empty_batch += load(&self.retained_indirect_validation_empty_batch);
+        report.render_skipped_empty_indirect_batch += load(&self.render_skipped_empty_indirect_batch);
     }
 
     /// One cumulative line, printed by the queue when its transit line prints.
@@ -112,10 +115,10 @@ impl MetalPrePassControl {
         if self.is_metal {
             let mut totals = crate::global::MetalPrePassReport::default();
             self.add_to(&mut totals);
-            std::eprintln!("[wgpu] metal prepass: {{\"schema\":1,\"enabled\":{},\"render_skipped\":{},\"compute_skipped\":{},\"retained_disabled\":{},\"retained_discard_fixups\":{},\"retained_query_resets\":{},\"retained_indirect_validation\":{},\"retained_indirect_validation_empty_batch\":{},\"scope\":\"cumulative per-pass decisions since device creation; one skipped decision is one HAL command buffer not created; command-buffer counts, not GPU time\"}}",
+            std::eprintln!("[wgpu] metal prepass: {{\"schema\":1,\"enabled\":{},\"render_skipped\":{},\"compute_skipped\":{},\"retained_disabled\":{},\"retained_discard_fixups\":{},\"retained_query_resets\":{},\"retained_indirect_validation\":{},\"render_skipped_empty_indirect_batch\":{},\"scope\":\"cumulative per-pass decisions since device creation; one skipped decision is one HAL command buffer not created; command-buffer counts, not GPU time\"}}",
                 self.enabled, totals.render_skipped, totals.compute_skipped, totals.retained_disabled,
                 totals.retained_discard_fixups, totals.retained_query_resets,
-                totals.retained_indirect_validation, totals.retained_indirect_validation_empty_batch);
+                totals.retained_indirect_validation, totals.render_skipped_empty_indirect_batch);
         }
     }
 }

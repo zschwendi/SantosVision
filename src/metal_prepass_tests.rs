@@ -27,7 +27,8 @@ fn fixture(indirect_validation: bool) -> Fixture {
 }
 
 /// [render skipped, compute skipped, retained: switch off, discard fixups,
-/// query resets, indirect validation, and of those with an empty batch].
+/// query resets, indirect validation; then how many of the render skips were
+/// on a device that validates indirect draws].
 type Counts = [u64; 7];
 
 /// Checks the instance's cumulative pre-pass decisions: `on` when this
@@ -37,7 +38,7 @@ fn assert_counts(f: &Fixture, on: Counts, passes: u64) {
     let report = f.instance.generate_report().expect("wgpu-core backend").metal_prepass;
     let counts: Counts = [report.render_skipped, report.compute_skipped, report.retained_disabled,
         report.retained_discard_fixups, report.retained_query_resets,
-        report.retained_indirect_validation, report.retained_indirect_validation_empty_batch];
+        report.retained_indirect_validation, report.render_skipped_empty_indirect_batch];
     let wanted = if report.enabled { on } else { [0, 0, passes, 0, 0, 0, 0] };
     assert_eq!(counts, wanted, "pre-pass decisions with the switch {}", if report.enabled { "on" } else { "off" });
 }
@@ -188,8 +189,8 @@ fn metal_prepass_render_and_compute_bytes_keep_pass_and_copy_order() {
     assert_eq!(&bytes[2][..64], &words(|i| i * 3 + 1)[..], "the first compute pass");
     assert_eq!(&bytes[3][..64], &words(|i| i * 3 + 6)[..], "the second compute pass read the first one's output");
     assert!(pollster::block_on(scope.pop()).is_none());
-    // No discard, no query, no indirect validation on this device: all four
-    // pre-pass buffers are empty.
+    // No discard, no query, and a device that does not validate indirect
+    // draws at all: all four pre-pass buffers are empty.
     assert_counts(&f, [2, 2, 0, 0, 0, 0, 0], 4);
 }
 
@@ -269,8 +270,8 @@ fn metal_prepass_query_pass_keeps_its_prepass_and_a_deferred_resolve_stays_in_pl
 }
 
 #[test]
-fn metal_prepass_is_kept_while_the_device_validates_indirect_draws() {
-    // Default flags, as the game's device has them.
+fn metal_prepass_with_indirect_validation_is_kept_only_for_a_real_indirect_draw() {
+    // Default flags, as the game's device has them: indirect draws are validated.
     let f = fixture(true);
     let scope = f.device.push_error_scope(ErrorFilter::Validation);
     let (red, green) = (solid_pipeline(&f.device, [1., 0., 0., 1.]), solid_pipeline(&f.device, [0., 1., 0., 1.]));
@@ -286,7 +287,8 @@ fn metal_prepass_is_kept_while_the_device_validates_indirect_draws() {
     let outputs: Vec<Buffer> = (0..3).map(|_| output(&f.device)).collect();
 
     let mut encoder = f.device.create_command_encoder(&CommandEncoderDescriptor::default());
-    // An ordinary draw: nothing to validate, and the pre-pass stays anyway.
+    // An ordinary draw: the device validates indirect draws, but this pass
+    // has none, so its pre-pass would be empty.
     {
         let mut pass = begin(&mut encoder, &view, LoadOp::Clear(Color::BLACK), StoreOp::Store, None);
         pass.set_pipeline(&red);
@@ -310,8 +312,8 @@ fn metal_prepass_is_kept_while_the_device_validates_indirect_draws() {
     assert_eq!(texels(&bytes[1]), halves(GREEN, RED), "the validated indirect draw ran");
     assert_eq!(&bytes[2][..64], &words(|i| i * 3 + 1)[..]);
     assert!(pollster::block_on(scope.pop()).is_none());
-    // Both render passes keep their pre-pass; only the first had no batch.
-    assert_counts(&f, [0, 1, 0, 0, 0, 2, 1], 3);
+    // The direct pass goes without a pre-pass; the indirect one keeps it.
+    assert_counts(&f, [1, 1, 0, 0, 0, 1, 1], 3);
 }
 
 #[test]
