@@ -2,6 +2,7 @@
 // Constantin Clerc (c22dev) - 0.1
 
 use crate::input;
+use objc2::runtime::NSObjectProtocol;
 use objc2_game_controller::{GCController, GCControllerButtonInput, GCExtendedGamepad};
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -70,6 +71,16 @@ fn down(b: &GCControllerButtonInput) -> bool {
     unsafe { b.isPressed() }
 }
 
+fn touchpad_pressed(gamepad: &GCExtendedGamepad) -> bool {
+    // Both Apple's DualSense and DualShock profiles expose this button.
+    // Other profiles may not; avoid subclass feature/dependency changes and
+    // never send an unsupported selector. DualShock's binding also permits nil.
+    if !gamepad.respondsToSelector(objc2::sel!(touchpadButton)) { return false; }
+    let button: Option<objc2::rc::Retained<GCControllerButtonInput>> =
+        unsafe { objc2::msg_send![gamepad, touchpadButton] };
+    button.is_some_and(|button| down(&button))
+}
+
 pub fn poll() -> bool {
     POLL_SAMPLES.fetch_add(1, Ordering::Relaxed);
     let Some(gp) = gamepad() else {
@@ -132,6 +143,7 @@ pub fn poll() -> bool {
         if down(&dp.right()) { keys.insert("ArrowRight"); }
         if down(&gp.buttonMenu()) { keys.insert("Escape"); }
         if gp.buttonOptions().is_some_and(|b| down(&b)) { keys.insert("KeyV"); }
+        if touchpad_pressed(&gp) { keys.insert("KeyV"); }
 
         let rs = gp.rightThumbstick();
         let curve = |v: f32| -> f64 {
