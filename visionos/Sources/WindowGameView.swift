@@ -192,6 +192,11 @@ struct WindowGameView: View {
                     Text("Low preset · Audio muted").foregroundStyle(.secondary)
                 }
                 .disabled(!runtime.canChangeGraphics)
+                Section("Controller") {
+                    Text(runtime.controllerSummary)
+                    Text("Click the touchpad to cycle cameras, including first person. In menus, use the D-pad to navigate, Cross to confirm, Circle to go back, and L1 for Tab.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
                 Section {
                     Toggle("Rendering optimizations", isOn: Binding(
                         get: { runtime.drawSetupOverheadEnabled },
