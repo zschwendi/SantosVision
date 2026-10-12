@@ -48,7 +48,7 @@ fn invoke(caller: &mut Caller<'_, HostState>, name: &str, args: &[Val]) -> Resul
     let args = crate::coerce_args(args, &ty);
     let mut out: Vec<Val> = ty.results().map(|kind| crate::default_val(&kind)).collect();
     function.call(&mut *caller, &args, &mut out)
-        .with_context(|| format!("diagnostic scene command trapped: {name}"))?;
+        .map_err(|error| anyhow!("diagnostic scene command trapped {name}: {error:#}"))?;
     Ok(out.into_iter().next().unwrap_or(Val::I32(0)))
 }
 
