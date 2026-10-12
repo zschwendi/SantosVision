@@ -21,6 +21,10 @@ use render_prepare::{PassKey, RenderPrepare};
 mod uniform_pack;
 use uniform_pack::UniformPack;
 
+#[path = "uniform_snapshot.rs"]
+mod uniform_snapshot;
+use uniform_snapshot::UniformSnapshot;
+
 #[path = "bind_group_prepare.rs"]
 mod bind_group_prepare;
 use bind_group_prepare::{BindGroupPrepare, EntryScratch, KeyScratch, NonBindingKind};
@@ -628,6 +632,7 @@ struct Tex {
     mip_passes: Option<Vec<(TextureView, BindGroup)>>,
 }
 struct Buf {
+    identity: u64,
     size: u64,
     stride: u32,
     gpu: Option<Buffer>,
@@ -911,6 +916,7 @@ pub struct Gpu {
     numeric_bgl_cache: HashMap<(u64, u32, u32), (BindGroupLayout, u64)>,
     render_prepare: RenderPrepare,
     uniform_pack: UniformPack,
+    uniform_snapshot: UniformSnapshot,
     bind_group_prepare: BindGroupPrepare,
     empty_bgl: Option<(BindGroupLayout, u64)>,
     pipelines: HashMap<Vec<i64>, PipeEntry>,
@@ -1071,6 +1077,8 @@ impl Gpu {
         };
         let render_prepare = RenderPrepare::from_environment();
         log(&format!("render prepare: {}", render_prepare.metrics(0, 0, 0, 0, 0)));
+        let uniform_snapshot = UniformSnapshot::from_environment();
+        log(&format!("uniform snapshot cache: {}", uniform_snapshot.metrics()));
         let uniform_pack = UniformPack::from_environment();
         log(&format!("uniform stage pack: {}", uniform_pack.metrics(0, 0, 0, 0)));
         let bind_group_prepare = BindGroupPrepare::from_environment();
@@ -1082,7 +1090,7 @@ impl Gpu {
             s: State::new(), world_view: None, world_depths: HashMap::new(), world_depth_before_ui: HashMap::new(), world_depth_snapshot_overflow: false, world_depth_snapshots_this_present: 0, world_depth_trace: HashMap::new(), world_depth_anomalies: Vec::new(), pdirty: true, last_pl: None, last_program_uids: None,
             float_programs: HashMap::new(), shader_index, shader_dir, next_uid: 1,
             bgl_cache: HashMap::new(), empty_bgl: None, pipelines: HashMap::new(), compute: HashMap::new(), bind_groups: HashMap::new(),
-            numeric_bgl_cache: HashMap::new(), render_prepare, uniform_pack, bind_group_prepare,
+            numeric_bgl_cache: HashMap::new(), render_prepare, uniform_pack, uniform_snapshot, bind_group_prepare,
             ubo_slots: (0..FRAME_SLOTS).map(|_| Vec::new()).collect(), ubo_shared: Vec::new(), ubo_slot: 0, ubo_chunk: 0, ubo_off: 0,
             dummy_tex: HashMap::new(), dummy_smp: None, dummy_cmp: None, dummy_bufs: HashMap::new(), zero_vb: None, zero_src: None, scratch: None,
             proxy_pipelines: HashMap::new(), f2d_pipeline: None, blit: None, mip_pipelines: HashMap::new(), mip_sampler: None,
@@ -1116,7 +1124,8 @@ impl Gpu {
         atomic(&self.mem, self.ring + 4 * w)
     }
     fn uid(&mut self) -> u64 {
-        self.next_uid += 1;
+        // Resource identities must never alias after integer wrap.
+        self.next_uid = self.next_uid.checked_add(1).expect("GPU resource identity exhausted");
         self.next_uid
     }
 
@@ -1551,7 +1560,8 @@ impl Gpu {
 
     fn create_buffer(&mut self, id: u32, size: u32, bind: u32, misc: u32, stride: u32) {
         let size = size as u64;
-        let mut b = Buf { size, stride, gpu: None, bytes: 0, shadow: None, version: 0, enc: 0, in_bg: false, counter: None };
+        let identity = self.uid();
+        let mut b = Buf { identity, size, stride, gpu: None, bytes: 0, shadow: None, version: 0, enc: 0, in_bg: false, counter: None };
         if bind & 4 != 0 { b.shadow = Some(vec![0u8; size as usize]); }
         let mut usage = BufferUsages::COPY_DST | BufferUsages::COPY_SRC;
         if bind & 1 != 0 { usage |= BufferUsages::VERTEX; }
@@ -1571,12 +1581,19 @@ impl Gpu {
         let data = self.bytes(data_addr, size).to_vec();
         let used = self.used(id);
         let Some(b) = self.buf_mut(id) else { return };
+        let mut version_wrapped = false;
         if let Some(sh) = b.shadow.as_mut() {
             let end = ((offset + size) as usize).min(sh.len());
             if (offset as usize) < end { sh[offset as usize..end].copy_from_slice(&data[..end - offset as usize]); }
-            b.version += 1;
+            let (version, wrapped) = b.version.overflowing_add(1);
+            b.version = version;
+            version_wrapped = wrapped;
         }
-        let Some(g) = b.gpu.clone() else { return };
+        let gpu = b.gpu.clone();
+        // Clear before returning for CB-only buffers too. Old offsets cannot
+        // match a recycled content version, even within this present.
+        if version_wrapped { self.uniform_snapshot.version_wrapped(); }
+        let Some(g) = gpu else { return };
         if !no_overwrite && used { self.flush(); }
         let source = if no_overwrite { UPLOAD_OP47 } else { UPLOAD_OP12 };
         let n = size & !3;
@@ -2299,6 +2316,9 @@ impl Gpu {
             log_once(&format!("packbig{}", prog.label), &format!("{}: constant buffers total {} bytes (> 64 KB)", prog.label, pack.size));
             return None;
         }
+        let bindings: &[Cb] = if pack.members.is_empty() { &[] } else { &self.s.cb[stage] };
+        let (snapshot_key, location) = self.uniform_snapshot.probe(prog.uid, stage, pack, &self.objs, bindings);
+        if let Some(location) = location { return Some(location); }
         let (ci, off) = self.uniform_alloc(pack.size);
         let (copied, grew) = if self.uniform_pack.enabled {
             // These fields are disjoint. No Gpu method, guest callback, wait or
@@ -2334,6 +2354,7 @@ impl Gpu {
         chunk.lo = chunk.lo.min(off);
         chunk.hi = chunk.hi.max(end as u64);
         self.uniform_pack.record(pack, copied, grew);
+        self.uniform_snapshot.insert(snapshot_key, (ci, off));
         Some((ci, off))
     }
 
@@ -3918,6 +3939,9 @@ impl Gpu {
         self.publish_geometry_capture_diagnostics();
         self.log_fps();
 
+        // Metadata is only valid until this present retires. Ordinary flush
+        // deliberately retains it because ring bytes are still immutable.
+        self.uniform_snapshot.present();
         self.frame_slot_done[self.ubo_slot] = self.last_submit.clone();
         self.ubo_slot = (self.ubo_slot + 1) % FRAME_SLOTS;
         self.ubo_chunk = 0;
@@ -4001,6 +4025,7 @@ impl Gpu {
             self.log_upload_timing(dt);
             log(&format!("render prepare: {}", self.render_prepare.metrics(self.presents, self.draws, self.passes, self.submits, self.errors.load(Ordering::Relaxed))));
             log(&format!("uniform stage pack: {}", self.uniform_pack.metrics(self.presents, self.draws, self.submits, self.errors.load(Ordering::Relaxed))));
+            log(&format!("uniform snapshot cache: {}", self.uniform_snapshot.metrics()));
             log(&format!("bind group prepare: {}", self.bind_group_prepare.metrics()));
             if let Some(r) = self.instance.generate_report() {
                 let h = &r.hub;

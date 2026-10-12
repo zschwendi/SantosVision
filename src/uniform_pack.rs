@@ -132,7 +132,7 @@ mod tests {
     use super::super::*;
 
     fn shadow(bytes: &[u8]) -> Obj {
-        Obj::Buf(Buf { size: bytes.len() as u64, stride: 0, gpu: None, bytes: 0, shadow: Some(bytes.to_vec()),
+        Obj::Buf(Buf { identity: 1, size: bytes.len() as u64, stride: 0, gpu: None, bytes: 0, shadow: Some(bytes.to_vec()),
             version: 0, enc: 0, in_bg: false, counter: None })
     }
 
@@ -170,7 +170,7 @@ mod tests {
         assert_eq!(stage, original);
         // Deliberately inconsistent synthetic shadow is a failure-path check,
         // not a legal game resource. The reference's source slice also panics.
-        let bad = vec![None, Some(Obj::Buf(Buf { size: 32, stride: 0, gpu: None, bytes: 0,
+        let bad = vec![None, Some(Obj::Buf(Buf { identity: 1, size: 32, stride: 0, gpu: None, bytes: 0,
             shadow: Some(vec![1; 4]), version: 0, enc: 0, in_bg: false, counter: None }))];
         let legal_destination = Pack { size: 16, members: vec![PackMember { binding: 0, size: 16, offset: 0 }] };
         assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| direct_copy(&legal_destination, &bad, &bindings, 256, &mut stage))).is_err());
@@ -282,7 +282,8 @@ fn main() {
 
     #[cfg(target_os = "macos")]
     fn overwrite(g: &mut Gpu, id: u32, first: u32, values: &[u32]) {
-        let shadow = g.buf_mut(id).unwrap().shadow.as_mut().unwrap(); shadow.fill(0x9b);
+        let b = g.buf_mut(id).unwrap(); b.version += 1;
+        let shadow = b.shadow.as_mut().unwrap(); shadow.fill(0x9b);
         for (at, word) in values.iter().enumerate() { let at = first as usize * 16 + at * 4; shadow[at..at + 4].copy_from_slice(&word.to_le_bytes()); }
     }
 
@@ -433,8 +434,95 @@ fn main() {
         p.pack = Some(Pack { size: 16, members: vec![PackMember { binding: 0, size: 16, offset: 0 }] });
         let mut constants = p.info.bindings.iter().find(|b| b.kind == Kind::Uniform).unwrap().clone();
         constants.binding = 15; p.group_bindings.get_mut(&0).unwrap().insert(1, constants);
+        // A new guest upload version forces a fresh snapshot even when the
+        // optional snapshot cache retained this earlier Pack layout.
+        g.buf_mut(5).unwrap().version += 1;
         let before = g.ubo_off; assert!(g.stage_bind_group(2, &p, 0, &bgl).is_none());
         assert_eq!(g.ubo_off, before+256); assert_eq!(&g.ubo_slots[0][g.ubo_chunk].stage[before as usize..before as usize+16], &[33;16]);
+        let error = pollster::block_on(scope.pop()); assert!(error.is_none(), "{error:?}"); assert_eq!(g.errors.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn metal_snapshot_cache_reuses_across_flush_and_preserves_ordered_guest_uploads() {
+        let mut g = gpu(); let scope = g.device.push_error_scope(ErrorFilter::Validation);
+        // Force this focused fixture on without process-environment mutation.
+        g.uniform_snapshot = super::super::uniform_snapshot::UniformSnapshot::new(true);
+        let (p, bgl, pipeline) = fixture(&mut g, 2);
+        put(&mut g, 3, 48, 1, &[101,102,103,104,105,106,107,108]);
+        put(&mut g, 4, 48, 1, &[201,202,203,204,205,206,207,208]);
+        g.s.cb[2][0] = Cb { buf: 3, first: 1 }; g.s.cb[2][1] = Cb { buf: 4, first: 1 };
+        control(&mut g, 0, 301,302,303);
+        let a = dispatch(&mut g, &p, &bgl, &pipeline);
+        let saved = g.ubo_slots[0][0].stage[..80].to_vec();
+        let cursor = g.ubo_off;
+        let repeat = dispatch(&mut g, &p, &bgl, &pipeline);
+        assert_eq!(repeat.dyn_off, a.dyn_off); assert_eq!(g.ubo_off, cursor);
+        g.flush(); let upload_calls = g.buffer_uploads[UPLOAD_UNIFORMS].api_wall.calls;
+        let after_flush = dispatch(&mut g, &p, &bgl, &pipeline);
+        assert_eq!(after_flush.dyn_off, a.dyn_off); assert_eq!(g.ubo_off, cursor);
+        assert!(g.ubo_slots[0][0].lo >= g.ubo_slots[0][0].hi);
+        g.flush(); assert_eq!(g.buffer_uploads[UPLOAD_UNIFORMS].api_wall.calls, upload_calls);
+
+        // Exercise both production upload op paths rather than direct shadow
+        // edits. Each new version keeps earlier GPU snapshots immutable.
+        let words: Vec<u8> = [401u32,402,403,404,405,406,407,408].into_iter().flat_map(u32::to_le_bytes).collect();
+        unsafe { std::ptr::copy_nonoverlapping(words.as_ptr(), g.base.add(4096), words.len()); }
+        let before_version = g.buf(3).unwrap().version;
+        g.upload_buffer(3, 16, 32, 4096, false);
+        assert_eq!(g.buf(3).unwrap().version, before_version + 1);
+        g.upload_buffer(3, 16, 32, 4096, true);
+        assert_eq!(g.buf(3).unwrap().version, before_version + 2);
+        control(&mut g, 1, 601,602,603);
+        let b = dispatch(&mut g, &p, &bgl, &pipeline);
+        assert_ne!(b.dyn_off, a.dyn_off); assert_eq!(&g.ubo_slots[0][0].stage[..80], saved.as_slice());
+        assert_eq!(read_output(&mut g, 160), [101,102,103,104,105,106,107,108,201,202,203,204,205,206,207,208,0,301,302,303,
+            401,402,403,404,405,406,407,408,201,202,203,204,205,206,207,208,1,601,602,603]);
+
+        // Same guest handle and reset content version cannot reuse its old
+        // snapshot after object destruction/recreation.
+        let old_identity = g.buf(3).unwrap().identity; g.destroy(3);
+        put(&mut g, 3, 48, 1, &[701,702,703,704,705,706,707,708]);
+        assert_ne!(g.buf(3).unwrap().identity, old_identity);
+        let recreated = g.pack_copy(&p, 2).unwrap(); assert_ne!(recreated.1, b.dyn_off.unwrap() as u64);
+        assert_eq!(&g.ubo_slots[0][recreated.0].stage[recreated.1 as usize..recreated.1 as usize + 4], &701u32.to_le_bytes());
+
+        // Wrapping the production upload version clears *all* old keys before
+        // the CB-only early return. A formerly cached version-zero key fails.
+        g.buf_mut(3).unwrap().version = 0; let zero = g.pack_copy(&p, 2).unwrap();
+        g.buf_mut(3).unwrap().version = u64::MAX;
+        g.upload_buffer(3, 16, 32, 4096, true);
+        let wrapped = g.pack_copy(&p, 2).unwrap(); assert_ne!(wrapped, zero);
+        assert_eq!(g.buf(3).unwrap().version, 0);
+        let metrics = g.uniform_snapshot.metrics(); assert_eq!(metrics["hits"], 2); assert_eq!(metrics["version_wrap_clears"], 1);
+        let error = pollster::block_on(scope.pop()); assert!(error.is_none(), "{error:?}"); assert_eq!(g.errors.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn metal_snapshot_cache_forgets_each_present_and_bypasses_mixed_gpu_buffers() {
+        let _present_isolation = HeadlessPresentIsolation::new();
+        let mut g = gpu(); let scope = g.device.push_error_scope(ErrorFilter::Validation);
+        g.uniform_snapshot = super::super::uniform_snapshot::UniformSnapshot::new(true);
+        let (p, bgl, pipeline) = fixture(&mut g, 1);
+        put(&mut g, 3, 32, 0, &[11,12,13,14,15,16,17,18]);
+        put(&mut g, 4, 32, 0, &[21,22,23,24,25,26,27,28]);
+        g.s.cb[2][0] = Cb { buf: 3, first: 0 }; g.s.cb[2][1] = Cb { buf: 4, first: 0 };
+        control(&mut g, 0, 31,32,33);
+        for present in 0..4 {
+            let a = dispatch(&mut g, &p, &bgl, &pipeline);
+            assert_eq!(a.dyn_off, Some(((present % FRAME_SLOTS) as u64 * RING_CHUNK) as u32));
+            assert_eq!(dispatch(&mut g, &p, &bgl, &pipeline).dyn_off, a.dyn_off);
+            assert_eq!(g.ubo_off, 256);
+            g.present(0); assert_eq!(g.uniform_snapshot.metrics()["entries"], 0);
+        }
+        assert_eq!(g.uniform_snapshot.metrics()["misses"], 4); assert_eq!(g.uniform_snapshot.metrics()["hits"], 4);
+        assert_eq!(read_output(&mut g, 80), [11,12,13,14,15,16,17,18,21,22,23,24,25,26,27,28,0,31,32,33]);
+        g.create_buffer(3, 32, 4 | 1, 0, 0);
+        overwrite(&mut g, 3, 0, &[41,42,43,44,45,46,47,48]);
+        let a = dispatch(&mut g, &p, &bgl, &pipeline); let b = dispatch(&mut g, &p, &bgl, &pipeline);
+        assert_ne!(a.dyn_off, b.dyn_off); assert_eq!(g.uniform_snapshot.metrics()["bypasses"], 2);
+        assert_eq!(read_output(&mut g, 80), [41,42,43,44,45,46,47,48,21,22,23,24,25,26,27,28,0,31,32,33]);
         let error = pollster::block_on(scope.pop()); assert!(error.is_none(), "{error:?}"); assert_eq!(g.errors.load(Ordering::Relaxed), 0);
     }
 }

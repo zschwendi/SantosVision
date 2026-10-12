@@ -209,8 +209,10 @@ mod tests {
         let mut p = program(&mut g, "@group(0) @binding(0) var<uniform> c: vec4u; @group(0) @binding(160) var<storage, read_write> out: array<u32>; @compute @workgroup_size(1) fn main() { out[c.y] = c.x; out[2] = c.z; out[3] = c.w; }", None);
         p.pack = Some(Pack { members: vec![PackMember { binding: 0, size: 16, offset: 0 }], size: 16 });
         let layout = g.bgl_for(&p, 2, 0);
+        g.buf_mut(3).unwrap().version += 1;
         { let shadow = g.buf_mut(3).unwrap().shadow.as_mut().unwrap(); shadow.fill(99); shadow[16..32].fill(0); shadow[16..20].copy_from_slice(&7u32.to_le_bytes()); }
         let a = g.stage_bind_group(2, &p, 0, &layout).unwrap(); compute(&mut g, &p, &a, &layout.0);
+        g.buf_mut(3).unwrap().version += 1;
         { let shadow = g.buf_mut(3).unwrap().shadow.as_mut().unwrap(); shadow[16..20].copy_from_slice(&11u32.to_le_bytes()); shadow[20..24].copy_from_slice(&1u32.to_le_bytes()); }
         let b = g.stage_bind_group(2, &p, 0, &layout).unwrap();
         assert_eq!(a.uid, b.uid); assert_eq!(a.dyn_off, Some(0)); assert_eq!(b.dyn_off, Some(256));
