@@ -4,11 +4,41 @@
 use crate::input;
 use objc2_game_controller::{GCController, GCControllerButtonInput, GCExtendedGamepad};
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 pub static ACTIVE: AtomicBool = AtomicBool::new(false);
+static POLL_SAMPLES: AtomicU64 = AtomicU64::new(0);
+static CONNECTED_SAMPLES: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_INPUT_SAMPLES: AtomicU64 = AtomicU64::new(0);
+static KEY_EVENTS: AtomicU64 = AtomicU64::new(0);
+static BUTTON_EVENTS: AtomicU64 = AtomicU64::new(0);
+static LOOK_EVENTS: AtomicU64 = AtomicU64::new(0);
+
+/// Cumulative sampling/mapping counters, independent of engine block readiness.
+/// Compare with input::status_json delivery counters to locate a broken path.
+pub(crate) fn status_json() -> serde_json::Value {
+    serde_json::json!({
+        "connected": ACTIVE.load(Ordering::Relaxed),
+        "poll_samples": POLL_SAMPLES.load(Ordering::Relaxed),
+        "connected_samples": CONNECTED_SAMPLES.load(Ordering::Relaxed),
+        "active_input_samples": ACTIVE_INPUT_SAMPLES.load(Ordering::Relaxed),
+        "mapped_key_events": KEY_EVENTS.load(Ordering::Relaxed),
+        "mapped_button_events": BUTTON_EVENTS.load(Ordering::Relaxed),
+        "mapped_look_events": LOOK_EVENTS.load(Ordering::Relaxed),
+    })
+}
+
+fn emit_key(key: &str, pressed: bool) {
+    KEY_EVENTS.fetch_add(1, Ordering::Relaxed);
+    input::key(key, pressed, false, None, false);
+}
+
+fn emit_button(button: usize, pressed: bool) {
+    BUTTON_EVENTS.fetch_add(1, Ordering::Relaxed);
+    input::button(button, pressed);
+}
 
 pub static IN_VEHICLE: AtomicBool = AtomicBool::new(false);
 
@@ -41,6 +71,7 @@ fn down(b: &GCControllerButtonInput) -> bool {
 }
 
 pub fn poll() -> bool {
+    POLL_SAMPLES.fetch_add(1, Ordering::Relaxed);
     let Some(gp) = gamepad() else {
         if ACTIVE.swap(false, Ordering::Relaxed) {
             if let Some(st) = STATE.lock().unwrap().take() { release(st); }
@@ -51,6 +82,7 @@ pub fn poll() -> bool {
     if !ACTIVE.swap(true, Ordering::Relaxed) {
         eprintln!("[pad] controller connected");
     }
+    CONNECTED_SAMPLES.fetch_add(1, Ordering::Relaxed);
     let mut guard = STATE.lock().unwrap();
     let st = guard.get_or_insert_with(|| State { held: HashSet::new(), buttons: 0, last: Instant::now(), down_since: None });
     let dt = st.last.elapsed().as_secs_f64().min(0.05);
@@ -59,6 +91,7 @@ pub fn poll() -> bool {
     let in_car = IN_VEHICLE.load(Ordering::Relaxed);
     let mut keys: HashSet<&'static str> = HashSet::new();
     let mut buttons = 0u8;
+    let mut looking = false;
     unsafe {
         let ls = gp.leftThumbstick();
         let (lx, ly) = (ls.xAxis().value(), ls.yAxis().value());
@@ -107,29 +140,34 @@ pub fn poll() -> bool {
         };
         let (dx, dy) = (curve(rs.xAxis().value()), -curve(rs.yAxis().value()));
         if dx != 0.0 || dy != 0.0 {
+            looking = true;
+            LOOK_EVENTS.fetch_add(1, Ordering::Relaxed);
             input::mouse_delta_f(dx * LOOK_SPEED * dt, dy * LOOK_SPEED * dt);
         }
+    }
+    if !keys.is_empty() || buttons != 0 || looking || (in_car && HORN_PAD.load(Ordering::Relaxed)) {
+        ACTIVE_INPUT_SAMPLES.fetch_add(1, Ordering::Relaxed);
     }
 
     if cfg!(target_os = "ios") { input::set_locked(true); }
 
-    for k in st.held.difference(&keys) { input::key(k, false, false, None, false); }
+    for k in st.held.difference(&keys) { emit_key(k, false); }
     for k in keys.difference(&st.held) {
         crate::mp::key_pressed(k);
-        input::key(k, true, false, None, false);
+        emit_key(k, true);
     }
     st.held = keys;
     for (bit, dom) in [(1u8, 0usize), (2, 2)] {
-        if (buttons ^ st.buttons) & bit != 0 { input::button(dom, buttons & bit != 0); }
+        if (buttons ^ st.buttons) & bit != 0 { emit_button(dom, buttons & bit != 0); }
     }
     st.buttons = buttons;
     true
 }
 
 fn release(st: State) {
-    for k in st.held { input::key(k, false, false, None, false); }
-    if st.buttons & 1 != 0 { input::button(0, false); }
-    if st.buttons & 2 != 0 { input::button(2, false); }
+    for k in st.held { emit_key(k, false); }
+    if st.buttons & 1 != 0 { emit_button(0, false); }
+    if st.buttons & 2 != 0 { emit_button(2, false); }
 }
 
 /// Release held controller input when the native application's scene deactivates.

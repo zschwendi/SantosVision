@@ -7,6 +7,9 @@ use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicU8, Ordering};
 use std::sync::{LazyLock, Mutex};
 
 static BLOCK: AtomicU64 = AtomicU64::new(0);
+static KEY_WRITES: AtomicU64 = AtomicU64::new(0);
+static BUTTON_WRITES: AtomicU64 = AtomicU64::new(0);
+static MOTION_WRITES: AtomicU64 = AtomicU64::new(0);
 static SIZE: Mutex<(i32, i32)> = Mutex::new((1280, 720));
 static HELD: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
 
@@ -36,6 +39,20 @@ fn ext(i: u64) -> Option<&'static AtomicI32> {
 }
 fn key_byte(vk: u8) -> Option<&'static AtomicU8> {
     base().map(|p| unsafe { &*(p.add(vk as usize) as *const AtomicU8) })
+}
+
+/// These counters increment only after writing a valid engine input block.
+/// Key writes count direct mapped keys (not alias refreshes/lifecycle clears).
+/// All callers share these counters; controller mapping counters are separate.
+pub(crate) fn status_json() -> serde_json::Value {
+    serde_json::json!({
+        "block_ready": base().is_some(),
+        "focused": word(FOCUS).map(|value| value.load(Ordering::SeqCst) != 0),
+        "locked": word(LOCKED).map(|value| value.load(Ordering::SeqCst) != 0),
+        "key_writes": KEY_WRITES.load(Ordering::Relaxed),
+        "button_writes": BUTTON_WRITES.load(Ordering::Relaxed),
+        "motion_writes": MOTION_WRITES.load(Ordering::Relaxed),
+    })
 }
 
 pub fn publish(block: u64) {
@@ -141,7 +158,10 @@ pub fn key(winit_name: &str, pressed: bool, repeat: bool, text: Option<&str>, ct
 
     let is_alias = FLY_ALIAS.iter().any(|(src, _)| *src == code);
     let v = if is_alias { None } else { vk(code) };
-    if let Some(v) = v { if let Some(k) = key_byte(v) { k.store(if pressed { 0x80 } else { 0 }, Ordering::SeqCst); } }
+    if let Some(v) = v { if let Some(k) = key_byte(v) {
+        k.store(if pressed { 0x80 } else { 0 }, Ordering::SeqCst);
+        KEY_WRITES.fetch_add(1, Ordering::Relaxed);
+    } }
     {
         let mut held = HELD.lock().unwrap();
         if pressed { held.insert(code.to_string()); } else { held.remove(code); }
@@ -171,6 +191,7 @@ pub fn button(dom_button: usize, pressed: bool) {
     let bit = 1 << [0, 2, 1, 3, 4].get(dom_button).copied().unwrap_or(0);
     if let Some(b) = word(BTN) {
         if pressed { b.fetch_or(bit, Ordering::SeqCst); } else { b.fetch_and(!bit, Ordering::SeqCst); }
+        BUTTON_WRITES.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -208,6 +229,7 @@ fn mouse_delta(dx_: i32, dy_: i32) {
         dy.fetch_add(dy_, Ordering::SeqCst);
         mx.store((mx.load(Ordering::SeqCst) + dx_).clamp(0, w - 1), Ordering::SeqCst);
         my.store((my.load(Ordering::SeqCst) + dy_).clamp(0, h - 1), Ordering::SeqCst);
+        MOTION_WRITES.fetch_add(1, Ordering::Relaxed);
     }
 }
 pub fn wheel(notches: i32) {
