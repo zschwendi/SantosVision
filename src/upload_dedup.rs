@@ -14,9 +14,10 @@
 //! A record is trusted only while nothing else can have changed its range:
 //! - a compared op47 that is not an exact repeat first drops every record of
 //!   that buffer whose range intersects its own, and keeps the disjoint ones;
-//! - every op12, and every op47 the guard does not compare, drops ALL of the
-//!   buffer's records, since a padded tail reaches past the range the guest
-//!   named and the guard does not model those writes;
+//! - a nonempty, aligned, checked in-bounds op47 too large to record drops only
+//!   intersecting records and is never stored; its legacy write has exact extent;
+//! - every op12 and all other uncompared op47 shapes drop ALL buffer records,
+//!   since a padded tail can reach past the guest's named range;
 //! - a GPU-side write (copy/clear/counter destination, writable storage
 //!   binding) drops them all and takes the object out of the guard for the
 //!   rest of its lifetime.
@@ -114,6 +115,7 @@ struct Interval {
     stored: u64, store_rejected: u64, evictions: u64, evictions_buffer_cap: u64,
     // Calls that dropped at least one record.
     invalidated_op12: u64, invalidated_unrecorded_op47: u64, invalidated_gpu_write: u64, forgotten: u64,
+    invalidated_oversized_op47: u64, oversized_retained_records: u64,
     // Records dropped, by cause. Evictions are counted above.
     dropped_changed_op47: u64, dropped_op12: u64, dropped_bypass: [u64; 4], dropped_gpu_write: u64,
     dropped_forgotten: u64, dropped_recency_reset: u64,
@@ -259,10 +261,26 @@ impl UploadDedup {
         let size = data.len() as u64;
         if let Some(shape) = bypass_shape(offset, size, gpu_bytes, self.caps.record_bytes) {
             bump(&mut self.stats.bypass_shape[shape]);
-            // The guard does not model where that legacy write lands (a padded
-            // tail reaches past the named range), so the whole buffer is
-            // purged, not just the records the named range intersects.
-            let dropped = self.purge(lifetime);
+            let dropped = if shape == SHAPE_OVERSIZE {
+                // This shape alone proved nonempty/aligned and checked the
+                // in-bounds end. The legacy route writes exactly this range,
+                // with no padded tail. Never compare/store its large bytes.
+                let end = offset + size;
+                let mut retained = 0u64;
+                let dropped = self.drop_matching(|record| {
+                    if record.lifetime != lifetime { return false; }
+                    if record.intersects(offset, end) { return true; }
+                    retained += 1;
+                    false
+                });
+                add(&mut self.stats.oversized_retained_records, retained);
+                if dropped > 0 { bump(&mut self.stats.invalidated_oversized_op47); }
+                dropped
+            } else {
+                // All other bypass shapes retain the conservative whole-buffer
+                // purge, including invalid or unaligned oversized requests.
+                self.purge(lifetime)
+            };
             if dropped > 0 {
                 bump(&mut self.stats.invalidated_unrecorded_op47);
                 add(&mut self.stats.dropped_bypass[shape], dropped);
@@ -447,6 +465,9 @@ impl UploadDedup {
             "out_of_bounds": s.bypass_shape[SHAPE_OUT_OF_BOUNDS], "over_record_cap": s.bypass_shape[SHAPE_OVERSIZE]});
         let invalidations = serde_json::json!({"op12": s.invalidated_op12, "unrecorded_op47": s.invalidated_unrecorded_op47,
             "gpu_write": s.invalidated_gpu_write, "destroyed_or_replaced": s.forgotten});
+        let oversized = serde_json::json!({"calls":s.bypass_shape[SHAPE_OVERSIZE],
+            "invalidated_calls":s.invalidated_oversized_op47,
+            "dropped_records":s.dropped_bypass[SHAPE_OVERSIZE], "retained_disjoint_records":s.oversized_retained_records});
         let dropped_by_shape = serde_json::json!({"empty": s.dropped_bypass[SHAPE_EMPTY], "unaligned_or_padded": s.dropped_bypass[SHAPE_UNALIGNED],
             "out_of_bounds": s.dropped_bypass[SHAPE_OUT_OF_BOUNDS], "over_record_cap": s.dropped_bypass[SHAPE_OVERSIZE]});
         let dropped = serde_json::json!({"changed_op47": s.dropped_changed_op47, "op12": s.dropped_op12,
@@ -464,7 +485,7 @@ impl UploadDedup {
             "saved_calls": s.saved_calls, "saved_bytes": s.saved_bytes,
             "check_ns": s.check_ns, "check_max_ns": s.check_max_ns, "store_ns": s.store_ns, "store_max_ns": s.store_max_ns,
             "miss_reasons": misses, "bypass_reasons": bypasses, "invalidations": invalidations,
-            "records_dropped": dropped, "disqualified": disqualified, "table": table});
+            "records_dropped": dropped, "oversized_range_bypass":oversized, "disqualified": disqualified, "table": table});
         serde_json::json!({"schema": 2, "enabled": self.enabled, "environment": ENVIRONMENT, "interval_s": interval_s,
             "cap_records": self.caps.records, "cap_buffer_records": self.caps.buffer_records,
             "cap_record_bytes": self.caps.record_bytes, "cap_total_bytes": self.caps.total_bytes,
@@ -745,12 +766,11 @@ mod tests {
     }
 
     #[test]
-    fn uncompared_op47_shapes_stay_legacy_and_drop_every_range() {
+    fn invalid_or_unaligned_op47_shapes_stay_legacy_and_drop_every_range() {
         let big = vec![9u8; Caps::DEFAULT.record_bytes + 4];
-        // (offset, data, gpu size, counter). All but the last two would not
-        // even reach the recorded ranges [0, 16) and [32, 48); the whole
-        // buffer is purged regardless.
-        let cases: [(u64, &[u8], u64, usize); 10] = [
+        // (offset, data, gpu size, counter). These shapes purge the whole
+        // buffer, including oversized lengths when alignment/bounds failed.
+        let cases: [(u64, &[u8], u64, usize); 12] = [
             (128, &[], GPU_BYTES, SHAPE_EMPTY),
             (130, &[1; 8], GPU_BYTES, SHAPE_UNALIGNED),
             (128, &[1; 6], GPU_BYTES, SHAPE_UNALIGNED),
@@ -758,9 +778,11 @@ mod tests {
             (252, &[1; 8], GPU_BYTES, SHAPE_OUT_OF_BOUNDS),
             (256, &[1; 4], GPU_BYTES, SHAPE_OUT_OF_BOUNDS),
             (u64::MAX - 3, &[1; 4], GPU_BYTES, SHAPE_OUT_OF_BOUNDS),
-            (8192, &big, 16384, SHAPE_OVERSIZE),
+            (8193, &big, 16384, SHAPE_UNALIGNED),
+            (8192, &big[..big.len()-1], 16384, SHAPE_UNALIGNED),
+            (16380, &big, 16384, SHAPE_OUT_OF_BOUNDS),
+            (u64::MAX - 3, &big, u64::MAX, SHAPE_OUT_OF_BOUNDS),
             (12, &[1; 6], GPU_BYTES, SHAPE_UNALIGNED),
-            (0, &big, 16384, SHAPE_OVERSIZE),
         ];
         for (index, (offset, data, gpu_bytes, shape)) in cases.into_iter().enumerate() {
             let mut guard = guard();
@@ -968,9 +990,9 @@ mod tests {
         assert!(!op47(&mut guard, c, 0, &[7; 8]));
         assert!(!op47(&mut guard, c, 16, &[8; 16]));
         assert_eq!((guard.totals().records, guard.totals().record_bytes, evictions(&guard)), (4, 48, (5, 2)));
-        // Over the per-record cap: legacy route, never stored, buffer purged.
+        // Over the per-record cap: legacy exact-range write touches no record.
         assert_eq!(guard.op47(b, 32, &[7; 20], GPU_BYTES), Op47::Legacy);
-        assert_eq!((guard.stats.bypass_shape[SHAPE_OVERSIZE], guard.stats.dropped_bypass[SHAPE_OVERSIZE], ranges(&guard, b)), (1, 1, vec![]));
+        assert_eq!((guard.stats.bypass_shape[SHAPE_OVERSIZE], guard.stats.dropped_bypass[SHAPE_OVERSIZE], ranges(&guard, b)), (1, 0, vec![(16, 16)]));
         assert_eq!((guard.stats.records_peak, guard.stats.record_bytes_peak, guard.stats.buffer_records_peak), (4, 48, 2));
 
         // A store nothing asked for cannot break the caps either.
@@ -1043,6 +1065,36 @@ mod tests {
     }
 
     #[test]
+    fn valid_oversized_op47_invalidates_only_intersections_and_never_stores() {
+        let caps = Caps { record_bytes: 16, total_bytes: 64, ..Caps::DEFAULT };
+        let data = [[11u8; 16], [22u8; 16], [33u8; 16]];
+        // One/multiple crossings, touching endpoints and a length larger than
+        // the entire record-byte budget ending exactly at the GPU boundary.
+        for (offset, len, survivors) in [
+            (4u64, 20usize, vec![(32,16),(64,16)]),
+            (8, 40, vec![(64,16)]),
+            (16, 20, vec![(0,16),(64,16)]),
+            (80, 176, vec![(0,16),(32,16),(64,16)]),
+            (96, 160, vec![(0,16),(32,16),(64,16)]),
+        ] {
+            let mut guard = UploadDedup::new(true, caps); let track = vertex_buffer(&mut guard);
+            for (at, bytes) in [(0u64,&data[0]),(32,&data[1]),(64,&data[2])] { assert!(op47(&mut guard, track, at, bytes)); }
+            let dropped = 3 - survivors.len() as u64;
+            assert_eq!(guard.op47(track, offset, &vec![9;len], GPU_BYTES), Op47::Legacy);
+            assert_eq!(ranges(&guard, track), survivors);
+            assert_eq!((guard.stats.stored, guard.stats.store_rejected, guard.total_bytes), (3,0,survivors.len()*16));
+            assert_eq!((guard.stats.dropped_bypass[SHAPE_OVERSIZE], guard.stats.oversized_retained_records), (dropped,survivors.len() as u64));
+            let metrics = guard.metrics(1.0);
+            assert_eq!(metrics["stats_interval"]["oversized_range_bypass"], serde_json::json!({
+                "calls":1,"invalidated_calls":if dropped>0 {1u64} else {0},"dropped_records":dropped,"retained_disjoint_records":survivors.len()}));
+            for (at, bytes) in [(0u64,&data[0]),(32,&data[1]),(64,&data[2])] {
+                assert_eq!(!op47(&mut guard, track, at, bytes), survivors.contains(&(at,16)), "[{offset}, +{len})");
+            }
+            assert_consistent(&guard);
+        }
+    }
+
+    #[test]
     fn interval_reset_keeps_records_and_metrics_report_every_counter() {
         let mut guard = guard();
         let mut a = vertex_buffer(&mut guard);
@@ -1076,6 +1128,7 @@ mod tests {
         assert_eq!(interval["miss_reasons"], serde_json::json!({"no_record": 3, "range": 1, "bytes": 1}));
         assert_eq!(interval["bypass_reasons"], serde_json::json!({"untracked_buffer": 1, "disqualified_buffer": 1,
             "empty": 0, "unaligned_or_padded": 1, "out_of_bounds": 0, "over_record_cap": 0}));
+        assert_eq!(interval["oversized_range_bypass"], serde_json::json!({"calls":0,"invalidated_calls":0,"dropped_records":0,"retained_disjoint_records":0}));
         assert_eq!(interval["invalidations"], serde_json::json!({"op12": 0, "unrecorded_op47": 1, "gpu_write": 1, "destroyed_or_replaced": 0}));
         assert_eq!(interval["records_dropped"], serde_json::json!({"changed_op47": 3, "op12": 0, "unrecorded_op47": 1,
             "unrecorded_op47_by_shape": {"empty": 0, "unaligned_or_padded": 1, "out_of_bounds": 0, "over_record_cap": 0},

@@ -299,7 +299,7 @@ fn metal_padded_tail_op47_keeps_the_legacy_route_and_drops_every_range() {
 }
 
 #[test]
-fn metal_oversized_op47_crossing_known_ranges_drops_every_range() {
+fn metal_oversized_op47_crossing_known_ranges_retains_disjoint_hits() {
     // A 16-byte record cap makes 40- and 20-byte uploads "oversized".
     let caps = Caps { record_bytes: 16, ..Caps::DEFAULT };
     let (a, b, c) = (pattern(16, 101), pattern(16, 103), pattern(16, 105));
@@ -316,7 +316,7 @@ fn metal_oversized_op47_crossing_known_ranges_drops_every_range() {
         let crossed = contents(g, 1);
         op47(g, 1, 0, &a); // both have to upload again
         op47(g, 1, 32, &b);
-        op47(g, 1, 64, &c); // and the range it never reached was forgotten too
+        op47(g, 1, 64, &c); // disjoint: its exact repeat still skips
         let restored = contents(g, 1);
         // [96, 116) is too long as well and reaches none of them.
         op47(g, 1, 96, &far);
@@ -330,8 +330,46 @@ fn metal_oversized_op47_crossing_known_ranges_drops_every_range() {
         image(128, &[(8, &wide[..]), (0, &a[..]), (32, &b[..]), (64, &c[..])]),
         image(128, &[(8, &wide[..]), (0, &a[..]), (32, &b[..]), (64, &c[..]), (96, &far[..])]),
     ]);
-    assert_eq!(outcome.totals, Totals { checked: 12, hits: 3, misses: 9, bypasses: 2, saved_calls: 3, saved_bytes: 48,
-        purged: 6, records: 3, record_bytes: 48, ..Default::default() });
+    assert_eq!(outcome.totals, Totals { checked: 12, hits: 7, misses: 5, bypasses: 2, saved_calls: 7, saved_bytes: 112,
+        purged: 2, records: 3, record_bytes: 48, ..Default::default() });
+}
+
+#[test]
+fn metal_oversized_single_crossing_budget_boundary_and_padded_purge_keep_exact_bytes() {
+    let caps = Caps { record_bytes: 16, total_bytes: 64, ..Caps::DEFAULT };
+    let (a,b,c) = (pattern(16,111),pattern(16,113),pattern(16,115));
+    let (cross,large,padded) = (pattern(20,117),pattern(160,119),pattern(21,121));
+    let outcome = off_then_on(caps, |g| {
+        g.create_buffer(1,256,VERTEX,0,0);
+        op47(g,1,0,&a); op47(g,1,32,&b); op47(g,1,64,&c);
+        op47(g,1,8,&cross); // exact [8,28), drops only A
+        let crossed = contents(g,1);
+        op47(g,1,0,&a); op47(g,1,32,&b); op47(g,1,64,&c); // one miss, two hits
+        // Larger than the entire 64-byte budget, ending exactly at GPU end.
+        // It is neither compared nor stored and touches no cached range.
+        op47(g,1,96,&large);
+        assert_eq!(g.upload_dedup.totals().records, if g.upload_dedup.enabled() {3} else {0});
+        op47(g,1,0,&a); op47(g,1,32,&b); op47(g,1,64,&c); // three hits
+        let boundary = contents(g,1);
+        // Length21 is also oversized but fails alignment before the size gate.
+        // Legacy body+zero-padded tail still writes24 bytes and purges all.
+        op47(g,1,128,&padded);
+        let tail = contents(g,1);
+        op47(g,1,0,&a); op47(g,1,32,&b); op47(g,1,64,&c); // all three miss
+        vec![crossed,boundary,tail,contents(g,1)]
+    });
+    assert_eq!(outcome.bytes, vec![
+        image(256,&[(0,&a[..]),(32,&b[..]),(64,&c[..]),(8,&cross[..])]),
+        image(256,&[(0,&a[..]),(32,&b[..]),(64,&c[..]),(8,&cross[..]),(0,&a[..]),(96,&large[..])]),
+        image(256,&[(0,&a[..]),(32,&b[..]),(64,&c[..]),(8,&cross[..]),(0,&a[..]),(96,&large[..]),
+            (128,&padded[..20]),(148,&[padded[20],0,0,0][..])]),
+        image(256,&[(0,&a[..]),(32,&b[..]),(64,&c[..]),(8,&cross[..]),(0,&a[..]),(96,&large[..]),
+            (128,&padded[..20]),(148,&[padded[20],0,0,0][..]),(0,&a[..]),(32,&b[..]),(64,&c[..])]),
+    ]);
+    // off_then_on also asserts actual route-call/byte reduction equals these
+    // saved counters, while every readback matches the unguarded stream.
+    assert_eq!(outcome.totals, Totals { checked:12,hits:5,misses:7,bypasses:3,saved_calls:5,saved_bytes:80,
+        purged:4,records:3,record_bytes:48,..Default::default() });
 }
 
 #[test]
@@ -496,8 +534,8 @@ fn metal_global_and_per_buffer_caps_evict_oldest_records_and_stay_exact() {
         capped_op47(g, 3, 0, &r0, CAPS); // repeat
         capped_op47(g, 3, 16, &r1, CAPS); // repeat
         capped_op47(g, 1, 16, &p1, CAPS); // repeat
-        capped_op47(g, 2, 32, &wide, CAPS); // over the per-record cap: buffer 2 is purged
-        capped_op47(g, 2, 16, &q1, CAPS); // so this uploads again
+        capped_op47(g, 2, 32, &wide, CAPS); // oversized but disjoint: q1 stays trusted
+        capped_op47(g, 2, 16, &q1, CAPS); // exact repeat still skips
         (1..=3).map(|id| contents(g, id)).collect()
     });
     assert_eq!(outcome.bytes, vec![
@@ -505,6 +543,6 @@ fn metal_global_and_per_buffer_caps_evict_oldest_records_and_stay_exact() {
         image(64, &[(0, &q0[..]), (16, &q1[..]), (32, &wide[..])]),
         image(64, &[(0, &r0[..]), (16, &r1[..])]),
     ]);
-    assert_eq!(outcome.totals, Totals { checked: 15, hits: 5, misses: 10, bypasses: 1, saved_calls: 5, saved_bytes: 56,
-        evictions: 5, purged: 1, records: 4, record_bytes: 48, ..Default::default() });
+    assert_eq!(outcome.totals, Totals { checked: 15, hits: 6, misses: 9, bypasses: 1, saved_calls: 6, saved_bytes: 72,
+        evictions: 5, purged: 0, records: 4, record_bytes: 48, ..Default::default() });
 }
