@@ -132,8 +132,13 @@ mod tests {
     use super::super::*;
 
     fn shadow(bytes: &[u8]) -> Obj {
+<<<<<<< HEAD
         Obj::Buf(Buf { identity: 1, size: bytes.len() as u64, stride: 0, gpu: None, bytes: 0, shadow: Some(bytes.to_vec()),
             version: 0, enc: 0, in_bg: false, counter: None })
+=======
+        Obj::Buf(Buf { size: bytes.len() as u64, stride: 0, gpu: None, bytes: 0, shadow: Some(bytes.to_vec()),
+            version: 0, enc: 0, in_bg: false, counter: None, dedup: crate::upload_dedup::Track::Untracked })
+>>>>>>> 974ba28 (Add default-off redundant op47 upload guard with CPU and Metal fixtures)
     }
 
     #[test]
@@ -170,8 +175,14 @@ mod tests {
         assert_eq!(stage, original);
         // Deliberately inconsistent synthetic shadow is a failure-path check,
         // not a legal game resource. The reference's source slice also panics.
+<<<<<<< HEAD
         let bad = vec![None, Some(Obj::Buf(Buf { identity: 1, size: 32, stride: 0, gpu: None, bytes: 0,
             shadow: Some(vec![1; 4]), version: 0, enc: 0, in_bg: false, counter: None }))];
+=======
+        let bad = vec![None, Some(Obj::Buf(Buf { size: 32, stride: 0, gpu: None, bytes: 0,
+            shadow: Some(vec![1; 4]), version: 0, enc: 0, in_bg: false, counter: None,
+            dedup: crate::upload_dedup::Track::Untracked }))];
+>>>>>>> 974ba28 (Add default-off redundant op47 upload guard with CPU and Metal fixtures)
         let legal_destination = Pack { size: 16, members: vec![PackMember { binding: 0, size: 16, offset: 0 }] };
         assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| direct_copy(&legal_destination, &bad, &bindings, 256, &mut stage))).is_err());
         assert_eq!(stage, original);

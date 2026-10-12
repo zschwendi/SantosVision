@@ -33,6 +33,10 @@ use bind_group_prepare::{BindGroupPrepare, EntryScratch, KeyScratch, NonBindingK
 #[path = "guest_write_tests.rs"]
 mod guest_write_tests;
 
+#[cfg(all(test, target_os = "macos"))]
+#[path = "upload_dedup_tests.rs"]
+mod upload_dedup_tests;
+
 // Test-only: adapter features withheld from the next Gpu::new on this thread,
 // so fixtures can reach the paths of devices that lack them.
 #[cfg(test)]
@@ -642,6 +646,7 @@ struct Buf {
     enc: u64,
     in_bg: bool,
     counter: Option<Buffer>,
+    dedup: crate::upload_dedup::Track,
 }
 #[derive(Clone, Copy)]
 struct SigEl { sem: u32, idx: u32, reg: u32 }
@@ -970,6 +975,7 @@ pub struct Gpu {
     fps_d0: u64,
     buffer_uploads: [BufferUploadStats; UPLOAD_SOURCE_COUNT],
     uploads: crate::buffer_upload::BufferUploads,
+    upload_dedup: crate::upload_dedup::UploadDedup,
     indirect_reads: IndirectReadStats,
     thread_wall: [ApiWallStats; THREAD_TIMING_COUNT],
     errors: Arc<AtomicU64>,
@@ -1083,6 +1089,8 @@ impl Gpu {
         log(&format!("uniform stage pack: {}", uniform_pack.metrics(0, 0, 0, 0)));
         let bind_group_prepare = BindGroupPrepare::from_environment();
         log(&format!("bind group prepare: {}", bind_group_prepare.metrics()));
+        let upload_dedup = crate::upload_dedup::UploadDedup::from_environment();
+        log(&format!("op47 upload dedup: {}", upload_dedup.metrics(0.0)));
         Ok(Gpu {
             instance: instance.clone(), pending_clears: HashMap::new(), clears_folded: 0, pipe_jobs, pipe_results, pipe_pending: HashMap::new(), pending_skips: 0, pending_skips0: 0,
             base, mem, ring, device, queue, adapter, surface, surface_format, surface_size: (0, 0),
@@ -1103,7 +1111,7 @@ impl Gpu {
             geometry_capture_diagnostics: GeometryCaptureDiagnostics::default(),
             draws: 0, skipped: 0, presents: 0, pipe_creates: 0, fps_t0: Instant::now(), fps_n0: 0, fps_d0: 0,
             buffer_uploads: [BufferUploadStats::default(); UPLOAD_SOURCE_COUNT], indirect_reads: IndirectReadStats::default(),
-            uploads: crate::buffer_upload::BufferUploads::from_environment(),
+            uploads: crate::buffer_upload::BufferUploads::from_environment(), upload_dedup,
             thread_wall: [ApiWallStats::default(); THREAD_TIMING_COUNT],
             errors, inflight: Arc::new(AtomicU64::new(0)), submits: 0, submits0: 0, passes: 0, passes0: 0,
         })
@@ -1201,6 +1209,8 @@ impl Gpu {
         }
         self.invalidate_world_depth(id, serde_json::json!("set_obj"));
         if self.occlusion_active == Some(id) { self.end_active_occlusion(); }
+        // A replaced buffer's lifetime ends here, and its op47 record with it.
+        if let Some(Obj::Buf(old)) = self.objs[i].as_ref() { self.upload_dedup.forget(old.dedup); }
         self.objs[i] = Some(o);
     }
     fn tex(&self, id: u32) -> Option<&Tex> {
@@ -1237,6 +1247,16 @@ impl Gpu {
             Some(Obj::Tex(t)) => t.enc == self.enc_epoch,
             Some(Obj::Buf(b)) => b.enc == self.enc_epoch,
             _ => false,
+        }
+    }
+    // A GPU-side write is about to target this buffer. Uploads run in a queue
+    // prelude ahead of every encoder command of their submission, so no later
+    // op47 can be trusted to describe its bytes: the object leaves the op47
+    // guard for good. Call this BEFORE the write itself is recorded.
+    fn op47_dedup_gpu_write(&mut self, id: u32, kind: crate::upload_dedup::GpuWrite) {
+        if !self.upload_dedup.enabled() { return; }
+        if let Some(Some(Obj::Buf(b))) = self.objs.get_mut(id as usize) {
+            self.upload_dedup.gpu_write(&mut b.dedup, kind);
         }
     }
 
@@ -1514,7 +1534,10 @@ impl Gpu {
         if let Some(o) = self.objs.get_mut(id as usize).and_then(|o| o.take()) {
             match o {
                 Obj::Tex(t) => t.tex.destroy(),
-                Obj::Buf(b) => { if let Some(g) = b.gpu { self.uploads.destroy(g); } }
+                Obj::Buf(b) => {
+                    self.upload_dedup.forget(b.dedup);
+                    if let Some(g) = b.gpu { self.uploads.destroy(g); }
+                }
                 _ => {}
             }
         }
@@ -1560,8 +1583,13 @@ impl Gpu {
 
     fn create_buffer(&mut self, id: u32, size: u32, bind: u32, misc: u32, stride: u32) {
         let size = size as u64;
+<<<<<<< HEAD
         let identity = self.uid();
         let mut b = Buf { identity, size, stride, gpu: None, bytes: 0, shadow: None, version: 0, enc: 0, in_bg: false, counter: None };
+=======
+        let mut b = Buf { size, stride, gpu: None, bytes: 0, shadow: None, version: 0, enc: 0, in_bg: false, counter: None,
+            dedup: crate::upload_dedup::Track::Untracked };
+>>>>>>> 974ba28 (Add default-off redundant op47 upload guard with CPU and Metal fixtures)
         if bind & 4 != 0 { b.shadow = Some(vec![0u8; size as usize]); }
         let mut usage = BufferUsages::COPY_DST | BufferUsages::COPY_SRC;
         if bind & 1 != 0 { usage |= BufferUsages::VERTEX; }
@@ -1574,6 +1602,7 @@ impl Gpu {
             b.bytes = ((size + 3) & !3).max(4);
             b.gpu = Some(self.device.create_buffer(&BufferDescriptor { label: None, size: b.bytes, usage, mapped_at_creation: false }));
         }
+        b.dedup = self.upload_dedup.track_new(bind, misc, b.gpu.is_some(), b.shadow.is_some());
         self.set_obj(id, Obj::Buf(b));
     }
 
@@ -1589,13 +1618,31 @@ impl Gpu {
             b.version = version;
             version_wrapped = wrapped;
         }
+<<<<<<< HEAD
         let gpu = b.gpu.clone();
         // Clear before returning for CB-only buffers too. Old offsets cannot
         // match a recycled content version, even within this present.
         if version_wrapped { self.uniform_snapshot.version_wrapped(); }
         let Some(g) = gpu else { return };
+=======
+        let Some(g) = b.gpu.clone() else { return };
+        let (track, gpu_bytes) = (b.dedup, b.bytes);
+        // Every op12 drops this buffer's op47 record before it flushes or writes.
+        if !no_overwrite { self.upload_dedup.op12(track); }
+>>>>>>> 974ba28 (Add default-off redundant op47 upload guard with CPU and Metal fixtures)
         if !no_overwrite && used { self.flush(); }
         let source = if no_overwrite { UPLOAD_OP47 } else { UPLOAD_OP12 };
+        // An op47 repeating the recorded range and bytes of this very object
+        // would rewrite what the GPU already holds: only that write is skipped.
+        // Anything else takes the route below, and a compared miss is recorded
+        // after its write.
+        let record = if no_overwrite {
+            match self.upload_dedup.op47(track, offset, &data, gpu_bytes) {
+                crate::upload_dedup::Op47::Skip => return,
+                crate::upload_dedup::Op47::Record(lifetime) => Some(lifetime),
+                crate::upload_dedup::Op47::Legacy => None,
+            }
+        } else { None };
         let n = size & !3;
         if n > 0 { measured_write_buffer(&mut self.uploads, &self.device, &self.queue, &mut self.buffer_uploads[source], &g, offset, &data[..n as usize]); }
         if size & 3 != 0 {
@@ -1603,6 +1650,7 @@ impl Gpu {
             tail[..(size - n) as usize].copy_from_slice(&data[n as usize..]);
             measured_write_buffer(&mut self.uploads, &self.device, &self.queue, &mut self.buffer_uploads[source], &g, offset + n, &tail);
         }
+        if let Some(lifetime) = record { self.upload_dedup.store(lifetime, offset, data); }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2479,6 +2527,8 @@ impl Gpu {
                     if let Some((r, _, _)) = buf_id {
                         self.use_buf(r);
                         if let Some(bo) = self.buf_mut(r) { bo.in_bg = true; }
+                        // Bound writable: a shader may change its bytes on the GPU.
+                        if b.kind == Kind::Storage && !is_counter { self.op47_dedup_gpu_write(r, crate::upload_dedup::GpuWrite::StorageBinding); }
                         key.push(id as u64);
                     } else {
                         key.push(0);
@@ -3415,6 +3465,7 @@ impl Gpu {
         let zero = values.iter().all(|&v| v == 0);
         if is_buf {
             let Some((g, bytes)) = self.buf(res).and_then(|b| b.gpu.clone().map(|g| (g, b.bytes))) else { return };
+            self.op47_dedup_gpu_write(res, crate::upload_dedup::GpuWrite::ClearUav);
             self.end_pass();
             if zero {
                 self.encoder().clear_buffer(&g, 0, None);
@@ -3481,6 +3532,7 @@ impl Gpu {
             let (Some(sg), Some(dg)) = (sb.gpu.clone(), db.gpu.clone()) else { return };
             let size = if has_box { (r - l) as u64 } else { sb.size.min(db.size) };
             let size = size & !3;
+            self.op47_dedup_gpu_write(dst, crate::upload_dedup::GpuWrite::CopyRegion);
             if size > 0 { self.encoder().copy_buffer_to_buffer(&sg, if has_box { l as u64 } else { 0 }, &dg, dx as u64, size); }
             self.use_buf(src);
             self.use_buf(dst);
@@ -3847,6 +3899,7 @@ impl Gpu {
         let Some(res) = self.view_obj(uav).filter(|v| v.is_buf).map(|v| v.res) else { return };
         let Some(dg) = self.buf(dst).and_then(|b| b.gpu.clone()) else { return };
         let Some(cb) = self.counter_buffer(res) else { return };
+        self.op47_dedup_gpu_write(dst, crate::upload_dedup::GpuWrite::CopyCounter);
         self.end_pass();
         self.encoder().copy_buffer_to_buffer(&cb, 0, &dg, offset, 4);
         self.use_buf(dst);
@@ -4043,6 +4096,7 @@ impl Gpu {
             self.buffer_uploads = [BufferUploadStats::default(); UPLOAD_SOURCE_COUNT];
             self.indirect_reads = IndirectReadStats::default();
             self.uploads.reset_interval();
+            self.upload_dedup.reset_interval();
             self.thread_wall = [ApiWallStats::default(); THREAD_TIMING_COUNT];
         }
     }
@@ -4064,6 +4118,7 @@ impl Gpu {
             indirect.attempts, indirect.wait_wall.calls, indirect.successes, indirect.poll_errors, indirect.map_errors,
             indirect.wait_wall.total_ns as f64 / 1e6, indirect.wait_wall.max_ns as f64 / 1e6, indirect.wait_wall.buckets));
         log(&format!("buffer upload pool: {}", self.uploads.metrics(seconds)));
+        if self.upload_dedup.enabled() { log(&format!("op47 upload dedup: {}", self.upload_dedup.metrics(seconds))); }
         let t = &self.thread_wall;
         log(&format!("gpu thread timing: {}", serde_json::json!({"schema": 1, "mode": self.uploads.mode(), "interval_s": seconds,
             "segments": {"uniform_slot_wait": t[THREAD_UNIFORM_WAIT].metrics(), "guest_completion_wait": t[THREAD_GUEST_WAIT].metrics(),
