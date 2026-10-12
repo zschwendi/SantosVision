@@ -38,6 +38,14 @@ enum RenderingOptimizations {
         resolved("MUGUET_UNIFORM_STAGE_PACK_OPT", stored: storedDrawSetup)
     }
 
+    static var uniformSnapshotEnabled: Bool {
+        resolved("MUGUET_UNIFORM_SNAPSHOT_CACHE", stored: storedDrawSetup)
+    }
+
+    static var xrEmissionFastpathEnabled: Bool {
+        resolved("MUGUET_XR_EMISSION_FASTPATH", stored: storedDrawSetup)
+    }
+
     static var bindGroupPrepareEnabled: Bool {
         resolved("MUGUET_BIND_GROUP_PREPARE_OPT", stored: storedDrawSetup)
     }

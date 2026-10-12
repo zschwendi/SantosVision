@@ -97,7 +97,7 @@ pub(super) struct UniformSnapshot {
 
 impl UniformSnapshot {
     pub(super) fn from_environment() -> Self {
-        Self::new(std::env::var("MUGUET_UNIFORM_SNAPSHOT_CACHE").as_deref() == Ok("1"))
+        Self::new(crate::draw_setup::uniform_snapshot_enabled())
     }
 
     pub(super) fn new(enabled: bool) -> Self {

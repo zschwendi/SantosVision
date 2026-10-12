@@ -74,7 +74,7 @@ pub extern "C" fn sv_world_set_frozen_depth_transfer(enabled: u32) -> i32 {
     0
 }
 
-/// Typed pre-start request for the three draw-setup experiments. The status
+/// Typed pre-start request for the rendering-overhead experiments. The status
 /// lock is also held by `start` while it changes idle/failed to initializing.
 #[no_mangle]
 pub extern "C" fn sv_runtime_set_draw_setup_overhead(enabled: u32) -> i32 {

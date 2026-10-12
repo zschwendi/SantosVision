@@ -307,8 +307,14 @@ static NEXT_EMISSION_TOKEN: AtomicU64 = AtomicU64::new(1);
 static LAST_EMITTED_TOKEN: AtomicU64 = AtomicU64::new(0);
 static EMISSION_FAST_COMMANDS: AtomicU64 = AtomicU64::new(0);
 static EMISSION_TOKEN_EXHAUSTED: AtomicBool = AtomicBool::new(false);
-static EMISSION_FAST_ENABLED: LazyLock<bool> = LazyLock::new(||
-    std::env::var("MUGUET_XR_EMISSION_FASTPATH").as_deref() == Ok("1"));
+// Resolve the diagnostic override once. The pre-start app request remains an
+// atomic read: a status probe may run before the launcher applies its choice.
+static EMISSION_FAST_OVERRIDE: LazyLock<Option<bool>> = LazyLock::new(||
+    crate::draw_setup::xr_emission_override(std::env::var(crate::draw_setup::XR_EMISSION_ENV).ok().as_deref()));
+
+fn emission_fast_enabled() -> bool {
+    crate::draw_setup::xr_emission_requested(*EMISSION_FAST_OVERRIDE)
+}
 
 fn next_token_value(value: u64) -> Option<u64> { value.checked_add(1) }
 
@@ -800,7 +806,7 @@ pub fn current_view(caller: &mut Caller<'_, HostState>, viewport: u64, _set_wind
         let epoch = EPOCH.load(Ordering::Acquire);
         if thread.epoch != epoch { *thread = RenderThread { epoch, ..Default::default() }; }
         thread.current = view;
-        if *EMISSION_FAST_ENABLED {
+        if emission_fast_enabled() {
             thread.emission_token = if view.is_some() { next_emission_token() } else { 0 };
         }
     });
@@ -813,7 +819,7 @@ pub fn gpu_command(_caller: &mut Caller<'_, HostState>, command: u64) -> Result<
     if !TRACE_ENABLED.load(Ordering::Acquire) { return Ok(()); }
     let mem = &RT.get().context("missing runtime")?.mem;
     let Some(opcode) = read_u32(mem, command) else { return Ok(()); };
-    if !*EMISSION_FAST_ENABLED {
+    if !emission_fast_enabled() {
         // Preserve the flag-off path's original lock/TLS/record publication
         // ordering exactly, including its epoch and current-view filtering.
         let mut state = lock_world_state();
@@ -934,7 +940,7 @@ pub fn status_json() -> serde_json::Value {
         "gpu_commands_marked":state.emitted_commands.saturating_add(EMISSION_FAST_COMMANDS.load(Ordering::Relaxed)),
         "emission_mutex_commands":state.emitted_commands,
         "emission_fast_commands":EMISSION_FAST_COMMANDS.load(Ordering::Relaxed),
-        "emission_fastpath_enabled":*EMISSION_FAST_ENABLED,
+        "emission_fastpath_enabled":emission_fast_enabled(),
         "emission_token_exhausted":EMISSION_TOKEN_EXHAUSTED.load(Ordering::Acquire),
         "view_marker_changes":state.marker_changes,
         "projection_clone_updates":state.projection_clone_updates,"projection_clone_failures":state.projection_clone_failures,
