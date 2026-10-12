@@ -14,6 +14,7 @@ private enum SantosTheme {
 /// A native game drawable. wgpu retains its CAMetalLayer; this view owns its
 /// attachment and never changes drawableSize behind the configured swapchain.
 private final class GameMetalView: UIView {
+    var windowAttachmentChanged: ((Bool) -> Void)?
     override class var layerClass: AnyClass { CAMetalLayer.self }
     var metalLayer: CAMetalLayer { layer as! CAMetalLayer }
     override init(frame: CGRect) {
@@ -30,6 +31,15 @@ private final class GameMetalView: UIView {
         addInteraction(controllerEvents)
     }
     required init?(coder: NSCoder) { fatalError("GameMetalView uses programmatic initialization") }
+    override func willMove(toWindow newWindow: UIWindow?) {
+        // Suspend input/presentation before UIKit detaches this drawable.
+        if newWindow == nil { windowAttachmentChanged?(false) }
+        super.willMove(toWindow: newWindow)
+    }
+    override func didMoveToWindow() {
+        super.didMoveToWindow()
+        windowAttachmentChanged?(window != nil)
+    }
 }
 
 /// The app, rather than a window's view tree, owns this single drawable. Closing
@@ -38,12 +48,16 @@ private final class GameMetalView: UIView {
 final class WindowGameSurface: ObservableObject {
     let view: UIView = GameMetalView(frame: .zero)
     var metalLayer: CAMetalLayer { view.layer as! CAMetalLayer }
+    func observeAttachment(_ callback: @escaping (Bool) -> Void) {
+        (view as! GameMetalView).windowAttachmentChanged = callback
+    }
 }
 
 private struct GameCanvas: UIViewRepresentable {
     let runtime: NativeRuntimeModel
     let surface: WindowGameSurface
     func makeUIView(context: Context) -> UIView {
+        surface.observeAttachment { runtime.setWindowAttached($0) }
         // Defer observable-state changes until SwiftUI finishes constructing
         // this view. Attachment still completes before any engine startup.
         Task { @MainActor in
@@ -58,6 +72,7 @@ private struct GameCanvas: UIViewRepresentable {
 }
 
 struct WindowGameView: View {
+    @Environment(\.scenePhase) private var scenePhase
     @ObservedObject var runtime: NativeRuntimeModel
     @ObservedObject var surface: WindowGameSurface
     @State private var showingSettings = false
@@ -98,6 +113,9 @@ struct WindowGameView: View {
         .background(GameWindowGeometry(isGameplay: runtime.startupAttempted))
         .preferredColorScheme(.dark)
         .tint(SantosTheme.accent)
+        .onChange(of: scenePhase, initial: true) { _, phase in
+            runtime.setWindowSceneActive(phase == .active)
+        }
         .ornament(visibility: runtime.startupAttempted ? .visible : .hidden,
                   attachmentAnchor: .scene(.bottom), contentAlignment: .top) {
             HStack(spacing: 18) {

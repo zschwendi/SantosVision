@@ -122,6 +122,9 @@ final class NativeRuntimeModel: ObservableObject {
     private var captureReturnCode: Int32?
     private var activeReturnCode: Int32?
     private var isActive = true
+    private var appSceneIsActive = true
+    private var windowIsAttached = false
+    private var windowSceneIsActive = true
     private var capturePaths = Set<String>()
     private var captureRequests: [[String: Any]] = []
     private var compositorOwnsHeadTracking = false
@@ -309,6 +312,24 @@ final class NativeRuntimeModel: ObservableObject {
     }
 
     func setActive(_ active: Bool) {
+        appSceneIsActive = active
+        updateActivity()
+    }
+
+    func setWindowSceneActive(_ active: Bool) {
+        windowSceneIsActive = active
+        updateActivity()
+    }
+
+    func setWindowAttached(_ attached: Bool) {
+        windowIsAttached = attached
+        // UIKit attachment callbacks can run during SwiftUI construction.
+        // Native suspension is immediate; observable/report updates defer.
+        updateActivity(deferReport: true)
+    }
+
+    private func updateActivity(deferReport: Bool = false) {
+        let active = appSceneIsActive && (!windowGameMode || (windowIsAttached && windowSceneIsActive))
         if active != isActive {
             worldGpuTimingNotBeforeUptime = ProcessInfo.processInfo.systemUptime
             worldGpuTiming = nil
@@ -322,7 +343,11 @@ final class NativeRuntimeModel: ObservableObject {
                 Task { await start() }
             }
         }
-        recordReport()
+        if deferReport {
+            Task { @MainActor [weak self] in self?.recordReport() }
+        } else {
+            recordReport()
+        }
     }
 
     func suspendHeadTracking() {
@@ -503,6 +528,8 @@ final class NativeRuntimeModel: ObservableObject {
             "presentation_mode": windowGameMode ? "window" : "immersive",
             "window_surface_ready": windowSurfaceReady,
             "window_scene_policy": "single_instance_main",
+            "window_attached": windowIsAttached,
+            "window_scene_active": windowSceneIsActive,
             "connected_window_scene_count": UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.count,
             "controllers": ["connected": !controllers.isEmpty, "names": controllerNames],
             "save_root": saveRoot.path, "has_game_data": hasGameData,
