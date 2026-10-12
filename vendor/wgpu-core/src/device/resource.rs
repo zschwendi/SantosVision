@@ -277,6 +277,7 @@ pub struct Device {
     pub(crate) deferred_destroy: Mutex<Vec<DeferredDestroy>>,
     pub(crate) usage_scopes: UsageScopePool,
     pub(crate) indirect_validation: Option<crate::indirect_validation::IndirectValidation>,
+    pub(crate) metal_prepass: super::metal_prepass::MetalPrePassControl,
     // Optional so that we can late-initialize this after the queue is created.
     pub(crate) timestamp_normalizer:
         OnceCellOrLock<crate::timestamp_normalization::TimestampNormalizer>,
@@ -564,6 +565,7 @@ impl Device {
             usage_scopes: Mutex::new(rank::DEVICE_USAGE_SCOPES, Default::default()),
             timestamp_normalizer: OnceCellOrLock::new(),
             indirect_validation,
+            metal_prepass: super::metal_prepass::MetalPrePassControl::new(adapter.backend()),
         })
     }
 

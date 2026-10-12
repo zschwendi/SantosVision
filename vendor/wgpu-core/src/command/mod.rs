@@ -1107,6 +1107,54 @@ impl CommandEncoder {
             .for_each(drop);
     }
 
+    /// [`Self::insert_barriers_from_scope`] without its HAL calls, for a Metal
+    /// render pass whose pre-pass command buffer is skipped. The caller has
+    /// established that nothing else would be encoded before the pass.
+    pub(crate) fn merge_scope_without_hal_barriers(
+        base: &mut Tracker,
+        head: &UsageScope,
+        snatch_guard: &SnatchGuard,
+    ) {
+        base.buffers.set_from_usage_scope(&head.buffers);
+        base.textures.set_from_usage_scope(&head.textures);
+
+        Self::drain_barriers_without_hal(base, snatch_guard);
+    }
+
+    /// [`Self::insert_barriers_from_tracker`] without its HAL calls, for a
+    /// Metal compute pass whose pre-pass command buffer is skipped.
+    pub(crate) fn merge_tracker_without_hal_barriers(
+        base: &mut Tracker,
+        head: &Tracker,
+        snatch_guard: &SnatchGuard,
+    ) {
+        base.buffers.set_from_tracker(&head.buffers);
+        base.textures.set_from_tracker(&head.textures);
+
+        Self::drain_barriers_without_hal(base, snatch_guard);
+    }
+
+    /// The tracker half of [`Self::drain_barriers`]. The same pending
+    /// transitions are drained and resolved against the same resources, so the
+    /// tracker ends in the same state and a destroyed resource fails exactly
+    /// as it does there, but nothing is handed to the HAL: Metal's
+    /// `transition_buffers` and `transition_textures` emit no GPU work, and
+    /// calling them on a closed encoder would still violate the HAL contract.
+    fn drain_barriers_without_hal(base: &mut Tracker, snatch_guard: &SnatchGuard) {
+        let buffer_barriers = base
+            .buffers
+            .drain_transitions(snatch_guard)
+            .collect::<Vec<_>>();
+        let (transitions, textures) = base.textures.drain_transitions(snatch_guard);
+        let texture_barriers = transitions
+            .into_iter()
+            .enumerate()
+            .map(|(i, p)| p.into_hal(textures[i].unwrap().raw()))
+            .collect::<Vec<_>>();
+
+        drop((buffer_barriers, texture_barriers));
+    }
+
     fn encode_commands(
         device: &Arc<Device>,
         cmd_buf_data: &mut CommandBufferMutable,
