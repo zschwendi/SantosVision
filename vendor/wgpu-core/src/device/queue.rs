@@ -71,12 +71,7 @@ struct MetalTransitControl {
 impl MetalTransitControl {
     fn new(backend: wgt::Backend) -> Self {
         let is_metal = backend == wgt::Backend::Metal;
-        #[cfg(feature = "std")]
-        let enabled = is_metal
-            && std::env::var_os("MUGUET_METAL_SKIP_EMPTY_TRANSIT")
-                .as_deref() == Some(std::ffi::OsStr::new("1"));
-        #[cfg(not(feature = "std"))]
-        let enabled = false;
+        let enabled = is_metal && crate::rendering_overhead::metal_transit_requested();
         Self {
             is_metal, enabled,
             skipped: AtomicU64::new(0), retained: AtomicU64::new(0),

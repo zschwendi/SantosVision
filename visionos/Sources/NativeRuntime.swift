@@ -483,7 +483,9 @@ final class NativeRuntimeModel: ObservableObject {
                 "uniform_stage_pack": RenderingOptimizations.uniformStagePackEnabled,
                 "bind_group_prepare": RenderingOptimizations.bindGroupPrepareEnabled,
                 "uniform_snapshot": RenderingOptimizations.uniformSnapshotEnabled,
-                "xr_emission_fastpath": RenderingOptimizations.xrEmissionFastpathEnabled
+                "xr_emission_fastpath": RenderingOptimizations.xrEmissionFastpathEnabled,
+                "metal_skip_empty_transit": RenderingOptimizations.metalSkipEmptyTransitEnabled,
+                "metal_skip_empty_prepass": RenderingOptimizations.metalSkipEmptyPrepassEnabled
             ],
             "probe": payload(lastProbe), "start": payload(lastStart), "status": payload(lastStatus),
             "head_pose_source": SimulatorPoseFixture.shared == nil ? "ARKit" : "simulator_fixture",

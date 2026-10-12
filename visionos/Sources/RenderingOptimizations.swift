@@ -49,4 +49,12 @@ enum RenderingOptimizations {
     static var bindGroupPrepareEnabled: Bool {
         resolved("MUGUET_BIND_GROUP_PREPARE_OPT", stored: storedDrawSetup)
     }
+
+    static var metalSkipEmptyTransitEnabled: Bool {
+        resolved("MUGUET_METAL_SKIP_EMPTY_TRANSIT", stored: storedDrawSetup)
+    }
+
+    static var metalSkipEmptyPrepassEnabled: Bool {
+        resolved("MUGUET_METAL_SKIP_EMPTY_PREPASS", stored: storedDrawSetup)
+    }
 }

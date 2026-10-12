@@ -90,6 +90,7 @@ mod pool;
 pub mod present;
 pub mod ray_tracing;
 pub mod registry;
+pub mod rendering_overhead;
 pub mod resource;
 mod snatch;
 pub mod storage;
