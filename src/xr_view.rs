@@ -95,6 +95,7 @@ struct UnmatchedViewport {
 struct RenderThread {
     epoch: u64,
     current: Option<WorldView>,
+    emission_token: u64,
 }
 
 // Only an opt-in proof run retains the request actually used by a successful
@@ -300,6 +301,30 @@ static ENABLED: AtomicBool = AtomicBool::new(false);
 static EPOCH: AtomicU64 = AtomicU64::new(1);
 static MARKER_COUNT: AtomicU64 = AtomicU64::new(0);
 static TRACE_ENABLED: AtomicBool = AtomicBool::new(cfg!(target_os = "visionos"));
+// Tokens describe a binding, not the view's matrix/value. A second binding of
+// the same view deliberately takes a different token. Zero means no shortcut.
+static NEXT_EMISSION_TOKEN: AtomicU64 = AtomicU64::new(1);
+static LAST_EMITTED_TOKEN: AtomicU64 = AtomicU64::new(0);
+static EMISSION_FAST_COMMANDS: AtomicU64 = AtomicU64::new(0);
+static EMISSION_TOKEN_EXHAUSTED: AtomicBool = AtomicBool::new(false);
+static EMISSION_FAST_ENABLED: LazyLock<bool> = LazyLock::new(||
+    std::env::var("MUGUET_XR_EMISSION_FASTPATH").as_deref() == Ok("1"));
+
+fn next_emission_token() -> u64 {
+    if EMISSION_TOKEN_EXHAUSTED.load(Ordering::Acquire) { return 0; }
+    match NEXT_EMISSION_TOKEN.fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| value.checked_add(1)) {
+        Ok(token) => token,
+        Err(_) => { EMISSION_TOKEN_EXHAUSTED.store(true, Ordering::Release); 0 }
+    }
+}
+
+fn can_skip_emission(opcode: u32, token: u64, previous_token: u64) -> bool {
+    token != 0 && token == previous_token && opcode != 32 && opcode != 7
+}
+
+fn token_after_slow_emission(state: &State, current: Option<WorldView>, token: u64) -> u64 {
+    if !state.correlation_failed && state.last_emitted == current { token } else { 0 }
+}
 
 fn lock_world_state() -> std::sync::MutexGuard<'static, State> {
     STATE.lock().unwrap_or_else(|poison| poison.into_inner())
@@ -319,6 +344,7 @@ pub fn set_active(_active: bool) {
     EPOCH.fetch_add(1, Ordering::AcqRel);
     let mut state = lock_world_state();
     invalidate_state(&mut state);
+    LAST_EMITTED_TOKEN.store(0, Ordering::Release);
 }
 
 fn invalidate_state(state: &mut State) {
@@ -772,6 +798,7 @@ pub fn current_view(caller: &mut Caller<'_, HostState>, viewport: u64, _set_wind
         let epoch = EPOCH.load(Ordering::Acquire);
         if thread.epoch != epoch { *thread = RenderThread { epoch, ..Default::default() }; }
         thread.current = view;
+        thread.emission_token = if view.is_some() && *EMISSION_FAST_ENABLED { next_emission_token() } else { 0 };
     });
     Ok(())
 }
@@ -782,15 +809,31 @@ pub fn gpu_command(_caller: &mut Caller<'_, HostState>, command: u64) -> Result<
     if !TRACE_ENABLED.load(Ordering::Acquire) { return Ok(()); }
     let mem = &RT.get().context("missing runtime")?.mem;
     let Some(opcode) = read_u32(mem, command) else { return Ok(()); };
-    let mut state = lock_world_state();
-    RENDER_THREAD.with(|thread| {
+    // wasm_gpu::Emit serializes producers while this callback runs. The token
+    // comparison therefore observes the immediately preceding emitted command.
+    // Draws/presents and every binding transition still use the legacy mutex.
+    let (current, token, thread_epoch) = RENDER_THREAD.with(|thread| {
         let mut thread = thread.borrow_mut();
         let epoch = EPOCH.load(Ordering::Acquire);
         if thread.epoch != epoch { *thread = RenderThread { epoch, ..Default::default() }; }
         let current = thread.current.filter(|view| !view.headset_applied || view_epoch_is_active(view.provenance_epoch));
-        record_emission(&mut state, command, opcode, current);
-        MARKER_COUNT.store(state.markers.len() as u64, Ordering::Release);
+        let token = if current.is_some() { thread.emission_token } else { 0 };
+        (current, token, thread.epoch)
     });
+    if *EMISSION_FAST_ENABLED && !EMISSION_TOKEN_EXHAUSTED.load(Ordering::Acquire)
+        && thread_epoch == EPOCH.load(Ordering::Acquire)
+        && can_skip_emission(opcode, token, LAST_EMITTED_TOKEN.load(Ordering::Acquire))
+        && current.is_some_and(|view| !view.headset_applied || view_epoch_is_active(view.provenance_epoch)) {
+        EMISSION_FAST_COMMANDS.fetch_add(1, Ordering::Relaxed);
+        return Ok(());
+    }
+    let mut state = lock_world_state();
+    let epoch = EPOCH.load(Ordering::Acquire);
+    let current = current.filter(|view| !view.headset_applied || view.provenance_epoch == epoch);
+    let token = if current.is_some() { token } else { 0 };
+    record_emission(&mut state, command, opcode, current);
+    LAST_EMITTED_TOKEN.store(token_after_slow_emission(&state, current, token), Ordering::Release);
+    MARKER_COUNT.store(state.markers.len() as u64, Ordering::Release);
     Ok(())
 }
 
@@ -870,7 +913,13 @@ pub fn status_json() -> serde_json::Value {
         "camera_calls":state.camera_calls,"main_camera_calls":state.main_camera_calls,"qualified_camera_calls":state.qualified_camera_calls,
         "overrides_applied":state.overrides_applied,"overrides_failed":state.overrides_failed,"scene_calls":state.scene_calls,
         "main_scene_calls":state.main_scene_calls,"viewport_commands":state.viewport_commands,"current_view_calls":state.current_calls,
-        "matched_current_view_calls":state.matched_current_calls,"gpu_commands_marked":state.emitted_commands,"view_marker_changes":state.marker_changes,
+        "matched_current_view_calls":state.matched_current_calls,
+        "gpu_commands_marked":state.emitted_commands.saturating_add(EMISSION_FAST_COMMANDS.load(Ordering::Relaxed)),
+        "emission_mutex_commands":state.emitted_commands,
+        "emission_fast_commands":EMISSION_FAST_COMMANDS.load(Ordering::Relaxed),
+        "emission_fastpath_enabled":*EMISSION_FAST_ENABLED,
+        "emission_token_exhausted":EMISSION_TOKEN_EXHAUSTED.load(Ordering::Acquire),
+        "view_marker_changes":state.marker_changes,
         "projection_clone_updates":state.projection_clone_updates,"projection_clone_failures":state.projection_clone_failures,
         "presents_enqueued":state.emitted_presents,"presents_consumed":state.consumed_presents,"world_presents":state.world_presents,
         "conflicting_presents":state.conflicting_presents,"pending_presents":state.presents.len(),"pending_markers":state.markers.len(),
@@ -1168,6 +1217,69 @@ mod tests {
         assert_eq!(state.markers.len(),2);
         assert!(state.markers.values().all(Option::is_none));
         assert_eq!(state.presents,VecDeque::from([None,None]));
+    }
+    #[test]
+    fn emission_tokens_match_legacy_ring_state_across_producers_ui_and_epoch_reset() {
+        // Tokens 1 and 2 are different SetCurrent bindings, even though their
+        // view values are equal. Token 3 belongs to another producer. The
+        // ordered sequence models the certified guest Emit producer mutex.
+        let left = view(0, 3);
+        let right = view(1, 4);
+        let mut after_reset = left;
+        after_reset.provenance_epoch = 2;
+        let events: &[(u64, u32, Option<WorldView>, u64)] = &[
+            (100, 26, Some(left), 1), (120, 23, Some(left), 1),
+            (140, 32, Some(left), 1), (160, 23, Some(left), 1),
+            (180, 26, Some(left), 2), (200, 7, Some(left), 2),
+            (220, 26, Some(right), 3), (240, 32, Some(right), 3),
+            (260, 23, Some(right), 3), (280, 7, None, 0),
+            (300, 23, None, 0), (320, 26, Some(after_reset), 4),
+            (340, 23, Some(after_reset), 4), (360, 32, Some(after_reset), 4),
+            (380, 7, None, 0),
+        ];
+        let mut legacy = State::default();
+        let mut optimized = State::default();
+        let mut previous_token = 0;
+        let mut fast_count = 0u64;
+        for (index, &(address, opcode, current, token)) in events.iter().enumerate() {
+            if index == 11 {
+                invalidate_state(&mut legacy);
+                invalidate_state(&mut optimized);
+                previous_token = 0;
+            }
+            record_emission(&mut legacy, address, opcode, current);
+            if can_skip_emission(opcode, token, previous_token) {
+                fast_count += 1;
+            } else {
+                record_emission(&mut optimized, address, opcode, current);
+                previous_token = token_after_slow_emission(&optimized, current, token);
+            }
+            assert_eq!(optimized.markers, legacy.markers, "marker step {index}");
+            assert_eq!(optimized.presents, legacy.presents, "present step {index}");
+            assert_eq!(optimized.last_emitted, legacy.last_emitted, "view step {index}");
+            assert_eq!(optimized.frame_world, legacy.frame_world, "draw step {index}");
+            assert_eq!(optimized.frame_conflict, legacy.frame_conflict, "conflict step {index}");
+            assert_eq!(optimized.correlation_failed, legacy.correlation_failed, "error step {index}");
+            assert_eq!(optimized.marker_changes, legacy.marker_changes, "marker count step {index}");
+            assert_eq!(optimized.emitted_presents, legacy.emitted_presents, "present count step {index}");
+            assert_eq!(optimized.emitted_commands + fast_count, legacy.emitted_commands, "command count step {index}");
+        }
+        assert!(fast_count > 0);
+        assert_eq!(legacy.presents, VecDeque::from([None, None, Some(after_reset)]));
+    }
+    #[test]
+    fn emission_fast_path_stops_after_marker_overrun_and_never_uses_zero_token() {
+        let left = view(0, 3);
+        let mut state = State::default();
+        state.markers = (0..MAX_MARKERS as u64).map(|address| (address, None)).collect();
+        record_emission(&mut state, MAX_MARKERS as u64 + 1, 26, Some(left));
+        assert!(state.correlation_failed);
+        assert_eq!(token_after_slow_emission(&state, Some(left), 4), 0);
+        assert!(!can_skip_emission(26, 0, 0));
+        assert!(!can_skip_emission(32, 4, 4));
+        assert!(!can_skip_emission(7, 4, 4));
+        assert!(!can_skip_emission(26, 5, 4));
+        assert!(can_skip_emission(26, 4, 4));
     }
     #[test]
     fn exact_native_stage_mapping_reproduces_eye_without_latest_pose() {
