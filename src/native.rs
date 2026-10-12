@@ -279,6 +279,7 @@ pub extern "C" fn sv_runtime_status(out: *mut c_char, capacity: usize) -> i32 {
         "gpu_started": crate::gpu::STARTED.load(Ordering::Relaxed),
         "frozen_depth_transfer_requested": frozen_depth_transfer_requested(),
         "window_surface_requested": WINDOW_SURFACE_REQUESTED.load(Ordering::Acquire),
+        "window_frames_presented": crate::gpu::WINDOW_PRESENTS.load(Ordering::Relaxed),
         "draw_setup": crate::draw_setup::status_json(),
         "diagnostic_scene": crate::host::benchmark::status_json(),
         "presents": crate::gpu::PRESENTS.load(Ordering::Relaxed),

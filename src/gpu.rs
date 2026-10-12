@@ -209,6 +209,7 @@ pub static OCCLUDED: AtomicBool = AtomicBool::new(false);
 pub static SUSPENDED: AtomicBool = AtomicBool::new(false);
 
 pub static PRESENTS: AtomicU64 = AtomicU64::new(0);
+pub static WINDOW_PRESENTS: AtomicU64 = AtomicU64::new(0);
 
 pub fn start(mem: &SharedMemory, ring: u64, size: u64, dbg: u64) {
     if STARTED.swap(true, Ordering::SeqCst) {
@@ -3961,6 +3962,7 @@ impl Gpu {
                 }
                 self.flush();
                 self.queue.present(frame);
+                WINDOW_PRESENTS.fetch_add(1, Ordering::Relaxed);
             } else {
                 self.flush();
             }
