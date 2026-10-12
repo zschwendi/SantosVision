@@ -165,7 +165,7 @@ mod tests {
 
     fn object(identity: u64, version: u64, bytes: &[u8]) -> Option<Obj> {
         Some(Obj::Buf(Buf { identity, size: bytes.len() as u64, stride: 0, gpu: None, bytes: 0,
-            shadow: Some(bytes.to_vec()), version, enc: 0, in_bg: false, counter: None }))
+            shadow: Some(bytes.to_vec()), version, enc: 0, in_bg: false, counter: None, dedup: crate::upload_dedup::Track::Untracked }))
     }
 
     fn fixture_pack() -> Pack { Pack { size: 32, members: vec![PackMember { binding: 0, size: 32, offset: 0 }] } }

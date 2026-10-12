@@ -1583,13 +1583,9 @@ impl Gpu {
 
     fn create_buffer(&mut self, id: u32, size: u32, bind: u32, misc: u32, stride: u32) {
         let size = size as u64;
-<<<<<<< HEAD
         let identity = self.uid();
-        let mut b = Buf { identity, size, stride, gpu: None, bytes: 0, shadow: None, version: 0, enc: 0, in_bg: false, counter: None };
-=======
-        let mut b = Buf { size, stride, gpu: None, bytes: 0, shadow: None, version: 0, enc: 0, in_bg: false, counter: None,
+        let mut b = Buf { identity, size, stride, gpu: None, bytes: 0, shadow: None, version: 0, enc: 0, in_bg: false, counter: None,
             dedup: crate::upload_dedup::Track::Untracked };
->>>>>>> 974ba28 (Add default-off redundant op47 upload guard with CPU and Metal fixtures)
         if bind & 4 != 0 { b.shadow = Some(vec![0u8; size as usize]); }
         let mut usage = BufferUsages::COPY_DST | BufferUsages::COPY_SRC;
         if bind & 1 != 0 { usage |= BufferUsages::VERTEX; }
@@ -1618,18 +1614,12 @@ impl Gpu {
             b.version = version;
             version_wrapped = wrapped;
         }
-<<<<<<< HEAD
-        let gpu = b.gpu.clone();
-        // Clear before returning for CB-only buffers too. Old offsets cannot
-        // match a recycled content version, even within this present.
+        let (gpu, track, gpu_bytes) = (b.gpu.clone(), b.dedup, b.bytes);
+        // End the buffer borrow before touching either feature's metadata.
+        // CB-only wrap invalidation must happen even without GPU storage.
         if version_wrapped { self.uniform_snapshot.version_wrapped(); }
         let Some(g) = gpu else { return };
-=======
-        let Some(g) = b.gpu.clone() else { return };
-        let (track, gpu_bytes) = (b.dedup, b.bytes);
-        // Every op12 drops this buffer's op47 record before it flushes or writes.
         if !no_overwrite { self.upload_dedup.op12(track); }
->>>>>>> 974ba28 (Add default-off redundant op47 upload guard with CPU and Metal fixtures)
         if !no_overwrite && used { self.flush(); }
         let source = if no_overwrite { UPLOAD_OP47 } else { UPLOAD_OP12 };
         // An op47 repeating the recorded range and bytes of this very object
