@@ -15,6 +15,9 @@ final class GameWorldModel: ObservableObject {
     private var startup: Task<Void, Never>?
     private var generation = UUID()
     private var appActive = true
+    private var lifecycle: [[String: Any]] = []
+    private var latestRendererState: [String: Any] = [:]
+    private var lastFailure: String?
     private weak var runtime: NativeRuntimeModel?
     private let log = Logger(subsystem: "com.zephyrstudios.santosvision", category: "GameWorldStatus")
 
@@ -24,14 +27,23 @@ final class GameWorldModel: ObservableObject {
         hasPresentedFrames = false
         runtime.beginWorldTracking()
         runtime.recordMetalCapabilities(layer.device)
+        lastFailure = nil
+        latestRendererState = [:]
+        recordState("renderer_constructor_started")
         let token = generation
         do {
             let renderer = try GameWorldRenderer(layer: layer) { [weak self] event in
                 Task { @MainActor [weak self] in
                     guard let self, self.generation == token else { return }
                     switch event {
+                    case .lifecycle(let event):
+                        self.latestRendererState = event.reportValue
+                        self.recordState(event.stage, detail: event.detail,
+                                         appendEvent: event.stage != "frame_sample")
+                        return
                     case .status(let message):
                         self.status = message
+                        self.recordState("renderer_status", detail: message)
                     case .presented(let presentation):
                         guard self.appActive else { return }
                         self.hasPresentedFrames = true
@@ -41,16 +53,18 @@ final class GameWorldModel: ObservableObject {
                     case .gpuTiming(let timing):
                         self.runtime?.recordWorldGpuTiming(timing)
                         return
-                    case .ended:
+                    case .ended(let reason):
                         self.renderer = nil
                         self.startup = nil
                         self.isImmersiveActive = false
+                        self.recordState("renderer_ended", detail: reason)
                         self.runtime?.endWorldTracking()
                     }
                     self.log.info("\(self.status, privacy: .public)")
                 }
             }
             self.renderer = renderer
+            recordState("renderer_constructor_succeeded")
             renderer.setActive(appActive)
             startup = Task {
                 do { try await renderer.start() }
@@ -58,30 +72,55 @@ final class GameWorldModel: ObservableObject {
                     renderer.stop()
                     guard generation == token else { return }
                     status = "The immersive game world could not start: \(error.localizedDescription)"
+                    lastFailure = String(reflecting: error)
+                    recordState("renderer_start_failed", detail: lastFailure)
                     runtime.endWorldTracking()
                     log.error("\(self.status, privacy: .public)")
                 }
             }
         } catch {
             status = "The immersive game world could not start: \(error.localizedDescription)"
+            lastFailure = String(reflecting: error)
+            recordState("renderer_constructor_failed", detail: lastFailure)
             runtime.endWorldTracking()
             log.error("\(self.status, privacy: .public)")
         }
     }
 
     func setActive(_ active: Bool) {
+        let changed = appActive != active
         appActive = active
         renderer?.setActive(active)
+        if changed { recordState("scene_activity_changed", detail: "active=\(active)") }
         if active, renderer != nil { XRHeadTracking.shared.resume() }
     }
 
     func stopRenderer() {
+        recordState("renderer_stop_requested")
         generation = UUID()
         startup?.cancel()
         startup = nil
         renderer?.stop()
         renderer = nil
         runtime?.endWorldTracking()
+        recordState("renderer_detached")
+    }
+
+    private func recordState(_ stage: String, detail: String? = nil, appendEvent: Bool = true) {
+        if appendEvent {
+            var event: [String: Any] = ["stage": stage, "generation": generation.uuidString,
+                "uptime_seconds": ProcessInfo.processInfo.systemUptime]
+            if let detail { event["detail"] = detail }
+            lifecycle.append(event)
+            if lifecycle.count > 32 { lifecycle.removeFirst(lifecycle.count - 32) }
+        }
+        var value: [String: Any] = ["stage": stage, "status": status,
+            "scene_active": appActive, "immersive_open": isImmersiveActive,
+            "opening": isOpening, "has_presented_game_frames": hasPresentedFrames,
+            "renderer_exists": renderer != nil, "generation": generation.uuidString,
+            "renderer": latestRendererState, "events": lifecycle]
+        if let lastFailure { value["last_failure"] = lastFailure }
+        runtime?.recordWorldState(value)
     }
 }
 #endif

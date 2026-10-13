@@ -38,11 +38,36 @@ struct GameWorldPresentation: Sendable {
     let headFrames: [UInt64]
 }
 
+struct GameWorldLifecycleEvent: Sendable {
+    let stage: String
+    let uptime: Double
+    let layerState: String
+    let trackingState: String
+    let rendererActive: Bool
+    let rendererStopped: Bool
+    let ownsWorldCamera: Bool
+    var detail: String? = nil
+    var viewCount: Int? = nil
+    var trackedPose: Bool? = nil
+
+    var reportValue: [String: Any] {
+        var value: [String: Any] = ["stage": stage, "uptime_seconds": uptime,
+            "layer_state": layerState, "tracking_state": trackingState,
+            "renderer_active": rendererActive, "renderer_stopped": rendererStopped,
+            "owns_world_camera_lease": ownsWorldCamera]
+        if let detail { value["detail"] = detail }
+        if let viewCount { value["view_count"] = viewCount }
+        if let trackedPose { value["tracked_pose"] = trackedPose }
+        return value
+    }
+}
+
 enum GameWorldEvent: Sendable {
+    case lifecycle(GameWorldLifecycleEvent)
     case status(String)
     case presented(GameWorldPresentation)
     case gpuTiming(GameWorldGpuTimingSummary)
-    case ended
+    case ended(String)
 }
 
 struct GameWorldUniforms {
@@ -327,6 +352,7 @@ final class GameWorldRenderer: @unchecked Sendable {
     private let inFlight = DispatchSemaphore(value: 3)
     private var lastStatus = ""
     private var frameNumber: UInt64 = 0
+    private var nextLifecycleSample: Double = 0
     private var loggedFrame = false
     private let debugPrefix = GameWorldDebugCapture.requestedPrefix()
     private var didDebugCapture = false
@@ -407,14 +433,22 @@ final class GameWorldRenderer: @unchecked Sendable {
     }
 
     func start() async throws {
+        recordLifecycle("startup_entered")
         try Task.checkCancellation()
         if SimulatorPoseFixture.shared == nil {
             guard WorldTrackingProvider.isSupported else { throw GameWorldError.unsupportedTracking }
-            try await session.run([tracking])
+            recordLifecycle("tracking_run_requested")
+            do { try await session.run([tracking]) }
+            catch {
+                recordLifecycle("tracking_run_failed", detail: String(reflecting: error))
+                throw error
+            }
+            recordLifecycle("tracking_run_returned")
         }
         try Task.checkCancellation()
         guard !isStopped else { session.stop(); return }
         let result = WorldCameraOwnership.shared.acquire(sessionToken)
+        recordLifecycle("world_camera_requested", detail: "return_code=\(result)")
         guard result == 0 else { throw GameWorldError.cameraEnable(result) }
         reportStatus(anchorProbe == nil ? "Waiting for a qualified native game world frame with its actual depth."
                      : "Anchor probe active: an analytic scene replaces game content. No game frame is being presented.")
@@ -459,20 +493,50 @@ final class GameWorldRenderer: @unchecked Sendable {
         log.info("\(message, privacy: .public)")
     }
 
+    private func recordLifecycle(_ stage: String, detail: String? = nil,
+                                 viewCount: Int? = nil, trackedPose: Bool? = nil) {
+        report(.lifecycle(GameWorldLifecycleEvent(stage: stage,
+            uptime: ProcessInfo.processInfo.systemUptime,
+            layerState: String(describing: layer.state),
+            trackingState: String(describing: tracking.state),
+            rendererActive: isActive, rendererStopped: isStopped,
+            ownsWorldCamera: WorldCameraOwnership.shared.isOwner(sessionToken),
+            detail: detail, viewCount: viewCount, trackedPose: trackedPose)))
+    }
+
     private func renderLoop() {
+        var endReason = "stop requested"
+        var previousLayerState: LayerRenderer.State?
+        var previousTrackingState: DataProviderState?
+        var previousActive: Bool?
+        recordLifecycle("render_loop_started")
         defer {
             session.stop()
             if retainsAnchors { XRHeadTracking.shared.invalidateRetainedAnchors(reason: "render loop ended") }
             WorldCameraOwnership.shared.release(sessionToken)
-            report(.ended)
+            recordLifecycle("render_loop_ended", detail: endReason)
+            report(.ended(endReason))
         }
         while !isStopped {
+            let layerState = layer.state
+            let trackingState = tracking.state
+            let active = isActive
+            if layerState != previousLayerState || trackingState != previousTrackingState || active != previousActive {
+                previousLayerState = layerState
+                previousTrackingState = trackingState
+                previousActive = active
+                recordLifecycle("render_state_changed")
+            }
             guard isActive else { Thread.sleep(forTimeInterval: 0.01); continue }
             switch layer.state {
-            case .invalidated: return
+            case .invalidated:
+                endReason = "compositor layer invalidated"
+                return
             case .paused: Thread.sleep(forTimeInterval: 0.01)
             case .running: autoreleasepool { renderFrame() }
-            @unknown default: return
+            @unknown default:
+                endReason = "unknown compositor layer state"
+                return
             }
         }
     }
@@ -511,6 +575,12 @@ final class GameWorldRenderer: @unchecked Sendable {
             // Capture drawables must not replace the headset's two-view request
             // with a one-view recording request.
             let builtIn = drawable.target == .builtIn
+            let sampleTime = ProcessInfo.processInfo.systemUptime
+            if builtIn, sampleTime >= nextLifecycleSample {
+                nextLifecycleSample = sampleTime + 5
+                recordLifecycle("frame_sample", viewCount: drawable.views.count,
+                                trackedPose: stageFromHead != nil)
+            }
             var sources: [GameWorldSourceEye] = []
             var drawableLeases: [GameWorldLease] = []
             var pairQualified = false
@@ -1013,6 +1083,11 @@ private final class WorldCameraOwnership: @unchecked Sendable {
     static let shared = WorldCameraOwnership()
     private let lock = NSLock()
     private var owner: UUID?
+    func isOwner(_ token: UUID) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return owner == token
+    }
     func acquire(_ token: UUID) -> Int32 {
         lock.lock()
         defer { lock.unlock() }
