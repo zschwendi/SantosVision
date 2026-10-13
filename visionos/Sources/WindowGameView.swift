@@ -81,6 +81,7 @@ struct WindowGameView: View {
     @Environment(\.openImmersiveSpace) private var openImmersiveSpace
     @Environment(\.dismissImmersiveSpace) private var dismissImmersiveSpace
     @Environment(\.dismissWindow) private var dismissWindow
+    @State private var attemptedAutomaticImmersion = false
     #endif
 
     private var shortStatus: String {
@@ -162,6 +163,24 @@ struct WindowGameView: View {
         }
         .sheet(isPresented: $showingSettings) { SantosSettingsView(runtime: runtime) }
         #if SV_GAME_RUNTIME
+        .task {
+            // Exercise the normal window-to-world transition after real window
+            // rendering has started, so cold loading does not spend the world's
+            // first-frame timeout. This is opt-in device QA, not launch policy.
+            guard ProcessInfo.processInfo.arguments.contains("--sv-auto-immersive-after-window-frames"),
+                  !attemptedAutomaticImmersion else { return }
+            let deadline = ContinuousClock.now + .seconds(60)
+            while !Task.isCancelled, ContinuousClock.now < deadline {
+                if runtime.engineFailed { return }
+                if runtime.hasStarted, runtime.presentedWindowFrames >= 300 {
+                    attemptedAutomaticImmersion = true
+                    await expandGame()
+                    return
+                }
+                do { try await Task.sleep(for: .milliseconds(250)) }
+                catch { return }
+            }
+        }
         .onChange(of: world.hasPresentedFrames) { _, presented in
             if presented, world.isImmersiveActive { dismissWindow(id: "main") }
         }

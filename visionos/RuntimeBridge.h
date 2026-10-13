@@ -70,4 +70,18 @@ _Static_assert(sizeof(SVWorldFrame) == 288, "SVWorldFrame ABI layout must match 
 int32_t sv_xr_submit_views(const SVXRViewRequest *request);
 int32_t sv_xr_world_camera_set_enabled(uint32_t enabled);
 
+/* Original gameplay camera ray, not a synthetic ballistic trajectory. */
+typedef struct {
+    uint32_t version, size;
+    uint64_t sequence, view_epoch;
+    double capture_time_seconds, age_seconds;
+    double origin[3], direction[3];
+    uint32_t flags;
+    int32_t ped_view_mode, vehicle_view_mode;
+    uint32_t reserved;
+} SVXRAimSnapshot;
+_Static_assert(sizeof(SVXRAimSnapshot) == 104, "SVXRAimSnapshot ABI layout must match Rust");
+int32_t sv_xr_get_aim_snapshot(SVXRAimSnapshot *snapshot, uint32_t byte_size);
+int32_t sv_xr_set_reticle_ready(uint32_t enabled);
+
 #endif

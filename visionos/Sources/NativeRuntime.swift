@@ -149,6 +149,14 @@ final class NativeRuntimeModel: ObservableObject {
     var canChangePlaySettings: Bool { isLinked && !startupAttempted && !hasStarted && !isBusy }
     var canChangeRenderingOptimizations: Bool { isLinked && !startupAttempted && !hasStarted && !isBusy }
 
+    /// Only used by an explicit device QA launch; ordinary play is unchanged.
+    var presentedWindowFrames: UInt64 {
+        guard let bytes = lastStatus?.payload.data(using: .utf8),
+              let object = try? JSONSerialization.jsonObject(with: bytes) as? [String: Any],
+              let value = object["window_frames_presented"] as? NSNumber else { return 0 }
+        return value.uint64Value
+    }
+
     init(arguments: [String] = ProcessInfo.processInfo.arguments) {
         windowGameMode = !arguments.contains("--sv-open-game") && !arguments.contains("--sv-open-tracking")
         let documents = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]

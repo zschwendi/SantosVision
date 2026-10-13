@@ -20,6 +20,10 @@ struct GameWorldConfiguration: CompositorLayerConfiguration {
             configuration.depthFormat = .depth32Float
         }
         configuration.isFoveationEnabled = false
+        if GameWorldDebugCapture.requestedPrefix() != nil {
+            configuration.colorUsage.formUnion([.renderTarget, .shaderRead])
+            configuration.depthUsage.formUnion([.renderTarget, .shaderRead])
+        }
         let layouts = capabilities.supportedLayouts(options: [])
         configuration.layout = layouts.contains(.dedicated) ? .dedicated
             : layouts.contains(.layered) ? .layered : .shared
@@ -343,6 +347,7 @@ final class GameWorldRenderer: @unchecked Sendable {
     private let tracking = WorldTrackingProvider()
     private let queue: any MTLCommandQueue
     private let pipeline: any MTLRenderPipelineState
+    private let reticle: GameWorldReticle?
     /// Optional exact corner-depth precompute (MUGUET_COMPOSITOR_CORNER_PRECOMPUTE=1); nil keeps the
     /// single-pass pipeline above. Off by default.
     private let cornerPrecompute: (kernel: any MTLComputePipelineState, pipeline: any MTLRenderPipelineState,
@@ -399,6 +404,9 @@ final class GameWorldRenderer: @unchecked Sendable {
         descriptor.colorAttachments[0].pixelFormat = layer.configuration.colorFormat
         descriptor.depthAttachmentPixelFormat = layer.configuration.depthFormat
         pipeline = try layer.device.makeRenderPipelineState(descriptor: descriptor)
+        reticle = GameWorldReticle(device: layer.device, library: library,
+                                   colorFormat: layer.configuration.colorFormat,
+                                   depthFormat: layer.configuration.depthFormat)
         let environment = ProcessInfo.processInfo.environment
         let cornerRequested = environment["MUGUET_COMPOSITOR_CORNER_PRECOMPUTE"] == "1"
         var precompute: (kernel: any MTLComputePipelineState, pipeline: any MTLRenderPipelineState, scratch: CornerScratchPool)?
@@ -472,8 +480,10 @@ final class GameWorldRenderer: @unchecked Sendable {
             recordLifecycle("tracking_run_returned")
         }
         try Task.checkCancellation()
-        guard !isStopped else { session.stop(); return }
-        let result = WorldCameraOwnership.shared.acquire(sessionToken)
+        let acquired: Int32? = stopLock.withLock {
+            stopped ? nil : WorldCameraOwnership.shared.acquire(sessionToken, reticleReady: reticle != nil)
+        }
+        guard let result = acquired else { session.stop(); return }
         recordLifecycle("world_camera_requested", detail: "return_code=\(result)")
         guard result == 0 else { throw GameWorldError.cameraEnable(result) }
         reportStatus(anchorProbe == nil ? "Waiting for a qualified native game world frame with its actual depth."
@@ -634,6 +644,9 @@ final class GameWorldRenderer: @unchecked Sendable {
                 }
                 let viewRequestAccepted = submitViews(drawable: drawable, timestamp: timestamp,
                                                        requestFrame: requestFrame, eyes: eyes)
+                if viewRequestAccepted {
+                    WorldCameraOwnership.shared.refreshReticleReady(sessionToken, ready: reticle != nil)
+                }
                 if let anchorProbe {
                     // Probe: no native lease is acquired; the analytic pair stands in for the game.
                     let views = drawable.views.indices.map { index in
@@ -970,6 +983,9 @@ final class GameWorldRenderer: @unchecked Sendable {
                         adaptiveScratch: inout AdaptiveScratchLease) -> (views: Int, copy: Bool) {
         var clearedTextures = Set<String>()
         var encodedViews = 0
+        // Both eyes use one original-game aim sample, even if the script thread
+        // publishes another sample between the two encoding calls.
+        let gameplayAim = reticle == nil ? nil : GameWorldReticle.snapshot()
         // Copy path decision for the whole drawable. The probe may force the mesh for A/B/A.
         var copyDecision: (retained: XRRetainedHeadPose, verified: [GameWorldSourcePoseCheck.Result])?
         if sourceCopy != nil, stageFromHead != nil, anchorProbe?.useCopyPath(now: timestamp) ?? true {
@@ -1070,6 +1086,12 @@ final class GameWorldRenderer: @unchecked Sendable {
                     log.info("Actual GTA source eye \(eye): kind=\(sourceEye.kind.rawValue, privacy: .public) size=\(sourceEye.width)x\(sourceEye.height) format=\(sourceEye.color.pixelFormat.rawValue) color_device=\(sourceEye.color.device.registryID) compositor_device=\(self.layer.device.registryID) eye_x=\(view.transform.columns.3.x) projection_x=\(uniforms.currentClipFromEye.columns.2.x) source_near=\(sourceEye.depthNear) source_far=\(sourceEye.depthFar) corner_precompute=\(corners != nil) adaptive=\(adaptiveSet != nil) copy=\(copyDecision != nil)")
                 }
             }
+            if let source, source.eye.kind == .actual, let stageFromHead, let gameplayAim {
+                let gameFromCurrentEye = worldDoubleMatrix(source.eye.gameFromStage)
+                    * worldDoubleMatrix(stageFromHead) * worldDoubleMatrix(view.transform)
+                reticle?.encode(encoder, aim: gameplayAim, gameFromCurrentEye: gameFromCurrentEye,
+                                projection: projection, viewport: map.viewport)
+            }
             encoder.endEncoding()
             if let adaptiveSet, let adaptiveMesh { adaptiveMesh.encodeCounterCopy(commands: commands, set: adaptiveSet) }
         }
@@ -1145,11 +1167,14 @@ private final class WorldCameraOwnership: @unchecked Sendable {
         defer { lock.unlock() }
         return owner == token
     }
-    func acquire(_ token: UUID) -> Int32 {
+    func acquire(_ token: UUID, reticleReady: Bool) -> Int32 {
         lock.lock()
         defer { lock.unlock() }
         let result = sv_xr_world_camera_set_enabled(1)
-        if result == 0 { owner = token }
+        if result == 0 {
+            owner = token
+            _ = sv_xr_set_reticle_ready(reticleReady ? 1 : 0)
+        }
         return result
     }
     func release(_ token: UUID) {
@@ -1157,7 +1182,16 @@ private final class WorldCameraOwnership: @unchecked Sendable {
         defer { lock.unlock() }
         guard owner == token else { return }
         owner = nil
+        _ = sv_xr_set_reticle_ready(0)
         _ = sv_xr_world_camera_set_enabled(0)
+    }
+    func refreshReticleReady(_ token: UUID, ready: Bool) {
+        lock.lock()
+        defer { lock.unlock() }
+        guard owner == token else { return }
+        // Tracking loss/recenter advances the native epoch without replacing
+        // the Swift renderer. Rebind readiness without resetting the camera.
+        _ = sv_xr_set_reticle_ready(ready ? 1 : 0)
     }
 }
 #endif

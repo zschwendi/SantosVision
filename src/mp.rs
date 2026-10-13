@@ -926,7 +926,10 @@ pub fn script_tick(caller: &mut Caller<'_, HostState>, thread: u64, tls: u64) ->
 /// in primary-camera propagation, including cinematics without script updates.
 /// Never change the game's chosen camera mode, controller look or cutscene.
 fn apply_native_head_pose(c: &mut Cmd<'_, '_>) {
-    if !crate::xr_view::world_camera_enabled() { return; }
+    if !crate::xr_view::world_camera_enabled() {
+        crate::xr_aim::clear("immersive camera inactive");
+        return;
+    }
     // Getter diagnostics are optional. A cinematic camera may render without a
     // gameplay camera/player; it still receives the consumed head transform.
     let ped = c.i("PlayerPedId", &[]);
@@ -936,6 +939,53 @@ fn apply_native_head_pose(c: &mut Cmd<'_, '_>) {
             crate::xr::record_camera_readback(readback, false);
         }
     }
+    capture_native_controller_aim(c, ped);
+}
+
+/// Uses the original gameplay ray; head movement remains render-only free look.
+/// This function runs only in script_tick's selected guest TLS/scratch scope.
+fn capture_native_controller_aim(c: &mut Cmd<'_, '_>, ped: i32) {
+    if !crate::pad::verified_guest_gameplay_context() || !crate::pad::exact_guest_abi_verified()
+        || ped == 0 || !c.exists(ped) || c.i("IsPedDeadOrDying", &[i(ped), b(true)]) != 0
+        || c.i("IsGameplayCamRendering", &[]) == 0 {
+        crate::xr_aim::clear("original gameplay camera unavailable or guest menu/cinematic active");
+        return;
+    }
+    let epoch = crate::xr_view::view_epoch();
+    if !crate::xr_aim::reticle_ready_for_epoch(epoch) {
+        crate::xr_aim::clear("replacement reticle frontend not ready for this immersive epoch");
+        return;
+    }
+    let result = (|| -> anyhow::Result<()> {
+        let readback = read_native_camera(c).ok_or_else(|| anyhow::anyhow!("original follow-camera modes unavailable"))?;
+        let coord = c.caller.get_export("mp:GetGameplayCamCoord").and_then(|e| e.into_func())
+            .ok_or_else(|| anyhow::anyhow!("original gameplay camera coordinate getter unavailable"))?
+            .typed::<i64, ()>(&mut *c.caller)?;
+        coord.call(&mut *c.caller, c.scratch as i64)?;
+        let origin = [c.read_f32(0), c.read_f32(8), c.read_f32(16)];
+        let rotation = c.caller.get_export("mp:GetGameplayCamRot").and_then(|e| e.into_func())
+            .ok_or_else(|| anyhow::anyhow!("original gameplay camera rotation getter unavailable"))?
+            .typed::<(i64, i32), ()>(&mut *c.caller)?;
+        rotation.call(&mut *c.caller, (c.scratch as i64, 2))?;
+        let rotation_degrees = [c.read_f32(0), c.read_f32(8), c.read_f32(16)];
+        let player = c.i("PlayerId", &[]);
+        let sample = crate::xr_aim::GameplayAim {
+            origin, rotation_degrees, ped_view_mode: readback.ped_view_mode,
+            vehicle_view_mode: readback.vehicle_view_mode,
+            in_vehicle: c.i("IsPedInAnyVehicle", &[i(ped), b(false)]) != 0,
+            armed: c.i("IsPedArmed", &[i(ped), i(4)]) != 0,
+            free_aiming: c.i("IsPlayerFreeAiming", &[i(player)]) != 0,
+            aiming_control: c.i("IsControlPressed", &[i(0), i(25)]) != 0,
+            shooting: c.i("IsPedShooting", &[i(ped)]) != 0,
+        };
+        anyhow::ensure!(crate::xr_aim::valid_gameplay_aim(sample), "nonfinite original gameplay aim sample");
+        anyhow::ensure!(crate::xr_aim::reticle_ready_for_epoch(epoch),
+            "immersive epoch changed before original reticle command");
+        crate::xr_aim::hide_original_reticle(c.caller, crate::pad::exact_guest_abi_verified())?;
+        anyhow::ensure!(crate::xr_aim::publish(sample, epoch, true), "immersive epoch changed before aim publication");
+        Ok(())
+    })();
+    if let Err(error) = result { crate::xr_aim::record_failure(&error.to_string()); }
 }
 
 fn read_native_camera(c: &mut Cmd<'_, '_>) -> Option<crate::xr::CameraReadback> {

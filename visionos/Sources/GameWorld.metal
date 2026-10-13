@@ -1,6 +1,23 @@
 #include <metal_stdlib>
 using namespace metal;
 
+struct GameWorldReticleUniforms { float4 clipPosition; float2 halfSizeNDC; float2 padding; };
+struct GameWorldReticleVertex { float4 position [[position]]; float2 local; };
+vertex GameWorldReticleVertex gameWorldReticleVertex(uint id [[vertex_id]],
+        constant GameWorldReticleUniforms &u [[buffer(0)]]) {
+    const float2 corners[4] = { float2(-1, -1), float2(-1, 1), float2(1, -1), float2(1, 1) };
+    GameWorldReticleVertex out;
+    out.position = u.clipPosition;
+    out.position.xy += corners[id] * u.halfSizeNDC * out.position.w;
+    out.local = corners[id];
+    return out;
+}
+fragment float4 gameWorldReticleFragment(GameWorldReticleVertex in [[stage_in]]) {
+    const float radius = length(in.local);
+    if (radius > 1) { discard_fragment(); }
+    return float4(radius < 0.55 ? float3(1) : float3(0), 1);
+}
+
 struct GameWorldUniforms {
     float4x4 sourceEyeFromClip;
     float4x4 currentEyeFromSourceEye;

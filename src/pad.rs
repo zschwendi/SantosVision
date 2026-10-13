@@ -27,6 +27,15 @@ static MENU_NAVIGATION: AtomicBool = AtomicBool::new(false);
 static GUEST_CONTEXT_AVAILABLE: AtomicBool = AtomicBool::new(false);
 static PHONE_INSTANTIATED: AtomicBool = AtomicBool::new(false);
 
+/// Share the exact original-game certificate with scoped guest-native helpers.
+pub(crate) fn exact_guest_abi_verified() -> bool {
+    guest_context::abi_verified() == Some(true)
+}
+
+pub(crate) fn verified_guest_gameplay_context() -> bool {
+    guest_context::read().is_some_and(|context| !context.paused)
+}
+
 /// Cumulative sampling/mapping counters, independent of engine block readiness.
 /// Compare with input::status_json delivery counters to locate a broken path.
 pub(crate) fn status_json() -> serde_json::Value {

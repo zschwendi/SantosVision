@@ -300,6 +300,8 @@ pub extern "C" fn sv_runtime_status(out: *mut c_char, capacity: usize) -> i32 {
         "window_visible": WINDOW_VISIBLE.load(Ordering::Acquire),
         "window_frames_presented": crate::gpu::WINDOW_PRESENTS.load(Ordering::Relaxed),
         "controller": crate::pad::status_json(), "input": crate::input::status_json(),
+        "immersive_aim": crate::xr_aim::status_json(),
+        "world_color_phase": crate::world_ui::status_json(),
         "draw_setup": crate::draw_setup::status_json(),
         "diagnostic_scene": crate::host::benchmark::status_json(),
         "presents": crate::gpu::PRESENTS.load(Ordering::Relaxed),

@@ -20,7 +20,9 @@ mod mp;
 pub mod native;
 pub mod capture;
 pub mod world_frame;
+pub mod world_ui;
 pub mod xr;
+pub mod xr_aim;
 pub mod xr_view;
 mod pad;
 #[cfg(feature = "jit")]
