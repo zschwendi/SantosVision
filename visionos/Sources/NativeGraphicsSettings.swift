@@ -44,7 +44,7 @@ struct NativeGraphicsSettings: Codable, Equatable, Sendable {
     var resolution: Resolution {
         Resolution.allCases.first { $0.dimensions.width == width && $0.dimensions.height == height } ?? .standard
     }
-    var summary: String { "Low preset · \(width)×\(height) · \(fpsLimit) FPS cap" }
+    var summary: String { "\(width)×\(height) · \(fpsLimit) FPS cap" }
     var reportValue: [String: Any] {
         ["width": width, "height": height, "fps_limit": fpsLimit, "graphics_preset": graphicsPreset]
     }

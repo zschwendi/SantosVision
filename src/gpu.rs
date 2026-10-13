@@ -3900,7 +3900,11 @@ impl Gpu {
     fn present(&mut self, id: u32) {
         let present_started = Instant::now();
         self.materialize_clears(id);
-        let visible = !OCCLUDED.load(Ordering::Relaxed);
+        // The compositor owns presentation during immersive play. Acquiring a
+        // drawable from a hidden window can block world-frame publication.
+        let visible = !OCCLUDED.load(Ordering::Relaxed) && !crate::xr_view::world_camera_enabled();
+        #[cfg(target_os = "visionos")]
+        let visible = visible && crate::native::window_can_present();
         if let (Some(t), Some(_), true) = (self.tex(id), self.surface.as_ref(), visible) {
             let (w, h) = (t.desc.w, t.desc.h);
             let tex = t.tex.clone();

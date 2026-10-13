@@ -15,11 +15,16 @@ int32_t sv_runtime_start(const char *game_root, const char *save_root,
                          char *error, size_t capacity);
 int32_t sv_runtime_status(char *json, size_t capacity);
 int32_t sv_runtime_set_active(uint32_t active);
+/* Bounded menu key pulse: 1 Escape, 2 Enter, 3 Space/Apply, 4 Yes/Y, 5 No/N.
+ * Returns -1 for unsupported action or full queue. */
+int32_t sv_runtime_menu_action(uint32_t action);
 /* Pre-start live 2D window surface. Pass a live CAMetalLayer pointer on visionOS.
  * Metal retains the layer; Swift must keep its owning UIView alive and attached
  * for presentation. Returns 0 on success, -1 for null, repeated, unsupported or
  * during/after runtime or GPU startup. Call before bootstrap/start; no replacement. */
 int32_t sv_runtime_set_window_layer(void *metal_layer);
+/* Attachment/visibility gate; never replaces or suspends the retained layer. */
+int32_t sv_runtime_set_window_visible(uint32_t visible);
 /* Pre-start app request for the immutable frozen-depth handoff. 0/1 only;
  * explicit MUGUET_TRANSFER_FROZEN_DEPTH=0/1 overrides it for diagnostics.
  * Returns -1 during or after native startup. */

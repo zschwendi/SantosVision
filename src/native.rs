@@ -18,6 +18,7 @@ struct Status {
 static ACTIVE: AtomicBool = AtomicBool::new(true);
 static APP_FROZEN_DEPTH_REQUESTED: AtomicBool = AtomicBool::new(false);
 static WINDOW_SURFACE_REQUESTED: AtomicBool = AtomicBool::new(false);
+static WINDOW_VISIBLE: AtomicBool = AtomicBool::new(false);
 static INPUT_LIFECYCLE: Mutex<()> = Mutex::new(());
 
 static STATUS: LazyLock<Mutex<Status>> = LazyLock::new(|| Mutex::new(Status { state: "idle", ..Default::default() }));
@@ -46,6 +47,17 @@ pub(crate) fn report_error(error: String) {
 }
 
 pub(crate) fn is_active() -> bool { ACTIVE.load(Ordering::Acquire) }
+
+pub(crate) fn window_can_present() -> bool {
+    !WINDOW_SURFACE_REQUESTED.load(Ordering::Acquire) || WINDOW_VISIBLE.load(Ordering::Acquire)
+}
+
+#[no_mangle]
+pub extern "C" fn sv_runtime_set_window_visible(visible: u32) -> i32 {
+    if visible > 1 { return -1; }
+    WINDOW_VISIBLE.store(visible != 0, Ordering::Release);
+    0
+}
 
 fn resolve_frozen_depth_request(environment: Option<&str>, app_requested: bool) -> bool {
     match environment {
@@ -147,6 +159,12 @@ pub extern "C" fn sv_runtime_set_active(active: u32) -> i32 {
     crate::xr_view::set_active(active);
     if !active { crate::world_frame::reset(); }
     0
+}
+
+/// Bounded menu-only keyboard pulses for native controller help controls.
+#[no_mangle]
+pub extern "C" fn sv_runtime_menu_action(action: u32) -> i32 {
+    if crate::pad::queue_menu_action(action) { 0 } else { -1 }
 }
 
 pub(crate) fn record_exit(code: i32) {
@@ -279,6 +297,7 @@ pub extern "C" fn sv_runtime_status(out: *mut c_char, capacity: usize) -> i32 {
         "gpu_started": crate::gpu::STARTED.load(Ordering::Relaxed),
         "frozen_depth_transfer_requested": frozen_depth_transfer_requested(),
         "window_surface_requested": WINDOW_SURFACE_REQUESTED.load(Ordering::Acquire),
+        "window_visible": WINDOW_VISIBLE.load(Ordering::Acquire),
         "window_frames_presented": crate::gpu::WINDOW_PRESENTS.load(Ordering::Relaxed),
         "controller": crate::pad::status_json(), "input": crate::input::status_json(),
         "draw_setup": crate::draw_setup::status_json(),

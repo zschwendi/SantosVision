@@ -107,11 +107,15 @@ final class NativeRuntimeModel: ObservableObject {
     @Published private(set) var drawSetupOverheadEnabled = RenderingOptimizations.storedDrawSetup
     @Published private(set) var windowSurfaceReady = false
     @Published private(set) var controllerSummary = "Controller not connected"
+    @Published private(set) var menuPressCount: UInt64 = 0
+    @Published var gameControlsVisible = false
     let windowGameMode: Bool
     let isLinked = NativeRuntime.isLinked
     let gameRoot: URL
     let saveRoot: URL
     let reportURL: URL
+    let cloudSaves: CloudSaveModel
+    @Published private(set) var isQuitting = false
     private var didBootstrap = false
     private var polling: Task<Void, Never>?
     private var simulatedPoseTask: Task<Void, Never>?
@@ -125,6 +129,7 @@ final class NativeRuntimeModel: ObservableObject {
     private var appSceneIsActive = true
     private var windowIsAttached = false
     private var windowSceneIsActive = true
+    private var immersiveSceneIsActive = false
     private var capturePaths = Set<String>()
     private var captureRequests: [[String: Any]] = []
     private var compositorOwnsHeadTracking = false
@@ -152,6 +157,7 @@ final class NativeRuntimeModel: ObservableObject {
             ?? documents.appendingPathComponent("saves", isDirectory: true)
         reportURL = value("--sv-report").map { URL(fileURLWithPath: $0) }
             ?? documents.appendingPathComponent("native-runtime-report.json")
+        cloudSaves = CloudSaveModel(saveRoot: saveRoot)
         do {
             graphicsSettings = try NativeGraphicsSettings.load(from: graphicsConfigURL)
             try graphicsSettings.apply(arguments: arguments)
@@ -221,6 +227,12 @@ final class NativeRuntimeModel: ObservableObject {
             return
         }
         isBusy = true
+        guard await cloudSaves.prepareForLaunch() else {
+            status = cloudSaves.status
+            isBusy = false
+            recordReport()
+            return
+        }
         do {
             try persistGraphics()
         } catch {
@@ -246,6 +258,7 @@ final class NativeRuntimeModel: ObservableObject {
         isBusy = false
         recordReport()
         if hasStarted {
+            await cloudSaves.gameplayStarted()
             activeReturnCode = NativeRuntime.setActive(isActive)
             configureCaptures()
             startPolling()
@@ -321,6 +334,11 @@ final class NativeRuntimeModel: ObservableObject {
         updateActivity()
     }
 
+    func setImmersiveSceneActive(_ active: Bool) {
+        immersiveSceneIsActive = active
+        updateActivity()
+    }
+
     func setWindowAttached(_ attached: Bool) {
         windowIsAttached = attached
         // UIKit attachment callbacks can run during SwiftUI construction.
@@ -329,14 +347,20 @@ final class NativeRuntimeModel: ObservableObject {
     }
 
     private func updateActivity(deferReport: Bool = false) {
-        let active = appSceneIsActive && (!windowGameMode || (windowIsAttached && windowSceneIsActive))
+        let active = (compositorOwnsHeadTracking && immersiveSceneIsActive)
+            || (appSceneIsActive && (!windowGameMode || (windowIsAttached && windowSceneIsActive)))
+        let changed = active != isActive
         if active != isActive {
             worldGpuTimingNotBeforeUptime = ProcessInfo.processInfo.systemUptime
             worldGpuTiming = nil
         }
         isActive = active
+        #if SV_GAME_RUNTIME
+        _ = sv_runtime_set_window_visible(windowIsAttached && windowSceneIsActive ? 1 : 0)
+        #endif
         if !active { suspendHeadTracking(); worldPresentation = nil; worldGpuTiming = nil }
-        if isLinked { activeReturnCode = NativeRuntime.setActive(active) }
+        // Repeating the native setter invalidates the current XR frame epoch.
+        if isLinked, changed { activeReturnCode = NativeRuntime.setActive(active) }
         if active {
             if hasStarted { resumeHeadTracking() }
             else if probePassed, ProcessInfo.processInfo.arguments.contains("--sv-start-runtime") {
@@ -358,7 +382,7 @@ final class NativeRuntimeModel: ObservableObject {
 
     func resumeHeadTracking() {
         guard isActive else { return }
-        guard !windowGameMode else {
+        guard !windowGameMode || compositorOwnsHeadTracking else {
             suspendHeadTracking()
             #if SV_GAME_RUNTIME
             _ = sv_xr_world_camera_set_enabled(0)
@@ -385,6 +409,7 @@ final class NativeRuntimeModel: ObservableObject {
         worldPresentation = nil
         worldGpuTiming = nil
         worldGpuTimingNotBeforeUptime = ProcessInfo.processInfo.systemUptime
+        updateActivity()
         if isActive { XRHeadTracking.shared.resume() }
         recordReport()
     }
@@ -395,7 +420,31 @@ final class NativeRuntimeModel: ObservableObject {
         worldGpuTiming = nil
         worldGpuTimingNotBeforeUptime = ProcessInfo.processInfo.systemUptime
         suspendHeadTracking()
+        updateActivity()
         recordReport()
+    }
+
+    func sendMenuAction(_ action: UInt32) {
+        #if SV_GAME_RUNTIME
+        _ = sv_runtime_menu_action(action)
+        #endif
+    }
+
+    func quitGame() async {
+        guard !isQuitting else { return }
+        isQuitting = true
+        setActive(false)
+        setImmersiveSceneActive(false)
+        guard await cloudSaves.finishBackup() else {
+            isQuitting = false
+            status = cloudSaves.status
+            gameControlsVisible = true
+            setActive(true)
+            if compositorOwnsHeadTracking { setImmersiveSceneActive(true) }
+            recordReport()
+            return
+        }
+        Darwin.exit(EXIT_SUCCESS)
     }
 
     #if SV_GAME_RUNTIME
@@ -493,6 +542,14 @@ final class NativeRuntimeModel: ObservableObject {
                 if let data = result.payload.data(using: .utf8),
                    let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
                    let state = object["state"] as? String {
+                    if let controller = object["controller"] as? [String: Any],
+                       let presses = (controller["menu_press_count"] as? NSNumber)?.uint64Value,
+                       presses != self.menuPressCount {
+                        let delta = presses &- self.menuPressCount
+                        self.menuPressCount = presses
+                        if delta % 2 == 1 { self.gameControlsVisible.toggle() }
+                        Task { await self.cloudSaves.backupNow() }
+                    }
                     self.engineFailed = state == "failed"
                     self.status = "Native engine state: \(state)."
                     if let error = object["last_error"] as? String {
@@ -525,7 +582,7 @@ final class NativeRuntimeModel: ObservableObject {
             "schema": 1, "timestamp": ISO8601DateFormatter().string(from: Date()),
             "report_system_uptime_seconds": ProcessInfo.processInfo.systemUptime,
             "native_runtime_linked": isLinked, "game_root": gameRoot.path,
-            "presentation_mode": windowGameMode ? "window" : "immersive",
+            "presentation_mode": compositorOwnsHeadTracking ? "immersive" : (windowGameMode ? "window" : "diagnostic"),
             "window_surface_ready": windowSurfaceReady,
             "window_scene_policy": "single_instance_main",
             "window_attached": windowIsAttached,
@@ -533,6 +590,7 @@ final class NativeRuntimeModel: ObservableObject {
             "connected_window_scene_count": UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.count,
             "controllers": ["connected": !controllers.isEmpty, "names": controllerNames],
             "save_root": saveRoot.path, "has_game_data": hasGameData,
+            "save_sync_status": cloudSaves.status,
             "graphics_requested": graphicsSettings.reportValue,
             "graphics_config_path": graphicsConfigURL.path,
             "graphics_config_written": graphicsConfigWritten,
@@ -554,7 +612,7 @@ final class NativeRuntimeModel: ObservableObject {
                 "metal_skip_empty_prepass": RenderingOptimizations.metalSkipEmptyPrepassEnabled
             ],
             "probe": payload(lastProbe), "start": payload(lastStart), "status": payload(lastStatus),
-            "head_pose_source": windowGameMode ? "disabled_in_window" : (SimulatorPoseFixture.shared == nil ? "ARKit" : "simulator_fixture"),
+            "head_pose_source": windowGameMode && !compositorOwnsHeadTracking ? "disabled_in_window" : (SimulatorPoseFixture.shared == nil ? "ARKit" : "simulator_fixture"),
             "simulator_pose_fixture": SimulatorPoseFixture.shared?.reportValue ?? [:],
             "capture_request_return_code": captureReturnCode.map { $0 as Any } ?? NSNull(),
             "capture_requests": captureRequests,

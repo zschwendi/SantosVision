@@ -76,6 +76,12 @@ struct WindowGameView: View {
     @ObservedObject var runtime: NativeRuntimeModel
     @ObservedObject var surface: WindowGameSurface
     @State private var showingSettings = false
+    #if SV_GAME_RUNTIME
+    @EnvironmentObject private var world: GameWorldModel
+    @Environment(\.openImmersiveSpace) private var openImmersiveSpace
+    @Environment(\.dismissImmersiveSpace) private var dismissImmersiveSpace
+    @Environment(\.dismissWindow) private var dismissWindow
+    #endif
 
     private var shortStatus: String {
         if runtime.engineFailed { return "Game stopped" }
@@ -116,18 +122,33 @@ struct WindowGameView: View {
         .onChange(of: scenePhase, initial: true) { _, phase in
             runtime.setWindowSceneActive(phase == .active)
         }
-        .ornament(visibility: runtime.startupAttempted ? .visible : .hidden,
-                  attachmentAnchor: .scene(.bottom), contentAlignment: .top) {
-            HStack(spacing: 18) {
-                Button("Settings", systemImage: "gearshape") { showingSettings = true }
-                Button("Quit game", systemImage: "power", role: .destructive) { quitGame() }
+        .ornament(visibility: runtime.hasStarted ? .visible : .hidden,
+                  attachmentAnchor: .scene(.topTrailing)) {
+            #if SV_GAME_RUNTIME
+            Button { Task { await expandGame() } } label: {
+                Image(systemName: "arrow.up.left.and.arrow.down.right")
+                    .font(.system(size: 17, weight: .semibold))
+                    .frame(width: 44, height: 44)
             }
-            .padding(.horizontal, 18)
-            .padding(.vertical, 12)
-            .glassBackgroundEffect()
-            .padding(.top, 12)
+            .buttonStyle(.plain)
+            .glassBackgroundEffect(in: Circle())
+            .accessibilityLabel("Enter immersive view")
+            .disabled(world.isOpening || world.isImmersiveActive || runtime.engineFailed)
+            #endif
         }
-        .sheet(isPresented: $showingSettings) { settings }
+        .ornament(visibility: runtime.hasStarted && runtime.gameControlsVisible ? .visible : .hidden,
+                  attachmentAnchor: .scene(.bottom), contentAlignment: .top) {
+            SantosPauseControls(runtime: runtime,
+                windowAction: { runtime.gameControlsVisible = false },
+                settingsAction: { showingSettings = true })
+                .padding(.top, 12)
+        }
+        .sheet(isPresented: $showingSettings) { SantosSettingsView(runtime: runtime) }
+        #if SV_GAME_RUNTIME
+        .onChange(of: world.hasPresentedFrames) { _, presented in
+            if presented, world.isImmersiveActive { dismissWindow(id: "main") }
+        }
+        #endif
     }
 
     private var launcher: some View {
@@ -172,60 +193,31 @@ struct WindowGameView: View {
         .background(SantosTheme.background)
     }
 
-    private var settings: some View {
-        NavigationStack {
-            Form {
-                Section("Graphics") {
-                    Picker("Resolution", selection: Binding(
-                        get: { runtime.graphicsSettings.resolution },
-                        set: { runtime.setGraphicsResolution($0) })) {
-                        ForEach(NativeGraphicsSettings.Resolution.allCases) { resolution in
-                            Text(resolution.label).tag(resolution)
-                        }
-                    }
-                    Picker("Frame cap", selection: Binding(
-                        get: { runtime.graphicsSettings.fpsLimit },
-                        set: { runtime.setGraphicsFrameCap($0) })) {
-                        Text("30 FPS").tag(30)
-                        Text("60 FPS").tag(60)
-                    }
-                    Text("Low preset · Audio muted").foregroundStyle(.secondary)
-                }
-                .disabled(!runtime.canChangeGraphics)
-                Section("Controller") {
-                    Text(runtime.controllerSummary)
-                    Text("Click the touchpad to cycle cameras, including first person. In menus, use the D-pad to navigate, Cross to confirm, Circle to go back, and L1 for Tab.")
-                        .font(.caption).foregroundStyle(.secondary)
-                }
-                Section {
-                    Toggle("Rendering optimizations", isOn: Binding(
-                        get: { runtime.drawSetupOverheadEnabled },
-                        set: { runtime.setDrawSetupOverhead($0) }))
-                        .disabled(!runtime.canChangeRenderingOptimizations)
-                    if runtime.hasStarted {
-                        Text("Quit and reopen to change graphics settings.").font(.caption).foregroundStyle(.secondary)
-                    }
-                    Button("Save screenshot", systemImage: "camera") { runtime.captureCurrentFrame() }
-                        .disabled(!runtime.hasStarted)
-                    Button("Quit game", systemImage: "power", role: .destructive) { quitGame() }
-                }
-                DisclosureGroup("Diagnostics") {
-                    Text(runtime.status).font(.caption)
-                    Text(runtime.nativeDetails).font(.system(.caption2, design: .monospaced)).textSelection(.enabled)
-                }
-            }
-            .navigationTitle("Settings")
-            .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Done") { showingSettings = false } } }
+    #if SV_GAME_RUNTIME
+    private func expandGame() async {
+        guard runtime.hasStarted, !runtime.engineFailed, !world.isOpening, !world.isImmersiveActive else { return }
+        world.isOpening = true
+        world.status = "Opening immersive Los Santos…"
+        switch await openImmersiveSpace(id: GameWorldModel.spaceID) {
+        case .opened:
+            world.isImmersiveActive = true
+            if world.hasPresentedFrames { dismissWindow(id: "main") }
+        case .userCancelled:
+            world.stopRenderer()
+            world.status = "Immersive view cancelled."
+        case .error:
+            world.stopRenderer()
+            world.status = "Immersive view could not open."
+        @unknown default:
+            world.stopRenderer()
+            world.status = "Immersive view could not open."
         }
-        .frame(width: 560, height: 540)
-        .tint(SantosTheme.accent)
+        world.isOpening = false
     }
+    #endif
 
     private func quitGame() {
-        runtime.setActive(false)
-        // The engine has process-wide Wasm/GPU threads and one-shot runtime
-        // state. Exiting guarantees all threads/audio stop; reopening is fresh.
-        Darwin.exit(EXIT_SUCCESS)
+        Task { await runtime.quitGame() }
     }
 }
 
@@ -269,6 +261,127 @@ private final class GameWindowGeometryHost: UIView {
         appliedGameplay = isGameplay
         scene.requestGeometryUpdate(.Vision(size: size, resizingRestrictions: isGameplay ? .uniform : .freeform)) { error in
             NSLog("SantosVision window geometry: %@", error.localizedDescription)
+        }
+    }
+}
+
+struct SantosSettingsView: View {
+    @ObservedObject var runtime: NativeRuntimeModel
+    @Environment(\.dismiss) private var dismiss
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section("Graphics") {
+                    Picker("Resolution", selection: Binding(
+                        get: { runtime.graphicsSettings.resolution },
+                        set: { runtime.setGraphicsResolution($0) })) {
+                        ForEach(NativeGraphicsSettings.Resolution.allCases) { resolution in
+                            Text(resolution.label).tag(resolution)
+                        }
+                    }
+                    Picker("Frame cap", selection: Binding(
+                        get: { runtime.graphicsSettings.fpsLimit },
+                        set: { runtime.setGraphicsFrameCap($0) })) {
+                        Text("30 FPS").tag(30)
+                        Text("60 FPS").tag(60)
+                    }
+                    Text("GTA graphics choices are preserved. Audio muted.").foregroundStyle(.secondary)
+                }
+                .disabled(!runtime.canChangeGraphics)
+                CloudSaveSettingsView(runtime: runtime, saves: runtime.cloudSaves)
+                Section("Controller") {
+                    Text(runtime.controllerSummary)
+                    Text("Click the touchpad to cycle cameras. In GTA menus: D-pad to navigate, Cross to confirm, Circle to go back, Square to apply, and L1 for Tab. Start also reveals the Los Santos controls.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+                Section {
+                    Toggle("Rendering optimizations", isOn: Binding(
+                        get: { runtime.drawSetupOverheadEnabled },
+                        set: { runtime.setDrawSetupOverhead($0) }))
+                        .disabled(!runtime.canChangeRenderingOptimizations)
+                    if runtime.hasStarted {
+                        Text("Quit and reopen to change graphics settings.").font(.caption).foregroundStyle(.secondary)
+                    }
+                    Button("Save screenshot", systemImage: "camera") { runtime.captureCurrentFrame() }
+                        .disabled(!runtime.hasStarted)
+                    Button("Quit game", systemImage: "power", role: .destructive) { quitGame() }
+                }
+                DisclosureGroup("Diagnostics") {
+                    Text(runtime.status).font(.caption)
+                    Text(runtime.nativeDetails).font(.system(.caption2, design: .monospaced)).textSelection(.enabled)
+                }
+            }
+            .navigationTitle("Settings")
+            .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Done") { dismiss() } } }
+        }
+        .frame(width: 560, height: 540)
+        .tint(SantosTheme.accent)
+    }
+
+    private func quitGame() {
+        Task { await runtime.quitGame() }
+    }
+}
+
+struct SantosPauseControls: View {
+    @ObservedObject var runtime: NativeRuntimeModel
+    let windowAction: () -> Void
+    let settingsAction: () -> Void
+
+    var body: some View {
+        VStack(spacing: 12) {
+            HStack(spacing: 16) {
+                Button("Window", systemImage: "arrow.down.right.and.arrow.up.left", action: windowAction)
+                Button("Los Santos settings", systemImage: "gearshape", action: settingsAction)
+                Button("Quit", systemImage: "power", role: .destructive) {
+                    Task { await runtime.quitGame() }
+                }
+            }
+            HStack(spacing: 16) {
+                Button("Resume") { runtime.sendMenuAction(1); runtime.gameControlsVisible = false }
+                Button("Apply") { runtime.sendMenuAction(3) }
+                Button("Yes") { runtime.sendMenuAction(4) }
+                Button("No") { runtime.sendMenuAction(5) }
+            }
+            Text("Cross · Select    Circle · Back    Square · Apply    Triangle · Yes    R1 · No")
+                .font(.caption2).foregroundStyle(.secondary)
+        }
+        .padding(16)
+        .glassBackgroundEffect()
+        .tint(SantosTheme.accent)
+        .disabled(runtime.isQuitting)
+    }
+}
+
+private struct CloudSaveSettingsView: View {
+    @ObservedObject var runtime: NativeRuntimeModel
+    @ObservedObject var saves: CloudSaveModel
+
+    var body: some View {
+        Section("iCloud saves") {
+            Text(saves.status).font(.caption).foregroundStyle(.secondary)
+            Button("Back up now", systemImage: "icloud.and.arrow.up") {
+                Task { await saves.backupNow() }
+            }.disabled(saves.isBusy || runtime.isQuitting)
+            DisclosureGroup("Save history") {
+                Button("Refresh backups") { Task { await saves.loadHistory() } }
+                    .disabled(saves.isBusy)
+                if saves.revisions.isEmpty { Text("No archived saves yet.").font(.caption) }
+                ForEach(saves.revisions, id: \.id) { revision in
+                    Button {
+                        Task { await saves.restore(revision.id) }
+                    } label: {
+                        VStack(alignment: .leading) {
+                            Text(revision.createdAt, format: .dateTime.month().day().hour().minute())
+                            Text("\(revision.fileCount) files · \(revision.inCloud ? "iCloud history" : "Local backup")")
+                                .font(.caption).foregroundStyle(.secondary)
+                        }
+                    }
+                    .disabled(runtime.startupAttempted || runtime.isBusy || saves.isBusy)
+                }
+                Text("Recovery preserves the current save first. Quit and reopen before restoring.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
         }
     }
 }

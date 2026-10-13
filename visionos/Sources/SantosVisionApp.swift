@@ -20,6 +20,7 @@ struct SantosVisionApp: App {
             #if SV_GAME_RUNTIME
             if runtime.windowGameMode {
                 WindowGameView(runtime: runtime, surface: windowSurface)
+                    .environmentObject(world)
             } else {
             LauncherView(model: model, runtime: runtime)
                 .environmentObject(world)
@@ -32,19 +33,6 @@ struct SantosVisionApp: App {
         .restorationBehavior(.disabled)
         .onChange(of: scenePhase, initial: true) { _, phase in
             runtime.setActive(phase == .active)
-            #if SV_GAME_RUNTIME
-            world.setActive(phase == .active)
-            #endif
-            if phase == .background {
-                model.stopRenderer()
-                #if SV_GAME_RUNTIME
-                world.stopRenderer()
-                #endif
-                Task {
-                    await dismissImmersiveSpace()
-                    model.isImmersiveActive = false
-                }
-            }
         }
 
         ImmersiveSpace(id: DiagnosticModel.spaceID) {
@@ -61,10 +49,15 @@ struct SantosVisionApp: App {
         .immersionStyle(selection: .constant(.full), in: .full)
 
         #if SV_GAME_RUNTIME
+        Window("Los Santos controls", id: "game-controls") {
+            ImmersiveGameControls(runtime: runtime, world: world)
+        }
+        .defaultSize(width: 460, height: 260)
+        .windowResizability(.contentSize)
+        .restorationBehavior(.disabled)
+
         ImmersiveSpace(id: GameWorldModel.spaceID) {
-            CompositorLayer(configuration: GameWorldConfiguration()) { layer in
-                world.startRenderer(layer, runtime: runtime)
-            }
+            GameImmersiveScene(runtime: runtime, world: world)
             .onDisappear {
                 world.stopRenderer()
                 runtime.endWorldTracking()

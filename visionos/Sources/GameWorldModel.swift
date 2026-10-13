@@ -9,6 +9,7 @@ final class GameWorldModel: ObservableObject {
     static let spaceID = "SantosVisionNativeGameWorld"
     @Published var isImmersiveActive = false
     @Published var isOpening = false
+    @Published private(set) var hasPresentedFrames = false
     @Published var status = "The immersive game world has not been opened."
     private var renderer: GameWorldRenderer?
     private var startup: Task<Void, Never>?
@@ -20,6 +21,7 @@ final class GameWorldModel: ObservableObject {
     func startRenderer(_ layer: LayerRenderer, runtime: NativeRuntimeModel) {
         stopRenderer()
         self.runtime = runtime
+        hasPresentedFrames = false
         runtime.beginWorldTracking()
         runtime.recordMetalCapabilities(layer.device)
         let token = generation
@@ -32,6 +34,7 @@ final class GameWorldModel: ObservableObject {
                         self.status = message
                     case .presented(let presentation):
                         guard self.appActive else { return }
+                        self.hasPresentedFrames = true
                         let source = SimulatorPoseFixture.shared == nil ? "predicted headset poses" : "explicit synthetic simulator poses"
                         self.status = "Rendering the actual GTA world in \(presentation.viewCount) compositor \(presentation.viewCount == 1 ? "view" : "views") with real scene depth and \(source)."
                         self.runtime?.recordWorldPresentation(presentation)

@@ -19,6 +19,7 @@ targets:
         SWIFT_STRICT_CONCURRENCY: complete
         SWIFT_DEFAULT_ACTOR_ISOLATION: nonisolated
         CODE_SIGN_STYLE: Automatic
+        CODE_SIGN_ENTITLEMENTS: ../../visionos/SantosVision.entitlements
         TARGETED_DEVICE_FAMILY: "7"
         ENABLE_USER_SCRIPT_SANDBOXING: YES
         SUPPORTS_MACCATALYST: NO
