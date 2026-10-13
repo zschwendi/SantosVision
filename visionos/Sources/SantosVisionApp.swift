@@ -16,7 +16,7 @@ struct SantosVisionApp: App {
     @Environment(\.dismissImmersiveSpace) private var dismissImmersiveSpace
 
     var body: some Scene {
-        Window("SantosVision", id: "main") {
+        Window("Los Santos", id: "main") {
             #if SV_GAME_RUNTIME
             if runtime.windowGameMode {
                 WindowGameView(runtime: runtime, surface: windowSurface)
@@ -141,7 +141,7 @@ private struct LauncherView: View {
     var body: some View {
         ScrollView {
         VStack(alignment: .leading, spacing: 20) {
-            Text("SantosVision").font(.largeTitle.bold())
+            Text("Los Santos").font(.largeTitle.bold())
             Text("Native engine and headset tracking").font(.title2)
             Text("The compatible GTA web-port engine is compiled for visionOS. The immersive game renderer requests the headset’s actual views and scene depth from the native engine.")
 
@@ -261,7 +261,7 @@ private struct LauncherView: View {
             .disabled(!runtime.canChangeGraphics)
             Text(runtime.graphicsStatus).font(.caption).foregroundStyle(.secondary)
             if runtime.hasStarted {
-                Text("Quit and reopen SantosVision to change graphics.")
+                Text("Quit and reopen Los Santos to change graphics.")
                     .font(.caption).foregroundStyle(.secondary)
             } else {
                 Button("Restore low defaults") { runtime.restoreLowGraphics() }
@@ -282,7 +282,7 @@ private struct LauncherView: View {
             Toggle("Reduce rendering overhead (experimental)", isOn: Binding(
                 get: { runtime.drawSetupOverheadEnabled },
                 set: { runtime.setDrawSetupOverhead($0) }))
-            Text("Rendering overhead reductions reuse unchanged setup work and avoid empty GPU work while preserving your graphics settings. Frame-copy reduction starts on; the experimental options start off. Choose before starting the game, then quit and reopen SantosVision to change these settings.")
+            Text("Rendering overhead reductions reuse unchanged setup work and avoid empty GPU work while preserving your graphics settings. Frame-copy reduction starts on; the experimental options start off. Choose before starting the game, then quit and reopen Los Santos to change these settings.")
                 .font(.caption).foregroundStyle(.secondary)
         }
         .disabled(!runtime.canChangeRenderingOptimizations)

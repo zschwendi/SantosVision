@@ -155,7 +155,7 @@ struct WindowGameView: View {
         VStack(spacing: 24) {
             HStack(spacing: 12) {
                 Image(systemName: "sparkles").foregroundStyle(SantosTheme.glow)
-                Text("SantosVision").font(.title3.bold())
+                Text("Los Santos").font(.title3.bold())
                 Spacer()
                 Button { showingSettings = true } label: {
                     Image(systemName: "gearshape").padding(4)
