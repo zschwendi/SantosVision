@@ -23,7 +23,8 @@ final class SantosSaveCloudDiscovery {
             self.continuation = continuation
             query.operationQueue = .main
             query.searchScopes = [NSMetadataQueryUbiquitousDocumentsScope]
-            query.predicate = NSPredicate(value: true)
+            query.predicate = NSPredicate(format: "%K BEGINSWITH %@",
+                                          NSMetadataItemPathKey, root.path + "/")
             observer = NotificationCenter.default.addObserver(
                 forName: .NSMetadataQueryDidFinishGathering, object: query, queue: .main
             ) { [weak self] _ in
