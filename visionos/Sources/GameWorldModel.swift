@@ -19,6 +19,7 @@ final class GameWorldModel: ObservableObject {
     private var latestRendererState: [String: Any] = [:]
     private var lastFailure: String?
     private var latestViewRequestFailure: [String: Any] = [:]
+    private var diagnosticRenderingMethod: String?
     private var recordedStatusKeys = Set<String>()
     private weak var runtime: NativeRuntimeModel?
     private let log = Logger(subsystem: "com.zephyrstudios.santosvision", category: "GameWorldStatus")
@@ -32,6 +33,7 @@ final class GameWorldModel: ObservableObject {
         lastFailure = nil
         latestRendererState = [:]
         latestViewRequestFailure = [:]
+        diagnosticRenderingMethod = nil
         recordedStatusKeys.removeAll(keepingCapacity: true)
         recordState("renderer_constructor_started")
         let token = generation
@@ -57,6 +59,20 @@ final class GameWorldModel: ObservableObject {
                         let source = SimulatorPoseFixture.shared == nil ? "predicted headset poses" : "explicit synthetic simulator poses"
                         self.status = "Rendering the actual GTA world in \(presentation.viewCount) compositor \(presentation.viewCount == 1 ? "view" : "views") with real scene depth and \(source)."
                         self.runtime?.recordWorldPresentation(presentation)
+                    case .singleSourcePresented(let presentation):
+                        guard self.appActive else { return }
+                        // Recenter/tracking loss may occur after GPU completion but before
+                        // this MainActor delivery; the visibility watchdog must reject it.
+                        guard XRHeadTracking.shared.retainedPose(headFrame: presentation.headFrame,
+                            now: ProcessInfo.processInfo.systemUptime)?.epoch == presentation.retainedEpoch else {
+                            self.recordState("single_source_completion_discarded", detail: "retained source epoch expired")
+                            return
+                        }
+                        self.hasPresentedFrames = true
+                        self.diagnosticRenderingMethod = "single_source_depth_stereo"
+                        self.status = "Diagnostic: one actual source frame reprojected into both eyes. Hidden surfaces, depth-edge gaps and fellow-eye peripheral cropping remain; gaps can swap sides as the source eye alternates. This is not two rendered game views."
+                        self.recordState("single_source_gpu_completed", detail:
+                            "rendering_method=single_source_depth_stereo source_view_index=\(presentation.sourceViewIndex) target_view_count=\(presentation.targetViewCount) game_frame=\(presentation.gameFrame) request_frame=\(presentation.requestFrame) head_frame=\(presentation.headFrame) retained_epoch=\(presentation.retainedEpoch)")
                     case .gpuTiming(let timing):
                         self.runtime?.recordWorldGpuTiming(timing)
                         return
@@ -145,6 +161,7 @@ final class GameWorldModel: ObservableObject {
             "renderer": latestRendererState, "events": lifecycle,
             "latest_rejected_view_request": latestViewRequestFailure]
         if let lastFailure { value["last_failure"] = lastFailure }
+        if let diagnosticRenderingMethod { value["rendering_method"] = diagnosticRenderingMethod }
         runtime?.recordWorldState(value)
     }
 }

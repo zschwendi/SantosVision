@@ -90,7 +90,8 @@ final class GameWorldDebugCapture: @unchecked Sendable {
           outputColor: any MTLTexture, outputDepth: any MTLTexture,
           slice: Int, viewport: MTLViewport, native: SVWorldFrame,
           sourceEyeFromClip: simd_float4x4, currentEyeFromSourceEye: simd_float4x4,
-          currentClipFromEye: simd_float4x4, timestamp: Double) {
+          currentClipFromEye: simd_float4x4, timestamp: Double,
+          outputViewIndex: Int = 0, renderingMethod: String = "unspecified") {
         let formats: Set<MTLPixelFormat> = [.rgba8Unorm, .bgra8Unorm, .rgba8Unorm_srgb, .bgra8Unorm_srgb]
         let width = Int(viewport.width), height = Int(viewport.height)
         let x = Int(viewport.originX), y = Int(viewport.originY)
@@ -132,6 +133,8 @@ final class GameWorldDebugCapture: @unchecked Sendable {
                     "game_frame": native.game_frame, "request_frame": native.request_frame,
                     "head_frame": native.head_frame, "view_count": native.view_count,
                     "view_index": native.view_index, "presentation_time": timestamp,
+                    "source_view_index": native.view_index, "output_view_index": outputViewIndex,
+                    "rendering_method": renderingMethod,
                     "source_presentation_time": native.presentation_time,
                     "source_projection_from_eye": Self.values(sourceEyeFromClip.inverse),
                     "source_eye_from_clip": Self.values(sourceEyeFromClip),

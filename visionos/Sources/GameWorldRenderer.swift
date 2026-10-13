@@ -42,6 +42,15 @@ struct GameWorldPresentation: Sendable {
     let headFrames: [UInt64]
 }
 
+struct GameWorldSingleSourcePresentation: Sendable {
+    let targetViewCount: Int
+    let sourceViewIndex: Int
+    let gameFrame: UInt64
+    let requestFrame: UInt64
+    let headFrame: UInt64
+    let retainedEpoch: UInt64
+}
+
 struct GameWorldLifecycleEvent: Sendable {
     let stage: String
     let uptime: Double
@@ -72,6 +81,7 @@ enum GameWorldEvent: Sendable {
     case lifecycle(GameWorldLifecycleEvent)
     case status(String)
     case presented(GameWorldPresentation)
+    case singleSourcePresented(GameWorldSingleSourcePresentation)
     case gpuTiming(GameWorldGpuTimingSummary)
     case ended(String)
 }
@@ -359,8 +369,11 @@ final class GameWorldRenderer: @unchecked Sendable {
     private let adaptiveMesh: GameWorldAdaptiveMesh?
     private let anchorProbe: GameWorldAnchorProbe?
     private let pairedRender: Bool
+    /// Diagnostic only: one immutable native eye image reprojected into both
+    /// physical eyes. Never a certified pair or a source-anchor copy.
+    private let singleSourceStereo = ProcessInfo.processInfo.arguments.contains("--sv-world-single-source-stereo")
     /// Anchors are retained only when a path can use them; legacy submission is otherwise untouched.
-    private var retainsAnchors: Bool { sourceCopy != nil || anchorProbe != nil }
+    private var retainsAnchors: Bool { sourceCopy != nil || anchorProbe != nil || singleSourceStereo }
     private var loggedPairUnavailable = false
     private var pathCounters = GameWorldPathCounters()
     private let countersLock = NSLock()
@@ -599,6 +612,7 @@ final class GameWorldRenderer: @unchecked Sendable {
         var adaptiveScratch = AdaptiveScratchLease()
         var probeLease = GameWorldAnchorProbe.Lease()
         var presentation: GameWorldPresentation?
+        var singleSourcePresentation: GameWorldSingleSourcePresentation?
         var probePresentation: (kind: GameWorldSourceKind, copy: Bool)?
         var debugCapture: GameWorldDebugCapture?
         for drawable in drawables {
@@ -622,6 +636,8 @@ final class GameWorldRenderer: @unchecked Sendable {
             var drawableLeases: [GameWorldLease] = []
             var pairQualified = false
             var acquisitionFailed = false
+            var singleSource: GameWorldSourceEye?
+            var singleSourceEpoch: UInt64?
             if builtIn, let stageFromHead, (1...2).contains(drawable.views.count) {
                 let eyes = drawable.views.indices.map { index in
                     let physicalProjection = drawable.computeProjection(convention: .rightUpBack, viewIndex: index)
@@ -663,7 +679,7 @@ final class GameWorldRenderer: @unchecked Sendable {
                         reportStatus("Anchor probe: waiting for a retained head pose to render the analytic scene.")
                     }
                 } else {
-                    if pairedRender, drawable.views.count == 2 {
+                    if pairedRender, !singleSourceStereo, drawable.views.count == 2 {
                         drawableLeases = acquirePair(timestamp: timestamp)
                         pairQualified = drawableLeases.count == 2
                     }
@@ -689,11 +705,24 @@ final class GameWorldRenderer: @unchecked Sendable {
                         }
                     }
                     sources = drawableLeases.map { GameWorldSourceEye(lease: $0) }
+                    if singleSourceStereo {
+                        let selected = selectSingleSource(drawableLeases, timestamp: timestamp,
+                            currentHeadFrame: viewRequestAccepted ? headFrame : nil,
+                            targetViewCount: drawable.views.count)
+                        for lease in drawableLeases where lease.native.lease != selected?.source.lease?.native.lease {
+                            lease.release()
+                        }
+                        drawableLeases = selected?.source.lease.map { [$0] } ?? []
+                        sources = selected.map { [$0.source] } ?? []
+                        singleSource = selected?.source
+                        singleSourceEpoch = selected?.epoch
+                        pairQualified = false
+                    }
                     // A rejected view request is the actionable failure. Do not
                     // replace it with generic waiting text later in the same frame.
                     if drawableLeases.isEmpty, !acquisitionFailed, viewRequestAccepted {
                         reportStatus("Waiting for a qualified native game world frame with its actual depth.")
-                    } else if drawableLeases.count < drawable.views.count, !acquisitionFailed, viewRequestAccepted {
+                    } else if !singleSourceStereo, drawableLeases.count < drawable.views.count, !acquisitionFailed, viewRequestAccepted {
                         reportStatus("Waiting for both distinct native game eye views and their matching depth.")
                     }
                 }
@@ -704,7 +733,8 @@ final class GameWorldRenderer: @unchecked Sendable {
                 reportStatus("The compositor supplied an unsupported game view count (\(drawable.views.count)); this bridge supports one or two views.")
             }
             let encoded = encode(drawable: drawable, stageFromHead: stageFromHead, sources: sources, pairQualified: pairQualified,
-                                 timestamp: timestamp, commands: commands, cornerScratch: &cornerScratch, adaptiveScratch: &adaptiveScratch)
+                                 timestamp: timestamp, commands: commands, cornerScratch: &cornerScratch, adaptiveScratch: &adaptiveScratch,
+                                 singleSource: singleSource)
             if builtIn, encoded.views == drawable.views.count, !sources.isEmpty {
                 if let first = sources.first, first.kind != .actual {
                     // Probe output: a separate namespace. Never a game presentation, never acknowledged.
@@ -712,15 +742,23 @@ final class GameWorldRenderer: @unchecked Sendable {
                     // Counted as a presentation only when the command buffer completes successfully (see the handler).
                     reportStatus("Anchor probe active: \(first.kind.rawValue) analytic scene, path=\(encoded.copy ? "fullscreen copy with retained source anchor" : "depth mesh"), mode=\(anchorProbe?.mode.rawValue ?? "?"). No game frame is being presented.")
                 } else if !drawableLeases.isEmpty {
-                    presentation = GameWorldPresentation(viewCount: drawable.views.count,
-                        gameFrames: drawableLeases.map { $0.native.game_frame },
-                        requestFrames: drawableLeases.map { $0.native.request_frame },
-                        headFrames: drawableLeases.map { $0.native.head_frame })
+                    if let singleSource, let singleSourceEpoch {
+                        singleSourcePresentation = GameWorldSingleSourcePresentation(targetViewCount: drawable.views.count,
+                            sourceViewIndex: singleSource.viewIndex, gameFrame: singleSource.gameFrame,
+                            requestFrame: singleSource.requestFrame, headFrame: singleSource.headFrame,
+                            retainedEpoch: singleSourceEpoch)
+                    } else {
+                        presentation = GameWorldPresentation(viewCount: drawable.views.count,
+                            gameFrames: drawableLeases.map { $0.native.game_frame },
+                            requestFrames: drawableLeases.map { $0.native.request_frame },
+                            headFrames: drawableLeases.map { $0.native.head_frame })
+                    }
                     if !didDebugCapture, let debugPrefix, let stageFromHead,
-                       let lease = drawableLeases.first(where: { $0.native.view_index == 0 }),
+                       let captureSource = singleSource ?? sources.first(where: { $0.viewIndex == 0 }),
+                       let lease = captureSource.lease,
                        lease.native.game_frame >= GameWorldDebugCapture.minimumGameFrame,
                        let view = drawable.views.first {
-                        let uniforms = worldUniforms(eye: GameWorldSourceEye(lease: lease), stageFromHead: stageFromHead,
+                        let uniforms = worldUniforms(eye: captureSource, stageFromHead: stageFromHead,
                             headFromEye: view.transform,
                             projection: drawable.computeProjection(convention: .rightUpBack, viewIndex: 0))
                         debugCapture = GameWorldDebugCapture(prefix: debugPrefix, device: layer.device, commands: commands,
@@ -730,7 +768,10 @@ final class GameWorldRenderer: @unchecked Sendable {
                             slice: view.textureMap.sliceIndex, viewport: view.textureMap.viewport, native: lease.native,
                             sourceEyeFromClip: uniforms.sourceEyeFromClip,
                             currentEyeFromSourceEye: uniforms.currentEyeFromSourceEye,
-                            currentClipFromEye: uniforms.currentClipFromEye, timestamp: timestamp)
+                            currentClipFromEye: uniforms.currentClipFromEye, timestamp: timestamp,
+                            outputViewIndex: 0, renderingMethod: singleSource == nil
+                                ? (encoded.copy ? "source_anchor_copy" : "independent_eye_depth_mesh")
+                                : "single_source_depth_stereo")
                         didDebugCapture = true
                         if debugCapture == nil { log.error("Live world capture unsupported or exceeded its 96 MiB bound.") }
                     }
@@ -747,10 +788,11 @@ final class GameWorldRenderer: @unchecked Sendable {
         let cornerPool = cornerPrecompute?.scratch
         let adaptivePool = adaptiveMesh?.pool
         let completedPresentation = presentation
+        let completedSingleSourcePresentation = singleSourcePresentation
         let completedProbe = probePresentation
         let completedDebugCapture = debugCapture
         let reportThisFrame = !loggedFrame || frameNumber % 120 == 0
-        if presentation != nil || probePresentation != nil { loggedFrame = true }
+        if presentation != nil || probePresentation != nil || singleSourcePresentation != nil { loggedFrame = true }
         frameNumber &+= 1
         if reportThisFrame { logDiagnostics() }
         commands.addCompletedHandler { [inFlight, report, log, probeLog, gpuTiming, probeTiming, weak self] buffer in
@@ -805,10 +847,53 @@ final class GameWorldRenderer: @unchecked Sendable {
             } else if buffer.status == .completed, acknowledged, let completedPresentation, reportThisFrame {
                 log.info("Actual GTA compositor command completed: views=\(completedPresentation.viewCount) game_frames=\(String(describing: completedPresentation.gameFrames), privacy: .public) request_frames=\(String(describing: completedPresentation.requestFrames), privacy: .public) head_frames=\(String(describing: completedPresentation.headFrames), privacy: .public)")
                 report(.presented(completedPresentation))
+            } else if buffer.status == .completed, let completedSingleSourcePresentation, reportThisFrame {
+                // One source token cannot satisfy native two-distinct-eye acknowledgement.
+                // Real GPU completion still informs the visibility watchdog separately.
+                let retained = XRHeadTracking.shared.retainedPose(headFrame: completedSingleSourcePresentation.headFrame,
+                    now: ProcessInfo.processInfo.systemUptime)
+                if retained?.epoch == completedSingleSourcePresentation.retainedEpoch {
+                    log.info("Single-source depth stereo diagnostic completed: source_eye=\(completedSingleSourcePresentation.sourceViewIndex) game_frame=\(completedSingleSourcePresentation.gameFrame) target_views=\(completedSingleSourcePresentation.targetViewCount); not two rendered game eyes.")
+                    report(.singleSourcePresented(completedSingleSourcePresentation))
+                } else {
+                    log.debug("Single-source diagnostic completion discarded: retained source epoch expired.")
+                }
             }
         }
         ownsSlot = false
         commands.commit()
+    }
+
+    private func selectSingleSource(_ leases: [GameWorldLease], timestamp: Double,
+                                    currentHeadFrame: UInt64?, targetViewCount: Int)
+        -> (source: GameWorldSourceEye, epoch: UInt64)? {
+        let currentEpoch = currentHeadFrame.flatMap {
+            XRHeadTracking.shared.retainedPose(headFrame: $0, now: timestamp)?.epoch
+        }
+        let candidates = leases.map { lease -> GameWorldSingleSourceSelection.Candidate in
+            let retained = XRHeadTracking.shared.retainedPose(headFrame: lease.native.head_frame, now: timestamp)
+            let qualified = retained.map { pose in
+                GameWorldSourcePoseCheck.verify(retainedStageFromHead: pose.stageFromHead,
+                    retainedEyes: pose.eyes, retainedRequestFrame: pose.requestFrame,
+                    eyeIndex: Int(lease.native.view_index), requestFrame: lease.native.request_frame,
+                    leaseGameFromStage: lease.gameFromStage, leaseGameFromEye: lease.gameFromEye,
+                    leaseProjection: lease.sourceProjection,
+                    leaseDepthReversed: lease.sourceProjection.columns.2.z >= 0).passed
+            } ?? false
+            return .init(lease: lease.native.lease, gameFrame: lease.native.game_frame,
+                requestFrame: lease.native.request_frame, headFrame: lease.native.head_frame,
+                sourceViewIndex: Int(lease.native.view_index), viewCount: Int(lease.native.view_count),
+                presentationTime: lease.native.presentation_time, retainedEpoch: retained?.epoch ?? 0,
+                poseQualified: qualified)
+        }
+        let decision = GameWorldSingleSourceSelection.select(candidates, currentEpoch: currentEpoch,
+            timestamp: timestamp, targetViewCount: targetViewCount)
+        guard let index = decision.index, let epoch = currentEpoch,
+              XRHeadTracking.shared.retainedPose(headFrame: leases[index].native.head_frame, now: timestamp)?.epoch == epoch else {
+            reportStatus("Single-source depth stereo diagnostic waiting: \(decision.reason).")
+            return nil
+        }
+        return (GameWorldSourceEye(lease: leases[index]), epoch)
     }
 
     /// One atomic pair from the certified producer, or nothing. Any rejection releases both leases.
@@ -980,7 +1065,8 @@ final class GameWorldRenderer: @unchecked Sendable {
     private func encode(drawable: LayerRenderer.Drawable, stageFromHead: simd_float4x4?,
                         sources: [GameWorldSourceEye], pairQualified: Bool, timestamp: Double,
                         commands: any MTLCommandBuffer, cornerScratch: inout CornerScratchLease,
-                        adaptiveScratch: inout AdaptiveScratchLease) -> (views: Int, copy: Bool) {
+                        adaptiveScratch: inout AdaptiveScratchLease,
+                        singleSource: GameWorldSourceEye? = nil) -> (views: Int, copy: Bool) {
         var clearedTextures = Set<String>()
         var encodedViews = 0
         // Both eyes use one original-game aim sample, even if the script thread
@@ -988,7 +1074,7 @@ final class GameWorldRenderer: @unchecked Sendable {
         let gameplayAim = reticle == nil ? nil : GameWorldReticle.snapshot()
         // Copy path decision for the whole drawable. The probe may force the mesh for A/B/A.
         var copyDecision: (retained: XRRetainedHeadPose, verified: [GameWorldSourcePoseCheck.Result])?
-        if sourceCopy != nil, stageFromHead != nil, anchorProbe?.useCopyPath(now: timestamp) ?? true {
+        if singleSource == nil, sourceCopy != nil, stageFromHead != nil, anchorProbe?.useCopyPath(now: timestamp) ?? true {
             copyDecision = copyEligibility(drawable: drawable, sources: sources, pairQualified: pairQualified, timestamp: timestamp)
         }
         if let copyDecision {
@@ -1013,7 +1099,7 @@ final class GameWorldRenderer: @unchecked Sendable {
             pass.depthAttachment.clearDepth = 0
             var source: (eye: GameWorldSourceEye, uniforms: GameWorldUniforms)?
             let projection = drawable.computeProjection(convention: .rightUpBack, viewIndex: eye)
-            if let stageFromHead, let sourceEye = sources.first(where: { $0.viewIndex == eye }) {
+            if let stageFromHead, let sourceEye = singleSource ?? sources.first(where: { $0.viewIndex == eye }) {
                 source = (sourceEye, worldUniforms(eye: sourceEye, stageFromHead: stageFromHead, headFromEye: view.transform,
                                                    projection: projection))
             }
