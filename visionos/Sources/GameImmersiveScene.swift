@@ -3,19 +3,20 @@ import CompositorServices
 import GameController
 import SwiftUI
 
-struct GameImmersiveScene: View {
+// Keep the Metal layer in the compositor content tree. Adapting it to View
+// selects ImmersiveSpace's RealityKit/View scene path instead of its Metal path.
+struct GameImmersiveScene: CompositorContent {
     @ObservedObject var runtime: NativeRuntimeModel
     @ObservedObject var world: GameWorldModel
     @Environment(\.openWindow) private var openWindow
     @Environment(\.dismissWindow) private var dismissWindow
     @Environment(\.scenePhase) private var scenePhase
+    @State private var fallbackTask: Task<Void, Never>?
 
-    var body: some View {
+    var body: some CompositorContent {
         CompositorLayer(configuration: GameWorldConfiguration()) { layer in
             world.startRenderer(layer, runtime: runtime)
         }
-        ._viewRepresentation
-        .handlesGameControllerEvents(matching: .gamepad, withOptions: .receivesEventsInView(false))
         .onChange(of: scenePhase, initial: true) { _, phase in
             runtime.setImmersiveSceneActive(phase == .active)
             world.setActive(phase == .active)
@@ -24,14 +25,20 @@ struct GameImmersiveScene: View {
             if runtime.gameControlsVisible { openWindow(id: "game-controls") }
             else if world.hasPresentedFrames { dismissWindow(id: "game-controls") }
         }
-        .task {
-            // Keep an escape route visible until actual game frames arrive.
-            try? await Task.sleep(for: .seconds(8))
-            if !Task.isCancelled, !world.hasPresentedFrames {
-                openWindow(id: "game-controls")
+        .onAppear {
+            fallbackTask?.cancel()
+            fallbackTask = Task { @MainActor in
+                // Keep an escape route visible until actual game frames arrive.
+                do { try await Task.sleep(for: .seconds(8)) }
+                catch { return }
+                if !Task.isCancelled, !world.hasPresentedFrames {
+                    openWindow(id: "game-controls")
+                }
             }
         }
         .onDisappear {
+            fallbackTask?.cancel()
+            fallbackTask = nil
             runtime.setImmersiveSceneActive(false)
             dismissWindow(id: "game-controls")
             openWindow(id: "main")
