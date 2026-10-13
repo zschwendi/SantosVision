@@ -937,6 +937,7 @@ pub struct Gpu {
     world_depth_snapshots_this_present: u8,
     world_depth_trace: HashMap<(u32, u64, bool, u32, bool), (u64, [f32; 6])>,
     world_depth_anomalies: Vec<serde_json::Value>,
+    color_phase_trace: crate::world_ui::ColorPhaseTrace,
     pdirty: bool,
     last_pl: Option<Rc<Pl>>,
     last_program_uids: Option<(u64, u64)>,
@@ -1122,7 +1123,8 @@ impl Gpu {
             instance: instance.clone(), pending_clears: HashMap::new(), clears_folded: 0, pipe_jobs, pipe_results, pipe_pending: HashMap::new(), pending_skips: 0, pending_skips0: 0,
             base, mem, ring, device, queue, adapter, surface, surface_format, surface_size: (0, 0),
             objs: Vec::new(), enc: None, enc_epoch: 1, pass: None, pass_key: None, pass_info: None, pass_st: PassSt::default(),
-            s: State::new(), world_view: None, world_depths: HashMap::new(), world_depth_before_ui: HashMap::new(), world_depth_snapshot_overflow: false, world_depth_snapshots_this_present: 0, world_depth_trace: HashMap::new(), world_depth_anomalies: Vec::new(), pdirty: true, last_pl: None, last_program_uids: None,
+            s: State::new(), world_view: None, world_depths: HashMap::new(), world_depth_before_ui: HashMap::new(), world_depth_snapshot_overflow: false, world_depth_snapshots_this_present: 0, world_depth_trace: HashMap::new(), world_depth_anomalies: Vec::new(),
+            color_phase_trace: crate::world_ui::ColorPhaseTrace::from_env(), pdirty: true, last_pl: None, last_program_uids: None,
             float_programs: HashMap::new(), shader_index, shader_dir, next_uid: 1,
             bgl_cache: HashMap::new(), empty_bgl: None, pipelines: HashMap::new(), compute: HashMap::new(), bind_groups: HashMap::new(),
             numeric_bgl_cache: HashMap::new(), render_prepare, uniform_pack, uniform_snapshot, bind_group_prepare,
@@ -1205,6 +1207,74 @@ impl Gpu {
         self.world_depth_before_ui.insert(id, (view,
             crate::world_frame::FrozenPreUiDepth::new_snapshot(snapshot), draws));
         log_once("world-depth-before-ui", "qualified real scene depth copied before GTA's clip-space UI clear; final color must retain the same camera rays");
+    }
+
+    fn color_phase_target(&self, id: u32) -> serde_json::Value {
+        serde_json::json!({"id":id,"texture":self.tex(id).map(|t| serde_json::json!({
+            "format":format!("{:?}",t.format),"width":t.desc.w,"height":t.desc.h,
+            "layers":t.desc.d,"samples":t.desc.samples}))})
+    }
+
+    /// Diagnostic only. A clip-space depth clear is not a certified HUD boundary:
+    /// weapons and subsequent post-processing can use the same untagged phase.
+    fn trace_color_draw(&mut self, vs: &Program, ps: Option<&Program>, viewport: [f32;6],
+        scissor: [u32;4], writes_depth: bool, full_world_viewport: bool,
+        depth_clear_boundary: bool, command_word: u64, count: u32, instances: u32) {
+        if !self.color_phase_trace.wants_draw(true) { return; }
+        let qualified = self.world_view.filter(|view| view.headset_applied && writes_depth
+            && full_world_viewport && self.s.ds.mip == 0 && self.s.ds.slice == 0
+            && self.tex(self.s.ds.tex).is_some_and(|t| is_depth(t.format)
+                && t.desc.samples == 1 && t.desc.d == 1));
+        if !self.color_phase_trace.wants_draw(qualified.is_some()) { return; }
+        let shader = |stage: usize, program: &Program| serde_json::json!({
+            "id":self.s.shader[stage],"label":program.label.chars().take(160).collect::<String>(),
+            "hash":match self.obj(self.s.shader[stage]) { Some(Obj::Shader(s))=>Some(&s.hash), _=>None },
+            "outputs":program.info.outputs,"fragment_depth":program.info.writes_fragment_depth});
+        let blend = self.state(self.s.blend.0);
+        let targets: Vec<_> = self.s.rt.iter().enumerate().filter(|(_,rt)|rt.tex != 0).map(|(slot,rt)| {
+            let (bl, mask) = blend_for(blend.as_deref(), slot);
+            let output = ps.is_some_and(|program|program.info.outputs.contains(&(slot as u32)));
+            let format = self.pass_info.as_ref().and_then(|pi|pi.rt_formats.get(slot)).copied().flatten();
+            let blendable = format.is_some_and(|format|self.adapter.get_texture_format_features(format)
+                .flags.contains(TextureFormatFeatureFlags::BLENDABLE));
+            serde_json::json!({"slot":slot,"target":self.color_phase_target(rt.tex),
+                "mip":rt.mip,"slice":rt.slice,"dxgi_view":rt.fmt,
+                "actual_view_format":format.map(|format|format!("{format:?}")),
+                "fragment_output":output,"write_mask":if output {mask.bits()} else {0},
+                "blend_requested":bl.map(|state|format!("{state:?}")),
+                "blend_applied":bl.filter(|_|output && blendable).map(|state|format!("{state:?}"))})
+        }).collect();
+        let mut srvs = Vec::new();
+        let mut srv_count = 0;
+        for (stage, program) in [(0,Some(vs)),(1,ps)] {
+            let Some(program) = program else {continue};
+            for binding in &program.info.bindings {
+                if binding.group != stage as u32 || !(32..160).contains(&binding.binding)
+                    || !matches!(binding.kind, Kind::Texture | Kind::ReadOnlyStorage | Kind::Storage) { continue; }
+                srv_count += 1;
+                if srvs.len() >= 64 { continue; }
+                let slot = (binding.binding - 32) as usize;
+                let id = self.s.srv[stage][slot];
+                srvs.push(serde_json::json!({"stage":stage,"slot":slot,"binding":binding.binding,"view":id,
+                    "resource":self.view_obj(id).map(|v|v.res),
+                    "view_desc":self.view_obj(id).map(|v|[v.fmt,v.vdim,v.a,v.b,v.c,v.d]),
+                    "is_buffer":self.view_obj(id).map(|v|v.is_buf),
+                    "texture":self.view_obj(id).filter(|v|!v.is_buf).map(|v|self.color_phase_target(v.res))}));
+            }
+        }
+        let record = serde_json::json!({"draw":self.draws,"command_word":command_word,
+            "count":count,"instances":instances,"world":self.world_view.as_ref().map(crate::world_ui::marker),
+            "shader":{"vertex":shader(0,vs),"pixel":ps.map(|program|shader(1,program))},
+            "render_targets":targets,"srv_bindings":srvs,"srv_bindings_omitted":srv_count-srvs.len(),
+            "blend_state":blend.map(|state|state.words.iter().take(66).copied().collect::<Vec<_>>()),
+            "blend_constant":self.s.blend.1,"depth_target":self.color_phase_target(self.s.ds.tex),
+            "depth_subresource":[self.s.ds.mip,self.s.ds.slice,self.s.ds.fmt,self.s.ds.flags],
+            "depth_state":self.state(self.s.dss.0).map(|state|state.words.iter().take(13).copied().collect::<Vec<_>>()),
+            "stencil_reference":self.s.dss.1,"viewport":viewport,"scissor":scissor,
+            "rasterizer_state":self.state(self.s.rs).map(|state|state.words.iter().take(10).copied().collect::<Vec<_>>()),
+            "writes_depth":writes_depth,"full_world_viewport":full_world_viewport,
+            "depth_clear_boundary":depth_clear_boundary});
+        self.color_phase_trace.record_draw(self.presents+1, qualified, record, depth_clear_boundary);
     }
 
     fn obj(&self, id: u32) -> Option<&Obj> {
@@ -3335,6 +3405,8 @@ impl Gpu {
                 }
             }
         }
+        self.trace_color_draw(&vs, ps.as_deref(), actual_viewport, scissor, writes_depth,
+            full_world_viewport, ui_depth_clear, p, d_count as u32, d_inst as u32);
         if self.geometry_stereo_capture && !self.geometry_stereo_capture_done
             && d_count == count as i64 && d_inst == inst as i64 {
             self.capture_geometry_stereo_draw(kind, count, inst, start, base_vertex, start_instance, &layout, &vs,
@@ -4032,6 +4104,10 @@ impl Gpu {
     fn publish_world_frame(&mut self, color_id: u32) {
         // Consume every presentation, including loading, to preserve queue order.
         let present_view = crate::xr_view::take_present_view();
+        if self.color_phase_trace.wants_draw(false) {
+            let target = self.color_phase_target(color_id);
+            self.color_phase_trace.present(self.presents+1, present_view.as_ref(), target);
+        }
         let depths = std::mem::take(&mut self.world_depths);
         let saved = std::mem::take(&mut self.world_depth_before_ui);
         let snapshot_overflow = std::mem::replace(&mut self.world_depth_snapshot_overflow, false);
