@@ -736,6 +736,28 @@ fn match_viewport(state: &State, mem: &SharedMemory, pointer: u64) -> Option<Wor
         && (!saved.view.headset_applied || projection_state_is_current(mem,pointer,&projection))).map(|saved| saved.view)
 }
 
+/// The guest can rebuild an eye's reverse-Z projection from its scalar fields,
+/// rounding the two focal scales once and clearing tiny cross terms left by
+/// the native matrix. Everything that changes rays or depth otherwise stays
+/// bit-identical to the applied primary eye.
+fn same_rebuilt_eye_projection(actual: &[f32; 16], expected: &[f32; 16]) -> bool {
+    if projection_scalars(actual).is_none() || projection_scalars(expected).is_none()
+        || reverse_z(actual) != Some(true) || reverse_z(expected) != Some(true) {
+        return false;
+    }
+    for index in 0..16 {
+        let a = actual[index];
+        let e = expected[index];
+        let matches = match index {
+            0 | 5 => a > 0. && e > 0. && a.to_bits().abs_diff(e.to_bits()) <= 1,
+            1 | 3 | 4 | 7 => a.to_bits() == e.to_bits() || a.to_bits() == 0.0f32.to_bits(),
+            _ => a.to_bits() == e.to_bits(),
+        };
+        if !matches { return false; }
+    }
+    true
+}
+
 fn reverse_clone_view(camera: &[f32;16], projection: &[f32;16], saved: &SavedViewport) -> Option<WorldView> {
     // Live v5d opaque clones retained the exact applied primary camera while
     // rebuilding the ORIGINAL source projection with z'=w-z. Accept only that
@@ -751,7 +773,8 @@ fn reverse_clone_view(camera: &[f32;16], projection: &[f32;16], saved: &SavedVie
     // Once source scalar fields describe the requested eye, the engine can
     // regenerate this exact reverse matrix itself. This is equally narrow;
     // near-plane/FOV variants still do not match either certified projection.
-    if !certified_original_clone && *projection != view.projection_from_eye { return None; }
+    if !certified_original_clone && *projection != view.projection_from_eye
+        && !same_rebuilt_eye_projection(projection, &view.projection_from_eye) { return None; }
     view.depth_reverse_z = true;
     Some(view)
 }
@@ -1190,6 +1213,55 @@ mod tests {
         assert!(reverse_clone_view(&other_camera,&original,&saved).is_none());
         let mut other_fov = original;other_fov[0] *= 1.01;
         assert!(reverse_clone_view(&identity(),&other_fov,&saved).is_none());
+    }
+    #[test]
+    fn physical_reverse_clone_accepts_only_reported_f32_rebuild_rounding() {
+        // Literal applied camera, forward-Z eye, original FOV, and reverse-Z
+        // command from headset-current-device-v1/native-runtime-report-first.
+        let camera = [-0.5062965154647827, 0.8614988923072815, 0.038516126573085785, 0.,
+            -0.005707232281565666, -0.04801009222865105, 0.9988305568695068, 0.,
+            0.8623406887054443, 0.5054847002029419, 0.029224129393696785, 0.,
+            -56.04039001464844, -1108.0574951171875, 27.25481414794922, 1.];
+        let primary = [0.7320510149002075, 2.3878741206573295e-9, 1.4761494249171392e-9, 1.4761494249171392e-9,
+            3.6488073673623944e-10, 0.9125128984451294, 5.3326298932177e-9, 5.3326298932177e-9,
+            -0.2679489850997925, -0.08748721331357956, -1.000100016593933, -1.,
+            0., 0., -0.10001001507043839, 0.];
+        let original = [1.2062851190567017, 0., 0., 0., 0., 2.1445069313049316, 0., 0.,
+            0.2679489552974701, -0.08748719841241837, -1.0000100135803223, -1.,
+            0., 0., -0.10000099986791611, 0.];
+        let rebuilt = [0.7320510745048523, 0., 0., 0., 0., 0.9125128984451294, 0., 0.,
+            -0.2679489850997925, -0.08748721331357956, 0.00010001659393310547, -1.,
+            0., 0., 0.10001001507043839, 0.];
+        let mut source_view = view(0, 823);
+        source_view.game_from_eye = camera;
+        source_view.projection_from_eye = primary;
+        source_view.depth_reverse_z = false;
+        let saved = SavedViewport { pointer: 357054832, source: 357054816,
+            view: source_view, base_camera: camera, base_projection: original };
+        let expected = flip_projection_depth(primary);
+        assert_eq!(rebuilt[0].to_bits().abs_diff(expected[0].to_bits()), 1);
+        assert!(same_rebuilt_eye_projection(&rebuilt, &expected));
+        let derived = reverse_clone_view(&camera, &rebuilt, &saved).expect("physical reverse clone");
+        assert_eq!(derived.projection_from_eye, expected);
+        assert!(derived.depth_reverse_z && derived.headset_applied);
+
+        let mut bad_camera = camera; bad_camera[12] += 0.01;
+        assert!(reverse_clone_view(&bad_camera, &rebuilt, &saved).is_none());
+        let mut bad = rebuilt; bad[0] = f32::from_bits(expected[0].to_bits() + 2);
+        assert!(reverse_clone_view(&camera, &bad, &saved).is_none());
+        bad = rebuilt; bad[5] = f32::from_bits(expected[5].to_bits() + 2);
+        assert!(reverse_clone_view(&camera, &bad, &saved).is_none());
+        for index in [8, 9, 10, 14] {
+            bad = rebuilt; bad[index] = f32::from_bits(bad[index].to_bits() + 1);
+            assert!(reverse_clone_view(&camera, &bad, &saved).is_none(), "field {index}");
+        }
+        bad = rebuilt; bad[1] = 1e-9; // A new tiny skew is not a zeroed source residual.
+        assert!(projection_scalars(&bad).is_some());
+        assert!(reverse_clone_view(&camera, &bad, &saved).is_none());
+        bad = rebuilt; bad[2] = 0.01; // Oblique or HUD projection.
+        assert!(reverse_clone_view(&camera, &bad, &saved).is_none());
+        let mut hud = saved; hud.view.headset_applied = false;
+        assert!(reverse_clone_view(&camera, &rebuilt, &hud).is_none());
     }
     #[test]
     fn eye_request_rejects_reflections_wrong_depth_and_extra_views() {
