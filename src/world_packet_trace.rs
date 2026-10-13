@@ -101,7 +101,8 @@ impl Transport {
         let valid=registration.runtime_lifetime!=0 && registration.memory_identity!=0
             && registration.process_id!=0 && registration.ring_bytes>=DATA_START+8
             && registration.ring_address%4==0 && registration.ring_bytes%4==0
-            && registration.ring_bytes<=u32::MAX as u64
+            // The native worker carries relative head/tail as signed i32.
+            && registration.ring_bytes<=i32::MAX as u64
             && registration.ring_address.checked_add(registration.ring_bytes).is_some_and(|end|end<=registration.memory_bytes);
         if !valid { self.invalidate(Rejection::InvalidRegistration); return Err(Rejection::InvalidRegistration); }
         let Some(generation)=self.generation.checked_add(1) else {
@@ -197,6 +198,10 @@ fn fingerprint(bytes:&[u8])->u64 {
     bytes.iter().fold(0xcbf29ce484222325,|hash,byte|(hash^*byte as u64).wrapping_mul(0x100000001b3))
 }
 
+#[cfg(all(test, feature = "jit"))]
+#[path = "world_packet_atomic_tests.rs"]
+mod atomic_ring_tests;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -210,6 +215,16 @@ mod tests {
         assert!(!LIVE_ADAPTERS_ENABLED);
         let mut transport=Transport::new(false);
         assert_eq!(transport.register(registration()),Err(Rejection::Disabled)); assert!(transport.packets.is_empty());
+    }
+
+    #[test] fn registration_rejects_native_signed_cursor_overflow_without_allocating_memory() {
+        // Gpu::run_commands carries ring-relative head/tail as signed i32.
+        // This exercises registration arithmetic only, with no giant allocation.
+        let mut transport=Transport::new(true);let mut reg=registration();
+        reg.memory_bytes=i32::MAX as u64+1;reg.ring_bytes=reg.memory_bytes;
+        assert_eq!(transport.register(reg),Err(Rejection::InvalidRegistration));
+        reg.ring_bytes=i32::MAX as u64 & !3;reg.memory_bytes=reg.ring_bytes;
+        assert!(transport.register(reg).is_ok());
     }
 
     #[test] fn owned_bytes_not_fingerprint_or_pointer_define_match() {
