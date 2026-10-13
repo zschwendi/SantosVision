@@ -4,6 +4,43 @@ import Metal
 import OSLog
 import simd
 
+// BEGIN GameWorldDepthFile
+/// CPU-only export of an already completed readback. Rows are streamed from the
+/// existing buffer; padding is omitted and every Float bit pattern is preserved.
+enum GameWorldDepthFile {
+    static func write(_ bytes: UnsafeRawBufferPointer, width: Int, height: Int,
+                      rowBytes: Int, to url: URL) throws -> Int {
+        let (packedRowBytes, rowOverflow) = width.multipliedReportingOverflow(by: 4)
+        let (bufferBytes, bufferOverflow) = rowBytes.multipliedReportingOverflow(by: height)
+        let (fileBytes, fileOverflow) = packedRowBytes.multipliedReportingOverflow(by: height)
+        var endianProbe: UInt32 = 1
+        let littleEndian = withUnsafeBytes(of: &endianProbe) { $0[0] == 1 }
+        guard littleEndian, width > 0, height > 0, rowBytes > 0,
+              !rowOverflow, !bufferOverflow, !fileOverflow,
+              rowBytes >= packedRowBytes, bufferBytes <= bytes.count,
+              fileBytes <= 96 * 1024 * 1024, let base = bytes.baseAddress else {
+            throw NSError(domain: "GameWorldDepthFile", code: 1,
+                          userInfo: [NSLocalizedDescriptionKey: "Invalid or oversized Float32 readback layout"])
+        }
+        // Match the capture's other files: never replace a previous diagnostic.
+        try Data().write(to: url, options: [.withoutOverwriting])
+        let handle = try FileHandle(forWritingTo: url)
+        do {
+            for row in 0..<height {
+                let data = Data(bytesNoCopy: UnsafeMutableRawPointer(mutating: base.advanced(by: row * rowBytes)),
+                                count: packedRowBytes, deallocator: .none)
+                try handle.write(contentsOf: data)
+            }
+            try handle.close()
+        } catch {
+            try? handle.close()
+            throw error
+        }
+        return fileBytes
+    }
+}
+// END GameWorldDepthFile
+
 /// Optional, bounded readback of the actual production shader command.
 /// CPU file work starts after completion, using independent shared buffers.
 final class GameWorldDebugCapture: @unchecked Sendable {
@@ -58,6 +95,7 @@ final class GameWorldDebugCapture: @unchecked Sendable {
         let width = Int(viewport.width), height = Int(viewport.height)
         let x = Int(viewport.originX), y = Int(viewport.originY)
         guard formats.contains(color.pixelFormat), depth.pixelFormat == .r32Float,
+              color.width == depth.width, color.height == depth.height,
               color.sampleCount == 1, depth.sampleCount == 1,
               !color.isFramebufferOnly, !depth.isFramebufferOnly,
               color.storageMode != .memoryless, depth.storageMode != .memoryless else { return nil }
@@ -90,7 +128,7 @@ final class GameWorldDebugCapture: @unchecked Sendable {
         self.sourceEyeFromClip = sourceEyeFromClip
         self.currentEyeFromSourceEye = currentEyeFromSourceEye
         self.currentClipFromEye = currentClipFromEye
-        metadata = ["schema": 1, "scope": "Readback of actual leased textures and the normal compositor shader output before presentation; no substitute render.",
+        metadata = ["schema": 2, "scope": "Readback of actual leased textures and the normal compositor shader output before presentation; no substitute render.",
                     "game_frame": native.game_frame, "request_frame": native.request_frame,
                     "head_frame": native.head_frame, "view_count": native.view_count,
                     "view_index": native.view_index, "presentation_time": timestamp,
@@ -103,7 +141,15 @@ final class GameWorldDebugCapture: @unchecked Sendable {
                     "game_from_stage": Self.tupleValues(native.game_from_stage),
                     "source_near": native.depth_near, "source_far": native.depth_far,
                     "source_color_format": color.pixelFormat.rawValue,
+                    "source_depth_format": depth.pixelFormat.rawValue,
                     "output_color_format": outputColor.pixelFormat.rawValue,
+                    "output_depth_format": outputDepth.pixelFormat.rawValue,
+                    "source_color_usage": color.usage.rawValue,
+                    "source_depth_usage": depth.usage.rawValue,
+                    "output_color_usage": outputColor.usage.rawValue,
+                    "output_depth_usage": outputDepth.usage.rawValue,
+                    "output_color_storage_mode": outputColor.storageMode.rawValue,
+                    "output_depth_storage_mode": outputDepth.storageMode.rawValue,
                     "output_capture_supported": outputColorBuffer != nil && outputDepthBuffer != nil,
                     "output_framebuffer_only": outputColor.isFramebufferOnly || outputDepth.isFramebufferOnly,
                     "output_capture_note": outputSupported ? "Actual compositor targets copied if buffers allocated."
@@ -138,10 +184,12 @@ final class GameWorldDebugCapture: @unchecked Sendable {
                 report["metal_command_status"] = "completed"
                 report["compositor_acknowledged"] = compositorAcknowledged
                 report["source_color"] = sourceStats
-                report["source_depth"] = depthStats(sourceDepth)
+                report["source_depth"] = try saveDepth(sourceDepth, suffix: "-source-depth.f32",
+                                                       pairedColorSuffix: "-source.ppm")
                 if let outputColor, let outputDepth {
                     report["output_color"] = try saveColor(outputColor, suffix: "-output.ppm")
-                    report["output_depth"] = depthStats(outputDepth)
+                    report["output_depth"] = try saveDepth(outputDepth, suffix: "-output-depth.f32",
+                                                           pairedColorSuffix: "-output.ppm")
                 }
                 report["sampled_vertex_checks"] = vertexChecks()
                 let data = try JSONSerialization.data(withJSONObject: report, options: [.prettyPrinted, .sortedKeys])
@@ -205,6 +253,25 @@ final class GameWorldDebugCapture: @unchecked Sendable {
                 "minimum": minimum.isFinite ? minimum as Any : NSNull(),
                 "maximum": maximum.isFinite ? maximum as Any : NSNull(),
                 "zeros": zeros, "ones": ones, "nonfinite": invalid, "in_0_1": inRange]
+    }
+
+    private func saveDepth(_ image: Image, suffix: String, pairedColorSuffix: String) throws -> [String: Any] {
+        let path = prefix.path + suffix
+        let bytes = UnsafeRawBufferPointer(start: image.buffer.contents(), count: image.buffer.length)
+        let written = try GameWorldDepthFile.write(bytes, width: image.width, height: image.height,
+                                                    rowBytes: image.rowBytes, to: URL(fileURLWithPath: path))
+        var report = depthStats(image)
+        report["path"] = path
+        report["encoding"] = "IEEE754 binary32 little-endian, tightly packed rows, no header"
+        report["byte_count"] = written
+        report["row_bytes"] = image.width * 4
+        report["readback_row_bytes"] = image.rowBytes
+        report["metal_pixel_format"] = image.format.rawValue
+        report["pixel_coordinates"] = "Top-left origin; x increases right, y increases down; Float32 byte offset = (y * width + x) * 4"
+        report["paired_color_path"] = prefix.path + pairedColorSuffix
+        report["paired_color_registration"] = "Depth[x,y] and paired PPM RGB[x,y] are the same captured texel, with identical dimensions and crop. Output coordinates are local to the report viewport crop."
+        report["preserves_nonfinite_and_clear_bits"] = true
+        return report
     }
 
     private func vertexChecks() -> [String: Any] {
