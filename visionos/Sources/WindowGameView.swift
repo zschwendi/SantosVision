@@ -113,6 +113,23 @@ struct WindowGameView: View {
                 .padding(28)
                 .glassBackgroundEffect()
             }
+            #if SV_GAME_RUNTIME
+            if runtime.hasStarted, !runtime.engineFailed,
+               (world.isOpening || world.isImmersiveActive), !world.hasPresentedFrames {
+                VStack(spacing: 14) {
+                    ProgressView()
+                    Text("Opening immersive view…").font(.headline)
+                    Text("Waiting for the first game frame.")
+                        .font(.caption).foregroundStyle(.secondary)
+                    Button("Return to window", systemImage: "arrow.down.right.and.arrow.up.left") {
+                        Task { await returnToWindow() }
+                    }
+                    .disabled(world.isOpening)
+                }
+                .padding(24)
+                .glassBackgroundEffect()
+            }
+            #endif
         }
         .frame(minWidth: 640, minHeight: 360)
         .background(.black)
@@ -213,6 +230,12 @@ struct WindowGameView: View {
             world.status = "Immersive view could not open."
         }
         world.isOpening = false
+    }
+
+    private func returnToWindow() async {
+        world.stopRenderer(reason: "window_transition_cancelled")
+        await dismissImmersiveSpace()
+        world.isImmersiveActive = false
     }
     #endif
 
