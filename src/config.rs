@@ -202,7 +202,7 @@ pub fn setup_native(game_root: &Path, save_root: &Path) -> anyhow::Result<Startu
     std::env::set_var("MUGUET_SHADERS", build.join("shaders"));
     let frame_limit = if native_graphics.config.fps_limit == 30 { 2 } else { 1 };
     Ok(Startup { wasm_path: build.join("game.wasm"), cache_dir,
-        engine_args: vec![format!("-frameLimit={frame_limit}"), "-wasmstartchoice=2".into()],
+        engine_args: vec![format!("-frameLimit={frame_limit}"), "-wasmstartchoice=1".into()],
         native_graphics: Some(native_graphics) })
 }
 

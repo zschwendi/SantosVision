@@ -285,12 +285,24 @@ struct SantosSettingsView: View {
                         Text("30 FPS").tag(30)
                         Text("60 FPS").tag(60)
                     }
-                    Text("GTA graphics choices are preserved. Audio muted.").foregroundStyle(.secondary)
+                    Text("GTA graphics choices are preserved.").foregroundStyle(.secondary)
                 }
                 .disabled(!runtime.canChangeGraphics)
                 CloudSaveSettingsView(runtime: runtime, saves: runtime.cloudSaves)
+                Section("Sound") {
+                    LabeledContent("Master volume", value: "\(Int((runtime.playSettings.masterVolume * 100).rounded()))%")
+                    Slider(value: Binding(get: { runtime.playSettings.masterVolume },
+                                          set: { runtime.setMasterVolume($0) }), in: 0...1, step: 0.01)
+                }
+                .disabled(!runtime.canChangePlaySettings)
                 Section("Controller") {
                     Text(runtime.controllerSummary)
+                    LabeledContent("Look sensitivity", value: "\(Int(runtime.playSettings.lookSensitivityPercent.rounded()))%")
+                    Slider(value: Binding(get: { runtime.playSettings.lookSensitivityPercent },
+                                          set: { runtime.setLookSensitivity($0) }), in: 0...100, step: 1)
+                        .disabled(!runtime.canChangePlaySettings)
+                    Text("Adjusts the right stick's look speed. GTA's own mouse sensitivity also applies.")
+                        .font(.caption).foregroundStyle(.secondary)
                     Text("Click the touchpad to cycle cameras. In GTA menus: D-pad to navigate, Cross to confirm, Circle to go back, Square to apply, and L1 for Tab. Start also reveals the Los Santos controls.")
                         .font(.caption).foregroundStyle(.secondary)
                 }
@@ -300,7 +312,10 @@ struct SantosSettingsView: View {
                         set: { runtime.setDrawSetupOverhead($0) }))
                         .disabled(!runtime.canChangeRenderingOptimizations)
                     if runtime.hasStarted {
-                        Text("Quit and reopen to change graphics settings.").font(.caption).foregroundStyle(.secondary)
+                        Text("Quit and reopen to change graphics, sound, or look sensitivity.").font(.caption).foregroundStyle(.secondary)
+                    }
+                    if !runtime.playSettingsStatus.isEmpty {
+                        Text(runtime.playSettingsStatus).font(.caption).foregroundStyle(.secondary)
                     }
                     Button("Save screenshot", systemImage: "camera") { runtime.captureCurrentFrame() }
                         .disabled(!runtime.hasStarted)

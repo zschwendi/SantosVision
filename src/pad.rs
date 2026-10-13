@@ -17,6 +17,7 @@ static KEY_EVENTS: AtomicU64 = AtomicU64::new(0);
 static BUTTON_EVENTS: AtomicU64 = AtomicU64::new(0);
 static LOOK_EVENTS: AtomicU64 = AtomicU64::new(0);
 static MENU_PRESS_COUNT: AtomicU64 = AtomicU64::new(0);
+static LOOK_SENSITIVITY: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
 // Navigation context follows controller Menu presses. It is an input-routing
 // hint, not an engine-confirmed paused state.
 static MENU_NAVIGATION: AtomicBool = AtomicBool::new(false);
@@ -34,6 +35,8 @@ pub(crate) fn status_json() -> serde_json::Value {
         "mapped_look_events": LOOK_EVENTS.load(Ordering::Relaxed),
         "menu_press_count": MENU_PRESS_COUNT.load(Ordering::Relaxed),
         "menu_navigation_inferred": MENU_NAVIGATION.load(Ordering::Relaxed),
+        "look_sensitivity_percent": LOOK_SENSITIVITY.get().copied(),
+        "look_speed_units_per_second": LOOK_SENSITIVITY.get().map(|percent| LOOK_SPEED * percent / 100.0),
     })
 }
 
@@ -114,6 +117,27 @@ const STICK_DEADZONE: f32 = 0.3;
 const LOOK_DEADZONE: f32 = 0.12;
 
 const LOOK_SPEED: f64 = 700.0;
+const DEFAULT_LOOK_SENSITIVITY_PERCENT: f64 = 75.0;
+
+fn resolve_look_sensitivity_percent(env: Option<&str>, setting: Option<&str>) -> f64 {
+    let valid = |v: f64| (v.is_finite() && (0.0..=100.0).contains(&v)).then_some(v);
+    env.and_then(|v| v.trim().parse::<f64>().ok()).and_then(valid)
+        .or_else(|| setting.and_then(|text| serde_json::from_str::<serde_json::Value>(text).ok())
+            .and_then(|v| v.get("look_sensitivity_percent").and_then(|v| v.as_f64())).and_then(valid))
+        .unwrap_or(DEFAULT_LOOK_SENSITIVITY_PERCENT)
+}
+
+/// Scales the controller's existing right-stick curve before the shared mouse
+/// input gain and GTA's own mouse setting. 100% is the previous 700-unit speed;
+/// 75% is 525 units/sec at full deflection. This does not rewrite GTA settings.
+fn look_sensitivity_percent() -> f64 {
+    *LOOK_SENSITIVITY.get_or_init(|| {
+        let env = std::env::var("MUGUET_CONTROLLER_LOOK_PERCENT").ok();
+        let setting = std::env::var_os("MUGUET_FSROOT")
+            .and_then(|root| std::fs::read_to_string(std::path::Path::new(&root).join("native-controller.json")).ok());
+        resolve_look_sensitivity_percent(env.as_deref(), setting.as_deref())
+    })
+}
 
 fn gamepad() -> Option<objc2::rc::Retained<GCExtendedGamepad>> {
     unsafe { GCController::controllers().iter().find_map(|c| c.extendedGamepad()) }
@@ -244,7 +268,8 @@ pub fn poll() -> bool {
         if !menu && (dx != 0.0 || dy != 0.0) {
             looking = true;
             LOOK_EVENTS.fetch_add(1, Ordering::Relaxed);
-            input::mouse_delta_f(dx * LOOK_SPEED * dt, dy * LOOK_SPEED * dt);
+            let speed = LOOK_SPEED * look_sensitivity_percent() / 100.0;
+            input::mouse_delta_f(dx * speed * dt, dy * speed * dt);
         }
     } } else {
         st.menu_button_down = false;
@@ -294,6 +319,19 @@ pub fn suspend() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn controller_look_percentage_respects_persistence_and_explicit_override() {
+        let saved = r#"{"look_sensitivity_percent":40}"#;
+        assert_eq!(resolve_look_sensitivity_percent(None, None), 75.0);
+        assert_eq!(resolve_look_sensitivity_percent(None, Some(saved)), 40.0);
+        assert_eq!(resolve_look_sensitivity_percent(Some("100"), Some(saved)), 100.0);
+        assert_eq!(resolve_look_sensitivity_percent(Some("0"), Some(saved)), 0.0);
+        for invalid in ["NaN", "inf", "-1", "101", "nonsense"] {
+            assert_eq!(resolve_look_sensitivity_percent(Some(invalid), Some(saved)), 40.0);
+        }
+        assert_eq!(resolve_look_sensitivity_percent(None, Some(r#"{"look_sensitivity_percent":101}"#)), 75.0);
+    }
 
     #[test]
     fn menu_confirmation_keys_do_not_send_gameplay_actions() {

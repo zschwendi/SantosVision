@@ -102,6 +102,8 @@ final class NativeRuntimeModel: ObservableObject {
     @Published private(set) var engineFailed = false
     @Published private(set) var graphicsSettings = NativeGraphicsSettings()
     @Published private(set) var graphicsStatus = ""
+    @Published private(set) var playSettings = NativePlaySettings()
+    @Published private(set) var playSettingsStatus = ""
     @Published private(set) var adaptiveRenderingEnabled = RenderingOptimizations.storedAdaptive
     @Published private(set) var frozenDepthHandoffEnabled = RenderingOptimizations.storedFrozenDepth
     @Published private(set) var drawSetupOverheadEnabled = RenderingOptimizations.storedDrawSetup
@@ -139,9 +141,11 @@ final class NativeRuntimeModel: ObservableObject {
     private var metalCapabilities: [String: Any] = [:]
     private var graphicsStartupError: String?
     private var graphicsConfigWritten = false
+    private var playSettingsStartupError: String?
 
     var graphicsConfigURL: URL { saveRoot.appendingPathComponent("native-graphics.json") }
     var canChangeGraphics: Bool { isLinked && !hasStarted && !isBusy }
+    var canChangePlaySettings: Bool { isLinked && !startupAttempted && !hasStarted && !isBusy }
     var canChangeRenderingOptimizations: Bool { isLinked && !startupAttempted && !hasStarted && !isBusy }
 
     init(arguments: [String] = ProcessInfo.processInfo.arguments) {
@@ -165,6 +169,12 @@ final class NativeRuntimeModel: ObservableObject {
         } catch {
             graphicsStartupError = error.localizedDescription
             graphicsStatus = "Graphics settings need attention: \(error.localizedDescription)"
+        }
+        do {
+            playSettings = try NativePlaySettings.load(from: saveRoot)
+        } catch {
+            playSettingsStartupError = error.localizedDescription
+            playSettingsStatus = "Sound and controls need attention: \(error.localizedDescription)"
         }
         if let device = MTLCreateSystemDefaultDevice() { recordMetalCapabilities(device) }
         if !isLinked { status = "This build contains the native immersive tracking test. Build game mode to link the GTA engine." }
@@ -226,6 +236,11 @@ final class NativeRuntimeModel: ObservableObject {
             recordReport()
             return
         }
+        if let playSettingsStartupError {
+            status = "Check sound and controller settings before starting. \(playSettingsStartupError)"
+            recordReport()
+            return
+        }
         isBusy = true
         guard await cloudSaves.prepareForLaunch() else {
             status = cloudSaves.status
@@ -235,8 +250,9 @@ final class NativeRuntimeModel: ObservableObject {
         }
         do {
             try persistGraphics()
+            try playSettings.save(to: saveRoot)
         } catch {
-            status = "Could not save graphics settings: \(error.localizedDescription)"
+            status = "Could not save game settings: \(error.localizedDescription)"
             isBusy = false
             recordReport()
             return
@@ -271,6 +287,30 @@ final class NativeRuntimeModel: ObservableObject {
         graphicsSettings.width = resolution.dimensions.width
         graphicsSettings.height = resolution.dimensions.height
         saveGraphicsSelection()
+    }
+
+    func setMasterVolume(_ volume: Double) {
+        guard canChangePlaySettings, volume.isFinite, (0...1).contains(volume) else { return }
+        playSettings.masterVolume = volume
+        savePlaySettings()
+    }
+
+    func setLookSensitivity(_ percent: Double) {
+        guard canChangePlaySettings, percent.isFinite, (0...100).contains(percent) else { return }
+        playSettings.lookSensitivityPercent = percent
+        savePlaySettings()
+    }
+
+    private func savePlaySettings() {
+        do {
+            try playSettings.save(to: saveRoot)
+            playSettingsStartupError = nil
+            playSettingsStatus = ""
+        } catch {
+            playSettingsStartupError = error.localizedDescription
+            playSettingsStatus = "Could not save sound and controls: \(error.localizedDescription)"
+        }
+        recordReport()
     }
 
     func setGraphicsFrameCap(_ cap: Int) {
@@ -592,6 +632,8 @@ final class NativeRuntimeModel: ObservableObject {
             "save_root": saveRoot.path, "has_game_data": hasGameData,
             "save_sync_status": cloudSaves.status,
             "graphics_requested": graphicsSettings.reportValue,
+            "play_settings_requested": playSettings.reportValue,
+            "play_settings_status": playSettingsStatus,
             "graphics_config_path": graphicsConfigURL.path,
             "graphics_config_written": graphicsConfigWritten,
             "graphics_settings_status": graphicsStatus,

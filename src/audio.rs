@@ -10,12 +10,9 @@ static CALLBACKS: AtomicU64 = AtomicU64::new(0);
 
 static STARTED: AtomicBool = AtomicBool::new(false);
 
-/// TEMPORARY (Zach, 2026-10-11): all game audio is muted until he restores
-/// sound. Before this there was no gain stage, i.e. unity (1.0).
-/// Restore by setting this back to 1.0 and rebuilding, or without a rebuild by
-/// writing {"master_volume": 1.0} to <save root>/native-audio.json, or by
-/// launching with MUGUET_MASTER_VOLUME=1.
-const DEFAULT_MASTER_VOLUME: f32 = 0.0;
+/// Unity restores the game's normal mix. The visionOS launcher migrates the
+/// earlier temporary mute once, then preserves subsequent volume selections.
+const DEFAULT_MASTER_VOLUME: f32 = 1.0;
 
 /// Launch override, then the persistent setting, then the default. Anything
 /// that is not a finite gain in 0...1 is ignored rather than played.
