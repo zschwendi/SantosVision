@@ -614,8 +614,13 @@ final class GameWorldRenderer: @unchecked Sendable {
             var acquisitionFailed = false
             if builtIn, let stageFromHead, (1...2).contains(drawable.views.count) {
                 let eyes = drawable.views.indices.map { index in
-                    XRRetainedEyeView(headFromEye: drawable.views[index].transform,
-                                      projectionFromEye: drawable.computeProjection(convention: .rightUpBack, viewIndex: index))
+                    let physicalProjection = drawable.computeProjection(convention: .rightUpBack, viewIndex: index)
+                    // Retain precisely the projection submitted to the game's
+                    // scalar camera bridge. Encoding below still uses the full
+                    // compositor projection for display-time reprojection.
+                    let nativeProjection = GameWorldProjection.nativePinhole(physicalProjection)?.matrix ?? physicalProjection
+                    return XRRetainedEyeView(headFromEye: drawable.views[index].transform,
+                                      projectionFromEye: nativeProjection)
                 }
                 // The request frame names the eye geometry; the head frame names the pose. Both are
                 // retained together so a lease can be checked against the exact pair it claims.
