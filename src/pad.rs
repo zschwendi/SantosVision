@@ -9,6 +9,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+#[path = "pad_guest_context.rs"]
+mod guest_context;
+
 pub static ACTIVE: AtomicBool = AtomicBool::new(false);
 static POLL_SAMPLES: AtomicU64 = AtomicU64::new(0);
 static CONNECTED_SAMPLES: AtomicU64 = AtomicU64::new(0);
@@ -18,9 +21,11 @@ static BUTTON_EVENTS: AtomicU64 = AtomicU64::new(0);
 static LOOK_EVENTS: AtomicU64 = AtomicU64::new(0);
 static MENU_PRESS_COUNT: AtomicU64 = AtomicU64::new(0);
 static LOOK_SENSITIVITY: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
-// Navigation context follows controller Menu presses. It is an input-routing
-// hint, not an engine-confirmed paused state.
+// Exact supported builds follow the guest pause state; Escape parity is only a
+// compatibility fallback for other executables.
 static MENU_NAVIGATION: AtomicBool = AtomicBool::new(false);
+static GUEST_CONTEXT_AVAILABLE: AtomicBool = AtomicBool::new(false);
+static PHONE_INSTANTIATED: AtomicBool = AtomicBool::new(false);
 
 /// Cumulative sampling/mapping counters, independent of engine block readiness.
 /// Compare with input::status_json delivery counters to locate a broken path.
@@ -35,6 +40,10 @@ pub(crate) fn status_json() -> serde_json::Value {
         "mapped_look_events": LOOK_EVENTS.load(Ordering::Relaxed),
         "menu_press_count": MENU_PRESS_COUNT.load(Ordering::Relaxed),
         "menu_navigation_inferred": MENU_NAVIGATION.load(Ordering::Relaxed),
+        "menu_navigation": MENU_NAVIGATION.load(Ordering::Relaxed),
+        "menu_context_source": if GUEST_CONTEXT_AVAILABLE.load(Ordering::Relaxed) { "verified_guest_pause_state" } else { "escape_fallback" },
+        "guest_context_abi_verified": guest_context::abi_verified(),
+        "phone_instantiated": if GUEST_CONTEXT_AVAILABLE.load(Ordering::Relaxed) { Some(PHONE_INSTANTIATED.load(Ordering::Relaxed)) } else { None },
         "look_sensitivity_percent": LOOK_SENSITIVITY.get().copied(),
         "look_speed_units_per_second": LOOK_SENSITIVITY.get().map(|percent| LOOK_SPEED * percent / 100.0),
     })
@@ -66,6 +75,7 @@ struct State {
     down_since: Option<Instant>,
     menu_navigation: bool,
     menu_button_down: bool,
+    blocked_context_buttons: u8,
 }
 static STATE: Mutex<Option<State>> = Mutex::new(None);
 
@@ -118,6 +128,18 @@ const LOOK_DEADZONE: f32 = 0.12;
 
 const LOOK_SPEED: f64 = 700.0;
 const DEFAULT_LOOK_SENSITIVITY_PERCENT: f64 = 75.0;
+const CROSS: u8 = 1;
+const CIRCLE: u8 = 2;
+const SQUARE: u8 = 4;
+const TRIANGLE: u8 = 8;
+const LEFT_SHOULDER: u8 = 16;
+const RIGHT_SHOULDER: u8 = 32;
+
+fn context_buttons(blocked: &mut u8, context_changed: bool, pressed: u8) -> u8 {
+    *blocked &= pressed;
+    if context_changed { *blocked |= pressed; }
+    pressed & !*blocked
+}
 
 fn resolve_look_sensitivity_percent(env: Option<&str>, setting: Option<&str>) -> f64 {
     let valid = |v: f64| (v.is_finite() && (0.0..=100.0).contains(&v)).then_some(v);
@@ -178,6 +200,17 @@ fn face_keys(keys: &mut HashSet<&'static str>, menu: bool, in_car: bool,
     }
 }
 
+fn navigation_context(previous: bool, escape_released: bool,
+                      guest: Option<guest_context::Context>) -> (bool, bool) {
+    if let Some(context) = guest {
+        // Phone Back/Escape and Circle leaving the root pause menu do not
+        // reliably toggle the pause state. Follow the game's actual state.
+        (context.paused, context.phone)
+    } else {
+        (previous ^ escape_released, false)
+    }
+}
+
 pub fn poll() -> bool {
     POLL_SAMPLES.fetch_add(1, Ordering::Relaxed);
     let gp = gamepad();
@@ -188,7 +221,7 @@ pub fn poll() -> bool {
     if connected { CONNECTED_SAMPLES.fetch_add(1, Ordering::Relaxed); }
     let mut guard = STATE.lock().unwrap();
     let st = guard.get_or_insert_with(|| State { held: HashSet::new(), buttons: 0, last: Instant::now(), down_since: None,
-        menu_navigation: MENU_NAVIGATION.load(Ordering::Relaxed), menu_button_down: false });
+        menu_navigation: MENU_NAVIGATION.load(Ordering::Relaxed), menu_button_down: false, blocked_context_buttons: 0 });
     let dt = st.last.elapsed().as_secs_f64().min(0.05);
     st.last = Instant::now();
 
@@ -202,15 +235,26 @@ pub fn poll() -> bool {
         MENU_PRESS_COUNT.fetch_add(1, Ordering::Relaxed);
     }
     st.menu_button_down = menu_down;
-    // Escape's merged release changes the inferred navigation context before
-    // sampling face buttons, so a fast Cross after Menu never leaks Shift.
-    if st.held.contains("Escape") && !menu_down && menu_key != Some("Escape") {
-        st.menu_navigation = !st.menu_navigation;
-        MENU_NAVIGATION.store(st.menu_navigation, Ordering::Relaxed);
-    }
+    let guest = guest_context::read();
+    let escape_released = st.held.contains("Escape") && !menu_down && menu_key != Some("Escape");
+    let (menu, phone_instantiated) = navigation_context(st.menu_navigation, escape_released, guest);
+    let context_changed = menu != st.menu_navigation;
+    st.menu_navigation = menu;
+    MENU_NAVIGATION.store(menu, Ordering::Relaxed);
+    GUEST_CONTEXT_AVAILABLE.store(guest.is_some(), Ordering::Relaxed);
+    PHONE_INSTANTIATED.store(phone_instantiated, Ordering::Relaxed);
     if menu_down { keys.insert("Escape"); }
     if let Some(gp) = gp.as_ref() { unsafe {
         let menu = st.menu_navigation;
+        let mut pressed = 0;
+        for (bit, button) in [(CROSS, gp.buttonA()), (CIRCLE, gp.buttonB()), (SQUARE, gp.buttonX()),
+            (TRIANGLE, gp.buttonY()), (LEFT_SHOULDER, gp.leftShoulder()), (RIGHT_SHOULDER, gp.rightShoulder())] {
+            if down(&button) { pressed |= bit; }
+        }
+        // Closing a menu with Circle must release Backspace, not turn the same
+        // still-held press into Reload. Require a fresh press after a transition.
+        let allowed = context_buttons(&mut st.blocked_context_buttons, context_changed, pressed);
+        let pressed = |bit| allowed & bit != 0;
         let ls = gp.leftThumbstick();
         let (lx, ly) = (ls.xAxis().value(), ls.yAxis().value());
         if lx < -STICK_DEADZONE { keys.insert(if menu { "ArrowLeft" } else { "KeyA" }); }
@@ -224,24 +268,24 @@ pub fn poll() -> bool {
             if ly < -STICK_DEADZONE { keys.insert("Numpad2"); }
             if gp.rightTrigger().value() > 0.2 { keys.insert("KeyW"); }
             if gp.leftTrigger().value() > 0.2 { keys.insert("KeyS"); }
-            if down(&gp.rightShoulder()) { keys.insert("Space"); }
+            if pressed(RIGHT_SHOULDER) { keys.insert("Space"); }
             HORN_PAD.store(gp.leftThumbstickButton().is_some_and(|b| down(&b)), Ordering::Relaxed);
         } else {
             if ly > STICK_DEADZONE { keys.insert("KeyW"); }
             if ly < -STICK_DEADZONE { keys.insert("KeyS"); }
             if gp.rightTrigger().value() > 0.2 { buttons |= 1; }
             if gp.leftTrigger().value() > 0.2 { buttons |= 2; }
-            if down(&gp.rightShoulder()) { keys.insert("KeyQ"); }
+            if pressed(RIGHT_SHOULDER) { keys.insert("KeyQ"); }
             if gp.leftThumbstickButton().is_some_and(|b| down(&b)) { keys.insert("ControlLeft"); }
         }
-        face_keys(&mut keys, menu, in_car, down(&gp.buttonA()), down(&gp.buttonB()), down(&gp.buttonX()));
+        face_keys(&mut keys, menu, in_car, pressed(CROSS), pressed(CIRCLE), pressed(SQUARE));
         if menu {
-            if down(&gp.buttonY()) { keys.insert("KeyY"); }
-            if down(&gp.rightShoulder()) { keys.insert("KeyN"); }
-            if down(&gp.leftShoulder()) { keys.insert("Tab"); }
+            if pressed(TRIANGLE) { keys.insert("KeyY"); }
+            if pressed(RIGHT_SHOULDER) { keys.insert("KeyN"); }
+            if pressed(LEFT_SHOULDER) { keys.insert("Tab"); }
         } else {
-            if down(&gp.buttonY()) { keys.insert("KeyF"); }
-            if down(&gp.leftShoulder()) { keys.insert("Tab"); }
+            if pressed(TRIANGLE) { keys.insert("KeyF"); }
+            if pressed(LEFT_SHOULDER) { keys.insert("Tab"); }
             if gp.rightThumbstickButton().is_some_and(|b| down(&b)) { keys.insert("KeyC"); }
         }
         let dp = gp.dpad();
@@ -273,6 +317,7 @@ pub fn poll() -> bool {
         }
     } } else {
         st.menu_button_down = false;
+        st.blocked_context_buttons = 0;
         st.down_since = None;
         HORN_PAD.store(false, Ordering::Relaxed);
     }
@@ -319,6 +364,47 @@ pub fn suspend() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn actual_guest_pause_state_recovers_sticks_after_back_and_phone_escape() {
+        let gameplay = guest_context::Context { paused: false, phone: false };
+        let phone = guest_context::Context { paused: false, phone: true };
+        let paused = guest_context::Context { paused: true, phone: false };
+        // Circle/Backspace can leave the root pause menu without an Escape.
+        assert_eq!(navigation_context(true, false, Some(gameplay)), (false, false));
+        // Escape can close a phone panel without opening the pause menu.
+        assert_eq!(navigation_context(false, true, Some(phone)), (false, true));
+        assert_eq!(navigation_context(true, true, Some(gameplay)), (false, false));
+        // Keyboard/menu transitions and confirmations use the actual menu state.
+        assert_eq!(navigation_context(false, false, Some(paused)), (true, false));
+        assert_eq!(navigation_context(true, true, Some(paused)), (true, false));
+        let (menu, _) = navigation_context(true, false, Some(gameplay));
+        let mut keys = HashSet::new();
+        face_keys(&mut keys, menu, false, true, false, false);
+        assert!(keys.contains("ShiftLeft"));
+        assert_eq!(navigation_context(false, true, None), (true, false));
+    }
+
+    #[test]
+    fn held_circle_releases_backspace_without_reloading_after_menu_close() {
+        let mut blocked = 0;
+        let allowed = context_buttons(&mut blocked, false, CIRCLE);
+        let mut menu_keys = HashSet::new();
+        face_keys(&mut menu_keys, true, false, false, allowed & CIRCLE != 0, false);
+        assert_eq!(menu_keys, HashSet::from(["Backspace"]));
+        let allowed = context_buttons(&mut blocked, true, CIRCLE);
+        let mut game_keys = HashSet::new();
+        face_keys(&mut game_keys, false, false, false, allowed & CIRCLE != 0, false);
+        assert!(game_keys.is_empty());
+        assert_eq!(menu_keys.difference(&game_keys).copied().collect::<HashSet<_>>(), HashSet::from(["Backspace"]));
+        assert_eq!(context_buttons(&mut blocked, false, CIRCLE), 0);
+        assert_eq!(context_buttons(&mut blocked, false, 0), 0);
+        let allowed = context_buttons(&mut blocked, false, CIRCLE);
+        face_keys(&mut game_keys, false, false, false, allowed & CIRCLE != 0, false);
+        assert_eq!(game_keys, HashSet::from(["KeyR", "Backspace"]));
+        // Holding Yes/No/Apply during another context change is equally gated.
+        assert_eq!(context_buttons(&mut blocked, true, TRIANGLE | RIGHT_SHOULDER | SQUARE), 0);
+    }
 
     #[test]
     fn controller_look_percentage_respects_persistence_and_explicit_override() {
