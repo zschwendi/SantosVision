@@ -397,9 +397,9 @@ actor SantosSaveSync {
         let fingerprint: String
     }
 
-    private var profileRoot: URL {
+    private var gameSaveRoot: URL {
         configuration.saveRoot.appendingPathComponent(
-            "userdata/Documents/Rockstar Games/GTA V/Profiles", isDirectory: true)
+            "userdata/Documents/Rockstar Games/GTA V", isDirectory: true)
             .resolvingSymlinksInPath()
     }
 
@@ -425,7 +425,7 @@ actor SantosSaveSync {
     }
 
     private func makeRevision(from snapshot: Snapshot, parent: UUID?) -> SantosSaveRevision {
-        SantosSaveRevision(version: 1, id: UUID(), parent: parent, createdAt: Date(),
+        SantosSaveRevision(version: 2, id: UUID(), parent: parent, createdAt: Date(),
                            fingerprint: snapshot.fingerprint, files: snapshot.files)
     }
 
@@ -458,7 +458,7 @@ actor SantosSaveSync {
             throw SantosSaveSyncError.damagedRevision(url.lastPathComponent)
         }
         let revision = try JSONDecoder().decode(SantosSaveRevision.self, from: Data(contentsOf: url))
-        guard revision.version == 1,
+        guard revision.version == 1 || revision.version == 2,
               url.lastPathComponent == "\(revision.id.uuidString).svsave",
               revision.files.count <= Self.maxFiles else {
             throw SantosSaveSyncError.damagedRevision(url.lastPathComponent)
@@ -466,7 +466,7 @@ actor SantosSaveSync {
         var total = 0
         var seen = Set<String>()
         for file in revision.files {
-            try validatePath(file.path)
+            try validatePath(file.path, legacyProfileRelative: revision.version == 1)
             total += file.data.count
             guard seen.insert(file.path).inserted,
                   file.data.count <= Self.maxFileBytes,
@@ -477,6 +477,15 @@ actor SantosSaveSync {
         }
         guard Self.fingerprint(revision.files) == revision.fingerprint else {
             throw SantosSaveSyncError.damagedRevision(url.lastPathComponent)
+        }
+        if revision.version == 1 {
+            let files = revision.files.map {
+                SantosSaveRevision.File(path: "Profiles/" + $0.path,
+                                        sha256: $0.sha256, data: $0.data)
+            }
+            return SantosSaveRevision(version: 2, id: revision.id,
+                                      parent: revision.parent, createdAt: revision.createdAt,
+                                      fingerprint: Self.fingerprint(files), files: files)
         }
         return revision
     }
@@ -492,10 +501,10 @@ actor SantosSaveSync {
     }
 
     private func snapshot() throws -> Snapshot {
-        guard manager.fileExists(atPath: profileRoot.path) else {
+        guard manager.fileExists(atPath: gameSaveRoot.path) else {
             return Snapshot(files: [], fingerprint: Self.fingerprint([]))
         }
-        guard let canonicalPointer = realpath(profileRoot.path, nil) else {
+        guard let canonicalPointer = realpath(gameSaveRoot.path, nil) else {
             throw SantosSaveSyncError.changingFiles
         }
         let canonicalRoot = URL(fileURLWithPath: String(cString: canonicalPointer))
@@ -508,14 +517,27 @@ actor SantosSaveSync {
         var files: [SantosSaveRevision.File] = []
         var total = 0
         for case let url as URL in enumerator {
-            let values = try url.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey])
+            let values = try url.resourceValues(forKeys: [
+                .isDirectoryKey, .isRegularFileKey, .isSymbolicLinkKey
+            ])
+            let prefix = canonicalRoot.path + "/"
+            guard url.path.hasPrefix(prefix) else { throw SantosSaveSyncError.unsafePath(url.path) }
+            let path = String(url.path.dropFirst(prefix.count))
+            if path == "Profiles" {
+                guard values.isSymbolicLink != true else {
+                    throw SantosSaveSyncError.unsafePath(url.path)
+                }
+                continue
+            }
+            if values.isDirectory == true && path != "Profiles" && !path.hasPrefix("Profiles/") {
+                enumerator.skipDescendants()
+                continue
+            }
+            guard path == "pc_settings.bin" || path.hasPrefix("Profiles/") else { continue }
             guard values.isSymbolicLink != true else {
                 throw SantosSaveSyncError.unsafePath(url.path)
             }
             guard values.isRegularFile == true else { continue }
-            let prefix = canonicalRoot.path + "/"
-            guard url.path.hasPrefix(prefix) else { throw SantosSaveSyncError.unsafePath(url.path) }
-            let path = String(url.path.dropFirst(prefix.count))
             try validatePath(path)
             var sampledURL = url
             let before = try sampledURL.resourceValues(
@@ -538,11 +560,17 @@ actor SantosSaveSync {
         return Snapshot(files: files, fingerprint: Self.fingerprint(files))
     }
 
-    private func validatePath(_ path: String) throws {
+    private func validatePath(_ path: String, legacyProfileRelative: Bool = false) throws {
         let parts = path.split(separator: "/", omittingEmptySubsequences: false)
         guard !parts.isEmpty, parts.count <= 8,
               parts.allSatisfy({ !$0.isEmpty && $0 != "." && $0 != ".." && !$0.contains("\\") }),
               !path.hasPrefix("/") else { throw SantosSaveSyncError.unsafePath(path) }
+        if !legacyProfileRelative {
+            guard path == "pc_settings.bin" ||
+                    (parts.count >= 2 && parts.first == "Profiles") else {
+                throw SantosSaveSyncError.unsafePath(path)
+            }
+        }
     }
 
     private func install(_ revision: SantosSaveRevision) throws {
@@ -550,7 +578,7 @@ actor SantosSaveSync {
         // these atomic per-file writes after a crash completes the same verified snapshot.
         for file in revision.files {
             try validatePath(file.path)
-            let destination = profileRoot.appendingPathComponent(file.path)
+            let destination = gameSaveRoot.appendingPathComponent(file.path)
             try manager.createDirectory(at: destination.deletingLastPathComponent(),
                                         withIntermediateDirectories: true)
             if manager.fileExists(atPath: destination.path) {

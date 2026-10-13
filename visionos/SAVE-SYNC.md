@@ -1,13 +1,15 @@
 # GTA save history for SantosVision
 
-`SantosSaveSync` mirrors the game's local profile files under
-`Documents/saves/userdata/Documents/Rockstar Games/GTA V/Profiles/`. The native
+`SantosSaveSync` mirrors only `pc_settings.bin` and files under `Profiles/`
+within `Documents/saves/userdata/Documents/Rockstar Games/GTA V/`. The native
 engine continues to use its local `Documents/saves` root. The synchronizer does
-not include `native-graphics.json`, caches, source game data, or the sibling
-`settings.xml` graphics configuration. `src/config.rs` confirms the GTA V
-`userdata/Documents/Rockstar Games/GTA V` mapping; the profile directory is
-the GTA V save convention and still needs confirmation against a physical
-SantosVision gameplay save.
+not include `native-graphics.json`, caches, source game data, sibling
+`settings.xml`, or its `native-low-backup` files. `src/config.rs` confirms the
+GTA V `userdata/Documents/Rockstar Games/GTA V` mapping. A physical device
+listing from 2026-10-12 confirms `pc_settings.bin` (952 bytes) and no
+`Profiles/` directory yet. A story save in `Profiles/` still needs physical
+confirmation; backing up the PC settings file alone does not claim game
+progress is backed up.
 
 ## App integration
 
@@ -60,6 +62,9 @@ files and reports `divergentRemoteRevisions`; both branches remain available
 in immutable history. A recovery UI can call `availableRevisions()` and, only
 before engine startup, `restoreRevisionBeforeLaunch(_:)`. That explicit
 restore first archives the current local snapshot.
+Revision schema 2 stores paths relative to the GTA V directory. Schema 1
+profile-only revisions remain readable and are mapped into `Profiles/` during
+verification and restore.
 
 ## Capability and acceptance
 
@@ -83,7 +88,8 @@ swiftc -swift-version 6 -strict-concurrency=complete \
 /tmp/santos-save-sync-host-tests
 ```
 
-The synthetic host test covers immutable publication, first-device restore,
+The synthetic host test covers the physical `pc_settings.bin`-only shape,
+exclusion of graphics XML/backups, immutable publication, first-device restore,
 newer descendant restore, divergent branches, explicit recovery, malformed
 cloud history, offline behavior, and the gameplay restore guard. The files
 also pass visionOS SDK Swift 6 typechecking. Physical acceptance must confirm

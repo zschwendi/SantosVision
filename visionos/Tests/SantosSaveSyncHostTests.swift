@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 
 @main
@@ -129,6 +130,75 @@ struct SantosSaveSyncHostTests {
             discover: { _ in fatalError("checkpoint discovered cloud history") },
             settleNanoseconds: 1_000_000))
         _ = try await trapCloud.checkpointLocal()
+
+        // Match the physical listing: PC settings exist before any Profiles directory.
+        let settingsCloud = root.appendingPathComponent("settings-cloud")
+        let settingsA = root.appendingPathComponent("settings-a")
+        let settingsB = root.appendingPathComponent("settings-b")
+        let gta = "userdata/Documents/Rockstar Games/GTA V"
+        let gtaRoot = settingsA.appendingPathComponent(gta)
+        try manager.createDirectory(at: gtaRoot.appendingPathComponent("cache"),
+                                    withIntermediateDirectories: true)
+        try Data("pc-state".utf8).write(to: gtaRoot.appendingPathComponent("pc_settings.bin"))
+        try Data("graphics".utf8).write(to: gtaRoot.appendingPathComponent("settings.xml"))
+        try Data("older-graphics".utf8).write(
+            to: gtaRoot.appendingPathComponent("settings.xml.native-low-backup.1"))
+        try Data("cache".utf8).write(to: gtaRoot.appendingPathComponent("cache/data"))
+        func settingsEngine(_ saveRoot: URL) -> SantosSaveSync {
+            SantosSaveSync(configuration: .init(
+                saveRoot: saveRoot,
+                archiveRoot: saveRoot.appendingPathComponent("archive"),
+                cloudRoot: { settingsCloud }, cloudIdentity: { "synthetic-account" },
+                discover: { root in
+                    (try? FileManager.default.contentsOfDirectory(
+                        at: root, includingPropertiesForKeys: nil)) ?? []
+                }, settleNanoseconds: 1_000_000))
+        }
+        let settingsPublisher = settingsEngine(settingsA)
+        let settingsResult = try await settingsPublisher.snapshotAndUpload()
+        precondition(settingsResult.localFiles == 1)
+        let settingsReceiver = settingsEngine(settingsB)
+        let restoredSettings = try await settingsReceiver.restoreBeforeLaunch()
+        precondition(restoredSettings.localFiles == 1)
+        let pcData = try Data(contentsOf: settingsB.appendingPathComponent(
+            gta + "/pc_settings.bin"))
+        precondition(String(decoding: pcData, as: UTF8.self) == "pc-state")
+        precondition(!manager.fileExists(atPath: settingsB.appendingPathComponent(
+            gta + "/settings.xml").path))
+        precondition(!manager.fileExists(atPath: settingsB.appendingPathComponent(
+            gta + "/Profiles").path))
+
+        // An existing schema-1 profile-only cloud revision remains recoverable.
+        let legacyCloud = root.appendingPathComponent("legacy-cloud")
+        let legacyDevice = root.appendingPathComponent("legacy-device")
+        try manager.createDirectory(at: legacyCloud, withIntermediateDirectories: true)
+        let legacyBytes = Data("old-slot".utf8)
+        let legacyHash = SHA256.hash(data: legacyBytes).map {
+            String(format: "%02x", $0)
+        }.joined()
+        let legacyPath = "ABCD/SGTA50000"
+        let legacyFingerprint = SHA256.hash(data: Data(
+            (legacyPath + "\0" + legacyHash + "\0").utf8
+        )).map { String(format: "%02x", $0) }.joined()
+        let legacy = SantosSaveRevision(
+            version: 1, id: UUID(), parent: nil, createdAt: Date(),
+            fingerprint: legacyFingerprint,
+            files: [.init(path: legacyPath, sha256: legacyHash, data: legacyBytes)])
+        try JSONEncoder().encode(legacy).write(to: legacyCloud.appendingPathComponent(
+            "\(legacy.id.uuidString).svsave"))
+        let legacyEngine = SantosSaveSync(configuration: .init(
+            saveRoot: legacyDevice,
+            archiveRoot: legacyDevice.appendingPathComponent("archive"),
+            cloudRoot: { legacyCloud }, cloudIdentity: { "synthetic-account" },
+            discover: { root in
+                (try? FileManager.default.contentsOfDirectory(
+                    at: root, includingPropertiesForKeys: nil)) ?? []
+            }, settleNanoseconds: 1_000_000))
+        let migrated = try await legacyEngine.restoreBeforeLaunch()
+        precondition(migrated.localFiles == 1)
+        let migratedBytes = try Data(contentsOf: legacyDevice.appendingPathComponent(
+            gta + "/Profiles/" + legacyPath))
+        precondition(migratedBytes == legacyBytes)
 
         print("Santos save sync host tests passed")
     }
