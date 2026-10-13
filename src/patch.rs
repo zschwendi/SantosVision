@@ -264,6 +264,17 @@ impl Patcher {
     }
 }
 
+/// Optional source audit only. This does NOT add foreground imports or hooks.
+/// Runtime scope instrumentation remains unavailable until recovered traps and
+/// every guest-call boundary have balanced host cleanup. Default patch5 stays
+/// byte-identical; even this audit API returns the ordinary patch5 module.
+pub fn patch_with_foreground_certificate(
+    wasm: &[u8], wanted: &[(&str, &str)],
+) -> Result<(Vec<u8>, crate::xr_foreground_scope::SourceCertificate)> {
+    let certificate = crate::xr_foreground_scope::certify(wasm)?;
+    Ok((patch(wasm, wanted)?, certificate))
+}
+
 pub fn patch(wasm: &[u8], wanted: &[(&str, &str)]) -> Result<Vec<u8>> {
     let (mut imported_funcs, mut types, mut tls_global) = (0u32, 0u32, None);
     let mut by_name: HashMap<String, u32> = HashMap::new();

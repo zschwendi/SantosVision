@@ -37,6 +37,10 @@ mod guest_write_tests;
 #[path = "upload_dedup_tests.rs"]
 mod upload_dedup_tests;
 
+#[cfg(all(test, target_os = "macos"))]
+#[path = "texture_view_cache_tests.rs"]
+mod texture_view_cache_tests;
+
 /// A frozen pre-UI depth copy belongs to its qualified camera/present, not to
 /// subsequent contents of the live source texture. Ordinary source clears do
 /// not modify the copy. Other mutations and unqualified geometry still revoke
@@ -1284,6 +1288,19 @@ impl Gpu {
     fn obj_mut(&mut self, id: u32) -> Option<&mut Obj> {
         self.objs.get_mut(id as usize).and_then(|o| o.as_mut())
     }
+    // A guest view ID can outlive the texture allocation it references. Its
+    // cached native views hold the OLD allocation strongly, so clearing only
+    // bind_groups cannot make that view follow a reused resource ID.
+    // Call only for texture creation/replacement/destruction, not ordinary
+    // buffer/shader/state churn. Already encoded commands keep their own refs.
+    fn invalidate_texture_views(&mut self, id: u32) {
+        for object in self.objs.iter_mut().flatten() {
+            if let Obj::Srv(view) | Obj::Uav(view) = object {
+                if !view.is_buf && view.res == id { view.views.clear(); }
+            }
+        }
+    }
+
     fn set_obj(&mut self, id: u32, o: Obj) {
         let i = id as usize;
         if i > 64 << 20 {
@@ -1296,8 +1313,19 @@ impl Gpu {
         // A previously empty resource ID may already be referenced by a view
         // whose unchanged ID cached a dummy binding. An old binding-relevant
         // object also requires invalidation when replaced by a nonbinding one.
-        if self.bind_group_prepare.enabled {
-            if binding_cache_needs_invalidation(self.objs[i].as_ref(), Some(&o)) {
+        let texture_lifetime = matches!(self.objs[i].as_ref(), Some(Obj::Tex(_))) || matches!(&o, Obj::Tex(_));
+        if texture_lifetime {
+            // Attachment keys and deferred clears name guest IDs, not native
+            // allocations. Retire only this texture's old lifetime; material
+            // texture creation must not split an unrelated render pass.
+            if id != 0 && self.in_open_pass(id) { self.end_pass(); }
+            self.pending_clears.remove(&id);
+            self.invalidate_texture_views(id);
+        }
+        // Texture identity correctness is independent of the lookup-preparation
+        // optimization: the legacy path also caches bind groups by guest IDs.
+        if texture_lifetime || self.bind_group_prepare.enabled {
+            if texture_lifetime || binding_cache_needs_invalidation(self.objs[i].as_ref(), Some(&o)) {
                 self.bind_groups.clear();
                 self.bind_group_prepare.invalidated();
             } else if let Some(kind) = o.nonbinding_kind() {
@@ -1746,8 +1774,10 @@ impl Gpu {
         if self.is_bound(id) { self.pdirty = true; }
         if self.obj(id).is_none() { return; }
         if self.used(id) { self.flush(); }
-        if self.bind_group_prepare.enabled {
-            if binding_cache_needs_invalidation(self.obj(id), None) {
+        let texture_lifetime = matches!(self.obj(id), Some(Obj::Tex(_)));
+        if texture_lifetime { self.invalidate_texture_views(id); }
+        if texture_lifetime || self.bind_group_prepare.enabled {
+            if texture_lifetime || binding_cache_needs_invalidation(self.obj(id), None) {
                 self.bind_groups.clear();
                 self.bind_group_prepare.invalidated();
             } else if let Some(kind) = self.obj(id).and_then(Obj::nonbinding_kind) {

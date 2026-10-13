@@ -25,6 +25,8 @@ pub mod world_command_trace;
 pub mod xr;
 pub mod xr_aim;
 pub mod xr_foreground;
+#[cfg(feature = "jit")]
+pub mod xr_foreground_scope;
 pub mod xr_view;
 mod pad;
 #[cfg(feature = "jit")]
