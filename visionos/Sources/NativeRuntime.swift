@@ -137,6 +137,7 @@ final class NativeRuntimeModel: ObservableObject {
     private var compositorOwnsHeadTracking = false
     private var worldPresentation: [String: Any]?
     private var worldGpuTiming: [String: Any]?
+    private var worldLifecycle: [String: Any] = [:]
     private var worldGpuTimingNotBeforeUptime = ProcessInfo.processInfo.systemUptime
     private var metalCapabilities: [String: Any] = [:]
     private var graphicsStartupError: String?
@@ -298,6 +299,12 @@ final class NativeRuntimeModel: ObservableObject {
     func setLookSensitivity(_ percent: Double) {
         guard canChangePlaySettings, percent.isFinite, (0...100).contains(percent) else { return }
         playSettings.lookSensitivityPercent = percent
+        savePlaySettings()
+    }
+
+    func setDeveloperMode(_ enabled: Bool) {
+        guard canChangePlaySettings else { return }
+        playSettings.developerMode = enabled
         savePlaySettings()
     }
 
@@ -488,6 +495,11 @@ final class NativeRuntimeModel: ObservableObject {
     }
 
     #if SV_GAME_RUNTIME
+    func recordWorldState(_ value: [String: Any]) {
+        worldLifecycle = value
+        recordReport()
+    }
+
     func recordWorldPresentation(_ presentation: GameWorldPresentation) {
         guard isActive, compositorOwnsHeadTracking else { return }
         worldPresentation = ["view_count": presentation.viewCount,
@@ -627,6 +639,9 @@ final class NativeRuntimeModel: ObservableObject {
             "window_scene_policy": "single_instance_main",
             "window_attached": windowIsAttached,
             "window_scene_active": windowSceneIsActive,
+            "app_scene_active": appSceneIsActive,
+            "immersive_scene_active": immersiveSceneIsActive,
+            "compositor_owns_head_tracking": compositorOwnsHeadTracking,
             "connected_window_scene_count": UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.count,
             "controllers": ["connected": !controllers.isEmpty, "names": controllerNames],
             "save_root": saveRoot.path, "has_game_data": hasGameData,
@@ -662,6 +677,7 @@ final class NativeRuntimeModel: ObservableObject {
             "set_active_return_code": activeReturnCode.map { $0 as Any } ?? NSNull(),
             "metal_capabilities": metalCapabilities,
             "immersive_game_renderer_connected": currentWorldConnected,
+            "immersive_lifecycle": worldLifecycle,
             "immersive_game_presentation": worldPresentation ?? [:],
             "immersive_compositor_gpu_timing": worldGpuTiming ?? [:]
         ]
