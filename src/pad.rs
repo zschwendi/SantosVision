@@ -173,7 +173,7 @@ pub fn poll() -> bool {
     let mut buttons = 0u8;
     let mut looking = false;
     let menu_key = menu_action_key(&mut MENU_ACTIONS.lock().unwrap(), Instant::now());
-    let menu_down = gp.as_ref().is_some_and(|gp| down(&gp.buttonMenu()));
+    let menu_down = gp.as_ref().is_some_and(|gp| unsafe { down(&gp.buttonMenu()) });
     if menu_down && !st.menu_button_down {
         MENU_PRESS_COUNT.fetch_add(1, Ordering::Relaxed);
     }
