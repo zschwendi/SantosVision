@@ -8,7 +8,7 @@
     <key>CFBundleExecutable</key><string>$(EXECUTABLE_NAME)</string>
     <key>CFBundlePackageType</key><string>APPL</string>
     <key>CFBundleShortVersionString</key><string>0.1</string>
-    <key>CFBundleVersion</key><string>1</string>
+    <key>CFBundleVersion</key><string>2</string>
     <key>GCSupportsControllerUserInteraction</key><true/>
     <key>GCSupportedGameControllers</key>
     <array><dict><key>ProfileName</key><string>ExtendedGamepad</string></dict></array>
@@ -18,6 +18,6 @@
         <key>UISceneConfigurations</key><dict/>
     </dict>
     <key>NSWorldSensingUsageDescription</key>
-    <string>The tracking diagnostic follows your headset pose to render a stationary 3D calibration scene.</string>
+    <string>SantosVision uses your headset position and movement to render the immersive game world around you.</string>
 </dict>
 </plist>
