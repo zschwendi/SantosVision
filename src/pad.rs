@@ -163,7 +163,8 @@ pub fn poll() -> bool {
     }
     if connected { CONNECTED_SAMPLES.fetch_add(1, Ordering::Relaxed); }
     let mut guard = STATE.lock().unwrap();
-    let st = guard.get_or_insert_with(|| State { held: HashSet::new(), buttons: 0, last: Instant::now(), down_since: None, menu_navigation: false, menu_button_down: false });
+    let st = guard.get_or_insert_with(|| State { held: HashSet::new(), buttons: 0, last: Instant::now(), down_since: None,
+        menu_navigation: MENU_NAVIGATION.load(Ordering::Relaxed), menu_button_down: false });
     let dt = st.last.elapsed().as_secs_f64().min(0.05);
     st.last = Instant::now();
 
@@ -213,6 +214,7 @@ pub fn poll() -> bool {
         if menu {
             if down(&gp.buttonY()) { keys.insert("KeyY"); }
             if down(&gp.rightShoulder()) { keys.insert("KeyN"); }
+            if down(&gp.leftShoulder()) { keys.insert("Tab"); }
         } else {
             if down(&gp.buttonY()) { keys.insert("KeyF"); }
             if down(&gp.leftShoulder()) { keys.insert("Tab"); }
@@ -277,14 +279,16 @@ fn release(st: State) {
 
 /// Release held controller input when the native application's scene deactivates.
 pub fn suspend() {
-    if let Some(state) = STATE.lock().unwrap().take() { release(state); }
+    if let Some(state) = STATE.lock().unwrap().take() {
+        MENU_NAVIGATION.store(state.menu_navigation, Ordering::Relaxed);
+        release(state);
+    }
     let mut actions = MENU_ACTIONS.lock().unwrap();
     actions.queued.clear();
     actions.active = None;
     actions.gap_until = None;
     ACTIVE.store(false, Ordering::Relaxed);
     HORN_PAD.store(false, Ordering::Relaxed);
-    MENU_NAVIGATION.store(false, Ordering::Relaxed);
 }
 
 #[cfg(test)]

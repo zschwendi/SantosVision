@@ -246,6 +246,8 @@ pub struct NativeGraphicsLaunch {
     settings_action: &'static str,
     changed_tags: Vec<String>,
     backup_path: Option<PathBuf>,
+    marker_path: PathBuf,
+    marker_action: &'static str,
 }
 
 impl NativeGraphicsLaunch {
@@ -254,7 +256,8 @@ impl NativeGraphicsLaunch {
             "fps_limit":self.config.fps_limit,"graphics_preset":"low", "config_source":self.config_source,
             "config_path":self.config_path,"settings_path":self.settings_path,
             "settings_action":self.settings_action,"changed_tags":self.changed_tags,"backup_path":self.backup_path,
-            "settings_scope":"saved XML applied before engine startup; runtime may normalize individual fields"})
+            "marker_path":self.marker_path,"marker_action":self.marker_action,
+            "settings_scope":"Low defaults on missing XML; existing GTA choices preserved unless the launcher resolution or FPS cap changes"})
     }
 }
 
@@ -313,14 +316,27 @@ const NATIVE_DEFAULT_SETTINGS: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
 /// Edit only value attributes in the graphics/video children of Settings.
 /// Comments, CDATA, audio/system settings and unknown tags remain byte-for-byte.
 fn low_settings_xml(xml: &str, config: &NativeGraphics) -> anyhow::Result<(String, Vec<String>)> {
-    use anyhow::{ensure, Context};
-    use std::collections::{BTreeMap, BTreeSet};
+    use std::collections::BTreeMap;
     let mut wanted: BTreeMap<(&str, &str), String> = LOW_GRAPHICS.iter()
         .map(|(tag, value)| (("graphics", *tag), (*value).into())).collect();
     for (tag, value) in [("ScreenWidth", config.width), ("ScreenHeight", config.height),
                          ("RefreshRate", config.fps_limit), ("VSync", 1)] {
         wanted.insert(("video", tag), value.to_string());
     }
+    settings_xml_with_values(xml, wanted)
+}
+
+fn video_settings_xml(xml: &str, config: &NativeGraphics) -> anyhow::Result<(String, Vec<String>)> {
+    let wanted = [("ScreenWidth", config.width), ("ScreenHeight", config.height),
+                  ("RefreshRate", config.fps_limit)].into_iter()
+        .map(|(tag, value)| (("video", tag), value.to_string())).collect();
+    settings_xml_with_values(xml, wanted)
+}
+
+fn settings_xml_with_values(xml: &str, wanted: std::collections::BTreeMap<(&str, &str), String>)
+    -> anyhow::Result<(String, Vec<String>)> {
+    use anyhow::{ensure, Context};
+    use std::collections::{BTreeMap, BTreeSet};
     let value_attribute = regex::Regex::new(r#"\bvalue\s*=\s*(?:"([^"]*)"|'([^']*)')"#)?;
     let mut stack: Vec<&str> = Vec::new();
     let mut sections = BTreeMap::new();
@@ -417,25 +433,43 @@ fn prepare_native_graphics(save_root: &Path) -> anyhow::Result<NativeGraphicsLau
         Err(error) => return Err(error).with_context(|| format!("read {}", config_path.display())),
     };
     let settings_path = save_root.join("userdata/Documents/Rockstar Games/GTA V/settings.xml");
+    let marker_path = save_root.join("native-graphics-applied.json");
+    let applied_config = match std::fs::read_to_string(&marker_path) {
+        Ok(text) => {
+            ensure!(text.len() <= 4096, "native graphics marker exceeds 4096 bytes");
+            Some(NativeGraphics::parse(&text).context("parse native graphics marker")?)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error).with_context(|| format!("read {}", marker_path.display())),
+    };
     let (original, existed) = match std::fs::read_to_string(&settings_path) {
         Ok(xml) => { ensure!(xml.len() <= 512 << 10, "settings.xml exceeds 512 KiB"); (xml, true) }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => (NATIVE_DEFAULT_SETTINGS.into(), false),
         Err(error) => return Err(error).with_context(|| format!("read {}", settings_path.display())),
     };
-    let (xml, changed_tags) = low_settings_xml(&original, &config).context("apply native low graphics preset")?;
+    let (xml, changed_tags) = if !existed {
+        low_settings_xml(&original, &config).context("create native low graphics defaults")?
+    } else if applied_config.as_ref().is_some_and(|previous| previous != &config) {
+        video_settings_xml(&original, &config).context("apply changed native resolution and frame cap")?
+    } else {
+        // A missing marker means this may be an upgrade with GTA-owned XML.
+        // Validate its structure, then adopt it without rewriting user values.
+        settings_xml_with_values(&original, std::collections::BTreeMap::new())
+            .context("validate existing GTA settings")?
+    };
     let mut backup_path = None;
     let settings_action = if existed && xml == original { "unchanged" } else {
         let parent = settings_path.parent().unwrap();
         std::fs::create_dir_all(parent).context("create native graphics settings directory")?;
         let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_nanos();
         if existed {
-            let backup = parent.join(format!("settings.xml.native-low-backup.{stamp}.{}", std::process::id()));
+            let backup = parent.join(format!("settings.xml.native-graphics-backup.{stamp}.{}", std::process::id()));
             let mut file = std::fs::OpenOptions::new().write(true).create_new(true).open(&backup).context("create settings.xml backup")?;
             file.write_all(original.as_bytes()).context("write settings.xml backup")?;
             file.sync_all().context("flush settings.xml backup")?;
             backup_path = Some(backup);
         }
-        let temporary = parent.join(format!(".settings.xml.native-low.{stamp}.{}.tmp", std::process::id()));
+        let temporary = parent.join(format!(".settings.xml.native-graphics.{stamp}.{}.tmp", std::process::id()));
         let result = (|| -> anyhow::Result<()> {
             let mut file = std::fs::OpenOptions::new().write(true).create_new(true).open(&temporary).context("create temporary settings.xml")?;
             if existed { file.set_permissions(std::fs::metadata(&settings_path)?.permissions())?; }
@@ -448,9 +482,33 @@ fn prepare_native_graphics(save_root: &Path) -> anyhow::Result<NativeGraphicsLau
         result?;
         if existed { "updated_with_backup" } else { "created_low_defaults" }
     };
-    let launch = NativeGraphicsLaunch { config, config_path, config_source, settings_path, settings_action, changed_tags, backup_path };
+    let marker_action = if applied_config.as_ref() == Some(&config) && existed { "unchanged" } else {
+        write_native_graphics_marker(&marker_path, &config)?;
+        if applied_config.is_some() { "updated" } else if existed { "adopted_existing" } else { "created" }
+    };
+    let launch = NativeGraphicsLaunch { config, config_path, config_source, settings_path, settings_action,
+        changed_tags, backup_path, marker_path, marker_action };
     eprintln!("[config] native graphics {}", launch.status_json());
     Ok(launch)
+}
+
+fn write_native_graphics_marker(path: &Path, config: &NativeGraphics) -> anyhow::Result<()> {
+    use anyhow::Context;
+    use std::io::Write;
+    let data = serde_json::to_vec(&serde_json::json!({"width": config.width, "height": config.height,
+        "fps_limit": config.fps_limit, "graphics_preset": "low"}))?;
+    let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_nanos();
+    let temporary = path.with_file_name(format!(".native-graphics-applied.{stamp}.{}.tmp", std::process::id()));
+    let result = (|| -> anyhow::Result<()> {
+        let mut file = std::fs::OpenOptions::new().write(true).create_new(true).open(&temporary)
+            .context("create temporary native graphics marker")?;
+        file.write_all(&data).context("write native graphics marker")?;
+        file.sync_all().context("flush native graphics marker")?;
+        std::fs::rename(&temporary, path).context("replace native graphics marker")?;
+        Ok(())
+    })();
+    if result.is_err() { let _ = std::fs::remove_file(&temporary); }
+    result
 }
 
 #[cfg(test)]
@@ -468,6 +526,7 @@ mod native_graphics_tests {
             std::fs::write(self.0.join("native-graphics.json"), format!(r#"{{"width":{width},"height":{height},"fps_limit":{fps},"graphics_preset":"low"}}"#)).unwrap();
         }
         fn settings(&self) -> PathBuf { self.0.join("userdata/Documents/Rockstar Games/GTA V/settings.xml") }
+        fn marker(&self) -> PathBuf { self.0.join("native-graphics-applied.json") }
     }
     impl Drop for Fixture { fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); } }
 
@@ -531,6 +590,7 @@ mod native_graphics_tests {
         let launch = prepare_native_graphics(&fixture.0).unwrap();
         assert_eq!(launch.config_source, "built_in_default");
         assert_eq!(launch.settings_action, "created_low_defaults");
+        assert_eq!(launch.marker_action, "created");
         assert!(launch.backup_path.is_none());
         let xml = std::fs::read_to_string(fixture.settings()).unwrap();
         assert!(xml.contains("<version value=\"27\" />"));
@@ -542,17 +602,23 @@ mod native_graphics_tests {
     }
 
     #[test]
-    fn native_graphics_backs_up_existing_xml_before_atomic_update() {
+    fn native_graphics_backs_up_existing_xml_before_dimension_change() {
         let fixture = Fixture::new();
         fixture.config(1280, 720, 30);
         let path = fixture.settings();
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, NATIVE_DEFAULT_SETTINGS).unwrap();
+        write_native_graphics_marker(&fixture.marker(), &NativeGraphics::default()).unwrap();
         let launch = prepare_native_graphics(&fixture.0).unwrap();
         assert_eq!(launch.config_source, "file");
         assert_eq!(launch.settings_action, "updated_with_backup");
+        assert_eq!(launch.changed_tags, vec!["RefreshRate".to_string(), "ScreenHeight".to_string(), "ScreenWidth".to_string()]);
+        assert_eq!(launch.marker_action, "updated");
         assert_eq!(std::fs::read_to_string(launch.backup_path.unwrap()).unwrap(), NATIVE_DEFAULT_SETTINGS);
-        assert!(std::fs::read_to_string(path).unwrap().contains("<RefreshRate value=\"30\" />"));
+        let xml = std::fs::read_to_string(path).unwrap();
+        assert!(xml.contains("<RefreshRate value=\"30\" />"));
+        assert!(!xml.contains("<TextureQuality"));
+        assert!(!xml.contains("<ShadowQuality"));
     }
 
     #[test]
@@ -562,6 +628,7 @@ mod native_graphics_tests {
         let path = fixture.settings();
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, NATIVE_DEFAULT_SETTINGS).unwrap();
+        write_native_graphics_marker(&fixture.marker(), &NativeGraphics::default()).unwrap();
         let save = fixture.0.join("SGTA50000");
         std::fs::write(&save, [9, 0, 255, 32]).unwrap();
         let launch = prepare_native_graphics(&fixture.0).unwrap();
@@ -574,6 +641,43 @@ mod native_graphics_tests {
         assert_eq!(std::fs::read_to_string(launch.backup_path.unwrap()).unwrap(), NATIVE_DEFAULT_SETTINGS);
         assert_eq!(prepare_native_graphics(&fixture.0).unwrap().settings_action, "unchanged");
         assert_eq!(NativeGraphics::default(), NativeGraphics { width: 960, height: 540, fps_limit: 60 });
+    }
+
+    #[test]
+    fn native_existing_xml_without_marker_is_adopted_byte_for_byte() {
+        let fixture = Fixture::new();
+        fixture.config(1920, 1080, 60);
+        let path = fixture.settings();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let xml = NATIVE_DEFAULT_SETTINGS.replace("<Shadow_Distance value=\"1.000000\" />",
+            "<Shadow_Distance value=\"1.000000\" /><TextureQuality value=\"1\" /><ShadowQuality value=\"2\" /><Shader_SSA value=\"true\" />");
+        std::fs::write(&path, &xml).unwrap();
+        let launch = prepare_native_graphics(&fixture.0).unwrap();
+        assert_eq!(launch.settings_action, "unchanged");
+        assert_eq!(launch.marker_action, "adopted_existing");
+        assert!(launch.backup_path.is_none());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), xml);
+        let again = prepare_native_graphics(&fixture.0).unwrap();
+        assert_eq!(again.settings_action, "unchanged");
+        assert_eq!(again.marker_action, "unchanged");
+        assert_eq!(std::fs::read_to_string(path).unwrap(), xml);
+    }
+
+    #[test]
+    fn native_low_defaults_do_not_overwrite_game_normalization_on_restart() {
+        let fixture = Fixture::new();
+        let first = prepare_native_graphics(&fixture.0).unwrap();
+        assert_eq!(first.settings_action, "created_low_defaults");
+        let path = fixture.settings();
+        let normalized = std::fs::read_to_string(&path).unwrap()
+            .replace("<TextureQuality value=\"0\" />", "<TextureQuality value=\"1\" />")
+            .replace("<ShadowQuality value=\"0\" />", "<ShadowQuality value=\"2\" />")
+            .replace("<Shader_SSA value=\"false\" />", "<Shader_SSA value=\"true\" />");
+        std::fs::write(&path, &normalized).unwrap();
+        let next = prepare_native_graphics(&fixture.0).unwrap();
+        assert_eq!(next.settings_action, "unchanged");
+        assert!(next.changed_tags.is_empty());
+        assert_eq!(std::fs::read_to_string(path).unwrap(), normalized);
     }
 
     #[test]
