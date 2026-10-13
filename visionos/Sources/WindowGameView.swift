@@ -308,7 +308,8 @@ struct SantosSettingsView: View {
                         Text("30 FPS").tag(30)
                         Text("60 FPS").tag(60)
                     }
-                    Text("GTA graphics choices are preserved.").foregroundStyle(.secondary)
+                    Text("MSAA is turned off at launch for immersive view. FXAA and your other GTA graphics choices are preserved.")
+                        .font(.caption).foregroundStyle(.secondary)
                 }
                 .disabled(!runtime.canChangeGraphics)
                 CloudSaveSettingsView(runtime: runtime, saves: runtime.cloudSaves)

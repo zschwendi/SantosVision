@@ -258,7 +258,7 @@ impl NativeGraphicsLaunch {
             "config_path":self.config_path,"settings_path":self.settings_path,
             "settings_action":self.settings_action,"changed_tags":self.changed_tags,"backup_path":self.backup_path,
             "marker_path":self.marker_path,"marker_action":self.marker_action,
-            "settings_scope":"Low defaults on missing XML; existing GTA choices preserved unless the launcher resolution or FPS cap changes"})
+            "settings_scope":"Low defaults on missing XML; existing GTA choices preserved except MSAA, which is disabled for the current immersive depth path; launcher resolution and FPS changes apply separately"})
     }
 }
 
@@ -306,6 +306,7 @@ const NATIVE_DEFAULT_SETTINGS: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
   <version value="27" />
   <configSource>SMC_AUTO</configSource>
   <graphics>
+    <MSAA value="0" />
     <Shadow_Distance value="1.000000" />
     <Shadow_SplitZStart value="0.930000" />
     <Shadow_SplitZEnd value="0.890000" />
@@ -471,7 +472,7 @@ fn prepare_native_graphics(save_root: &Path) -> anyhow::Result<NativeGraphicsLau
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => (NATIVE_DEFAULT_SETTINGS.into(), false),
         Err(error) => return Err(error).with_context(|| format!("read {}", settings_path.display())),
     };
-    let (xml, changed_tags) = if !existed {
+    let (xml, mut changed_tags) = if !existed {
         low_settings_xml(&original, &config).context("create native low graphics defaults")?
     } else if applied_config.as_ref().is_some_and(|previous| previous != &config) {
         video_settings_xml(&original, &config).context("apply changed native resolution and frame cap")?
@@ -481,6 +482,15 @@ fn prepare_native_graphics(save_root: &Path) -> anyhow::Result<NativeGraphicsLau
         settings_xml_with_values(&original, std::collections::BTreeMap::new())
             .context("validate existing GTA settings")?
     };
+    // The current world-frame handoff requires actual single-sample depth.
+    // Do not accept MSAA targets as if they were qualified scene depth. Keep
+    // all other game choices, including FXAA, and use the existing exact backup.
+    let (xml, compatibility_tags) = settings_xml_with_values(&xml,
+        [( ("graphics", "MSAA"), "0".to_string() )].into_iter().collect())
+        .context("apply immersive single-sample depth compatibility")?;
+    changed_tags.extend(compatibility_tags);
+    changed_tags.sort();
+    changed_tags.dedup();
     let mut backup_path = None;
     let settings_action = if existed && xml == original { "unchanged" } else {
         let parent = settings_path.parent().unwrap();
@@ -721,6 +731,24 @@ mod native_graphics_tests {
         assert_eq!(next.settings_action, "unchanged");
         assert!(next.changed_tags.is_empty());
         assert_eq!(std::fs::read_to_string(path).unwrap(), normalized);
+    }
+
+    #[test]
+    fn native_msaa_compatibility_preserves_other_choices_and_exact_backup() {
+        let fixture = Fixture::new();
+        prepare_native_graphics(&fixture.0).unwrap();
+        let path = fixture.settings();
+        let changed = std::fs::read_to_string(&path).unwrap()
+            .replace("<MSAA value=\"0\" />", "<MSAA value=\"2\" />")
+            .replace("<TextureQuality value=\"0\" />", "<TextureQuality value=\"1\" />")
+            .replace("<FXAA_Enabled value=\"false\" />", "<FXAA_Enabled value=\"true\" />");
+        std::fs::write(&path, &changed).unwrap();
+        let launch = prepare_native_graphics(&fixture.0).unwrap();
+        assert_eq!(launch.changed_tags, ["MSAA"]);
+        assert_eq!(std::fs::read_to_string(launch.backup_path.unwrap()).unwrap(), changed);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(),
+            changed.replace("<MSAA value=\"2\" />", "<MSAA value=\"0\" />"));
+        assert_eq!(prepare_native_graphics(&fixture.0).unwrap().settings_action, "unchanged");
     }
 
     #[test]
