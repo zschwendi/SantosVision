@@ -646,12 +646,89 @@ static RE_LOC_U: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"@location\((\d+
 struct TexDesc { w: u32, h: u32, d: u32, mips: u32, samples: u32, dim: TextureDimension }
 struct Proxy {
     tex: Texture,
+    trace_native_identity: Option<u64>,
     format: TextureFormat,
     dirty: bool,
     passes: Vec<(TextureView, BindGroup)>,
 }
+
+fn trace_native_texture(tag:Option<u64>,kind:&str)->serde_json::Value {
+    tag.map(|tag|serde_json::json!({"kind":kind,"tag":tag,"scope":"this_process",
+        "basis":"tag minted for returned wgpu Texture handle at allocation site; parent Eq where view reported",
+        "identity_kind":"wgpu_texture_handle_lifetime","backend_allocation_validated":false,"backend_id":null}))
+        .unwrap_or(serde_json::Value::Null)
+}
+
+#[cfg(all(test,target_os="macos"))]
+mod native_trace_evidence_tests {
+    use super::*;
+    fn gpu(enabled:bool)->Gpu {
+        let mut config=wasmtime::Config::new(); config.wasm_threads(true); config.shared_memory(true);
+        let engine=wasmtime::Engine::new(&config).unwrap();
+        let mem=SharedMemory::new(&engine,wasmtime::MemoryType::shared(1,1)).unwrap();
+        let mut gpu=Gpu::new(mem,0,65536,0,None).unwrap();
+        gpu.command_trace=crate::world_command_trace::CommandTrace::fixture(enabled); gpu
+    }
+    fn texture(g:&mut Gpu,id:u32) { g.create_texture(id,2,1,1,1,1,1,28,BIND_RT|BIND_SRV,1); }
+
+    #[test]
+    fn allocation_tags_match_retained_parent_not_reused_guest_id_or_render_uid() {
+        let mut g=gpu(true); let uid=g.next_uid; texture(&mut g,1);
+        assert_eq!(g.next_uid,uid);
+        let first=g.tex(1).unwrap().trace_native_identity.unwrap();
+        let view=g.tex(1).unwrap().tex.create_view(&TextureViewDescriptor::default());
+        let clone=view.clone();
+        assert_eq!(g.command_trace_view_parent(1,&clone)["native_allocation"]["tag"],first);
+        texture(&mut g,1);
+        assert_ne!(g.tex(1).unwrap().trace_native_identity.unwrap(),first);
+        assert_eq!(g.command_trace_view_parent(1,&view)["resolved"],false);
+        assert_eq!(g.command_trace_view_parent(1,&view)["parent_eq"],false);
+        g.create_buffer(7,16,1,0,4);
+        let buffer=g.command_trace_resource(7);
+        assert_eq!(buffer["native_allocation"]["identity_kind"],"wgpu_buffer_handle_lifetime");
+        assert_eq!(buffer["native_allocation"]["backend_allocation_validated"],false);
+        assert_eq!(buffer["native_allocation"]["tag"],g.buf(7).unwrap().identity);
+        let mut off=gpu(false); let uid=off.next_uid; texture(&mut off,1);
+        assert!(off.tex(1).unwrap().trace_native_identity.is_none()); assert_eq!(off.next_uid,uid);
+    }
+
+    #[test]
+    fn proxy_allocation_is_distinct_and_parent_eq_identifies_it() {
+        let mut g=gpu(true); texture(&mut g,1);
+        g.float_to_depth_proxy(1).unwrap();
+        let texture=g.tex(1).unwrap(); let proxy=texture.proxy_fdepth.as_ref().unwrap();
+        let view=proxy.tex.create_view(&TextureViewDescriptor::default());
+        assert_ne!(texture.trace_native_identity,proxy.trace_native_identity);
+        let evidence=g.command_trace_view_parent(1,&view);
+        assert_eq!(evidence["native_allocation"]["kind"],"texture_proxy");
+        assert_eq!(evidence["native_allocation"]["tag"],proxy.trace_native_identity.unwrap());
+        g.flush();
+    }
+
+    #[test]
+    fn retained_pass_uses_its_key_and_pending_clear_enumeration_is_bounded() {
+        let mut g=gpu(true); texture(&mut g,1); texture(&mut g,2);
+        g.s.rt[0]=Rt{tex:1,mip:0,slice:0,fmt:28}; assert!(g.ensure_pass());
+        let tag=g.tex(1).unwrap().trace_native_identity.unwrap();
+        g.s.rt[0].tex=2;
+        let native=g.command_trace_native_context();
+        assert_eq!(native["attachments"][0]["guest_id"],1);
+        assert_eq!(native["attachments"][0]["retained_parent"]["native_allocation"]["tag"],tag);
+        for i in 0..70 { g.pending_clears.entry(9).or_default().push((0,0,PendingClear{color:None,depth:Some(i as f32),stencil:Some(i)})); }
+        let native=g.command_trace_native_context();
+        assert_eq!(native["pending_clears_observed"],70);
+        assert_eq!(native["pending_clears_omitted"],6);
+        assert_eq!(native["pending_clears"].as_array().unwrap().len(),64);
+        assert_eq!(native["pending_clears"][63]["queue_index"],63);
+        assert_eq!(native["pending_clears"][0]["current_target_native_allocation"],serde_json::Value::Null);
+        assert_eq!(g.pending_clears[&9].len(),70);
+        assert_eq!(g.s.rt[0].tex,2);
+        g.pending_clears.remove(&9); g.flush();
+    }
+}
 struct Tex {
     tex: Texture,
+    trace_native_identity: Option<u64>,
     desc: TexDesc,
     format: TextureFormat,
     // Original compressed format when the adapter uses decoded storage.
@@ -1724,7 +1801,7 @@ impl Gpu {
             "world":self.world_view.as_ref().map(crate::world_ui::marker),
             "resources":resources,"resource_access_rows_omitted":resource_count.saturating_sub(64),
             "resource_access_caveat":"pre-exec potential bound accesses; not shader-consumption or native graph proof",
-            "payload":payload,"inherited_state":inherited});
+            "payload":payload,"inherited_state":inherited,"native_context":self.command_trace_native_context()});
         self.command_trace.command(op,record);
     }
 
@@ -1732,12 +1809,28 @@ impl Gpu {
         use serde_json::json;
         match self.obj(id) {
             Some(Obj::Buf(b))=>json!({"kind":"buffer","identity":b.identity,"version":b.version,"size":b.size,"stride":b.stride,
+                "native_allocation":b.gpu.as_ref().map(|_|json!({"kind":"buffer","tag":b.identity,
+                    "basis":"returned wgpu Buffer handle associated with host Buf lifetime UID","scope":"this_gpu_instance",
+                    "identity_kind":"wgpu_buffer_handle_lifetime","backend_allocation_validated":false,"backend_id":null})),
+                "native_counter_present":b.counter.is_some(),"native_counter_allocation":null,
                 "gpu_contents_captured":false,"version_caveat":"host buffer version is not a complete GPU-write generation"}),
             Some(Obj::Tex(t))=>json!({"kind":"texture","size":[t.desc.w,t.desc.h,t.desc.d],"mips":t.desc.mips,
-                "samples":t.desc.samples,"format":format!("{:?}",t.format),"generation":null,"contents_captured":false}),
+                "samples":t.desc.samples,"format":format!("{:?}",t.format),"generation":null,"contents_captured":false,
+                "native_allocation":trace_native_texture(t.trace_native_identity,"texture"),
+                "proxies":([("depth",t.proxy_depth.as_ref()),("stencil",t.proxy_stencil.as_ref()),("float_depth",t.proxy_fdepth.as_ref())].into_iter()
+                    .filter_map(|(kind,proxy)|proxy.map(|p|json!({"kind":kind,"dirty":p.dirty,"native_allocation":trace_native_texture(p.trace_native_identity,"texture_proxy")}))).collect::<Vec<_>>())}),
             Some(Obj::Shader(s))=>json!({"kind":"shader","stage":s.stage,"hash":s.hash,"native_variant_captured":false}),
-            Some(Obj::Srv(v))|Some(Obj::Uav(v))=>json!({"kind":"view","resource":v.res,"is_buffer":v.is_buf,
-                "desc":[v.fmt,v.vdim,v.a,v.b,v.c,v.d],"generation":null}),
+            Some(Obj::Srv(v))|Some(Obj::Uav(v))=>{
+                let mut cached=BTreeMap::new();
+                for (key,view) in &v.views { cached.insert(key,view); if cached.len()>8 { cached.pop_last(); } }
+                json!({"kind":"view","resource":v.res,"is_buffer":v.is_buf,
+                    "desc":[v.fmt,v.vdim,v.a,v.b,v.c,v.d],"generation":null,
+                    "current_resource_native_allocation":self.tex(v.res).map(|t|trace_native_texture(t.trace_native_identity,"texture")),
+                    "cached_native_views":cached.iter().map(|(key,view)|json!({"key":key,
+                        "retained_parent_allocation":self.command_trace_view_parent(v.res,view),"view_backend_identity":null})).collect::<Vec<_>>(),
+                    "cached_native_views_omitted":v.views.len().saturating_sub(8),
+                    "cache_caveat":"exact parent Eq where matched; cached entries are not proof that shader consumed any entry"})
+            },
             Some(Obj::Layout(_))=>json!({"kind":"layout","generation":null}),
             Some(Obj::State(s))=>json!({"kind":"state","words":s.words.iter().take(128).copied().collect::<Vec<_>>(),
                 "words_omitted":s.words.len().saturating_sub(128),"generation":null}),
@@ -1759,7 +1852,71 @@ impl Gpu {
             "viewports_omitted":self.s.viewports.len().saturating_sub(128),
             "scissors":self.s.scissors.iter().take(128).copied().collect::<Vec<_>>(),
             "scissors_omitted":self.s.scissors.len().saturating_sub(128),
-            "native_pass_state_and_pending_clears_captured":false})
+            "native_pass_state_and_pending_clears_evidence_present":true})
+    }
+
+    fn command_trace_view_parent(&self,id:u32,view:&TextureView)->serde_json::Value {
+        let Some(t)=self.tex(id) else { return serde_json::json!({"resolved":false,"reason":"current_texture_missing_or_retired"}); };
+        if view.texture()==&t.tex {
+            return serde_json::json!({"resolved":t.trace_native_identity.is_some(),"parent_eq":true,
+                "native_allocation":trace_native_texture(t.trace_native_identity,"texture")});
+        }
+        for proxy in [&t.proxy_depth,&t.proxy_stencil,&t.proxy_fdepth].into_iter().flatten() {
+            if view.texture()==&proxy.tex {
+                return serde_json::json!({"resolved":proxy.trace_native_identity.is_some(),"parent_eq":true,
+                    "native_allocation":trace_native_texture(proxy.trace_native_identity,"texture_proxy")});
+            }
+        }
+        serde_json::json!({"resolved":false,"reason":"cached_parent_not_current_texture_or_proxy","parent_eq":false})
+    }
+
+    fn command_trace_native_context(&self)->serde_json::Value {
+        use serde_json::json;
+        let key=self.pass_key.as_ref().map(PassKey::words);
+        let mut attachments=Vec::new();
+        if self.pass.is_some() {
+            if let (Some(key),Some(info))=(key,self.pass_info.as_ref()) {
+                for slot in 0..8 {
+                    let Some(format)=info.rt_formats.get(slot).copied().flatten() else { continue; };
+                    let q=slot*4; let id=key[q];
+                    let view=self.tex(id).and_then(|t|t.views.get(&(format,key[q+1],key[q+2])));
+                    attachments.push(json!({"aspect":"color","slot":slot,"guest_id":id,"mip":key[q+1],"slice":key[q+2],
+                        "format":format!("{format:?}"),"retained_parent":view.map(|view|self.command_trace_view_parent(id,view)),
+                        "attachment_basis":"retained pass key and cached native attachment; texture lifetime repair retires affected pass"}));
+                }
+                if let Some(format)=info.ds_format {
+                    let id=key[32];
+                    let view=self.tex(id).and_then(|t|t.views.get(&(format,key[33],key[34])));
+                    attachments.push(json!({"aspect":"depth_stencil","guest_id":id,"mip":key[33],"slice":key[34],
+                        "format":format!("{format:?}"),"retained_parent":view.map(|view|self.command_trace_view_parent(id,view)),
+                        "attachment_basis":"retained pass key and cached native attachment; texture lifetime repair retires affected pass"}));
+                }
+            }
+        }
+        // Enumerate deterministically with bounded retention, even if the live
+        // host map contains more subresources than the report can retain.
+        let mut pending=BTreeMap::new(); let mut count=0usize;
+        for (&id,subresources) in &self.pending_clears {
+            for (index,&(mip,slice,clear)) in subresources.iter().enumerate() {
+                count+=1; pending.insert((id,mip,slice,index),clear);
+                if pending.len()>64 { pending.pop_last(); }
+            }
+        }
+        json!({"capture_phase":"pre_exec","encoder_epoch":self.enc_epoch,"pass_active":self.pass.is_some(),
+            "pass_key":key,"pass_info":self.pass_info.as_ref().map(|info|json!({"width":info.width,"height":info.height,
+                "samples":info.samples,"read_only_depth":info.ro_depth,"read_only_stencil":info.ro_stencil})),
+            "attachments":attachments,"pipeline_host_uid":self.pass_st.pl,"bind_group_host_uids":self.pass_st.bg,
+            "applied_viewport":self.pass_st.vp,"applied_scissor":self.pass_st.sc,"applied_blend_constant":self.pass_st.bf,
+            "applied_viewport_f32_bits":self.pass_st.vp.map(|values|values.map(f32::to_bits)),
+            "applied_blend_constant_f64_bits":self.pass_st.bf.map(|values|values.map(f64::to_bits)),
+            "applied_stencil_reference":self.pass_st.sref,
+            "pending_clears":pending.into_iter().map(|((id,mip,slice,index),clear)|json!({"guest_id":id,"mip":mip,"slice":slice,"queue_index":index,
+                "current_target_native_allocation":self.tex(id).map(|t|trace_native_texture(t.trace_native_identity,"texture")),
+                "color_f64_bits":clear.color.map(|c|[c.r.to_bits(),c.g.to_bits(),c.b.to_bits(),c.a.to_bits()]),
+                "depth_f32_bits":clear.depth.map(f32::to_bits),"stencil":clear.stencil,
+                "association":"pending clear owns no native handle; current guest-ID target only"})).collect::<Vec<_>>(),
+            "pending_clears_observed":count,"pending_clears_omitted":count.saturating_sub(64),
+            "native_graph_complete":false,"actual_gpu_execution_certified":false})
     }
 
     fn reset_state(&mut self) {
@@ -1828,8 +1985,9 @@ impl Gpu {
             label: None, size, mip_level_count: mips.max(1), sample_count: samples, dimension, format: m.format, usage, view_formats: &views,
         };
         let tex = match self.scoped(&format!("createTexture id={id} dim={dim} {}x{}x{} mips={mips} dxgi={dxgi} bind=0x{bind:x} samples={samples} -> {:?} usage {:?}", size.width, size.height, size.depth_or_array_layers, m.format, usage), |d| d.create_texture(&desc)) { Some(t) => t, None => return };
+        let trace_native_identity=crate::world_command_trace::native_texture_tag(self.command_trace.captures_native_identities());
         self.set_obj(id, Obj::Tex(Tex {
-            tex, desc: TexDesc { w: size.width, h: size.height, d: size.depth_or_array_layers, mips: mips.max(1), samples, dim: dimension },
+            tex, trace_native_identity, desc: TexDesc { w: size.width, h: size.height, d: size.depth_or_array_layers, mips: mips.max(1), samples, dim: dimension },
             format: m.format, bc_source, views: HashMap::new(), a8: m.a8, enc: 0, in_bg: false, proxy_depth: None, proxy_stencil: None,
             proxy_fdepth: None, blit_bg: None, mip_passes: None,
         }));
@@ -2407,6 +2565,7 @@ impl Gpu {
         let pl = self.proxy_pipeline(if stencil { "stencil" } else { "depth" });
         let (desc, tex) = { let t = self.tex(id)?; (t.desc, t.tex.clone()) };
         let dev = self.device.clone();
+        let trace_identities=self.command_trace.captures_native_identities();
         let t = self.tex_mut(id).unwrap();
         let slot = if stencil { &mut t.proxy_stencil } else { &mut t.proxy_depth };
         if slot.is_none() {
@@ -2427,7 +2586,8 @@ impl Gpu {
                     passes.push((dst, bg));
                 }
             }
-            *slot = Some(Proxy { tex: ptex, format: fmt, dirty: true, passes });
+            let trace_native_identity=crate::world_command_trace::native_texture_tag(trace_identities);
+            *slot = Some(Proxy { tex: ptex, trace_native_identity, format: fmt, dirty: true, passes });
         }
         let px = slot.as_mut().unwrap();
         let out = (px.tex.clone(), px.format);
@@ -2464,6 +2624,7 @@ impl Gpu {
         let pl = self.f2d_pipeline.clone().unwrap();
         let (desc, tex) = { let t = self.tex(id)?; (t.desc, t.tex.clone()) };
         let dev = self.device.clone();
+        let trace_identities=self.command_trace.captures_native_identities();
         let t = self.tex_mut(id).unwrap();
         if t.proxy_fdepth.is_none() {
             let ptex = dev.create_texture(&TextureDescriptor {
@@ -2479,7 +2640,8 @@ impl Gpu {
                     passes.push((dst, bg));
                 }
             }
-            t.proxy_fdepth = Some(Proxy { tex: ptex, format: TextureFormat::Depth32Float, dirty: true, passes });
+            let trace_native_identity=crate::world_command_trace::native_texture_tag(trace_identities);
+            t.proxy_fdepth = Some(Proxy { tex: ptex, trace_native_identity, format: TextureFormat::Depth32Float, dirty: true, passes });
         }
         let px = t.proxy_fdepth.as_mut().unwrap();
         let out = (px.tex.clone(), px.format);

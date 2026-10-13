@@ -13,6 +13,7 @@ mod float_sampling;
 mod gpu;
 mod heap_autopsy;
 mod host;
+mod guest_call_scope;
 mod input;
 pub mod import;
 mod io;
@@ -65,6 +66,12 @@ pub struct Runtime {
 
 pub struct HostState {
     pub pthread: u64,
+    guest_calls: guest_call_scope::StoreLifetime,
+}
+impl HostState {
+    pub fn new(pthread: u64) -> Self {
+        Self { pthread, guest_calls: guest_call_scope::StoreLifetime::new() }
+    }
 }
 
 pub static RT: OnceLock<Arc<Runtime>> = OnceLock::new();
@@ -231,7 +238,7 @@ pub fn run_engine(rt: &Arc<Runtime>, args: Vec<String>) -> Result<()> {
     eprintln!("[host] main: {}", args.join(" "));
     let main = instance.get_func(&mut store, "__main_argc_argv").context("no main")?;
     let mut out = [Val::I32(0)];
-    match main.call(&mut store, &[Val::I32(args.len() as i32), Val::I64(argv as i64)], &mut out) {
+    match guest_call_scope::call(&mut store, guest_call_scope::Kind::Ordinary, |store| main.call(store, &[Val::I32(args.len() as i32), Val::I64(argv as i64)], &mut out)) {
         Ok(()) => eprintln!("[host] main returned {:?}", out[0]),
         Err(_) if host::take_unwind() => {
             eprintln!("[host] main unwound with a live runtime; waiting on engine threads");
@@ -426,7 +433,7 @@ mod platform_tests {
 }
 
 pub fn instantiate(rt: &Arc<Runtime>, pthread: u64) -> Result<(Store<HostState>, Instance)> {
-    let mut store = Store::new(&rt.engine, HostState { pthread });
+    let mut store = Store::new(&rt.engine, HostState::new(pthread));
     let mut linker: Linker<HostState> = Linker::new(&rt.engine);
     linker.define(&store, "env", "memory", rt.mem.clone())?;
     for (idx, imp) in rt.imports.iter().enumerate() {
@@ -434,7 +441,7 @@ pub fn instantiate(rt: &Arc<Runtime>, pthread: u64) -> Result<(Store<HostState>,
             host::call(caller, idx, params, results).map_err(wasmtime::Error::from_anyhow)
         })?;
     }
-    let instance = linker.instantiate(&mut store, &rt.module)?;
+    let instance = guest_call_scope::call(&mut store, guest_call_scope::Kind::Instantiate, |store| linker.instantiate(store, &rt.module))?;
     Ok((store, instance))
 }
 
@@ -484,7 +491,7 @@ fn run_pthread(rt: &Arc<Runtime>, ptr: u64, start_routine: u64, arg: u64) -> Res
         .and_then(|r| r.as_func().flatten().cloned())
         .with_context(|| format!("null start routine {start_routine}"))?;
     let mut res = [Val::I64(0)];
-    let result = match entry.call(&mut store, &[Val::I64(arg as i64)], &mut res) {
+    let result = match guest_call_scope::call(&mut store, guest_call_scope::Kind::Ordinary, |store| entry.call(store, &[Val::I64(arg as i64)], &mut res)) {
         Ok(()) => match res[0] { Val::I64(v) => v, Val::I32(v) => v as i64, _ => 0 },
         Err(_) if host::take_unwind() => return Ok(()),
         Err(e) => {
@@ -512,7 +519,7 @@ pub fn call_export(store: &mut Store<HostState>, inst: &Instance, name: &str, ar
     let ty = f.ty(&mut *store);
     let args = coerce_args(args, &ty);
     let mut results: Vec<Val> = ty.results().map(|t| default_val(&t)).collect();
-    f.call(&mut *store, &args, &mut results)?;
+    guest_call_scope::call(store, guest_call_scope::Kind::Ordinary, |store| f.call(store, &args, &mut results))?;
     Ok(results)
 }
 
@@ -531,11 +538,11 @@ fn build_argv(store: &mut Store<HostState>, inst: &Instance, mem: &SharedMemory,
     let mut ptrs = Vec::new();
     for a in args {
         let bytes = [a.as_bytes(), &[0]].concat();
-        let p = alloc.call(&mut *store, bytes.len() as i64)? as u64;
+        let p = guest_call_scope::call(store, guest_call_scope::Kind::Ordinary, |store| alloc.call(store, bytes.len() as i64))? as u64;
         write_bytes(mem, p, &bytes);
         ptrs.push(p);
     }
-    let argv = alloc.call(&mut *store, ((ptrs.len() + 1) * 8) as i64)? as u64;
+    let argv = guest_call_scope::call(store, guest_call_scope::Kind::Ordinary, |store| alloc.call(store, ((ptrs.len() + 1) * 8) as i64))? as u64;
     for (i, p) in ptrs.iter().chain(std::iter::once(&0)).enumerate() {
         write_u64(mem, argv + i as u64 * 8, *p);
     }

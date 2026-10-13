@@ -12,6 +12,7 @@ const MAX_HASH_BYTES: usize = 16 * 1024 * 1024;
 const MAX_REPORT_BYTES: usize = 17 * 1024 * 1024;
 const MAX_STATUS_BYTES: usize = 2048;
 static CLAIMED: AtomicBool = AtomicBool::new(false);
+static NATIVE_TEXTURE_TAG: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 static STATUS: LazyLock<Mutex<Value>> = LazyLock::new(|| Mutex::new(json!({
     "schema":1,"enabled":false,"state":"disabled"
 })));
@@ -67,6 +68,11 @@ impl CommandTrace {
     pub(crate) fn wants_command(&self, opcode: u32) -> bool {
         self.enabled && !self.finished && (self.start.is_some() || opcode == 7)
     }
+
+    pub(crate) fn captures_native_identities(&self) -> bool { self.enabled && !self.finished }
+
+    #[cfg(test)]
+    pub(crate) fn fixture(enabled: bool) -> Self { Self::new(enabled,None) }
 
     pub(crate) fn retaining_commands(&self) -> bool {
         self.records.len() < self.max_records && self.record_bytes < self.max_bytes
@@ -132,7 +138,7 @@ impl CommandTrace {
             "limits":{"records":MAX_RECORDS,"record_bytes":MAX_BYTES,"full_report_bytes":MAX_REPORT_BYTES,"operand_bytes_per_command":MAX_OPERAND_BYTES,"upload_hash_bytes":MAX_HASH_BYTES},
             "qualification_caveat":"opening queued headset-camera marker; not proof that publish_world_frame or compositor acknowledgement succeeded",
             "snapshot_complete":false,
-            "missing":["pre-existing resource contents and texture/view generations",
+            "missing":["pre-existing resource contents; native identities only where actual allocation evidence is retained",
                 "GPU-written buffer/texture contents, query results and asynchronous host operations",
                 "native derived pipeline/shader variants, implicit passes/clears/proxies and resource transitions",
                 "retained native GPU resources and frozen simulation epoch; this file cannot certify replay or stereo"],
@@ -161,6 +167,14 @@ impl CommandTrace {
     fn status(&self, value: Value) {
         update_status(value);
     }
+}
+
+/// Minted for a returned native wgpu Texture handle at its allocation site.
+/// This is a process-scoped handle association, never a guest ID or GPU content
+/// generation. It retains no Texture handle and never changes render UIDs.
+pub(crate) fn native_texture_tag(enabled: bool) -> Option<u64> {
+    if !enabled { return None; }
+    NATIVE_TEXTURE_TAG.fetch_update(Ordering::Relaxed,Ordering::Relaxed,|tag|tag.checked_add(1)).ok()
 }
 
 fn update_status(value: Value) {

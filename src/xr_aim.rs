@@ -181,7 +181,8 @@ fn invoke_reticle_hider<T: AsContextMut<Data = HostState>>(store: &mut T, table:
     let Some(Ref::Func(Some(function))) = table.get(&mut *store, RETICLE_HIDE_TABLE_SLOT) else {
         anyhow::bail!("certified original reticle command table slot unavailable");
     };
-    function.typed::<i32, ()>(&mut *store)?.call(&mut *store, RETICLE_COMPONENT)?;
+    let function = function.typed::<i32, ()>(&mut *store)?;
+    crate::guest_call_scope::call(store, crate::guest_call_scope::Kind::Ordinary, |store| function.call(store, RETICLE_COMPONENT))?;
     Ok(())
 }
 
@@ -233,7 +234,7 @@ mod tests {
     fn original_table_dispatch_requires_certificate_and_exact_argument_type() {
         use std::sync::{Arc,atomic::{AtomicI32,Ordering}};
         use wasmtime::{Engine,Func,RefType,Store,TableType};
-        let engine=Engine::default();let mut store=Store::new(&engine,HostState{pthread:0});
+        let engine=Engine::default();let mut store=Store::new(&engine,HostState::new(0));
         let received=Arc::new(AtomicI32::new(-1));let sink=received.clone();
         let function=Func::wrap(&mut store,move |component:i32| {sink.store(component,Ordering::Relaxed);});
         let table=Table::new(&mut store,TableType::new(RefType::FUNCREF,48296,Some(48296)),Ref::Func(None)).unwrap();

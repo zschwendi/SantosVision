@@ -567,8 +567,8 @@ fn update_viewport(caller: &mut Caller<'_, HostState>, viewport: u64, camera: Op
         .typed::<(i64, i64), ()>(&mut *caller)?;
     let set_projection = caller.get_export("mp:XRSetViewportProjection").and_then(|e| e.into_func()).context("missing projection setter")?
         .typed::<(i64, i64), ()>(&mut *caller)?;
-    let stack = stack_get.call(&mut *caller, ())?;
-    let scratch = allocate.call(&mut *caller, 128)? as u64;
+    let stack = crate::guest_call_scope::call(caller, crate::guest_call_scope::Kind::Ordinary, |caller| stack_get.call(caller, ()))?;
+    let scratch = crate::guest_call_scope::call(caller, crate::guest_call_scope::Kind::Ordinary, |caller| allocate.call(caller, 128))? as u64;
     let result = (|| {
         let mem = &RT.get().context("missing runtime")?.mem;
         anyhow::ensure!(scratch != 0 && scratch.checked_add(128).is_some_and(|end| end <= mem.data_size() as u64), "camera scratch outside guest memory");
@@ -580,18 +580,18 @@ fn update_viewport(caller: &mut Caller<'_, HostState>, viewport: u64, camera: Op
             anyhow::ensure!(crate::write_bytes(mem, scratch + 64, &matrix_bytes(projection)), "projection scratch write failed");
         }
         // Setters regenerate the inverse, dependent matrices and frustum planes.
-        if camera.is_some() { set_camera.call(&mut *caller, (viewport as i64, scratch as i64))?; }
+        if camera.is_some() { crate::guest_call_scope::call(caller, crate::guest_call_scope::Kind::Ordinary, |caller| set_camera.call(caller, (viewport as i64, scratch as i64)))?; }
         if let (Some(projection),Some(fields)) = (projection,scalars) {
             let bytes: Vec<u8> = fields.into_iter().flat_map(f32::to_le_bytes).collect();
             anyhow::ensure!(crate::write_bytes(mem,viewport + 872,&bytes), "projection scalar write failed");
             anyhow::ensure!(crate::write_bytes(mem,viewport + 928,&[reverse_z(projection).context("unsupported depth direction")? as u8]), "projection direction write failed");
             // Calling RegenerateNearFarClip afterward would replace the custom
             // matrix. SetProjection instead regenerates its inverses/frustums.
-            set_projection.call(&mut *caller, (viewport as i64, (scratch + 64) as i64))?;
+            crate::guest_call_scope::call(caller, crate::guest_call_scope::Kind::Ordinary, |caller| set_projection.call(caller, (viewport as i64, (scratch + 64) as i64)))?;
         }
         Ok(())
     })();
-    let restored = restore.call(&mut *caller, stack);
+    let restored = crate::guest_call_scope::call(caller, crate::guest_call_scope::Kind::Ordinary, |caller| restore.call(caller, stack));
     result.and(restored.map_err(Into::into))
 }
 

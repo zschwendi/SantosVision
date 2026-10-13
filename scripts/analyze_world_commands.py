@@ -45,6 +45,76 @@ def words(value, label):
     return value
 
 
+def native_allocation(value):
+    if value is None:
+        return None
+    require(type(value) is dict and value.get("kind") in ("texture","texture_proxy","buffer"),"invalid native allocation kind")
+    require(uint(value.get("tag"),"native allocation tag")>0,"zero native allocation tag")
+    require(value.get("scope") in ("this_process","this_gpu_instance"),"invalid native allocation scope")
+    require(type(value.get("basis")) is str and len(value["basis"])<=192,"invalid native allocation basis")
+    require(value.get("backend_id") is None,"unexpected backend identity assertion")
+    require(value.get("backend_allocation_validated") is None or value.get("backend_allocation_validated") is False,"unexpected backend allocation validation assertion")
+    return {key:value.get(key) for key in ("kind","tag","scope","basis","backend_id","identity_kind","backend_allocation_validated")}
+
+
+def retained_parent(value):
+    if value is None:
+        return None
+    require(type(value) is dict and type(value.get("resolved")) is bool,"invalid retained parent evidence")
+    allocation=native_allocation(value.get("native_allocation"))
+    if value["resolved"]:
+        require(value.get("parent_eq") is True and allocation is not None,"resolved native parent lacks exact Eq and allocation")
+    else:
+        require(allocation is None,"unresolved parent asserts native allocation")
+    return {"resolved":value["resolved"],"parent_eq":value.get("parent_eq"),"native_allocation":allocation,
+            "reason":str(value.get("reason",""))[:192]}
+
+
+def native_context(value):
+    if value is None:
+        return None
+    require(type(value) is dict and value.get("capture_phase")=="pre_exec","invalid native context")
+    require(type(value.get("pass_active")) is bool,"invalid native pass state")
+    key=value.get("pass_key")
+    if key is not None:
+        require(len(words(key,"pass key"))==37,"invalid retained pass key")
+    attachments=value.get("attachments")
+    require(type(attachments) is list and len(attachments)<=9,"native attachment cap invalid")
+    copied=[]
+    for row in attachments:
+        require(type(row) is dict and key is not None,"attachment lacks retained pass key")
+        ident=uint(row.get("guest_id"),"attachment id",(1<<32)-1)
+        aspect=row.get("aspect")
+        require(aspect in ("color","depth_stencil"),"invalid attachment aspect")
+        slot=uint(row.get("slot"),"attachment slot",7) if aspect=="color" else None
+        offset=slot*4 if slot is not None else 32
+        uint(row.get("mip"),"attachment mip",(1<<32)-1); uint(row.get("slice"),"attachment slice",(1<<32)-1)
+        require(ident==key[offset] and row.get("mip")==key[offset+1] and row.get("slice")==key[offset+2],"attachment conflicts with retained pass key")
+        copied.append({"aspect":aspect,"slot":slot,"guest_id":ident,"mip":key[offset+1],"slice":key[offset+2],
+                       "retained_parent":retained_parent(row.get("retained_parent")),"format":str(row.get("format",""))[:80]})
+    pending=value.get("pending_clears")
+    require(type(pending) is list and len(pending)<=64,"pending clear cap invalid")
+    observed=uint(value.get("pending_clears_observed"),"pending clear count")
+    omitted=uint(value.get("pending_clears_omitted"),"pending clear omissions")
+    require(observed==len(pending)+omitted,"pending clear counts conflict")
+    clears=[]
+    for row in pending:
+        require(type(row) is dict,"invalid pending clear")
+        for name in ("guest_id","mip","slice","queue_index"):
+            uint(row.get(name),"pending clear "+name)
+        color=row.get("color_f64_bits")
+        if color is not None:
+            require(type(color) is list and len(color)==4,"invalid clear color bits")
+            for bit in color:uint(bit,"clear color bits")
+        for name in ("depth_f32_bits","stencil"):
+            if row.get(name) is not None:uint(row[name],name,(1<<32)-1)
+        clears.append({**{k:row.get(k) for k in ("guest_id","mip","slice","queue_index","color_f64_bits","depth_f32_bits","stencil")},
+                       "current_target_native_allocation":native_allocation(row.get("current_target_native_allocation"))})
+    return {"capture_phase":"pre_exec","pass_active":value["pass_active"],"pass_key":key,"attachments":copied,
+            "pending_clears":clears,"pending_clears_omitted":omitted,"native_graph_complete":False,
+            "applied_state":{k:value.get(k) for k in ("encoder_epoch","pipeline_host_uid","bind_group_host_uids","applied_viewport","applied_scissor","applied_blend_constant","applied_viewport_f32_bits","applied_blend_constant_f64_bits","applied_stencil_reference")}}
+
+
 def no_duplicates(pairs):
     result = {}
     for key, value in pairs:
@@ -215,6 +285,30 @@ class Analyzer:
             if node is None:
                 continue
             pre = row["pre_exec"]
+            allocation=native_allocation(pre.get("native_allocation"))
+            if allocation is not None:
+                if node.get("native_allocation") not in (None,allocation):
+                    self.issue("native_allocation_conflict",id=ident)
+                    node["native_identity_conflict"]=True
+                node["native_allocation"]=allocation
+                node["native_allocation_observed_ordinal"]=self.ordinal
+            cached=pre.get("cached_native_views",[])
+            require(type(cached) is list and len(cached)<=8,"invalid cached native view evidence")
+            require(all(type(item) is dict for item in cached),"invalid cached native view row")
+            if "current_resource_native_allocation" in pre:
+                node["current_resource_native_allocation"]=native_allocation(pre["current_resource_native_allocation"])
+            proxies=pre.get("proxies",[])
+            require(type(proxies) is list and len(proxies)<=3,"invalid native proxy evidence")
+            if "proxies" in pre:
+                require(all(type(proxy) is dict for proxy in proxies),"invalid proxy evidence row")
+                node["native_proxy_allocations"]=[{"kind":str(proxy.get("kind",""))[:80],"dirty":proxy.get("dirty"),
+                    "native_allocation":native_allocation(proxy.get("native_allocation"))} for proxy in proxies]
+            if "cached_native_views" in pre:
+                node["cached_native_view_parents"]=[retained_parent(item.get("retained_parent_allocation")) for item in cached]
+                node["cached_native_view_observed_ordinal"]=self.ordinal
+                node["cached_native_views_omitted"]=uint(pre.get("cached_native_views_omitted",0),"cached native views omitted")
+                if node["cached_native_views_omitted"]:
+                    self.issue("native_cached_view_cap",omitted=node["cached_native_views_omitted"])
             kind = pre.get("kind","unknown")
             if kind == "missing":
                 node["observed_missing_ordinal"] = self.ordinal
@@ -246,11 +340,15 @@ class Analyzer:
         if node is None:
             return None
         view_key = None
+        cached_parents=[]
+        cached_observed=None
         native_resolution = "unknown_native_execution"
         old_candidates = []
         unresolved_view = False
         if through_view:
             view_key = node["key"]
+            cached_parents=node.get("cached_native_view_parents",[])
+            cached_observed=node.get("cached_native_view_observed_ordinal")
             is_buffer = node.get("view_is_buffer",node.get("descriptor",{}).get("is_buffer"))
             resource_id = node.get("resource_id",node.get("descriptor",{}).get("resource_id"))
             if resource_id is None:
@@ -271,6 +369,11 @@ class Analyzer:
                   "native_allocation_resolution":native_resolution,"native_allocation_known":False,
                   "cached_prior_lifetime_candidates":old_candidates[:4],"prior_candidates_omitted":max(0,len(old_candidates)-4),
                   "unresolved_view_resource":unresolved_view,"native_identity_conflict":node.get("native_identity_conflict",False)}
+        result["candidate_native_allocation"]=node.get("native_allocation")
+        result["candidate_native_allocation_observed_ordinal"]=node.get("native_allocation_observed_ordinal")
+        result["cached_native_view_parent_evidence"]=cached_parents
+        result["cached_native_view_observed_ordinal"]=cached_observed
+        result["cached_native_view_evidence_current"]=cached_observed==self.ordinal
         if mode == "possible_write" and not unresolved_view:
             if node["last_potential_writer"] != self.ordinal:
                 node["version_before_current_write"] = node["potential_write_version"]
@@ -309,6 +412,10 @@ class Analyzer:
         self.ordinal = row["ordinal"]
         op,w = row["opcode"],row["operands"]
         self.metadata(row.get("resources",[]))
+        resource_metadata_omitted=uint(row.get("resource_access_rows_omitted",0),"resource metadata omitted")
+        context=native_context(row.get("native_context"))
+        if context and context["pending_clears_omitted"]:
+            self.issue("native_pending_clear_cap",omitted=context["pending_clears_omitted"])
         reads,writes,configuration = [],[],[]
         details = {}
         candidates = []
@@ -419,6 +526,8 @@ class Analyzer:
             self.issue("payload_fingerprint_metadata_unavailable")
         self.timeline.append({"ordinal":self.ordinal,"opcode":op,"operation":NAMES.get(op,"unknown"),"world":world,
                               "accesses":refs,"accesses_omitted":max(0,len(unique)-MAX_REFS),"details":details,
+                              "native_context":context,
+                              "resource_metadata_rows_omitted":resource_metadata_omitted,
                               "boundary_candidates":candidates,"boundary_certified":False})
 
     def run(self):
@@ -433,9 +542,12 @@ class Analyzer:
                 "retained_potential_edge_list_complete":self.edge_omissions==0,
                 "timeline_access_lists_complete":not any(row["accesses_omitted"] for row in self.timeline),
                 "native_resource_graph_complete":False,
+                "native_evidence_untruncated":all(row["native_context"] is not None and row["native_context"]["pending_clears_omitted"]==0 for row in self.timeline)
+                    and all(row["resource_metadata_rows_omitted"]==0 for row in self.timeline)
+                    and not any(issue["kind"]=="native_cached_view_cap" for issue in self.issues) and self.issue_count==len(self.issues),
                 "host_candidate_access_reconstruction_complete":self.edge_omissions==0 and not any(
                     issue["kind"] in {"unknown_opcode","unresolved_view_resource","null_view_resource","kind_conflict",
-                        "view_resource_conflict","unobserved_native_lifetime_change","per_command_access_cap"} for issue in self.issues)
+                        "view_resource_conflict","unobserved_native_lifetime_change","native_allocation_conflict","per_command_access_cap"} for issue in self.issues)
                     and self.issue_count==len(self.issues),
                 "limits":{"edges":MAX_EDGES,"resource_lifetimes":MAX_RESOURCES,"accesses_per_command":MAX_REFS,"output_bytes":MAX_OUTPUT},
                 "missing":["native derived work and actual binding consumption","GPU contents and async effects","subresource alias/coverage and confirmed execution","foreground/HUD semantics and coherent stereo epoch"]}

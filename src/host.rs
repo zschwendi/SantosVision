@@ -57,6 +57,10 @@ fn now_ms() -> f64 {
 }
 
 fn export_call(caller: &mut Caller<'_, HostState>, name: &str, args: &[Val]) -> Result<Vec<Val>> {
+    export_call_kind(caller, name, args, crate::guest_call_scope::Kind::Ordinary)
+}
+
+fn export_call_kind(caller: &mut Caller<'_, HostState>, name: &str, args: &[Val], kind: crate::guest_call_scope::Kind) -> Result<Vec<Val>> {
     let f = caller
         .get_export(name)
         .and_then(|e| e.into_func())
@@ -64,7 +68,7 @@ fn export_call(caller: &mut Caller<'_, HostState>, name: &str, args: &[Val]) -> 
     let ty = f.ty(&mut *caller);
     let args = crate::coerce_args(args, &ty);
     let mut results: Vec<Val> = ty.results().map(|t| default_val(&t)).collect();
-    f.call(&mut *caller, &args, &mut results)?;
+    crate::guest_call_scope::call(caller, kind, |caller| f.call(caller, &args, &mut results))?;
     Ok(results)
 }
 
@@ -88,7 +92,7 @@ pub fn call(mut caller: Caller<'_, HostState>, idx: usize, params: &[Val], resul
         if has {
             ANY_PENDING.fetch_sub(1, Ordering::Relaxed);
             mailbox_await(mem, me);
-            export_call(&mut caller, "_emscripten_check_mailbox", &[])?;
+            export_call_kind(&mut caller, "_emscripten_check_mailbox", &[], crate::guest_call_scope::Kind::Mailbox)?;
         }
     }
 
@@ -232,7 +236,7 @@ fn invoke(caller: &mut Caller<'_, HostState>, params: &[Val], results: &mut [Val
         .and_then(|r| r.as_func().flatten().cloned())
         .ok_or_else(|| anyhow::anyhow!("invoke: null function index {index}"))?;
     let sp = export_call(caller, "emscripten_stack_get_current", &[])?;
-    match f.call(&mut *caller, &params[1..], results) {
+    match crate::guest_call_scope::call(caller, crate::guest_call_scope::Kind::Ordinary, |caller| f.call(caller, &params[1..], results)) {
         Ok(()) => Ok(()),
         Err(_) if take_longjmp() => {
             export_call(caller, "_emscripten_stack_restore", &sp)?;
@@ -343,4 +347,22 @@ fn mktime_utc(mem: &SharedMemory, tm: u64) -> i64 {
     let y = 1900 + year + mon.div_euclid(12);
     let m = mon.rem_euclid(12) + 1;
     days_from_civil(y, m, 1) * 86400 + (mday - 1) * 86400 + hour * 3600 + min * 60 + sec
+}
+
+// Test adapters exercise the actual invoke/recovery path without the global game
+// Runtime. They cannot be called by production or add guest imports.
+#[cfg(test)]
+pub(crate) fn guest_scope_test_invoke(caller: &mut Caller<'_, HostState>, params: &[Val], results: &mut [Val]) -> Result<()> {
+    invoke(caller, params, results)
+}
+#[cfg(test)]
+pub(crate) fn guest_scope_test_longjmp() -> Result<()> {
+    PENDING_LONGJMP.with(|pending| pending.set(true));
+    Err(LongJmp.into())
+}
+
+#[cfg(test)]
+pub(crate) fn guest_scope_test_unwind() -> Result<()> {
+    PENDING_UNWIND.with(|pending| pending.set(true));
+    Err(Unwind.into())
 }

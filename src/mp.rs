@@ -961,12 +961,13 @@ fn capture_native_controller_aim(c: &mut Cmd<'_, '_>, ped: i32) {
         let coord = c.caller.get_export("mp:GetGameplayCamCoord").and_then(|e| e.into_func())
             .ok_or_else(|| anyhow::anyhow!("original gameplay camera coordinate getter unavailable"))?
             .typed::<i64, ()>(&mut *c.caller)?;
-        coord.call(&mut *c.caller, c.scratch as i64)?;
+        let scratch = c.scratch as i64;
+        crate::guest_call_scope::call(c.caller, crate::guest_call_scope::Kind::Ordinary, |caller| coord.call(caller, scratch))?;
         let origin = [c.read_f32(0), c.read_f32(8), c.read_f32(16)];
         let rotation = c.caller.get_export("mp:GetGameplayCamRot").and_then(|e| e.into_func())
             .ok_or_else(|| anyhow::anyhow!("original gameplay camera rotation getter unavailable"))?
             .typed::<(i64, i32), ()>(&mut *c.caller)?;
-        rotation.call(&mut *c.caller, (c.scratch as i64, 2))?;
+        crate::guest_call_scope::call(c.caller, crate::guest_call_scope::Kind::Ordinary, |caller| rotation.call(caller, (scratch, 2)))?;
         let rotation_degrees = [c.read_f32(0), c.read_f32(8), c.read_f32(16)];
         let player = c.i("PlayerId", &[]);
         let sample = crate::xr_aim::GameplayAim {
@@ -1003,7 +1004,7 @@ fn call(caller: &mut Caller<'_, HostState>, name: &str, args: &[Val]) -> Option<
     let ty = f.ty(&mut *caller);
     let args = crate::coerce_args(args, &ty);
     let mut out: Vec<Val> = ty.results().map(|t| crate::default_val(&t)).collect();
-    if let Err(e) = f.call(&mut *caller, &args, &mut out) {
+    if let Err(e) = crate::guest_call_scope::call(caller, crate::guest_call_scope::Kind::Ordinary, |caller| f.call(caller, &args, &mut out)) {
         eprintln!("[mp] {name} trapped: {e}");
         return None;
     }

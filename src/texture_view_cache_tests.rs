@@ -100,7 +100,7 @@ fn metal_rt_replacement_rebuilds_only_its_open_attachment() {
     assert!(old_pass_retired);assert!(g.pdirty);assert_eq!(g.passes,first_passes+1);
     // The old encoded clear stays valid even though its guest slot was replaced.
     // Reinsert a separate reference only for readback, never to render into it.
-    g.set_obj(20,Obj::Tex(Tex {tex:old,desc:TexDesc {w:1,h:1,d:1,mips:1,samples:1,dim:TextureDimension::D2},format:TextureFormat::Rgba8Unorm,bc_source:None,views:HashMap::new(),a8:false,enc:0,in_bg:false,proxy_depth:None,proxy_stencil:None,proxy_fdepth:None,blit_bg:None,mip_passes:None}));
+    g.set_obj(20,Obj::Tex(Tex {tex:old,trace_native_identity:None,desc:TexDesc {w:1,h:1,d:1,mips:1,samples:1,dim:TextureDimension::D2},format:TextureFormat::Rgba8Unorm,bc_source:None,views:HashMap::new(),a8:false,enc:0,in_bg:false,proxy_depth:None,proxy_stencil:None,proxy_fdepth:None,blit_bg:None,mip_passes:None}));
     assert_eq!(pixel(&mut g,20),[255,0,0,255]);assert_eq!(g.errors.load(Ordering::Relaxed),0);
 }
 #[test]

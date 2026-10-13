@@ -126,6 +126,61 @@ class Tests(unittest.TestCase):
         self.assertFalse(result["host_candidate_access_reconstruction_complete"])
         self.assertTrue(result["retained_potential_edge_list_complete"])
 
+    def test_native_handle_evidence_does_not_certify_selected_binding_or_contents(self):
+        allocation={"kind":"texture","tag":123,"scope":"this_process","basis":"returned wgpu handle allocation site", "backend_id":None,
+                    "identity_kind":"wgpu_texture_handle_lifetime","backend_allocation_validated":False}
+        value=trace([(24,[1,0,1,2]),(32,[0,3,1,0,0,0])])
+        value["records"][1]["resources"]=[{"id":2,"pre_exec":{"kind":"view","resource":1,"is_buffer":False,
+            "cached_native_views":[{"key":"D2","retained_parent_allocation":{"resolved":True,"parent_eq":True,"native_allocation":allocation}}],"cached_native_views_omitted":0}}]
+        analyzer=m.Analyzer(value); result=analyzer.run()
+        edge=next(e for e in analyzer.timeline[-2]["accesses"] if e["through_view"])
+        self.assertEqual(edge["cached_native_view_parent_evidence"][0]["native_allocation"]["tag"],123)
+        self.assertFalse(edge["native_allocation_known"])
+        self.assertEqual(edge["cached_native_view_observed_ordinal"],2)
+        self.assertFalse(edge["cached_native_view_evidence_current"])
+        self.assertFalse(result["snapshot_complete"])
+        value["records"][2]["resources"]=[{"id":2,"pre_exec":{"kind":"view","resource":1,"is_buffer":False,"cached_native_views":[],"cached_native_views_omitted":0}}]
+        analyzer=m.Analyzer(value); analyzer.run()
+        edge=next(e for e in analyzer.timeline[-2]["accesses"] if e["through_view"])
+        self.assertEqual(edge["cached_native_view_parent_evidence"],[])
+        self.assertTrue(edge["cached_native_view_evidence_current"])
+
+    def test_native_pass_key_distinct_from_state_and_clear_omissions_preserved(self):
+        value=trace([]); key=[1,0,0,28]+[0]*33
+        context={"capture_phase":"pre_exec","pass_active":True,"pass_key":key,
+                 "attachments":[{"aspect":"color","slot":0,"guest_id":1,"mip":0,"slice":0,"retained_parent":None}],
+                 "pending_clears":[],"pending_clears_observed":2,"pending_clears_omitted":2}
+        value["records"][0]["native_context"]=context
+        analyzer=m.Analyzer(value); result=analyzer.run()
+        self.assertEqual(analyzer.timeline[0]["native_context"]["pass_key"][0],1)
+        self.assertEqual(analyzer.state["render_targets"][0][0],0)
+        self.assertIn("native_pending_clear_cap",[e["kind"] for e in result["issues_retained"]])
+        self.assertFalse(result["native_evidence_untruncated"])
+        context["attachments"][0]["guest_id"]=2
+        with self.assertRaises(ValueError):m.Analyzer(value).run()
+
+    def test_native_identity_conflict_invalidates_candidate_reconstruction(self):
+        value=trace([(5,[1,0,0,0,0,0,0]),(5,[1,0,0,0,0,0,0])])
+        for row,tag in zip(value["records"][1:3],[100,200]):
+            row["resources"]=[{"id":1,"pre_exec":{"kind":"texture","native_allocation":
+                {"kind":"texture","tag":tag,"scope":"this_process","basis":"returned handle","backend_id":None,"backend_allocation_validated":False}}}]
+        analyzer=m.Analyzer(value); result=analyzer.run()
+        self.assertFalse(result["host_candidate_access_reconstruction_complete"])
+        self.assertTrue(analyzer.live[1]["native_identity_conflict"])
+        value["records"][1]["resources"][0]["pre_exec"]["native_allocation"]["backend_allocation_validated"]=True
+        with self.assertRaises(ValueError):m.Analyzer(value).run()
+
+    def test_raw_resource_metadata_cap_invalidates_native_evidence_completeness(self):
+        value=trace([])
+        for row in value["records"]:
+            row["native_context"]={"capture_phase":"pre_exec","pass_active":False,"pass_key":None,"attachments":[],
+                                   "pending_clears":[],"pending_clears_observed":0,"pending_clears_omitted":0}
+        self.assertTrue(m.Analyzer(value).run()["native_evidence_untruncated"])
+        value["records"][0]["resource_access_rows_omitted"]=2
+        analyzer=m.Analyzer(value); result=analyzer.run()
+        self.assertFalse(result["native_evidence_untruncated"])
+        self.assertEqual(analyzer.timeline[0]["resource_metadata_rows_omitted"],2)
+
     def test_create_new_outputs_and_input_size_duplicate_rejection(self):
         with tempfile.TemporaryDirectory() as temp:
             base=Path(temp); source=base/"trace.json"; source.write_text(json.dumps(trace([])))
