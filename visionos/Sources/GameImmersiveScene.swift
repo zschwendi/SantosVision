@@ -10,6 +10,7 @@ struct GameImmersiveScene: CompositorContent {
     @ObservedObject var world: GameWorldModel
     @Environment(\.openWindow) private var openWindow
     @Environment(\.dismissWindow) private var dismissWindow
+    @Environment(\.dismissImmersiveSpace) private var dismissImmersiveSpace
     @Environment(\.scenePhase) private var scenePhase
     @State private var fallbackTask: Task<Void, Never>?
 
@@ -28,11 +29,16 @@ struct GameImmersiveScene: CompositorContent {
         .onAppear {
             fallbackTask?.cancel()
             fallbackTask = Task { @MainActor in
-                // Keep an escape route visible until actual game frames arrive.
+                // The window drawable pauses when the immersive camera owns
+                // presentation. Restore it if qualified game frames never arrive.
                 do { try await Task.sleep(for: .seconds(8)) }
                 catch { return }
                 if !Task.isCancelled, !world.hasPresentedFrames {
-                    openWindow(id: "game-controls")
+                    world.failImmersiveTransition("Immersive view could not show a game frame. Returned to the game window.")
+                    openWindow(id: "main")
+                    world.stopRenderer(reason: "first game frame timed out after 8 seconds")
+                    await dismissImmersiveSpace()
+                    world.isImmersiveActive = false
                 }
             }
         }

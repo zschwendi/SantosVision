@@ -18,6 +18,8 @@ final class GameWorldModel: ObservableObject {
     private var lifecycle: [[String: Any]] = []
     private var latestRendererState: [String: Any] = [:]
     private var lastFailure: String?
+    private var latestViewRequestFailure: [String: Any] = [:]
+    private var recordedStatusKeys = Set<String>()
     private weak var runtime: NativeRuntimeModel?
     private let log = Logger(subsystem: "com.zephyrstudios.santosvision", category: "GameWorldStatus")
 
@@ -29,6 +31,8 @@ final class GameWorldModel: ObservableObject {
         runtime.recordMetalCapabilities(layer.device)
         lastFailure = nil
         latestRendererState = [:]
+        latestViewRequestFailure = [:]
+        recordedStatusKeys.removeAll(keepingCapacity: true)
         recordState("renderer_constructor_started")
         let token = generation
         do {
@@ -38,6 +42,9 @@ final class GameWorldModel: ObservableObject {
                     switch event {
                     case .lifecycle(let event):
                         self.latestRendererState = event.reportValue
+                        if event.stage == "view_request_rejected" {
+                            self.latestViewRequestFailure = event.reportValue
+                        }
                         self.recordState(event.stage, detail: event.detail,
                                          appendEvent: event.stage != "frame_sample")
                         return
@@ -95,8 +102,14 @@ final class GameWorldModel: ObservableObject {
         if active, renderer != nil { XRHeadTracking.shared.resume() }
     }
 
-    func stopRenderer() {
-        recordState("renderer_stop_requested")
+    func failImmersiveTransition(_ message: String) {
+        lastFailure = message
+        status = message
+        recordState("first_frame_timeout", detail: message)
+    }
+
+    func stopRenderer(reason: String = "requested") {
+        recordState("renderer_stop_requested", detail: reason)
         generation = UUID()
         startup?.cancel()
         startup = nil
@@ -107,6 +120,17 @@ final class GameWorldModel: ObservableObject {
     }
 
     private func recordState(_ stage: String, detail: String? = nil, appendEvent: Bool = true) {
+        var appendEvent = appendEvent
+        if ["renderer_status", "view_request_rejected", "view_request_recovered"].contains(stage) {
+            // Repeated waiting/failure updates must not evict startup evidence.
+            // Retain at most 64 distinct status keys per renderer generation.
+            let key = stage + "|" + (detail ?? "")
+            if recordedStatusKeys.contains(key) || recordedStatusKeys.count >= 64 {
+                appendEvent = false
+            } else {
+                recordedStatusKeys.insert(key)
+            }
+        }
         if appendEvent {
             var event: [String: Any] = ["stage": stage, "generation": generation.uuidString,
                 "uptime_seconds": ProcessInfo.processInfo.systemUptime]
@@ -118,7 +142,8 @@ final class GameWorldModel: ObservableObject {
             "scene_active": appActive, "immersive_open": isImmersiveActive,
             "opening": isOpening, "has_presented_game_frames": hasPresentedFrames,
             "renderer_exists": renderer != nil, "generation": generation.uuidString,
-            "renderer": latestRendererState, "events": lifecycle]
+            "renderer": latestRendererState, "events": lifecycle,
+            "latest_rejected_view_request": latestViewRequestFailure]
         if let lastFailure { value["last_failure"] = lastFailure }
         runtime?.recordWorldState(value)
     }

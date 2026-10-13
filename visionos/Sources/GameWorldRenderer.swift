@@ -49,6 +49,7 @@ struct GameWorldLifecycleEvent: Sendable {
     var detail: String? = nil
     var viewCount: Int? = nil
     var trackedPose: Bool? = nil
+    var requestBytesHex: String? = nil
 
     var reportValue: [String: Any] {
         var value: [String: Any] = ["stage": stage, "uptime_seconds": uptime,
@@ -58,6 +59,7 @@ struct GameWorldLifecycleEvent: Sendable {
         if let detail { value["detail"] = detail }
         if let viewCount { value["view_count"] = viewCount }
         if let trackedPose { value["tracked_pose"] = trackedPose }
+        if let requestBytesHex { value["request_bytes_hex"] = requestBytesHex }
         return value
     }
 }
@@ -313,6 +315,26 @@ private struct GameWorldPathCounters {
     mutating func copyFallback(_ reason: String) { copyFallbacks[reason, default: 0] &+= 1 }
 }
 
+// BEGIN GameWorldStatusLimiter
+/// Status changes can alternate within one render frame. Bound expensive main
+/// actor/report updates while preserving the first occurrence of each error.
+struct GameWorldStatusLimiter {
+    private var lastMessage = ""
+    private var lastReported: [String: Double] = [:]
+    mutating func shouldReport(_ message: String, at now: Double) -> Bool {
+        guard message != lastMessage else { return false }
+        lastMessage = message
+        if let previous = lastReported[message], now - previous < 1 { return false }
+        if lastReported[message] == nil, lastReported.count >= 32,
+           let oldest = lastReported.min(by: { $0.value < $1.value })?.key {
+            lastReported.removeValue(forKey: oldest)
+        }
+        lastReported[message] = now
+        return true
+    }
+}
+// END GameWorldStatusLimiter
+
 /// Native Metal snapshots are immutable and already GPU-complete when leased.
 /// The render thread only calls host mailbox/lease APIs, never guest functions.
 final class GameWorldRenderer: @unchecked Sendable {
@@ -350,9 +372,13 @@ final class GameWorldRenderer: @unchecked Sendable {
     private var active = true
     private let sessionToken = UUID()
     private let inFlight = DispatchSemaphore(value: 3)
-    private var lastStatus = ""
+    private var statusLimiter = GameWorldStatusLimiter()
     private var frameNumber: UInt64 = 0
     private var nextLifecycleSample: Double = 0
+    private var nextRejectedViewSample: Double = 0
+    private var lastViewRequestResult: Int32?
+    private var lastRejectedViewResult: Int32?
+    private var nextViewRecoverySample: Double = 0
     private var loggedFrame = false
     private let debugPrefix = GameWorldDebugCapture.requestedPrefix()
     private var didDebugCapture = false
@@ -487,21 +513,22 @@ final class GameWorldRenderer: @unchecked Sendable {
     }
 
     private func reportStatus(_ message: String) {
-        guard message != lastStatus else { return }
-        lastStatus = message
+        guard statusLimiter.shouldReport(message, at: ProcessInfo.processInfo.systemUptime) else { return }
         report(.status(message))
         log.info("\(message, privacy: .public)")
     }
 
     private func recordLifecycle(_ stage: String, detail: String? = nil,
-                                 viewCount: Int? = nil, trackedPose: Bool? = nil) {
+                                 viewCount: Int? = nil, trackedPose: Bool? = nil,
+                                 requestBytesHex: String? = nil) {
         report(.lifecycle(GameWorldLifecycleEvent(stage: stage,
             uptime: ProcessInfo.processInfo.systemUptime,
             layerState: String(describing: layer.state),
             trackingState: String(describing: tracking.state),
             rendererActive: isActive, rendererStopped: isStopped,
             ownsWorldCamera: WorldCameraOwnership.shared.isOwner(sessionToken),
-            detail: detail, viewCount: viewCount, trackedPose: trackedPose)))
+            detail: detail, viewCount: viewCount, trackedPose: trackedPose,
+            requestBytesHex: requestBytesHex)))
     }
 
     private func renderLoop() {
@@ -600,7 +627,8 @@ final class GameWorldRenderer: @unchecked Sendable {
                 } else {
                     XRHeadTracking.shared.submit(timestamp: timestamp, stageFromHead: stageFromHead, tracked: true)
                 }
-                submitViews(drawable: drawable, timestamp: timestamp, requestFrame: requestFrame, eyes: eyes)
+                let viewRequestAccepted = submitViews(drawable: drawable, timestamp: timestamp,
+                                                       requestFrame: requestFrame, eyes: eyes)
                 if let anchorProbe {
                     // Probe: no native lease is acquired; the analytic pair stands in for the game.
                     let views = drawable.views.indices.map { index in
@@ -643,9 +671,11 @@ final class GameWorldRenderer: @unchecked Sendable {
                         }
                     }
                     sources = drawableLeases.map { GameWorldSourceEye(lease: $0) }
-                    if drawableLeases.isEmpty, !acquisitionFailed {
+                    // A rejected view request is the actionable failure. Do not
+                    // replace it with generic waiting text later in the same frame.
+                    if drawableLeases.isEmpty, !acquisitionFailed, viewRequestAccepted {
                         reportStatus("Waiting for a qualified native game world frame with its actual depth.")
-                    } else if drawableLeases.count < drawable.views.count, !acquisitionFailed {
+                    } else if drawableLeases.count < drawable.views.count, !acquisitionFailed, viewRequestAccepted {
                         reportStatus("Waiting for both distinct native game eye views and their matching depth.")
                     }
                 }
@@ -809,7 +839,7 @@ final class GameWorldRenderer: @unchecked Sendable {
         return [left, right]
     }
 
-    private func submitViews(drawable: LayerRenderer.Drawable, timestamp: Double, requestFrame: UInt64, eyes: [XRRetainedEyeView]) {
+    private func submitViews(drawable: LayerRenderer.Drawable, timestamp: Double, requestFrame: UInt64, eyes: [XRRetainedEyeView]) -> Bool {
         var request = SVXRViewRequest()
         request.version = 1
         request.size = UInt32(MemoryLayout<SVXRViewRequest>.size)
@@ -830,7 +860,29 @@ final class GameWorldRenderer: @unchecked Sendable {
             }
         }
         let result = sv_xr_submit_views(&request)
-        if result != 0 { reportStatus("Native compositor view submission failed (\(result)).") }
+        if result != 0 {
+            let now = ProcessInfo.processInfo.systemUptime
+            if lastRejectedViewResult != result || now >= nextRejectedViewSample {
+                lastRejectedViewResult = result
+                nextRejectedViewSample = now + 5
+                // Preserve the exact ABI bytes, including nonfinite Float bit
+                // patterns, without putting invalid JSON numbers in the report.
+                let bytes = withUnsafeBytes(of: request) { bytes in
+                    bytes.map { String(format: "%02x", $0) }.joined()
+                }
+                recordLifecycle("view_request_rejected", detail: "return_code=\(result)",
+                                viewCount: drawable.views.count, requestBytesHex: bytes)
+            }
+            reportStatus("Native compositor view submission failed (\(result)).")
+        } else if let lastViewRequestResult, lastViewRequestResult != 0 {
+            let now = ProcessInfo.processInfo.systemUptime
+            if now >= nextViewRecoverySample {
+                nextViewRecoverySample = now + 5
+                recordLifecycle("view_request_recovered")
+            }
+        }
+        lastViewRequestResult = result
+        return result == 0
     }
 
     /// Encodes the corner-depth kernel for one eye on `commands`, ahead of that eye's draw. Returns nil,
