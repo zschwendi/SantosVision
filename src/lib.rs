@@ -28,6 +28,8 @@ pub mod xr_aim;
 pub mod xr_foreground;
 #[cfg(feature = "jit")]
 pub mod xr_foreground_scope;
+#[cfg(feature = "jit")]
+pub mod xr_foreground_patch;
 pub mod xr_view;
 mod pad;
 #[cfg(feature = "jit")]

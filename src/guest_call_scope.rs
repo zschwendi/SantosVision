@@ -31,6 +31,11 @@ impl StoreLifetime {
     }
 }
 
+/// Read-only producer identity for future packet registration. This is the
+/// current Store/HostState lifetime, not a TLS or general Instance identity.
+#[allow(dead_code)]
+pub(crate) fn producer_store_lifetime(state:&HostState)->u64 { state.guest_calls.nonce }
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Kind { Ordinary, Instantiate, Mailbox }
 

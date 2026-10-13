@@ -14,6 +14,10 @@ use anyhow::{Context, Result};
 use wasmtime::{Caller, SharedMemory};
 use crate::{HostState, RT};
 
+#[path = "world_packet_trace.rs"]
+#[allow(dead_code)] // Inactive prerequisite; no live packet adapter is installed.
+pub(crate) mod packet_trace;
+
 const ACTIVE_CVIEWPORT: u64 = 19_237_856;
 const CAMERA_OFFSET: u64 = 192;
 const PROJECTION_OFFSET: u64 = 320;

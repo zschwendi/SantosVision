@@ -76,6 +76,26 @@ pub fn mailbox_await(mem: &SharedMemory, pthread_ptr: u64) {
     write_u32(mem, pthread_ptr + 204, 1);
 }
 
+// One place owns pending delivery. Normal callers use the false policy; the
+// experimental true policy has no production activation path because eventual
+// delivery on every real producer thread is not yet certified.
+fn deliver_pending_mailbox<const DEFER_EMIT: bool>(caller: &mut Caller<'_, HostState>, name: &str, mem: &SharedMemory) -> Result<()> {
+    // The certified Emit hook runs while its producer mutex is held and before
+    // publishing head. Guest mailbox work here can reenter Emit or replace the
+    // current producer view. Leave it queued for an ordinary eligible import.
+    if ANY_PENDING.load(Ordering::Relaxed) != 0 && !name.contains("mailbox")
+        && !(DEFER_EMIT && name == "muguet_xr_gpu_command") {
+        let me = caller.data().pthread;
+        let has = me != 0 && PENDING_MAILBOX.lock().unwrap().remove(&me);
+        if has {
+            ANY_PENDING.fetch_sub(1, Ordering::Relaxed);
+            mailbox_await(mem, me);
+            export_call_kind(caller, "_emscripten_check_mailbox", &[], crate::guest_call_scope::Kind::Mailbox)?;
+        }
+    }
+    Ok(())
+}
+
 pub fn call(mut caller: Caller<'_, HostState>, idx: usize, params: &[Val], results: &mut [Val]) -> Result<()> {
     let rt = RT.get().expect("runtime");
     let n = rt.counts[idx].fetch_add(1, Ordering::Relaxed) + 1;
@@ -86,15 +106,9 @@ pub fn call(mut caller: Caller<'_, HostState>, idx: usize, params: &[Val], resul
         *r = default_val(&t);
     }
 
-    if ANY_PENDING.load(Ordering::Relaxed) != 0 && !name.contains("mailbox") {
-        let me = caller.data().pthread;
-        let has = me != 0 && PENDING_MAILBOX.lock().unwrap().remove(&me);
-        if has {
-            ANY_PENDING.fetch_sub(1, Ordering::Relaxed);
-            mailbox_await(mem, me);
-            export_call_kind(&mut caller, "_emscripten_check_mailbox", &[], crate::guest_call_scope::Kind::Mailbox)?;
-        }
-    }
+    // Preserve normal runtime scheduling until a safe polling/liveness boundary
+    // is certified for every producer. The true policy is test-only groundwork.
+    deliver_pending_mailbox::<false>(&mut caller, name, mem)?;
 
     if name.starts_with("invoke_") {
         return invoke(&mut caller, params, results);
@@ -365,4 +379,71 @@ pub(crate) fn guest_scope_test_longjmp() -> Result<()> {
 pub(crate) fn guest_scope_test_unwind() -> Result<()> {
     PENDING_UNWIND.with(|pending| pending.set(true));
     Err(Unwind.into())
+}
+
+#[cfg(all(test, feature = "jit"))]
+mod mailbox_publication_tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+    use wasmtime::{Config, Engine, Linker, MemoryType, Module, Store};
+    #[test]
+    fn critical_emit_defers_mailbox_then_normal_import_delivers_once() {
+        use wasm_encoder::{CodeSection, EntityType, ExportKind, ExportSection, Function,
+            FunctionSection, ImportSection, Instruction as I, TypeSection};
+        let mut wasm=wasm_encoder::Module::new();
+        let mut types=TypeSection::new(); types.ty().function([],[]); wasm.section(&types);
+        let mut imports=ImportSection::new();
+        for name in ["lock","midpoint","unlock","ordinary","mailbox_observed","mailbox_import"] {
+            imports.import("test",name,EntityType::Function(0));
+        }
+        wasm.section(&imports);
+        let mut funcs=FunctionSection::new(); for _ in 0..4 {funcs.function(0);} wasm.section(&funcs);
+        let mut exports=ExportSection::new();
+        for (name,index) in [("emit",6),("ordinary",7),("_emscripten_check_mailbox",8),("mailbox_import",9)] {
+            exports.export(name,ExportKind::Func,index);
+        }
+        wasm.section(&exports);
+        let mut code=CodeSection::new();
+        for calls in [&[0,1,2][..],&[3][..],&[4][..],&[5][..]] {
+            let mut f=Function::new([]); for call in calls {f.instruction(&I::Call(*call));} f.instruction(&I::End);code.function(&f);
+        }
+        wasm.section(&code);
+        let mut config=Config::new(); config.wasm_threads(true).shared_memory(true);
+        let engine=Engine::new(&config).unwrap();
+        let mem=SharedMemory::new(&engine,MemoryType::shared(1,1)).unwrap();
+        let locked=Arc::new(AtomicBool::new(false));
+        let observed=Arc::new(Mutex::new(Vec::<bool>::new()));
+        let mut linker=Linker::<HostState>::new(&engine);
+        let flag=locked.clone();linker.func_wrap("test","lock",move|| {assert!(!flag.swap(true,Ordering::SeqCst));}).unwrap();
+        let flag=locked.clone();linker.func_wrap("test","unlock",move|| {assert!(flag.swap(false,Ordering::SeqCst));}).unwrap();
+        for (name,import_name) in [("midpoint","muguet_xr_gpu_command"),("ordinary","ordinary_test_import"),("mailbox_import","_emscripten_thread_mailbox_await")] {
+            let memory=mem.clone();
+            linker.func_wrap("test",name,move |mut caller:Caller<'_,HostState>| -> std::result::Result<(),wasmtime::Error> {
+                deliver_pending_mailbox::<true>(&mut caller,import_name,&memory).map_err(wasmtime::Error::from_anyhow)
+            }).unwrap();
+        }
+        let flag=locked.clone();let observations=observed.clone();
+        linker.func_wrap("test","mailbox_observed",move|| {observations.lock().unwrap().push(flag.load(Ordering::SeqCst));}).unwrap();
+        let me=256u64;
+        assert_eq!(ANY_PENDING.load(Ordering::Relaxed),0);
+        assert!(PENDING_MAILBOX.lock().unwrap().insert(me));ANY_PENDING.fetch_add(1,Ordering::Relaxed);
+        let mut store=Store::new(&engine,HostState::new(me));
+        let module=Module::new(&engine,wasm.finish()).unwrap();let inst=linker.instantiate(&mut store,&module).unwrap();
+        inst.get_typed_func::<(),()>(&mut store,"emit").unwrap().call(&mut store,()).unwrap();
+        assert!(!locked.load(Ordering::SeqCst));
+        let visits=observed.lock().unwrap().clone();
+        assert!(visits.is_empty(),"mailbox ran inside producer critical section: {visits:?}");
+        assert_eq!(ANY_PENDING.load(Ordering::Relaxed),1);
+        assert!(PENDING_MAILBOX.lock().unwrap().contains(&me));
+        assert_eq!(read_u32(&mem,me+204),Some(0));
+        // Preserve the existing explicit-mailbox-name exclusion too.
+        inst.get_typed_func::<(),()>(&mut store,"mailbox_import").unwrap().call(&mut store,()).unwrap();
+        assert!(observed.lock().unwrap().is_empty());assert_eq!(ANY_PENDING.load(Ordering::Relaxed),1);
+        let ordinary=inst.get_typed_func::<(),()>(&mut store,"ordinary").unwrap();
+        ordinary.call(&mut store,()).unwrap();ordinary.call(&mut store,()).unwrap();
+        assert_eq!(*observed.lock().unwrap(),vec![false]);
+        assert_eq!(ANY_PENDING.load(Ordering::Relaxed),0);assert!(!PENDING_MAILBOX.lock().unwrap().contains(&me));
+        assert_eq!(read_u32(&mem,me+204),Some(1));
+    }
 }
