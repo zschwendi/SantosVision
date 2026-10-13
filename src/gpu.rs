@@ -37,6 +37,32 @@ mod guest_write_tests;
 #[path = "upload_dedup_tests.rs"]
 mod upload_dedup_tests;
 
+/// A frozen pre-UI depth copy belongs to its qualified camera/present, not to
+/// subsequent contents of the live source texture. Ordinary source clears do
+/// not modify the copy. Other mutations and unqualified geometry still revoke
+/// it; publication also requires the exact camera/eye provenance and consumes
+/// every saved copy at each present.
+#[derive(Clone, Copy)]
+enum WorldDepthChange { LiveClear, ProvenUiClear, Other }
+
+impl WorldDepthChange {
+    fn retains_frozen_snapshot(self) -> bool { matches!(self, Self::LiveClear | Self::ProvenUiClear) }
+}
+
+fn invalidate_world_depth_records<Snapshot>(
+    live: &mut HashMap<u32, (crate::xr_view::WorldView, u64)>,
+    frozen: &mut HashMap<u32, (crate::xr_view::WorldView, Snapshot, u64)>,
+    id: u32, change: WorldDepthChange,
+) -> Option<(crate::xr_view::WorldView, u64)> {
+    let previous_live = live.remove(&id);
+    let previous_saved = if change.retains_frozen_snapshot() {
+        frozen.get(&id).map(|(view, _, draws)| (*view, *draws))
+    } else {
+        frozen.remove(&id).map(|(view, _, draws)| (view, draws))
+    };
+    previous_live.or(previous_saved)
+}
+
 // Test-only: adapter features withheld from the next Gpu::new on this thread,
 // so fixtures can reach the paths of devices that lack them.
 #[cfg(test)]
@@ -1139,18 +1165,17 @@ impl Gpu {
     }
 
     fn invalidate_world_depth(&mut self, id: u32, reason: serde_json::Value) {
-        self.invalidate_world_depth_inner(id, reason, false);
+        self.invalidate_world_depth_inner(id, reason, WorldDepthChange::Other);
     }
 
-    fn invalidate_world_depth_inner(&mut self, id: u32, reason: serde_json::Value, keep_ui_snapshot: bool) {
-        let live = self.world_depths.remove(&id);
-        let saved = if keep_ui_snapshot { None } else { self.world_depth_before_ui.remove(&id) };
-        let previous = live.or_else(|| saved.map(|(view, _, draws)| (view, draws)));
+    fn invalidate_world_depth_inner(&mut self, id: u32, reason: serde_json::Value, change: WorldDepthChange) {
+        let previous = invalidate_world_depth_records(&mut self.world_depths,
+            &mut self.world_depth_before_ui, id, change);
         if let Some((view, draws)) = previous {
             if self.world_depth_anomalies.len() >= 8 { self.world_depth_anomalies.remove(0); }
             self.world_depth_anomalies.push(serde_json::json!({"depth":id,"invalidation":reason,
                 "previous_sequence":view.camera_sequence,"previous_draws":draws,
-                "ui_snapshot_retained":keep_ui_snapshot && self.world_depth_before_ui.contains_key(&id)}));
+                "ui_snapshot_retained":change.retains_frozen_snapshot() && self.world_depth_before_ui.contains_key(&id)}));
         }
     }
 
@@ -3305,7 +3330,8 @@ impl Gpu {
                         "rasterizer":self.state(self.s.rs).map(|state|state.words.clone()),
                         "world":self.world_view.map(|view|serde_json::json!({"sequence":view.camera_sequence,
                             "reverse_z":view.depth_reverse_z,"headset_applied":view.headset_applied}))});
-                    self.invalidate_world_depth_inner(ds.tex, reason, ui_depth_clear);
+                    self.invalidate_world_depth_inner(ds.tex, reason,
+                        if ui_depth_clear { WorldDepthChange::ProvenUiClear } else { WorldDepthChange::Other });
                 }
             }
         }
@@ -3404,7 +3430,7 @@ impl Gpu {
         let Some((fmt, three)) = self.tex(id).map(|t| (t.format, t.desc.dim == TextureDimension::D3)) else { return };
         self.mark_depth_dirty(id);
         let d = (flags & 1 != 0).then(|| depth.clamp(0.0, 1.0));
-        if d.is_some() && mip == 0 && slice == 0 { self.invalidate_world_depth(id, serde_json::json!("clear_ds")); }
+        if d.is_some() && mip == 0 && slice == 0 { self.invalidate_world_depth_inner(id, serde_json::json!("clear_ds"), WorldDepthChange::LiveClear); }
         let st = (flags & 2 != 0 && has_stencil(fmt)).then_some(stencil);
         if d.is_none() && st.is_none() { return; }
         if three { self.materialize_clears(id); self.clear_ds_now(id, mip, slice, d, st); return; }
@@ -3437,7 +3463,7 @@ impl Gpu {
     }
     fn clear_ds_now(&mut self, id: u32, mip: u32, slice: u32, depth: Option<f32>, stencil: Option<u32>) {
         let Some(fmt) = self.tex(id).map(|t| t.format) else { return };
-        if depth.is_some() && mip == 0 && slice == 0 { self.invalidate_world_depth(id, serde_json::json!("clear_ds_now")); }
+        if depth.is_some() && mip == 0 && slice == 0 { self.invalidate_world_depth_inner(id, serde_json::json!("clear_ds_now"), WorldDepthChange::LiveClear); }
         self.end_pass();
         let Some(view) = self.clear_view(id, mip, slice) else { return };
         self.use_tex(id);
@@ -4275,5 +4301,75 @@ mod query_life_tests {
         let result = u64::from_le_bytes(frozen[24..32].try_into().unwrap());
         assert_eq!(result as u32, sequence);
         assert!(result >= 1000);
+    }
+}
+
+#[cfg(test)]
+mod frozen_world_depth_policy_tests {
+    use super::*;
+
+    fn world() -> crate::xr_view::WorldView {
+        let identity = [1.,0.,0.,0., 0.,1.,0.,0., 0.,0.,1.,0., 0.,0.,0.,1.];
+        crate::xr_view::WorldView { provenance_epoch: 7, camera_sequence: 2256,
+            request_frame: 338, head_pose_frame: 353, presentation_time_seconds: 42.,
+            eye_index: 0, view_count: 2, game_from_eye: identity, game_from_stage: identity,
+            projection_from_eye: [0.732051,0.,0.,0., 0.,0.9125127,0.,0.,
+                -0.267949,-0.087487,0.00010001659,-1., 0.,0.,0.10001,0.],
+            depth_reverse_z: true, headset_applied: true }
+    }
+
+    #[test]
+    fn physical_ui_then_live_clears_retain_same_immutable_snapshot_until_present() {
+        // Physical build3: depth1221, camera2256,1580 qualified draws. The known
+        // UI draw preserved its copy, then clear_ds incorrectly removed it.
+        let view = world();
+        let samples = vec![0x3f000001u32, 0x3e800002, 0x00000000];
+        let mut live = HashMap::from([(1221, (view, 1580))]);
+        let mut frozen = HashMap::from([(1221, (view, samples.clone(), 1580))]);
+        for event in [WorldDepthChange::ProvenUiClear, WorldDepthChange::LiveClear,
+            WorldDepthChange::LiveClear] {
+            assert_eq!(invalidate_world_depth_records(&mut live, &mut frozen, 1221, event), Some((view, 1580)));
+            assert!(live.is_empty());
+            assert_eq!(frozen.get(&1221), Some(&(view, samples.clone(), 1580)));
+        }
+        assert!(crate::world_frame::shares_screen_rays(&view, &frozen[&1221].0));
+        // publish_world_frame takes all frozen entries on EVERY present, even
+        // a loading/unqualified present, preventing cross-present resurrection.
+        let retired = std::mem::take(&mut frozen);
+        assert_eq!(retired[&1221].1, samples);
+        assert!(invalidate_world_depth_records(&mut live, &mut frozen, 1221, WorldDepthChange::LiveClear).is_none());
+        assert!(frozen.is_empty());
+    }
+
+    #[test]
+    fn other_depth_mutations_revoke_snapshot_and_clear_never_creates_one() {
+        let view = world();
+        let mut live = HashMap::from([(1221, (view, 1580))]);
+        let mut frozen: HashMap<u32, (_, Vec<u32>, _)> = HashMap::new();
+        assert_eq!(invalidate_world_depth_records(&mut live, &mut frozen, 1221, WorldDepthChange::LiveClear), Some((view, 1580)));
+        assert!(live.is_empty() && frozen.is_empty());
+        frozen.insert(1221, (view, vec![0x3f000001], 1580));
+        // Resource replacement/destruction, copy/upload and unqualified non-UI
+        // depth draws all use Other, even after a successful UI snapshot.
+        assert_eq!(invalidate_world_depth_records(&mut live, &mut frozen, 1221, WorldDepthChange::Other), Some((view, 1580)));
+        assert!(live.is_empty() && frozen.is_empty());
+    }
+
+    #[test]
+    fn retained_snapshot_still_rejects_foreign_or_stale_present_identity() {
+        let view = world();
+        let mut live = HashMap::new();
+        let mut frozen = HashMap::from([(1221, (view, vec![0x3f000001u32], 1580))]);
+        invalidate_world_depth_records(&mut live, &mut frozen, 1221, WorldDepthChange::LiveClear);
+        let depth = frozen[&1221].0;
+        let mut foreign = Vec::new();
+        foreign.push(crate::xr_view::WorldView { provenance_epoch: view.provenance_epoch + 1, ..view });
+        foreign.push(crate::xr_view::WorldView { camera_sequence: view.camera_sequence + 1, ..view });
+        foreign.push(crate::xr_view::WorldView { request_frame: view.request_frame + 1, ..view });
+        foreign.push(crate::xr_view::WorldView { head_pose_frame: view.head_pose_frame + 1, ..view });
+        foreign.push(crate::xr_view::WorldView { eye_index: 1, ..view });
+        let mut moved = view; moved.game_from_eye[12] = 0.01; foreign.push(moved);
+        let mut different_rays = view; different_rays.projection_from_eye[8] += 0.001; foreign.push(different_rays);
+        for color in foreign { assert!(!crate::world_frame::shares_screen_rays(&color, &depth)); }
     }
 }
