@@ -938,6 +938,7 @@ pub struct Gpu {
     world_depth_trace: HashMap<(u32, u64, bool, u32, bool), (u64, [f32; 6])>,
     world_depth_anomalies: Vec<serde_json::Value>,
     color_phase_trace: crate::world_ui::ColorPhaseTrace,
+    command_trace: crate::world_command_trace::CommandTrace,
     pdirty: bool,
     last_pl: Option<Rc<Pl>>,
     last_program_uids: Option<(u64, u64)>,
@@ -1124,7 +1125,7 @@ impl Gpu {
             base, mem, ring, device, queue, adapter, surface, surface_format, surface_size: (0, 0),
             objs: Vec::new(), enc: None, enc_epoch: 1, pass: None, pass_key: None, pass_info: None, pass_st: PassSt::default(),
             s: State::new(), world_view: None, world_depths: HashMap::new(), world_depth_before_ui: HashMap::new(), world_depth_snapshot_overflow: false, world_depth_snapshots_this_present: 0, world_depth_trace: HashMap::new(), world_depth_anomalies: Vec::new(),
-            color_phase_trace: crate::world_ui::ColorPhaseTrace::from_env(), pdirty: true, last_pl: None, last_program_uids: None,
+            color_phase_trace: crate::world_ui::ColorPhaseTrace::from_env(), command_trace: crate::world_command_trace::CommandTrace::from_env(), pdirty: true, last_pl: None, last_program_uids: None,
             float_programs: HashMap::new(), shader_index, shader_dir, next_uid: 1,
             bgl_cache: HashMap::new(), empty_bgl: None, pipelines: HashMap::new(), compute: HashMap::new(), bind_groups: HashMap::new(),
             numeric_bgl_cache: HashMap::new(), render_prepare, uniform_pack, uniform_snapshot, bind_group_prepare,
@@ -1458,6 +1459,7 @@ impl Gpu {
             let op = self.u(base);
             let n = self.u(base + 1) as u64;
             if let Some(view) = crate::xr_view::take_command_view(base * 4) { self.world_view = view; }
+            if self.command_trace.wants_command(op) { self.trace_ring_command(op, base, n); }
             if op == 1 {
                 tail = RING_DATA as i32;
                 continue;
@@ -1604,6 +1606,132 @@ impl Gpu {
             46 => self.end_query(u(0), u(1)),
             other => log_once(&format!("op{other}"), &format!("unknown opcode {other}")),
         }
+    }
+
+    /// Trace copies precede exec and every ring-tail acknowledgement. No guest
+    /// slices, native resource handles or async mutable state escape this call.
+    fn trace_ring_command(&mut self, op: u32, base: u64, n: u64) {
+        use serde_json::json;
+        if !self.command_trace.retaining_commands() {
+            self.command_trace.command(op, json!({"opcode":op,"command_address":base*4,
+                "declared_operand_words":n,"operands_complete":false,"record_omitted":"trace_capacity"}));
+            return;
+        }
+        let p = base + 2;
+        let memory_words = self.mem.data_size() as u64 / 4;
+        // Wrap's n is not consumed by exec; retain its raw header without
+        // interpreting a potentially stale length as a command payload.
+        let wanted = if op == 1 { 0 } else { n };
+        let valid = p.checked_add(wanted).is_some_and(|end|end<=memory_words);
+        let copied = if valid { wanted.min((crate::world_command_trace::MAX_OPERAND_BYTES/4) as u64) } else { 0 };
+        let words: Vec<u32> = (0..copied).map(|offset|self.u(p+offset)).collect();
+        let mut accesses: Vec<(u32,&str)> = Vec::new();
+        let mut add = |index:usize,role:&'static str| { if let Some(&id)=words.get(index) { if id!=0 { accesses.push((id,role)); } } };
+        match op {
+            3|11|14|15|16|44 => add(0,"create_id_preexisting_object"),
+            17|37 => { add(0,"create_view_id_preexisting_object"); add(2,"view_resource"); },
+            4 => add(0,"destroy"), 5|6|12|13|47 => add(0,"write"),
+            7|42 => add(0,"read"),
+            18 => add(1,"bind_shader"), 19|27|28|29 => add(0,"bind_state"),
+            22 => add(0,"bind_index_buffer"),
+            21|23|24|25|38 => {
+                let (start,count,stride) = match op {
+                    21 => (2,words.get(1).copied().unwrap_or(0),3),
+                    23 => (3,words.get(2).copied().unwrap_or(0),3),
+                    _ => (3,words.get(2).copied().unwrap_or(0),1),
+                };
+                for i in 0..(count as usize).min(128) { add(start+i*stride,"bind_possible_access"); }
+            },
+            26 => { for i in 0..8 { add(i*4,"bind_render_target"); } add(32,"bind_depth_target"); },
+            34 => { add(0,"copy_destination"); add(5,"copy_source"); },
+            35 => { add(0,"copy_destination"); add(1,"copy_source"); },
+            36 => { add(0,"resolve_destination"); add(2,"resolve_source"); },
+            40|41 => add(0,"view_read_write"),
+            43 => { add(0,"counter_destination"); add(2,"counter_source_view"); },
+            45|46 => add(0,"query"),
+            32|39 => {
+                if op==32 && words.first().is_some_and(|kind|*kind>=4) { add(1,"indirect_arguments_read"); }
+                for &id in &self.s.shader { if id!=0 { accesses.push((id,"bound_shader")); } }
+                for vb in &self.s.vb { if vb.buf!=0 { accesses.push((vb.buf,"bound_vertex_possible_read")); } }
+                if self.s.ib.0!=0 { accesses.push((self.s.ib.0,"bound_index_possible_read")); }
+                for stage in &self.s.cb { for cb in stage { if cb.buf!=0 { accesses.push((cb.buf,"bound_constant_possible_read")); } } }
+                for stage in &self.s.srv { for &id in stage { if id!=0 { accesses.push((id,"bound_srv_possible_read")); } } }
+                for stage in &self.s.uav { for &id in stage { if id!=0 { accesses.push((id,"bound_uav_possible_read_write")); } } }
+                if op==32 {
+                    for rt in &self.s.rt { if rt.tex!=0 { accesses.push((rt.tex,"bound_target_possible_write")); } }
+                    if self.s.ds.tex!=0 { accesses.push((self.s.ds.tex,"bound_depth_possible_read_write")); }
+                }
+            },
+            _ => {},
+        }
+        let resource_count=accesses.len();
+        let resources: Vec<_> = accesses.into_iter().take(64).map(|(id,role)|json!({
+            "id":id,"role":role,"pre_exec":self.command_trace_resource(id)})).collect();
+        let mut payload = serde_json::Value::Null;
+        let upload_layout = match op { 12|47=>Some((3,2)),13=>Some((12,11)),10=>Some((1,0)),_=>None };
+        if let Some((header,length_word))=upload_layout {
+            if let Some(&length)=words.get(length_word) {
+                let length=length as usize;
+                let declared_bytes=n.checked_mul(4).and_then(|bytes|bytes.checked_sub(header as u64*4));
+                let inline_valid=valid && declared_bytes.is_some_and(|bytes|bytes>=length as u64);
+                let hash_bytes=if inline_valid { self.command_trace.hash_allowance(length) } else { 0 };
+                // Hash an OWNED copy before acknowledgement; truncated hashes
+                // explicitly identify the prefix, never the full upload.
+                let owned = if hash_bytes>0 { self.bytes((p+header as u64)*4,hash_bytes as u64).to_vec() } else { Vec::new() };
+                let hash = (hash_bytes>0 || (inline_valid && length==0)).then(||crate::world_command_trace::upload_fingerprint(&owned));
+                self.command_trace.note_hash_bytes(hash_bytes);
+                payload=json!({"kind":if op==10 {"inline_text"} else {"inline_upload"},
+                    "declared_bytes":length,"inline_range_valid":inline_valid,"hash_bytes":hash_bytes,
+                    "hash_complete":inline_valid && hash_bytes==length,"hash":hash,
+                    "hash_algorithm":"fnv1a64_noncryptographic_correlation_only",
+                    "raw_payload_bytes_retained_in_operand_words":length.min(copied.saturating_sub(header as u64) as usize*4),
+                    "raw_payload_complete_in_operand_words":inline_valid && copied.saturating_sub(header as u64)*4>=length as u64});
+            } else { payload=json!({"kind":"inline_payload","metadata_missing":true}); }
+        }
+        let inherited = if op==7 { Some(self.command_trace_state()) } else { None };
+        let record=json!({"opcode":op,"command_address":base*4,"declared_operand_words":n,
+            "operands":words,"operands_complete":valid && copied==wanted,
+            "operand_words_omitted":wanted.saturating_sub(copied),"operand_range_valid":valid,
+            "wrap_declared_length_not_interpreted":op==1,
+            "world":self.world_view.as_ref().map(crate::world_ui::marker),
+            "resources":resources,"resource_access_rows_omitted":resource_count.saturating_sub(64),
+            "resource_access_caveat":"pre-exec potential bound accesses; not shader-consumption or native graph proof",
+            "payload":payload,"inherited_state":inherited});
+        self.command_trace.command(op,record);
+    }
+
+    fn command_trace_resource(&self, id:u32) -> serde_json::Value {
+        use serde_json::json;
+        match self.obj(id) {
+            Some(Obj::Buf(b))=>json!({"kind":"buffer","identity":b.identity,"version":b.version,"size":b.size,"stride":b.stride,
+                "gpu_contents_captured":false,"version_caveat":"host buffer version is not a complete GPU-write generation"}),
+            Some(Obj::Tex(t))=>json!({"kind":"texture","size":[t.desc.w,t.desc.h,t.desc.d],"mips":t.desc.mips,
+                "samples":t.desc.samples,"format":format!("{:?}",t.format),"generation":null,"contents_captured":false}),
+            Some(Obj::Shader(s))=>json!({"kind":"shader","stage":s.stage,"hash":s.hash,"native_variant_captured":false}),
+            Some(Obj::Srv(v))|Some(Obj::Uav(v))=>json!({"kind":"view","resource":v.res,"is_buffer":v.is_buf,
+                "desc":[v.fmt,v.vdim,v.a,v.b,v.c,v.d],"generation":null}),
+            Some(Obj::Layout(_))=>json!({"kind":"layout","generation":null}),
+            Some(Obj::State(s))=>json!({"kind":"state","words":s.words.iter().take(128).copied().collect::<Vec<_>>(),
+                "words_omitted":s.words.len().saturating_sub(128),"generation":null}),
+            Some(Obj::Query(_))=>json!({"kind":"query","result_captured":false,"generation":null}),
+            None=>json!({"kind":"missing"}),
+        }
+    }
+
+    fn command_trace_state(&self) -> serde_json::Value {
+        use serde_json::json;
+        json!({"shader":self.s.shader,"layout":self.s.layout,"topology":self.s.topo,
+            "vertex_buffers":self.s.vb.iter().map(|v|[v.buf,v.stride,v.offset]).collect::<Vec<_>>(),
+            "index_buffer":self.s.ib,"constant_buffers":self.s.cb.iter().map(|stage|stage.iter().map(|b|[b.buf,b.first]).collect::<Vec<_>>()).collect::<Vec<_>>(),
+            "srv":self.s.srv,"uav":self.s.uav,"samplers":self.s.smp,
+            "render_targets":self.s.rt.iter().map(|rt|[rt.tex,rt.mip,rt.slice,rt.fmt]).collect::<Vec<_>>(),
+            "depth_target":[self.s.ds.tex,self.s.ds.mip,self.s.ds.slice,self.s.ds.fmt,self.s.ds.flags],
+            "blend_state":self.s.blend,"depth_state":self.s.dss,"raster_state":self.s.rs,
+            "viewports":self.s.viewports.iter().take(128).copied().collect::<Vec<_>>(),
+            "viewports_omitted":self.s.viewports.len().saturating_sub(128),
+            "scissors":self.s.scissors.iter().take(128).copied().collect::<Vec<_>>(),
+            "scissors_omitted":self.s.scissors.len().saturating_sub(128),
+            "native_pass_state_and_pending_clears_captured":false})
     }
 
     fn reset_state(&mut self) {
@@ -4104,6 +4232,11 @@ impl Gpu {
     fn publish_world_frame(&mut self, color_id: u32) {
         // Consume every presentation, including loading, to preserve queue order.
         let present_view = crate::xr_view::take_present_view();
+        if self.command_trace.wants_command(7) {
+            self.command_trace.present(self.presents+1, present_view.as_ref(),
+                crate::xr_view::world_camera_enabled() && present_view.as_ref().is_some_and(|view|
+                    crate::xr_view::view_epoch_is_active(view.provenance_epoch)));
+        }
         if self.color_phase_trace.wants_draw(false) {
             let target = self.color_phase_target(color_id);
             self.color_phase_trace.present(self.presents+1, present_view.as_ref(), target);
