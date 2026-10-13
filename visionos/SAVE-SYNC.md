@@ -28,11 +28,20 @@ await sync.markGameplayStarted()
 If prelaunch discovery or verification fails, surface the error and keep local
 saves; do not start gameplay against a partly restored profile. During gameplay,
 call `snapshotAndUpload()` on a bounded periodic timer and after a user pause.
-At quit, stop native writes, await a final `snapshotAndUpload()`, then call
-`markGameplayStopped()`. An OS termination cannot promise a final upload, which
-is why periodic snapshots matter. The method uses two matching content scans
-separated by 350 ms and reports changing files for retry. It does not restore
-or overwrite any gameplay file while the engine is running.
+At quit, deactivate native input/rendering, await `checkpointLocal()`, and
+report any checkpoint failure before process exit. The current native active
+setter does not acknowledge that every engine save write has stopped. An OS
+termination cannot promise a final cloud upload, which is why periodic
+snapshots matter. The methods use two matching content scans separated by
+350 ms and report changing files for retry. They do not restore or overwrite
+any gameplay file while the engine is running.
+
+For an explicit quit, `checkpointLocal()` is the bounded local durability
+operation. It archives a verified stable snapshot without waiting for iCloud
+discovery or an upload, even if a cloud history request is in flight. The next
+launch uploads any newer local revision. `Result.cloudUploadPending` remains
+true until File Provider reports that a cloud revision has actually uploaded;
+writing into the container alone is only a queued transfer.
 
 The cloud files live at
 `<container>/Documents/SantosVisionSaveSync/v1/revisions/<UUID>.svsave`.

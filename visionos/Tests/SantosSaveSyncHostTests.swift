@@ -39,6 +39,7 @@ struct SantosSaveSyncHostTests {
         let deviceA = engine(first)
         let publishedA = try await deviceA.snapshotAndUpload()
         precondition(publishedA.publishedRevision != nil)
+        precondition(publishedA.cloudUploadPending) // Synthetic directory cannot confirm upload.
         let firstA = try read(first)
         precondition(firstA == "A")
 
@@ -97,10 +98,37 @@ struct SantosSaveSyncHostTests {
         } catch {}
         let afterBroken = try read(first)
         precondition(afterBroken == "B")
+        try manager.removeItem(at: broken)
+
+        // The quit checkpoint writes only to local history. A new process uploads it later.
+        try write("E-final", to: first)
+        let countBeforeCheckpoint = try manager.contentsOfDirectory(
+            at: cloud, includingPropertiesForKeys: nil).count
+        let localResult = try await deviceA.checkpointLocal()
+        precondition(!localResult.cloudAvailable && localResult.publishedRevision == nil)
+        let countAfterCheckpoint = try manager.contentsOfDirectory(
+            at: cloud, includingPropertiesForKeys: nil).count
+        precondition(countAfterCheckpoint == countBeforeCheckpoint)
+        let nextLaunch = engine(first)
+        let resumed = try await nextLaunch.restoreBeforeLaunch()
+        precondition(resumed.restoredRevision == nil)
+        let uploadedFinal = try await nextLaunch.snapshotAndUpload()
+        precondition(uploadedFinal.publishedRevision != nil)
+        let finalData = try read(first)
+        precondition(finalData == "E-final")
 
         let noCloud = engine(root.appendingPathComponent("offline"), offline: true)
         let offlineRestore = try await noCloud.restoreBeforeLaunch()
         precondition(!offlineRestore.cloudAvailable)
+
+        let trapCloud = SantosSaveSync(configuration: .init(
+            saveRoot: first,
+            archiveRoot: first.appendingPathComponent("sync-archive"),
+            cloudRoot: { fatalError("checkpoint queried cloud root") },
+            cloudIdentity: { fatalError("checkpoint queried account") },
+            discover: { _ in fatalError("checkpoint discovered cloud history") },
+            settleNanoseconds: 1_000_000))
+        _ = try await trapCloud.checkpointLocal()
 
         print("Santos save sync host tests passed")
     }

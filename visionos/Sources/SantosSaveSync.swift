@@ -26,6 +26,7 @@ enum SantosSaveSyncError: LocalizedError {
     case damagedRevision(String)
     case cloudNotReady
     case restoreDuringGameplay
+    case checkpointInProgress
 
     var errorDescription: String? {
         switch self {
@@ -35,6 +36,7 @@ enum SantosSaveSyncError: LocalizedError {
         case .damagedRevision(let name): "A saved revision failed verification: \(name)."
         case .cloudNotReady: "iCloud has not finished downloading the save history."
         case .restoreDuringGameplay: "Cloud restores are allowed only before the engine starts."
+        case .checkpointInProgress: "Save recovery stopped because the game is closing."
         }
     }
 }
@@ -88,6 +90,19 @@ actor SantosSaveSync {
         let publishedRevision: UUID?
         let divergentRemoteRevisions: Int
         let localFiles: Int
+        /// A cloud-container write is only queued until File Provider confirms upload.
+        let cloudUploadPending: Bool
+
+        init(cloudAvailable: Bool, restoredRevision: UUID?, publishedRevision: UUID?,
+             divergentRemoteRevisions: Int, localFiles: Int,
+             cloudUploadPending: Bool = false) {
+            self.cloudAvailable = cloudAvailable
+            self.restoredRevision = restoredRevision
+            self.publishedRevision = publishedRevision
+            self.divergentRemoteRevisions = divergentRemoteRevisions
+            self.localFiles = localFiles
+            self.cloudUploadPending = cloudUploadPending
+        }
     }
 
     struct RevisionSummary: Sendable {
@@ -110,14 +125,52 @@ actor SantosSaveSync {
     private let configuration: Configuration
     private let manager = FileManager.default
     private var gameplayStarted = false
+    private var finalCheckpointRequested = false
     private static let maxFiles = 256
     private static let maxFileBytes = 16 * 1024 * 1024
     private static let maxTotalBytes = 128 * 1024 * 1024
 
     init(configuration: Configuration) { self.configuration = configuration }
 
-    func markGameplayStarted() { gameplayStarted = true }
+    func markGameplayStarted() {
+        gameplayStarted = true
+        finalCheckpointRequested = false
+    }
     func markGameplayStopped() { gameplayStarted = false }
+
+    /// Quit-time durability boundary. No cloud lookup or file coordination can hold this up.
+    /// An in-flight upload may finish later, but cannot replace this local revision pointer.
+    func checkpointLocal() async throws -> Result {
+        finalCheckpointRequested = true
+        try prepareArchives()
+        let snapshot: Snapshot
+        do {
+            snapshot = try await stableSnapshot()
+        } catch SantosSaveSyncError.changingFiles {
+            // A save already in progress can settle shortly after the pause request.
+            try await Task.sleep(nanoseconds: 200_000_000)
+            snapshot = try await stableSnapshot()
+        }
+        var state = try readState()
+        guard !snapshot.files.isEmpty else {
+            return Result(cloudAvailable: false, restoredRevision: nil,
+                          publishedRevision: nil, divergentRemoteRevisions: 0,
+                          localFiles: 0)
+        }
+        if state.localFingerprint == snapshot.fingerprint,
+           let id = state.localRevision {
+            _ = try readRevision(at: localRevisionURL(id))
+        } else {
+            let revision = makeRevision(from: snapshot, parent: state.appliedRevision)
+            try archive(revision)
+            state.localRevision = revision.id
+            state.localFingerprint = revision.fingerprint
+            try writeState(state)
+        }
+        return Result(cloudAvailable: false, restoredRevision: nil,
+                      publishedRevision: nil, divergentRemoteRevisions: 0,
+                      localFiles: snapshot.files.count)
+    }
 
     /// Supports a future recovery picker without exposing mutable cloud paths to the UI.
     func availableRevisions() async throws -> [RevisionSummary] {
@@ -152,6 +205,7 @@ actor SantosSaveSync {
     /// Explicit recovery always preserves the current local snapshot before changing it.
     func restoreRevisionBeforeLaunch(_ id: UUID) async throws -> Result {
         guard !gameplayStarted else { throw SantosSaveSyncError.restoreDuringGameplay }
+        guard !finalCheckpointRequested else { throw SantosSaveSyncError.checkpointInProgress }
         try prepareArchives()
         let localURL = localRevisionURL(id)
         let selected: SantosSaveRevision
@@ -166,8 +220,10 @@ actor SantosSaveSync {
         } else {
             throw SantosSaveSyncError.cloudNotReady
         }
+        guard !finalCheckpointRequested else { throw SantosSaveSyncError.checkpointInProgress }
         var state = try readState()
         let current = try await stableSnapshot()
+        guard !finalCheckpointRequested else { throw SantosSaveSyncError.checkpointInProgress }
         if current.fingerprint != selected.fingerprint {
             if !current.files.isEmpty {
                 let backup = makeRevision(from: current, parent: state.appliedRevision)
@@ -193,6 +249,7 @@ actor SantosSaveSync {
     /// Call and await before NativeRuntime.start. A failed cloud read leaves local saves intact.
     func restoreBeforeLaunch() async throws -> Result {
         guard !gameplayStarted else { throw SantosSaveSyncError.restoreDuringGameplay }
+        guard !finalCheckpointRequested else { throw SantosSaveSyncError.checkpointInProgress }
         try prepareArchives()
         var state = try readState()
         if let pending = state.pendingRestore {
@@ -205,6 +262,7 @@ actor SantosSaveSync {
         }
 
         let local = try await stableSnapshot()
+        guard !finalCheckpointRequested else { throw SantosSaveSyncError.checkpointInProgress }
         guard let root = configuration.cloudRoot(),
               let identity = configuration.cloudIdentity() else {
             return Result(cloudAvailable: false, restoredRevision: nil,
@@ -219,6 +277,7 @@ actor SantosSaveSync {
         }
 
         let revisions = try await readCloudHistory(root)
+        guard !finalCheckpointRequested else { throw SantosSaveSyncError.checkpointInProgress }
         let heads = revisions.filter { candidate in
             !revisions.contains { other in
                 other.id != candidate.id && isAncestor(candidate.id, of: other, in: revisions)
@@ -277,6 +336,11 @@ actor SantosSaveSync {
     func snapshotAndUpload() async throws -> Result {
         try prepareArchives()
         let snapshot = try await stableSnapshot()
+        if finalCheckpointRequested {
+            return Result(cloudAvailable: false, restoredRevision: nil,
+                          publishedRevision: nil, divergentRemoteRevisions: 0,
+                          localFiles: snapshot.files.count)
+        }
         var state = try readState()
         guard !snapshot.files.isEmpty else {
             return Result(cloudAvailable: configuration.cloudRoot() != nil,
@@ -316,12 +380,16 @@ actor SantosSaveSync {
         } else {
             try coordinatedWrite(encoded(revision), to: destination)
         }
+        // A quit checkpoint can run while a cloud operation awaits. Reload to preserve its
+        // newer local pointer; the cloud publish still records its own applied base.
+        state = try readState()
         state.appliedRevision = revision.id
         state.appliedFingerprint = revision.fingerprint
         try writeState(state)
         return Result(cloudAvailable: true, restoredRevision: nil,
                       publishedRevision: revision.id, divergentRemoteRevisions: 0,
-                      localFiles: revision.files.count)
+                      localFiles: revision.files.count,
+                      cloudUploadPending: !uploadConfirmed(at: destination))
     }
 
     private struct Snapshot {
@@ -536,6 +604,13 @@ actor SantosSaveSync {
         }
         if let error = coordinationError { throw error }
         if let error = writeError { throw error }
+    }
+
+    private func uploadConfirmed(at url: URL) -> Bool {
+        guard let values = try? url.resourceValues(forKeys: [
+            .isUbiquitousItemKey, .ubiquitousItemIsUploadedKey
+        ]) else { return false }
+        return values.isUbiquitousItem == true && values.ubiquitousItemIsUploaded == true
     }
 
     private func revisionOrder(_ lhs: SantosSaveRevision, _ rhs: SantosSaveRevision) -> Bool {
