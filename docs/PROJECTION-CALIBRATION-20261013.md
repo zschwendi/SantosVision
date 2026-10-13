@@ -9,3 +9,9 @@ The retained eye record and native request use the same converted source project
 The standalone Swift regression consumes the exact 288-byte packet, verifies 18,491 double-precision points per eye, rejects malformed matrices and writes the actual converted native packet. Compile `visionos/Sources/GameWorldProjection.swift` with `visionos/Tests/ProjectionCalibrationValidation.swift`; run the result with input and output binary paths. Local evidence and production Rust contract checks are in `target/verification/projection-calibration-20261013`. The raw packet returned -3; the actual Swift output passed the unmodified Rust validator. Observed ray errors were 6.383832e-6 and 4.347413e-6 NDC, below 0.013 pixels at 3840 width.
 
 Both Master Cheef and Project Reach pass full compositor matrices to Metal and do not impose GTA's scalar camera restrictions. The fix is specific to the GTA source camera boundary. Original game AOT and game assets remain unchanged. Build 5 is a hardware candidate; these numerical and build checks do not establish visible immersive rendering or stereo performance.
+
+## User checkpoint
+
+After build 5 installation, the user reported “The game appears around me” and requested this exact version be saved and committed. The implementation is commit `f32bbb1e91332673d95b16e96c46c2d5412dfcf1`; the signed build and installation receipts are retained at `target/verification/render-hotpath-20261011/los-santos-calibration-device-v5`. Local tag `los-santos-calibration-device-v5-20261013` pins the implementation.
+
+The report copied at 2026-10-13T09:10:06Z shows window mode and no immersive lifecycle events or completed world-frame counters. It does not corroborate the user's immersive session; preserve that distinction. First visible success is user-reported. Image correctness, both-eye telemetry, performance and phone regression remain separate follow-up checks. Preserve this build before further changes.
