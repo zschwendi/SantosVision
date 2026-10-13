@@ -195,6 +195,7 @@ pub fn setup_native(game_root: &Path, save_root: &Path) -> anyhow::Result<Startu
     let build = build_dir(game_root).ok_or_else(|| anyhow::anyhow!("game root has no b/<build>/shaders/index.json"))?;
     std::fs::create_dir_all(save_root)?;
     let native_graphics = prepare_native_graphics(save_root)?;
+    let start_mode = native_start_mode(save_root)?;
     let cache_dir = save_root.join("cache");
     std::fs::create_dir_all(&cache_dir)?;
     std::env::set_var("MUGUET_FSROOT", save_root);
@@ -202,7 +203,7 @@ pub fn setup_native(game_root: &Path, save_root: &Path) -> anyhow::Result<Startu
     std::env::set_var("MUGUET_SHADERS", build.join("shaders"));
     let frame_limit = if native_graphics.config.fps_limit == 30 { 2 } else { 1 };
     Ok(Startup { wasm_path: build.join("game.wasm"), cache_dir,
-        engine_args: vec![format!("-frameLimit={frame_limit}"), "-wasmstartchoice=1".into()],
+        engine_args: vec![format!("-frameLimit={frame_limit}"), format!("-wasmstartchoice={start_mode}")],
         native_graphics: Some(native_graphics) })
 }
 
@@ -259,6 +260,29 @@ impl NativeGraphicsLaunch {
             "marker_path":self.marker_path,"marker_action":self.marker_action,
             "settings_scope":"Low defaults on missing XML; existing GTA choices preserved unless the launcher resolution or FPS cap changes"})
     }
+}
+
+/// Story is the normal launch. Developer mode deliberately opts into the
+/// original guest's Sandbox path; this does not alter the compiled game AOT.
+fn native_start_mode(save_root: &Path) -> anyhow::Result<u32> {
+    use anyhow::{ensure, Context};
+    use std::io::Read;
+    let path = save_root.join("native-gameplay.json");
+    let file = match std::fs::File::open(&path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(1),
+        Err(error) => return Err(error).context("open native-gameplay.json"),
+    };
+    let mut text = String::new();
+    file.take(65_537).read_to_string(&mut text).context("read native-gameplay.json")?;
+    ensure!(text.len() <= 65_536, "native-gameplay.json is too large");
+    let value: serde_json::Value = serde_json::from_str(&text).context("parse native-gameplay.json")?;
+    let object = value.as_object().ok_or_else(|| anyhow::anyhow!("native gameplay config must be an object"))?;
+    let developer = match object.get("developer_mode") {
+        None => false,
+        Some(value) => value.as_bool().ok_or_else(|| anyhow::anyhow!("developer_mode must be a boolean"))?,
+    };
+    Ok(if developer { 2 } else { 1 })
 }
 
 const LOW_GRAPHICS: &[(&str, &str)] = &[
@@ -529,6 +553,25 @@ mod native_graphics_tests {
         fn marker(&self) -> PathBuf { self.0.join("native-graphics-applied.json") }
     }
     impl Drop for Fixture { fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); } }
+
+    #[test]
+    fn native_start_mode_defaults_to_story_and_requires_explicit_sandbox() {
+        let fixture = Fixture::new();
+        assert_eq!(native_start_mode(&fixture.0).unwrap(), 1);
+        let path = fixture.0.join("native-gameplay.json");
+        for (text, expected) in [("{}", 1), (r#"{"developer_mode":false}"#, 1),
+            (r#"{"developer_mode":true,"other_setting":7}"#, 2)] {
+            std::fs::write(&path, text).unwrap();
+            assert_eq!(native_start_mode(&fixture.0).unwrap(), expected);
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
+        }
+        for text in [r#"{"developer_mode":1}"#, r#"{"developer_mode":"true"}"#, "[]", "broken"] {
+            std::fs::write(&path, text).unwrap();
+            assert!(native_start_mode(&fixture.0).is_err());
+        }
+        std::fs::write(&path, " ".repeat(65_537)).unwrap();
+        assert!(native_start_mode(&fixture.0).is_err());
+    }
 
     #[test]
     fn native_graphics_accepts_only_safe_resolution_and_frame_caps() {

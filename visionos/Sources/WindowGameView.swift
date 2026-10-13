@@ -321,6 +321,14 @@ struct SantosSettingsView: View {
                         .disabled(!runtime.hasStarted)
                     Button("Quit game", systemImage: "power", role: .destructive) { quitGame() }
                 }
+                Section {
+                    Toggle("Developer mode", isOn: Binding(
+                        get: { runtime.playSettings.developerMode },
+                        set: { runtime.setDeveloperMode($0) }))
+                        .disabled(!runtime.canChangePlaySettings)
+                    Text("Starts in Sandbox. Turn off for Story Mode and story saves. Quit and reopen to change this setting.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
                 DisclosureGroup("Diagnostics") {
                     Text(runtime.status).font(.caption)
                     Text(runtime.nativeDetails).font(.system(.caption2, design: .monospaced)).textSelection(.enabled)

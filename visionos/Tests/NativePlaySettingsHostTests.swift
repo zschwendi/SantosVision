@@ -42,6 +42,31 @@ struct NativePlaySettingsHostTests {
             with: Data(contentsOf: fresh.appendingPathComponent("native-controller.json"))) as! [String: Any]
         precondition(nativeController["look_sensitivity_percent"] as? Double == 75)
 
+        // Developer mode is opt-in and persists without altering unrelated
+        // gameplay preferences. Switching back must restore normal Story Mode.
+        precondition(initial.developerMode == false)
+        let gameplayURL = fresh.appendingPathComponent("native-gameplay.json")
+        try Data("{\"developer_mode\":false,\"other_setting\":9}".utf8).write(to: gameplayURL)
+        var developerSettings = try NativePlaySettings.load(from: fresh)
+        developerSettings.developerMode = true
+        try developerSettings.save(to: fresh)
+        let developerReload = try NativePlaySettings.load(from: fresh)
+        precondition(developerReload.developerMode)
+        precondition(developerReload.reportValue["game_start_mode"] as? String == "sandbox")
+        let gameplayObject = try JSONSerialization.jsonObject(with: Data(contentsOf: gameplayURL)) as! [String: Any]
+        precondition(gameplayObject["other_setting"] as? Int == 9)
+        developerSettings.developerMode = false
+        try developerSettings.save(to: fresh)
+        let storyReload = try NativePlaySettings.load(from: fresh)
+        precondition(!storyReload.developerMode)
+        precondition(storyReload.reportValue["game_start_mode"] as? String == "story")
+        for invalid in ["{\"developer_mode\":1}", "{\"developer_mode\":\"true\"}", "{\"developer_mode\":null}"] {
+            try Data(invalid.utf8).write(to: gameplayURL)
+            do { _ = try NativePlaySettings.load(from: fresh); preconditionFailure("Invalid developer setting accepted") }
+            catch { }
+        }
+        try developerSettings.save(to: fresh)
+
         let custom = root.appendingPathComponent("custom")
         try manager.createDirectory(at: custom, withIntermediateDirectories: true)
         try Data("{\"master_volume\":0.5}".utf8).write(to: custom.appendingPathComponent("native-audio.json"))
@@ -53,6 +78,6 @@ struct NativePlaySettingsHostTests {
             do { _ = try NativePlaySettings.load(from: fresh); preconditionFailure("Invalid controller setting accepted") }
             catch { }
         }
-        print("Native play settings host tests passed: mute migration backup, preserved future choices, defaults, exact native JSON, validation")
+        print("Native play settings host tests passed: mute migration backup, preserved future choices, defaults, exact native JSON, developer mode persistence and validation")
     }
 }

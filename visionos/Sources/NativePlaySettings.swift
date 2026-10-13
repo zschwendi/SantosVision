@@ -6,16 +6,19 @@ import CoreFoundation
 struct NativePlaySettings: Equatable, Sendable {
     var masterVolume = 1.0
     var lookSensitivityPercent = 75.0
+    var developerMode = false
 
     private static let audioName = "native-audio.json"
     private static let controllerName = "native-controller.json"
+    private static let gameplayName = "native-gameplay.json"
     private static let audioMigrationName = "native-audio-restored-v1.json"
 
     var reportValue: [String: Any] {
         ["master_volume": masterVolume,
          "controller_look_sensitivity_percent": lookSensitivityPercent,
          "controller_look_semantics": "percent_of_original_host_right_stick_speed",
-         "game_start_mode": "story"]
+         "developer_mode": developerMode,
+         "game_start_mode": developerMode ? "sandbox" : "story"]
     }
 
     static func load(from root: URL) throws -> Self {
@@ -35,8 +38,10 @@ struct NativePlaySettings: Equatable, Sendable {
             try writeObject(["schema": 1], to: migration)
         }
         let controller = try readObject(root.appendingPathComponent(controllerName))
+        let gameplay = try readObject(root.appendingPathComponent(gameplayName))
         return Self(masterVolume: try number(audio, key: "master_volume", range: 0...1) ?? 1,
-                    lookSensitivityPercent: try number(controller, key: "look_sensitivity_percent", range: 0...100) ?? 75)
+                    lookSensitivityPercent: try number(controller, key: "look_sensitivity_percent", range: 0...100) ?? 75,
+                    developerMode: try boolean(gameplay, key: "developer_mode") ?? false)
     }
 
     func save(to root: URL) throws {
@@ -53,6 +58,10 @@ struct NativePlaySettings: Equatable, Sendable {
         var controller = try Self.readObject(controllerURL)
         controller["look_sensitivity_percent"] = lookSensitivityPercent
         try Self.writeObject(controller, to: controllerURL)
+        let gameplayURL = root.appendingPathComponent(Self.gameplayName)
+        var gameplay = try Self.readObject(gameplayURL)
+        gameplay["developer_mode"] = developerMode
+        try Self.writeObject(gameplay, to: gameplayURL)
         // An intentional mute saved through this UI must never be mistaken for
         // the old temporary mute, even when saving precedes the first load.
         try Self.writeObject(["schema": 1], to: root.appendingPathComponent(Self.audioMigrationName))
@@ -65,6 +74,14 @@ struct NativePlaySettings: Equatable, Sendable {
             throw NativeGraphicsSettings.SettingsError.invalid("Invalid \(key) in the play settings.")
         }
         return number.doubleValue
+    }
+
+    private static func boolean(_ object: [String: Any], key: String) throws -> Bool? {
+        guard let value = object[key] else { return nil }
+        guard let number = value as? NSNumber, CFGetTypeID(number) == CFBooleanGetTypeID() else {
+            throw NativeGraphicsSettings.SettingsError.invalid("Invalid \(key) in the play settings.")
+        }
+        return number.boolValue
     }
 
     private static func readObject(_ url: URL) throws -> [String: Any] {
