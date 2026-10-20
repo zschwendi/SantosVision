@@ -26,6 +26,8 @@ One targeted Mac M4 replay of that captured scene removes 9,028 of the 9,031 sam
 
 A separate conservative curvature-welding experiment was rejected: it repaired none of the 1,557 third-person region cracks and changed depth by up to 0.228m in the replay. Its shader and harness remain outside production. True depth-edge disocclusions, HUD isolation and head-directed gameplay aim still need their own fixes.
 
+Signed build 8 is installed in place, confirmed by the own-app version query. Frozen tag `los-santos-candidate8-20261020` points to `cb52093`; executable SHA256 is `0e575fa4cdb7a74eb4590e0cb4d121bc0ec01edc6ef72608191a9455c0d480ff`. Its complete optimized visionOS Swift/Metal build, signature, device profile, original AOT hash and RX protection passed. The exact build-7 native archive was reused with unchanged native inputs and bridge headers. The automatic launch subsequently timed out and its unique requested report was absent, so build-8 execution and wearer acceptance remain unconfirmed. Open Los Santos normally for the next first-person clothing/close-clipping check. Evidence: `candidate8/signed-build-receipt.json`, `app-after-install.json`, and `next-physical-tests.json`. Builds 5, 7 and their rollback tags remain preserved.
+
 The earlier signed r6 session produced two registered source/output color and Float32 depth images and a matching late-color trace. The user's subsequent 19 screenshots are preserved, with hashes and capture metadata, in `target/verification/device-session-20261020/feedback-images/manifest.json`. Originals remain in Downloads. The folder was copied through Finder after direct Downloads reads stalled; no unrelated media was opened.
 
 ## Screenshot provenance and findings
