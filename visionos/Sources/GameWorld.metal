@@ -200,6 +200,80 @@ fragment float4 gameWorldFragment(GameWorldVertex in [[stage_in]],
 // opt-in pipelines GameWorldRenderer creates for the matching environment flag.
 // ===========================================================================
 
+// ---- MUGUET_COMPOSITOR_FINITE_SKY_SUPPORT: explicit final ownership + repair ----
+// RGB/fade arithmetic intentionally matches gameWorldFragment above. The MRT
+// is written by the same surviving, depth-tested source fragment: 0 untouched,
+// 1 exact-clear sky, 2 finite geometry. It is not a color/alpha inference.
+struct GameWorldSkyOwnershipOut {
+    float4 color [[color(0)]];
+    uint owner [[color(1)]];
+};
+
+fragment GameWorldSkyOwnershipOut gameWorldSkyOwnershipFragment(GameWorldVertex in [[stage_in]],
+                                  constant GameWorldUniforms &u [[buffer(0)]],
+                                  texture2d<float> color [[texture(0)]]) {
+    constexpr sampler s(filter::linear, address::clamp_to_edge);
+    if (!all(isfinite(in.sourceUVQ)) || in.sourceUVQ.z <= 1e-7) { discard_fragment(); }
+    const float visibility = in.background != 0 ? 1 : smoothstep(u.nearFadeDistances.x, u.nearFadeDistances.y,
+                                        length(in.currentEyePosition));
+    const uint bayer[16] = { 0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5 };
+    const uint2 pixel = uint2(in.position.xy);
+    const float threshold = (float(bayer[(pixel.y & 3) * 4 + (pixel.x & 3)]) + 0.5) / 16;
+    if (visibility <= threshold) { discard_fragment(); }
+    float3 rgb = color.sample(s, in.sourceUVQ.xy / in.sourceUVQ.z).rgb;
+    if (u.colorTransfer == 1) {
+        rgb = select(1.055 * pow(max(rgb, 0.0), float3(1.0 / 2.4)) - 0.055,
+                     12.92 * rgb, rgb <= 0.0031308);
+    } else if (u.colorTransfer == 2) {
+        rgb = select(pow((max(rgb, 0.0) + 0.055) / 1.055, float3(2.4)),
+                     rgb / 12.92, rgb <= 0.04045);
+    }
+    GameWorldSkyOwnershipOut out;
+    out.color = float4(rgb, 1);
+    out.owner = in.background != 0 ? 1u : 2u;
+    return out;
+}
+
+struct GameWorldSkyRepairUniforms {
+    float4x4 eyeFromClip;
+    float4x4 clipFromEye;
+    float2 viewportOrigin;
+    float2 viewportSize;
+    float radius;
+    float padding;
+    float2 reserved;
+};
+struct GameWorldSkyRepairVertex { float4 position [[position]]; };
+struct GameWorldSkyRepairOut { float depth [[depth(any)]]; };
+vertex GameWorldSkyRepairVertex gameWorldSkyRepairVertex(uint id [[vertex_id]]) {
+    const float2 corners[3] = { float2(-1, -1), float2(3, -1), float2(-1, 3) };
+    GameWorldSkyRepairVertex out;
+    out.position = float4(corners[id], 0, 1);
+    return out;
+}
+fragment GameWorldSkyRepairOut gameWorldSkyRepairFragment(GameWorldSkyRepairVertex in [[stage_in]],
+                                         constant GameWorldSkyRepairUniforms &u [[buffer(0)]],
+                                         texture2d<uint, access::read> ownership [[texture(0)]]) {
+    const uint2 pixel = uint2(in.position.xy);
+    if (pixel.x >= ownership.get_width() || pixel.y >= ownership.get_height()
+        || ownership.read(pixel).r != 1u) { discard_fragment(); }
+    const float2 uv = (in.position.xy - u.viewportOrigin) / u.viewportSize;
+    float4 eyePoint = u.eyeFromClip * float4(uv.x * 2 - 1, 1 - uv.y * 2, 0.5, 1);
+    if (!all(isfinite(eyePoint)) || abs(eyePoint.w) <= 1e-7) { discard_fragment(); }
+    const float3 ray = eyePoint.xyz / eyePoint.w;
+    const float rayLength = length(ray);
+    if (!isfinite(rayLength) || rayLength <= 1e-7 || !isfinite(u.radius) || u.radius <= 0) { discard_fragment(); }
+    const float4 support = u.clipFromEye * float4(ray * (u.radius / rayLength), 1);
+    if (!all(isfinite(support)) || support.w <= 1e-7) { discard_fragment(); }
+    const float z = support.z / support.w;
+    // Strict validity, not an arbitrary epsilon. Source RGB stays untouched and
+    // final finite-world owners can never enter this depth-only pass.
+    if (!(z > 0 && z < 1)) { discard_fragment(); }
+    GameWorldSkyRepairOut out;
+    out.depth = z;
+    return out;
+}
+
 // ---- MUGUET_COMPOSITOR_SOURCE_ANCHOR_COPY: one fullscreen triangle per eye ----
 //
 // The drawable is labelled with the pose the source was rendered at, so the

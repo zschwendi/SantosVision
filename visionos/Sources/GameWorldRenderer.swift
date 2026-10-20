@@ -365,6 +365,9 @@ final class GameWorldRenderer: @unchecked Sendable {
     private var loggedCornerFallback = false
     /// Experimental paths, all nil unless their flag is "1". See docs/REPROJECTION-IMPLEMENTATION-20261011.md.
     private let sourceCopy: GameWorldSourceCopy?
+    /// DEFAULT OFF; final ownership prevents finite sky support from occluding
+    /// real far geometry. The experiment runs only on the legacy actual-eye path.
+    private let finiteSkySupport: GameWorldFiniteSkySupport?
     private let allowSyntheticAnchorCopy: Bool
     private let adaptiveMesh: GameWorldAdaptiveMesh?
     private let anchorProbe: GameWorldAnchorProbe?
@@ -445,6 +448,10 @@ final class GameWorldRenderer: @unchecked Sendable {
         allowSyntheticAnchorCopy = environment["MUGUET_COMPOSITOR_SOURCE_ANCHOR_COPY_ALLOW_SYNTHETIC"] == "1"
         let adaptiveRequested = RenderingOptimizations.adaptiveMeshEnabled
         let skyFanRequested = RenderingOptimizations.skyFanEnabled
+        finiteSkySupport = GameWorldFiniteSkySupport.requested
+            && !cornerRequested && !copyRequested && !probeRequested && !adaptiveRequested
+            ? GameWorldFiniteSkySupport(device: layer.device, library: library,
+                colorFormat: layer.configuration.colorFormat, depthFormat: layer.configuration.depthFormat) : nil
         adaptiveMesh = adaptiveRequested ? GameWorldAdaptiveMesh(device: layer.device, library: library,
                                                                  colorFormat: layer.configuration.colorFormat,
                                                                  depthFormat: layer.configuration.depthFormat,
@@ -459,6 +466,9 @@ final class GameWorldRenderer: @unchecked Sendable {
             throw GameWorldError.missingMetal
         }
         self.depthState = depthState
+        if GameWorldFiniteSkySupport.requested {
+            log.info("FINITE SKY SUPPORT EXPERIMENT: \(self.finiteSkySupport == nil ? "unavailable or incompatible path flags; unchanged rendering" : "enabled, final source ownership plus 0.8*far support sphere; no unseen coverage", privacy: .public)")
+        }
         if cornerRequested {
             log.info("Corner-depth precompute requested: \(precompute == nil ? "unavailable, using the single-pass pipeline" : "enabled", privacy: .public)")
         }
@@ -770,7 +780,8 @@ final class GameWorldRenderer: @unchecked Sendable {
                             currentEyeFromSourceEye: uniforms.currentEyeFromSourceEye,
                             currentClipFromEye: uniforms.currentClipFromEye, timestamp: timestamp,
                             outputViewIndex: 0, renderingMethod: singleSource == nil
-                                ? (encoded.copy ? "source_anchor_copy" : "independent_eye_depth_mesh")
+                                ? (encoded.finiteSkyFirstEye ? "finite_sky_support_experiment_depth_mesh"
+                                    : (encoded.copy ? "source_anchor_copy" : "independent_eye_depth_mesh"))
                                 : "single_source_depth_stereo")
                         didDebugCapture = true
                         if debugCapture == nil { log.error("Live world capture unsupported or exceeded its 96 MiB bound.") }
@@ -1066,9 +1077,10 @@ final class GameWorldRenderer: @unchecked Sendable {
                         sources: [GameWorldSourceEye], pairQualified: Bool, timestamp: Double,
                         commands: any MTLCommandBuffer, cornerScratch: inout CornerScratchLease,
                         adaptiveScratch: inout AdaptiveScratchLease,
-                        singleSource: GameWorldSourceEye? = nil) -> (views: Int, copy: Bool) {
+                        singleSource: GameWorldSourceEye? = nil) -> (views: Int, copy: Bool, finiteSkyFirstEye: Bool) {
         var clearedTextures = Set<String>()
         var encodedViews = 0
+        var finiteSkyFirstEye = false
         // Both eyes use one original-game aim sample, even if the script thread
         // publishes another sample between the two encoding calls.
         let gameplayAim = reticle == nil ? nil : GameWorldReticle.snapshot()
@@ -1102,6 +1114,30 @@ final class GameWorldRenderer: @unchecked Sendable {
             if let stageFromHead, let sourceEye = singleSource ?? sources.first(where: { $0.viewIndex == eye }) {
                 source = (sourceEye, worldUniforms(eye: sourceEye, stageFromHead: stageFromHead, headFromEye: view.transform,
                                                    projection: projection))
+            }
+            if copyDecision == nil, singleSource == nil, let finiteSkySupport, let source,
+               source.eye.kind == .actual,
+               finiteSkySupport.encode(commands: commands, pass: pass, viewport: map.viewport,
+                    projection: projection, far: drawable.depthRange.x, uniforms: source.uniforms,
+                    color: source.eye.color, depth: source.eye.depth) != nil {
+                encodedViews += 1
+                if eye == 0 { finiteSkyFirstEye = true }
+                // Ownership and depth repair have finished. This new pass has
+                // only attachment0, matching the normal reticle pipeline.
+                if let stageFromHead, let gameplayAim {
+                    pass.colorAttachments[0].loadAction = .load
+                    pass.depthAttachment.loadAction = .load
+                    if let overlay = commands.makeRenderCommandEncoder(descriptor: pass) {
+                        overlay.label = "Gameplay reticle after finite sky experiment"
+                        overlay.setViewport(map.viewport)
+                        let gameFromCurrentEye = worldDoubleMatrix(source.eye.gameFromStage)
+                            * worldDoubleMatrix(stageFromHead) * worldDoubleMatrix(view.transform)
+                        reticle?.encode(overlay, aim: gameplayAim, gameFromCurrentEye: gameFromCurrentEye,
+                                        projection: projection, viewport: map.viewport)
+                        overlay.endEncoding()
+                    }
+                }
+                continue
             }
             // Pre-pass work for this eye, encoded on this command buffer before its render pass.
             var corners: (any MTLTexture)?
@@ -1181,7 +1217,7 @@ final class GameWorldRenderer: @unchecked Sendable {
             encoder.endEncoding()
             if let adaptiveSet, let adaptiveMesh { adaptiveMesh.encodeCounterCopy(commands: commands, set: adaptiveSet) }
         }
-        return (encodedViews, copyDecision != nil)
+        return (encodedViews, copyDecision != nil, finiteSkyFirstEye)
     }
 
     private func worldUniforms(eye: GameWorldSourceEye, stageFromHead: simd_float4x4,
