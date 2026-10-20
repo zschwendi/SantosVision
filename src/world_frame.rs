@@ -59,7 +59,7 @@ impl FrozenPreUiDepth {
 }
 #[derive(Clone)]
 struct Ready { slot: Arc<Slot>, frame: WorldFrame, generation: u64, provenance_epoch: u64,
-    pair_epoch: u64, ready_at: Instant }
+    pair_epoch: u64, ready_at: Instant, snapshot_submit_to_gpu_completion_seconds: Option<f64> }
 impl Ready {
     #[cfg(test)]
     fn depth_texture(&self) -> &Texture { &self.slot.depth }
@@ -101,8 +101,49 @@ pub(crate) fn reset() {
     }
 }
 
+// This interval ends when the completion callback is observed, not at a GPU
+// timestamp. It includes prior queued work, the snapshot copy and callback/poll
+// delay; it is neither isolated GPU execution time nor motion-to-photon latency.
+fn snapshot_completion_seconds(submitted_at: Instant, completion_observed_at: Instant) -> Option<f64> {
+    completion_observed_at.checked_duration_since(submitted_at).map(|duration| duration.as_secs_f64())
+}
+
+fn qualified_primary_pose(view: &crate::xr_view::WorldView) -> bool {
+    view.headset_applied && view.provenance_epoch != 0 && view.head_pose_frame != 0
+        && view.request_frame != 0 && view.presentation_time_seconds.is_finite()
+        && view.presentation_time_seconds > 0.
+}
+
+fn source_to_primary_pose_lag_seconds(frame: &WorldFrame, provenance_epoch: u64,
+    newest_primary: Option<&crate::xr_view::WorldView>) -> Option<f64> {
+    let newest = newest_primary.filter(|view| qualified_primary_pose(view))?;
+    if newest.provenance_epoch != provenance_epoch || frame.head_frame == 0
+        || frame.head_frame > newest.head_pose_frame || !frame.presentation_time.is_finite()
+        || frame.presentation_time <= 0. { return None; }
+    let lag = newest.presentation_time_seconds - frame.presentation_time;
+    (lag.is_finite() && lag >= 0.).then_some(lag)
+}
+
+fn describe_ready(frame: &WorldFrame, provenance_epoch: u64, ready_at: Instant,
+    snapshot_submit_to_gpu_completion_seconds: Option<f64>,
+    newest_primary: Option<&crate::xr_view::WorldView>, observed_at: Instant) -> serde_json::Value {
+    let ready_age_seconds = observed_at.checked_duration_since(ready_at).map(|duration| duration.as_secs_f64());
+    json!({"view_index": frame.view_index, "game_frame": frame.game_frame, "provenance_epoch": provenance_epoch,
+        "request_frame": frame.request_frame, "head_frame": frame.head_frame,
+        "presentation_time": frame.presentation_time, "width": frame.width, "height": frame.height,
+        "age_seconds": ready_age_seconds, "ready_age_seconds": ready_age_seconds,
+        "source_to_newest_primary_pose_lag_seconds": source_to_primary_pose_lag_seconds(frame, provenance_epoch, newest_primary),
+        "snapshot_submit_to_gpu_completion_seconds": snapshot_submit_to_gpu_completion_seconds})
+}
+
 pub(crate) fn status_json() -> serde_json::Value {
+    // Never nest the XR world-state mutex under FRAMES. The reference is sampled
+    // first and its lock released before observing ready images; they are not
+    // one atomic snapshot. A newer source or changed epoch therefore yields null.
+    let newest_primary = crate::xr_view::latest_world_view().filter(|view|
+        qualified_primary_pose(view) && crate::xr_view::view_epoch_is_active(view.provenance_epoch));
     let Ok(frames) = FRAMES.lock() else { return json!({"error": "world frame lock poisoned"}); };
+    let observed_at = Instant::now();
     json!({"abi_version": 1, "pair_abi_version": PAIR_ABI_VERSION,
         "paired_render_requested": paired_render_requested(),
         "storage": "immutable GPU-complete Metal color and real depth",
@@ -115,12 +156,18 @@ pub(crate) fn status_json() -> serde_json::Value {
         "compositor_completed_frames": frames.compositor_frames, "compositor_completed_views": frames.compositor_views,
         "compositor_completed_pair_epoch": frames.compositor_pair_epoch,
         "compositor_completion_age_seconds": frames.compositor_completed_at.map(|time| time.elapsed().as_secs_f64()),
-        "latest_views": frames.latest.iter().map(|r| r.as_ref().map(|r| json!({
-            "view_index": r.frame.view_index, "game_frame": r.frame.game_frame,
-            "request_frame": r.frame.request_frame, "head_frame": r.frame.head_frame,
-            "presentation_time": r.frame.presentation_time, "width": r.frame.width, "height": r.frame.height,
-            "age_seconds": r.ready_at.elapsed().as_secs_f64()
-        }))).collect::<Vec<_>>()})
+        "newest_primary_pose_reference": newest_primary.map(|view| json!({
+            "provenance_epoch": view.provenance_epoch, "camera_sequence": view.camera_sequence,
+            "request_frame": view.request_frame, "head_frame": view.head_pose_frame,
+            "presentation_time_seconds": view.presentation_time_seconds})),
+        "timing_metrics_scope": {
+            "units": "seconds",
+            "ready_age_seconds": "Time since GPU-complete publication; age_seconds is the compatibility alias, not source-pose age.",
+            "source_to_newest_primary_pose_lag_seconds": "Source pose timestamp subtracted from newest qualified primary-camera pose timestamp in the same native status observation; not wall-clock age or motion-to-photon. Reference is sampled before ready images, non-atomically; incompatible or future source metadata yields null.",
+            "snapshot_submit_to_gpu_completion_seconds": "Instant interval immediately after queue.submit returns until its completion callback is observed, before the publication lock. Includes queued work/copy and callback or polling delay; not isolated GPU execution time or motion-to-photon."},
+        "latest_views": frames.latest.iter().map(|r| r.as_ref().map(|r| describe_ready(&r.frame,
+            r.provenance_epoch, r.ready_at, r.snapshot_submit_to_gpu_completion_seconds,
+            newest_primary.as_ref(), observed_at))).collect::<Vec<_>>()})
 }
 
 /// This is a capability request, not evidence that a guest produced a pair.
@@ -321,14 +368,16 @@ pub(crate) fn publish_pair(device: &Device, queue: &Queue, sources: [PairSource<
             }
         }
         queue.submit([encoder.finish()]);
+        let snapshot_submitted_at = Instant::now();
         queue.on_submitted_work_done(move || {
+            let snapshot_submit_to_gpu_completion_seconds = snapshot_completion_seconds(snapshot_submitted_at, Instant::now());
             if let Ok(mut frames) = FRAMES.lock() {
                 if generation != frames.generation || !crate::xr_view::view_epoch_is_active(provenance_epoch)
                     || frames.latest_pair.as_ref().is_some_and(|pair| pair.scene_epoch >= scene_epoch) { return; }
                 let ready_at = Instant::now();
                 let eyes = std::array::from_fn(|index| Ready { slot: slots[index].clone(),
                     frame: published[index], generation, provenance_epoch, pair_epoch: scene_epoch,
-                    ready_at });
+                    ready_at, snapshot_submit_to_gpu_completion_seconds });
                 frames.latest = [Some(eyes[0].clone()), Some(eyes[1].clone())];
                 frames.latest_pair = Some(ReadyPair { eyes, scene_epoch, ready_at });
                 frames.published += 2;
@@ -411,13 +460,15 @@ pub(crate) fn publish_with_frozen_depth(device: &Device, queue: &Queue, color: &
         copy(color, &slot.color);
         if !used_frozen_depth { copy(depth, &slot.depth); }
         queue.submit([commands.finish()]);
+        let snapshot_submitted_at = Instant::now();
         // Separate compositor queues may read only after the producer's copy finishes.
         queue.on_submitted_work_done(move || {
+            let snapshot_submit_to_gpu_completion_seconds = snapshot_completion_seconds(snapshot_submitted_at, Instant::now());
             if let Ok(mut frames) = FRAMES.lock() {
                 if generation != frames.generation || !crate::xr_view::view_epoch_is_active(provenance_epoch) { return; }
                 let index = frame.view_index as usize;
                 frames.latest[index] = Some(Ready { slot, frame, generation, provenance_epoch,
-                    pair_epoch: 0, ready_at: Instant::now() });
+                    pair_epoch: 0, ready_at: Instant::now(), snapshot_submit_to_gpu_completion_seconds });
                 frames.published += 1;
                 if used_frozen_depth { frames.frozen_depth_handoffs += 1; }
                 else { frames.copied_depth_snapshots += 1; }
@@ -555,6 +606,80 @@ pub extern "C" fn sv_world_complete_frame(leases: *const u64, count: u32, metal_
 mod tests {
     use super::*;
     static TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn telemetry_primary_pose() -> crate::xr_view::WorldView {
+        let identity = [1.,0.,0.,0., 0.,1.,0.,0., 0.,0.,1.,0., 0.,0.,0.,1.];
+        crate::xr_view::WorldView { provenance_epoch: 4, camera_sequence: 9,
+            request_frame: 8, head_pose_frame: 8, presentation_time_seconds: 100.25,
+            eye_index: 0, view_count: 2, game_from_eye: identity, game_from_stage: identity,
+            projection_from_eye: identity, depth_reverse_z: true, headset_applied: true }
+    }
+
+    #[test]
+    fn ready_telemetry_distinguishes_publication_age_pose_lag_and_snapshot_wait() {
+        let ready_at = Instant::now();
+        let observed_at = ready_at + Duration::from_millis(10);
+        let snapshot_wait = snapshot_completion_seconds(ready_at - Duration::from_millis(125), ready_at);
+        let frame = WorldFrame { game_frame: 42, request_frame: 7, head_frame: 7,
+            presentation_time: 100., width: 1920, height: 1080, ..Default::default() };
+        let primary = telemetry_primary_pose();
+        let status = describe_ready(&frame, 4, ready_at, snapshot_wait, Some(&primary), observed_at);
+        assert_eq!(status["age_seconds"], status["ready_age_seconds"]);
+        assert_eq!(status["ready_age_seconds"], json!(0.01));
+        assert_eq!(status["source_to_newest_primary_pose_lag_seconds"], json!(0.25));
+        assert_eq!(status["snapshot_submit_to_gpu_completion_seconds"], json!(0.125));
+        assert_eq!(status["presentation_time"], json!(100.));
+        assert_eq!(status["head_frame"], json!(7));
+        assert_eq!(status["provenance_epoch"], json!(4));
+    }
+
+    #[test]
+    fn pose_lag_rejects_unqualified_cross_epoch_invalid_and_future_source_metadata() {
+        let mut frame = WorldFrame { head_frame: 7, presentation_time: 100., ..Default::default() };
+        let mut primary = telemetry_primary_pose();
+        assert_eq!(source_to_primary_pose_lag_seconds(&frame, 4, Some(&primary)), Some(0.25));
+        assert_eq!(source_to_primary_pose_lag_seconds(&frame, 4, None), None);
+        assert_eq!(source_to_primary_pose_lag_seconds(&frame, 5, Some(&primary)), None);
+        for invalid in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -1., 0., 101.] {
+            frame.presentation_time = invalid;
+            assert_eq!(source_to_primary_pose_lag_seconds(&frame, 4, Some(&primary)), None);
+        }
+        frame.presentation_time = 100.;
+        for invalid in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -1., 0., 99.] {
+            primary.presentation_time_seconds = invalid;
+            assert_eq!(source_to_primary_pose_lag_seconds(&frame, 4, Some(&primary)), None);
+        }
+        primary.presentation_time_seconds = 100.;
+        assert_eq!(source_to_primary_pose_lag_seconds(&frame, 4, Some(&primary)), Some(0.));
+        frame.head_frame = 9; // Source advanced after the non-atomic reference sample.
+        assert_eq!(source_to_primary_pose_lag_seconds(&frame, 4, Some(&primary)), None);
+        frame.head_frame = 0;
+        assert_eq!(source_to_primary_pose_lag_seconds(&frame, 4, Some(&primary)), None);
+        frame.head_frame = 7;
+        primary.headset_applied = false;
+        assert_eq!(source_to_primary_pose_lag_seconds(&frame, 4, Some(&primary)), None);
+        primary.headset_applied = true;
+        primary.head_pose_frame = 0;
+        assert_eq!(source_to_primary_pose_lag_seconds(&frame, 4, Some(&primary)), None);
+        primary.head_pose_frame = 8;
+        primary.request_frame = 0;
+        assert_eq!(source_to_primary_pose_lag_seconds(&frame, 4, Some(&primary)), None);
+    }
+
+    #[test]
+    fn monotonic_telemetry_handles_zero_duration_and_future_observations_without_clamping() {
+        let now = Instant::now();
+        assert_eq!(snapshot_completion_seconds(now, now), Some(0.));
+        assert_eq!(snapshot_completion_seconds(now, now + Duration::from_micros(250)), Some(0.00025));
+        assert_eq!(snapshot_completion_seconds(now + Duration::from_micros(1), now), None);
+        let status = describe_ready(&WorldFrame::default(), 0, now + Duration::from_millis(1),
+            None, None, now);
+        assert!(status["ready_age_seconds"].is_null());
+        assert_eq!(status["age_seconds"], status["ready_age_seconds"]);
+        assert!(status["source_to_newest_primary_pose_lag_seconds"].is_null());
+        assert!(status["snapshot_submit_to_gpu_completion_seconds"].is_null());
+    }
+
     #[test]
     fn depth_remapping_preserves_screen_rays_but_rejects_other_cameras() {
         let identity = [1.,0.,0.,0., 0.,1.,0.,0., 0.,0.,1.,0., 0.,0.,0.,1.];
@@ -717,9 +842,18 @@ mod tests {
         upload(&depths[1], 0.5f32.to_le_bytes());
         let sources = std::array::from_fn(|index| PairSource { color: &colors[index],
             depth: &depths[index], frame: [left, right][index] });
+        let before_publish = Instant::now();
         publish_pair(&device, &queue, sources,
             crate::xr_view::fixture_certified_pair_epoch(1, provenance));
         device.poll(PollType::Wait { submission_index: None, timeout: Some(Duration::from_secs(10)) }).unwrap();
+        {
+            let frames = FRAMES.lock().unwrap();
+            let pair = frames.latest_pair.as_ref().unwrap();
+            let wait = pair.eyes[0].snapshot_submit_to_gpu_completion_seconds.unwrap();
+            assert!(wait >= 0. && wait <= before_publish.elapsed().as_secs_f64());
+            assert_eq!(pair.eyes[1].snapshot_submit_to_gpu_completion_seconds, Some(wait));
+            assert_eq!(pair.eyes[0].ready_at, pair.eyes[1].ready_at);
+        }
         let mut pair = WorldPair { abi_version: PAIR_ABI_VERSION, byte_size: 592, ..Default::default() };
         assert_eq!(sv_world_acquire_pair(&mut pair), 0);
         assert_eq!(pair.scene_epoch, 1);
@@ -830,8 +964,15 @@ mod tests {
             presentation_time: 1., ..Default::default() };
         assert_eq!(crate::xr_view::sv_xr_world_camera_set_enabled(1), 0);
         let epoch = crate::xr_view::view_epoch();
+        let before_publish = Instant::now();
         publish(&device, &queue, &color, &depth, frame, epoch);
         device.poll(PollType::Wait { submission_index: None, timeout: Some(std::time::Duration::from_secs(10)) }).unwrap();
+        {
+            let frames = FRAMES.lock().unwrap();
+            let ready = frames.latest[0].as_ref().unwrap();
+            let wait = ready.snapshot_submit_to_gpu_completion_seconds.unwrap();
+            assert!(wait >= 0. && wait <= before_publish.elapsed().as_secs_f64());
+        }
         frame.abi_version = 1; frame.byte_size = 288;
         assert_eq!(sv_world_acquire_frame(0, &mut frame), 0);
         assert_eq!(frame.game_frame, 42); assert_ne!(frame.color_texture, 0); assert_ne!(frame.depth_texture, 0);
