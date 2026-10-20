@@ -16,6 +16,16 @@ Registered normal-run analysis now shows black cracks on the third-person charac
 
 A separate finite-sky-only process presented on the physical headset. The user reports the sky holes are **much smaller and only in the distance**, a partial improvement rather than complete resolution. Its unique schema-2 capture completed and was compositor-acknowledged with `rendering_method=finite_sky_support_experiment_depth_mesh`; all four registered source/output color/depth files are local and analyzed. That captured viewpoint looks down and contains only 294 source clear-depth pixels, so it cannot certify the user's distant sky result or both eyes by itself. No guard band, corner-precompute, adaptive mesh or single-source mode was enabled. Receipts and captures are in `target/verification/device-session-20261020/candidate7/`, including `normal-ready-feedback-receipt.json` and `analysis-sky-ready/`. First-person head aim, full HUD routing, coherent stereo and performance acceptance remain unfinished.
 
+## Build 8 changes from the captured evidence
+
+Normal launches now request the same partial sky improvement tested in build 7. The explicit QA disable and original incompatible-path/resource fallback remain available. Bounded per-eye lifecycle telemetry distinguishes CPU encoding from actual GPU/display acceptance.
+
+The first-person clothing capture also isolates the broad near-body fade: 10,350 projected source body centers are 20.77–22.94cm from the current eye; the old 15–45cm Bayer predicate exactly predicts 9,031 black/clear output pixels with zero mismatches. The new uniform narrows the radial fade to 5–10cm, keeping this visible clothing opaque. With the normal axial near plane around 10cm this intentionally relies mainly on clipping for intersections; it is a firmer cut, not a clean transparent body fade revealing unseen background. Shader geometry, color transfer, depth testing, original source/aim and reticle remain unchanged. Captures now record the actual fade distances instead of using an old hardcoded diagnostic threshold.
+
+One targeted Mac M4 replay of that captured scene removes 9,028 of the 9,031 sampled body holes; three unrelated mesh/clip gaps remain. It adds 72,906 written pixels, loses none, and changes no color/depth/coverage beyond 0.4501m. The ordinary and sky-ownership fragments match bit for bit for both fade settings. This validates the scoped parameter change, not headset acceptance. Evidence: `near-fade-replay-20261020/output/results.json` and `candidate7/first-person-body-bayer-audit-20261020.json`.
+
+A separate conservative curvature-welding experiment was rejected: it repaired none of the 1,557 third-person region cracks and changed depth by up to 0.228m in the replay. Its shader and harness remain outside production. True depth-edge disocclusions, HUD isolation and head-directed gameplay aim still need their own fixes.
+
 The earlier signed r6 session produced two registered source/output color and Float32 depth images and a matching late-color trace. The user's subsequent 19 screenshots are preserved, with hashes and capture metadata, in `target/verification/device-session-20261020/feedback-images/manifest.json`. Originals remain in Downloads. The folder was copied through Finder after direct Downloads reads stalled; no unrelated media was opened.
 
 ## Screenshot provenance and findings

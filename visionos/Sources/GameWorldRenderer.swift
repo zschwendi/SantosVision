@@ -93,7 +93,10 @@ struct GameWorldUniforms {
     var sourceSize: SIMD2<UInt32>
     var sourceDepthReversed: UInt32 = 1
     var colorTransfer: UInt32 = 0
-    var nearFadeDistances = SIMD2<Float>(0.15, 0.45)
+    // Keep visible arms/clothing opaque. The former 15–45cm fade produced the
+    // recorded first-person Bayer holes; normal ~10cm near clipping protects
+    // intersections while this small radial range handles the closest pixels.
+    var nearFadeDistances = SIMD2<Float>(0.05, 0.10)
     var reserved = SIMD2<Float>.zero
 }
 
@@ -787,7 +790,8 @@ final class GameWorldRenderer: @unchecked Sendable {
                             slice: view.textureMap.sliceIndex, viewport: view.textureMap.viewport, native: lease.native,
                             sourceEyeFromClip: uniforms.sourceEyeFromClip,
                             currentEyeFromSourceEye: uniforms.currentEyeFromSourceEye,
-                            currentClipFromEye: uniforms.currentClipFromEye, timestamp: timestamp,
+                            currentClipFromEye: uniforms.currentClipFromEye,
+                            nearFadeDistances: uniforms.nearFadeDistances, timestamp: timestamp,
                             outputViewIndex: 0, renderingMethod: singleSource == nil
                                 ? (encoded.finiteSkyFirstEye ? "finite_sky_support_experiment_depth_mesh"
                                     : (encoded.copy ? "source_anchor_copy" : "independent_eye_depth_mesh"))

@@ -59,6 +59,7 @@ final class GameWorldDebugCapture: @unchecked Sendable {
     private let sourceEyeFromClip: simd_float4x4
     private let currentEyeFromSourceEye: simd_float4x4
     private let currentClipFromEye: simd_float4x4
+    private let nearFadeDistances: SIMD2<Float>
     private let metadata: [String: Any]
     private static let log = Logger(subsystem: "com.zephyrstudios.santosvision", category: "GameWorldCapture")
 
@@ -90,7 +91,7 @@ final class GameWorldDebugCapture: @unchecked Sendable {
           outputColor: any MTLTexture, outputDepth: any MTLTexture,
           slice: Int, viewport: MTLViewport, native: SVWorldFrame,
           sourceEyeFromClip: simd_float4x4, currentEyeFromSourceEye: simd_float4x4,
-          currentClipFromEye: simd_float4x4, timestamp: Double,
+          currentClipFromEye: simd_float4x4, nearFadeDistances: SIMD2<Float>, timestamp: Double,
           outputViewIndex: Int = 0, renderingMethod: String = "unspecified") {
         let formats: Set<MTLPixelFormat> = [.rgba8Unorm, .bgra8Unorm, .rgba8Unorm_srgb, .bgra8Unorm_srgb]
         let width = Int(viewport.width), height = Int(viewport.height)
@@ -129,6 +130,7 @@ final class GameWorldDebugCapture: @unchecked Sendable {
         self.sourceEyeFromClip = sourceEyeFromClip
         self.currentEyeFromSourceEye = currentEyeFromSourceEye
         self.currentClipFromEye = currentClipFromEye
+        self.nearFadeDistances = nearFadeDistances
         metadata = ["schema": 2, "scope": "Readback of actual leased textures and the normal compositor shader output before presentation; no substitute render.",
                     "game_frame": native.game_frame, "request_frame": native.request_frame,
                     "head_frame": native.head_frame, "view_count": native.view_count,
@@ -143,6 +145,7 @@ final class GameWorldDebugCapture: @unchecked Sendable {
                     "game_from_eye": Self.tupleValues(native.game_from_eye),
                     "game_from_stage": Self.tupleValues(native.game_from_stage),
                     "source_near": native.depth_near, "source_far": native.depth_far,
+                    "near_fade_distances_m": [nearFadeDistances.x, nearFadeDistances.y],
                     "source_color_format": color.pixelFormat.rawValue,
                     "source_depth_format": depth.pixelFormat.rawValue,
                     "output_color_format": outputColor.pixelFormat.rawValue,
@@ -311,7 +314,7 @@ final class GameWorldDebugCapture: @unchecked Sendable {
                 geometryDistanceSamples += 1
                 let distance = simd_length(SIMD3(eye.x, eye.y, eye.z))
                 minimumDistance = min(minimumDistance, distance); maximumDistance = max(maximumDistance, distance)
-                if distance <= 0.15 { nearFaded += 1 }
+                if distance <= nearFadeDistances.x { nearFaded += 1 }
             }
         }
         return ["scope": "Sampled source texel-center checks of the original mesh before any final sky-support depth repair; actual output readback establishes final raster coverage/depth. Exact-clear rays rotate without translation; distance/fade statistics include finite geometry only.",
