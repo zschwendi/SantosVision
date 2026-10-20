@@ -598,9 +598,9 @@ fn restore_primary_projection(caller: &mut Caller<'_, HostState>, mem: &SharedMe
         .context("missing crop restore projection setter")?.typed::<(i64, i64), ()>(&mut *caller)?;
     let stack = crate::guest_call_scope::call(caller, crate::guest_call_scope::Kind::Ordinary,
         |caller| stack_get.call(caller, ()))?;
-    let scratch = crate::guest_call_scope::call(caller, crate::guest_call_scope::Kind::Ordinary,
-        |caller| allocate.call(caller, 64))? as u64;
     let result = (|| {
+        let scratch = crate::guest_call_scope::call(caller, crate::guest_call_scope::Kind::Ordinary,
+            |caller| allocate.call(caller, 64))? as u64;
         anyhow::ensure!(scratch != 0 && scratch.checked_add(64).is_some_and(|end| end <= mem.data_size() as u64),
             "crop restore scratch outside guest memory");
         if read_u64(mem, ACTIVE_CVIEWPORT) != Some(restore.before.source)
@@ -634,8 +634,8 @@ fn update_viewport(caller: &mut Caller<'_, HostState>, viewport: u64, camera: Op
     let set_projection = caller.get_export("mp:XRSetViewportProjection").and_then(|e| e.into_func()).context("missing projection setter")?
         .typed::<(i64, i64), ()>(&mut *caller)?;
     let stack = crate::guest_call_scope::call(caller, crate::guest_call_scope::Kind::Ordinary, |caller| stack_get.call(caller, ()))?;
-    let scratch = crate::guest_call_scope::call(caller, crate::guest_call_scope::Kind::Ordinary, |caller| allocate.call(caller, 128))? as u64;
     let result = (|| {
+        let scratch = crate::guest_call_scope::call(caller, crate::guest_call_scope::Kind::Ordinary, |caller| allocate.call(caller, 128))? as u64;
         let mem = &RT.get().context("missing runtime")?.mem;
         anyhow::ensure!(scratch != 0 && scratch.checked_add(128).is_some_and(|end| end <= mem.data_size() as u64), "camera scratch outside guest memory");
         if scalars.is_some() {
@@ -1163,7 +1163,7 @@ mod tests {
         outer.instruction(&I::Call(0)).instruction(&I::End); code.function(&outer); module.section(&code);
         let mut config = wasmtime::Config::new(); config.shared_memory(true);
         let engine = Engine::new(&config).unwrap(); let module = Module::new(&engine,module.finish()).unwrap();
-        for changed_during_allocation in 0..3 {
+        for changed_during_allocation in 0..5 {
             let mem = SharedMemory::new(&engine,MemoryType::shared(300,300)).unwrap();
             let source = 8192u64; let viewport = source + 16;
             let mut geometry = [0.,0.,1.,1.,0.,1.,0.,0.,1.,1.,0.,1.,0.,0.].map(f32::to_bits);
@@ -1182,6 +1182,7 @@ mod tests {
             assert!(crate::write_bytes(&mem,viewport+872,&bytes));
             assert!(crate::write_bytes(&mem,viewport+PROJECTION_OFFSET,&matrix_bytes(&live.projection)));
             let calls = Arc::new(AtomicUsize::new(0)); let restored_stack = Arc::new(AtomicUsize::new(0));
+            let stack_pointer = Arc::new(AtomicUsize::new(4096));
             let mut linker = Linker::new(&engine); let run_mem = mem.clone();
             linker.func_wrap("fixture","run",move |mut caller:Caller<'_,HostState>| -> wasmtime::Result<i32> {
                 let store = crate::guest_call_scope::producer_store_lifetime(caller.data());
@@ -1192,34 +1193,47 @@ mod tests {
                 restore_primary_projection(&mut caller,&run_mem,plan).map(i32::from)
                     .map_err(wasmtime::Error::from_anyhow)
             }).unwrap();
-            linker.func_wrap("fixture","get",||4096i64).unwrap();
+            let get_stack = stack_pointer.clone();
+            linker.func_wrap("fixture","get",move ||get_stack.load(AtomicOrdering::Relaxed) as i64).unwrap();
             let alloc_mem = mem.clone();
-            linker.func_wrap("fixture","alloc",move |size:i64| {
+            let allocate_stack = stack_pointer.clone();
+            linker.func_wrap("fixture","alloc",move |size:i64| -> wasmtime::Result<i64> {
                 assert_eq!(size,64);
+                allocate_stack.store(8192,AtomicOrdering::Relaxed);
                 match changed_during_allocation {
                     1=>assert!(crate::write_bytes(&alloc_mem,viewport+888,&0.125f32.to_le_bytes())),
                     2=>assert!(crate::write_bytes(&alloc_mem,ACTIVE_CVIEWPORT,&(source+4096).to_le_bytes())),
+                    3=>return Err(wasmtime::Error::msg("fixture allocator trap after changing stack")),
                     _=>{},
-                } 4096i64
+                } Ok(4096i64)
             }).unwrap();
             let stack_sink = restored_stack.clone();
-            linker.func_wrap("fixture","restore",move |stack:i64| {assert_eq!(stack,4096);stack_sink.fetch_add(1,AtomicOrdering::Relaxed);}).unwrap();
+            let restore_stack = stack_pointer.clone();
+            linker.func_wrap("fixture","restore",move |stack:i64| {
+                assert_eq!(stack,4096); restore_stack.store(stack as usize,AtomicOrdering::Relaxed);
+                stack_sink.fetch_add(1,AtomicOrdering::Relaxed);
+            }).unwrap();
             let setter_mem = mem.clone(); let sink = calls.clone();
-            linker.func_wrap("fixture","projection",move |pointer:i64,scratch:i64| {
+            linker.func_wrap("fixture","projection",move |pointer:i64,scratch:i64| -> wasmtime::Result<()> {
                 assert_eq!(pointer,viewport as i64);
                 // The production driver changes ONLY crop before dispatch.
                 assert_eq!(read_projection_scalars(&setter_mem,viewport).unwrap().map(f32::to_bits),game.fields.map(f32::to_bits));
                 let bytes = crate::read_bytes(&setter_mem,scratch as u64,64);
                 assert!(crate::write_bytes(&setter_mem,viewport+PROJECTION_OFFSET,&bytes));
                 sink.fetch_add(1,AtomicOrdering::Relaxed);
+                if changed_during_allocation==4 {return Err(wasmtime::Error::msg("fixture setter trap"));}
+                Ok(())
             }).unwrap();
             let mut store = Store::new(&engine,HostState::new(0));
             let instance = linker.instantiate(&mut store,&module).unwrap();
             let outer = instance.get_typed_func::<(),i32>(&mut store,"outer").unwrap();
-            assert_eq!(outer.call(&mut store,()).unwrap(),i32::from(changed_during_allocation==0));
-            assert_eq!(calls.load(AtomicOrdering::Relaxed),usize::from(changed_during_allocation==0));
+            let result = outer.call(&mut store,());
+            if changed_during_allocation>=3 {assert!(result.is_err());}
+            else {assert_eq!(result.unwrap(),i32::from(changed_during_allocation==0));}
+            assert_eq!(calls.load(AtomicOrdering::Relaxed),usize::from(matches!(changed_during_allocation,0|4)));
             assert_eq!(restored_stack.load(AtomicOrdering::Relaxed),1);
-            if changed_during_allocation==0 {
+            assert_eq!(stack_pointer.load(AtomicOrdering::Relaxed),4096);
+            if matches!(changed_during_allocation,0|4) {
                 assert_eq!(read_projection_scalars(&mem,viewport).unwrap().map(f32::to_bits),game.fields.map(f32::to_bits));
                 assert!(projection_restore::same_matrix(&read_matrix(&mem,viewport+PROJECTION_OFFSET).unwrap(),
                     &projection_restore::guest_projection(game.fields,false).unwrap()));
