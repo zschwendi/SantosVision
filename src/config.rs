@@ -27,6 +27,14 @@ const DEFAULT_CONFIG: &str = r#"{
 }
 "#;
 
+const DEFAULT_START_MODE: i64 = if cfg!(target_os = "ios") { 1 } else { 2 };
+
+fn default_config() -> serde_json::Value {
+    let mut cfg: serde_json::Value = serde_json::from_str(DEFAULT_CONFIG).unwrap();
+    cfg["start_mode"] = DEFAULT_START_MODE.into();
+    cfg
+}
+
 fn support_dir() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
     if cfg!(any(target_os = "ios", target_os = "visionos")) {
@@ -92,7 +100,7 @@ pub fn setup() -> anyhow::Result<Startup> {
 
     let cfg_path = support.join("config.json");
     if !cfg_path.exists() {
-        std::fs::write(&cfg_path, DEFAULT_CONFIG)?;
+        std::fs::write(&cfg_path, serde_json::to_vec_pretty(&default_config())?)?;
     }
     let engine_args = settings(&cfg_path);
 
@@ -132,7 +140,7 @@ fn settings(cfg_path: &Path) -> Vec<String> {
     let cfg: serde_json::Value = std::fs::read_to_string(&cfg_path)
         .ok()
         .and_then(|t| serde_json::from_str(&t).map_err(|e| eprintln!("[config] {}: {e}", cfg_path.display())).ok())
-        .unwrap_or_else(|| serde_json::from_str(DEFAULT_CONFIG).unwrap());
+        .unwrap_or_else(default_config);
     let num = |k: &str| cfg.get(k).and_then(|v| v.as_f64());
     let flag = |k: &str| cfg.get(k).and_then(|v| v.as_bool()).unwrap_or(false);
     if let Some(v) = num("scale") { set_default("MUGUET_SCALE", v.to_string()); }
@@ -154,8 +162,8 @@ fn settings(cfg_path: &Path) -> Vec<String> {
     let fps = std::env::var("MUGUET_FPS").ok().and_then(|v| v.parse::<f64>().ok()).or_else(|| num("fps_limit")).unwrap_or(60.0);
     engine_args.push(format!("-frameLimit={}", if fps <= 0.0 { 0 } else if fps <= 30.0 { 2 } else { 1 }));
 
-    let start_mode = std::env::var("MUGUET_START").ok().and_then(|v| v.parse::<f64>().ok()).or_else(|| num("start_mode")).unwrap_or(2.0) as i64;
-    let start_mode = if (1..=2).contains(&start_mode) { start_mode } else { 2 };
+    let start_mode = std::env::var("MUGUET_START").ok().and_then(|v| v.parse::<f64>().ok()).or_else(|| num("start_mode")).unwrap_or(DEFAULT_START_MODE as f64) as i64;
+    let start_mode = if (1..=2).contains(&start_mode) { start_mode } else { DEFAULT_START_MODE };
     if !std::env::args().any(|a| a.starts_with("-wasmstartchoice")) {
         engine_args.push(format!("-wasmstartchoice={start_mode}"));
     }

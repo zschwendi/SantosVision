@@ -85,7 +85,10 @@ impl ApplicationHandler for App {
         gpu::SUSPENDED.store(true, std::sync::atomic::Ordering::Relaxed);
         input::set_focus(false);
         #[cfg(target_os = "ios")]
-        crate::touch::release();
+        {
+            crate::pad::suspend();
+            crate::touch::release();
+        }
     }
 
     fn window_event(&mut self, _el: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
@@ -104,7 +107,11 @@ impl ApplicationHandler for App {
             }
             WindowEvent::Focused(f) => {
                 input::set_focus(f);
-                if !f { self.unlock(&window); }
+                if !f {
+                    #[cfg(target_os = "ios")]
+                    crate::pad::suspend();
+                    self.unlock(&window);
+                }
             }
             WindowEvent::ModifiersChanged(m) => self.mods = m.state(),
             WindowEvent::KeyboardInput { event, .. } => {

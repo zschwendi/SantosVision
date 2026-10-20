@@ -9,7 +9,7 @@ let configURL = FileManager.default.urls(for: .documentDirectory, in: .userDomai
     .appendingPathComponent("config.json")
 
 final class Settings: ObservableObject {
-    @Published var mode = 2
+    @Published var mode = 1
     @Published var scale = 0.5
     @Published var fps = 60
     @Published var textures = 0
@@ -100,7 +100,7 @@ struct LauncherView: View {
     var body: some View {
         HStack(spacing: 0) {
             VStack(spacing: 16) {
-                Text("Muguet").font(.largeTitle.weight(.bold))
+                Text("Los Santos").font(.largeTitle.weight(.bold))
                 if !muguet_has_game_code() {
                     Text("This build has no game code: build it with ./make-ios.sh <game.zip>.")
                         .foregroundStyle(.red).font(.callout).multilineTextAlignment(.center)
