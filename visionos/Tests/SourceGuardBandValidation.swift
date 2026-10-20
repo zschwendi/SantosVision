@@ -1,0 +1,57 @@
+import Foundation
+import simd
+
+@main
+struct SourceGuardBandValidation {
+    static func matrix(_ values: [Double]) -> simd_float4x4 {
+        precondition(values.count == 16)
+        return simd_float4x4(columns: (
+            SIMD4(values[0...3].map(Float.init)), SIMD4(values[4...7].map(Float.init)),
+            SIMD4(values[8...11].map(Float.init)), SIMD4(values[12...15].map(Float.init))))
+    }
+
+    static func main() throws {
+        let data = try Data(contentsOf: URL(fileURLWithPath: CommandLine.arguments[1]))
+        let report = try JSONSerialization.jsonObject(with: data) as! [String: Any]
+        let physical = matrix(report["current_clip_from_eye"] as! [Double])
+        var otherAsymmetricEye = physical
+        otherAsymmetricEye[2][0] = -physical[2][0]
+        var checked = 0
+        for original in [physical, otherAsymmetricEye] {
+            let canonical = GameWorldProjection.nativePinhole(original)!.matrix
+            precondition(GameWorldSourceGuardBand.projection(original, scale: 1)! == canonical)
+            let inverse = original.inverse
+            for scale: Float in [1.05, 1.1, 1.2] {
+                let source = GameWorldSourceGuardBand.projection(original, scale: scale)!
+                precondition(source[2][2] == canonical[2][2] && source[3][2] == canonical[3][2])
+                for zi in 0...10 {
+                    for yi in 0...40 {
+                        for xi in 0...40 {
+                            let ndc = SIMD4<Float>(Float(xi) / 20 - 1, Float(yi) / 20 - 1, Float(zi) / 10, 1)
+                            let eye = inverse * ndc
+                            let expandedClip = source * eye
+                            let expanded = expandedClip / expandedClip.w
+                            precondition(abs(expanded.x - ndc.x / scale) < 3e-5)
+                            precondition(abs(expanded.y - ndc.y / scale) < 3e-5)
+                            precondition(abs(expanded.z - ndc.z) < 3e-5)
+                            precondition(abs(expanded.x) <= 1 / scale + 3e-5 && abs(expanded.y) <= 1 / scale + 3e-5)
+                            checked += 1
+                        }
+                    }
+                }
+            }
+        }
+        for value in ["", "nan", "inf", "0.9", "1.21", "garbage"] {
+            precondition(GameWorldSourceGuardBand.resolveScale(["MUGUET_XR_SOURCE_GUARD_BAND": value]) == 1)
+        }
+        precondition(GameWorldSourceGuardBand.resolveScale([:]) == 1)
+        precondition(GameWorldSourceGuardBand.resolveScale(["MUGUET_XR_SOURCE_GUARD_BAND": "1.1"]) == 1.1)
+        for scale: Float in [.nan, .infinity, 0.9, 1.21] {
+            precondition(GameWorldSourceGuardBand.projection(physical, scale: scale) == nil)
+        }
+        var oblique = physical; oblique[0][2] = 0.01
+        precondition(GameWorldSourceGuardBand.projection(oblique, scale: 1.1) == nil)
+        print("PASS: \(checked) source coverage/depth rays, default identity, asymmetric frusta, invalid configuration and oblique rejection")
+        print("Physical capture supplies one eye; the second case mirrors its horizontal asymmetry. No device or latency claim.")
+    }
+}

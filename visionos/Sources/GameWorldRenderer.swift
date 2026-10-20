@@ -466,6 +466,9 @@ final class GameWorldRenderer: @unchecked Sendable {
             throw GameWorldError.missingMetal
         }
         self.depthState = depthState
+        if GameWorldSourceGuardBand.configuredScale > 1 {
+            log.info("Source-only guard band enabled: scale=\(GameWorldSourceGuardBand.configuredScale). Display projection and eye spacing unchanged; fixed-size source loses angular resolution.")
+        }
         if GameWorldFiniteSkySupport.requested {
             log.info("FINITE SKY SUPPORT EXPERIMENT: \(self.finiteSkySupport == nil ? "unavailable or incompatible path flags; unchanged rendering" : "enabled, final source ownership plus 0.8*far support sphere; no unseen coverage", privacy: .public)")
         }
@@ -654,7 +657,7 @@ final class GameWorldRenderer: @unchecked Sendable {
                     // Retain precisely the projection submitted to the game's
                     // scalar camera bridge. Encoding below still uses the full
                     // compositor projection for display-time reprojection.
-                    let nativeProjection = GameWorldProjection.nativePinhole(physicalProjection)?.matrix ?? physicalProjection
+                    let nativeProjection = GameWorldSourceGuardBand.projection(physicalProjection) ?? physicalProjection
                     return XRRetainedEyeView(headFromEye: drawable.views[index].transform,
                                       projectionFromEye: nativeProjection)
                 }
