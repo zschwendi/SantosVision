@@ -314,7 +314,7 @@ final class GameWorldDebugCapture: @unchecked Sendable {
                 if distance <= 0.15 { nearFaded += 1 }
             }
         }
-        return ["scope": "Sampled source texel-center point checks; actual output readback establishes raster coverage. Exact clear-depth rays rotate without translation at destination depth zero; distance/fade statistics include finite geometry only.",
+        return ["scope": "Sampled source texel-center checks of the original mesh before any final sky-support depth repair; actual output readback establishes final raster coverage/depth. Exact-clear rays rotate without translation; distance/fade statistics include finite geometry only.",
                 "sampled": total, "inverse_invalid": inverseInvalid, "clip_invalid": clipInvalid,
                 "exact_clear_background_samples": backgroundSamples, "behind_eye_samples": behindEye,
                 "geometry_distance_samples": geometryDistanceSamples,

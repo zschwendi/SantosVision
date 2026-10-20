@@ -365,9 +365,11 @@ final class GameWorldRenderer: @unchecked Sendable {
     private var loggedCornerFallback = false
     /// Experimental paths, all nil unless their flag is "1". See docs/REPROJECTION-IMPLEMENTATION-20261011.md.
     private let sourceCopy: GameWorldSourceCopy?
-    /// DEFAULT OFF; final ownership prevents finite sky support from occluding
-    /// real far geometry. The experiment runs only on the legacy actual-eye path.
+    /// Physical A/B showed a partial improvement. Final ownership protects real
+    /// far geometry; QA can disable this, and other rendering paths stay separate.
     private let finiteSkySupport: GameWorldFiniteSkySupport?
+    private let finiteSkySupportUnavailable: GameWorldFiniteSkyTelemetry.Outcome?
+    private let finiteSkyTelemetry: GameWorldFiniteSkyTelemetry
     private let allowSyntheticAnchorCopy: Bool
     private let adaptiveMesh: GameWorldAdaptiveMesh?
     private let anchorProbe: GameWorldAnchorProbe?
@@ -448,10 +450,16 @@ final class GameWorldRenderer: @unchecked Sendable {
         allowSyntheticAnchorCopy = environment["MUGUET_COMPOSITOR_SOURCE_ANCHOR_COPY_ALLOW_SYNTHETIC"] == "1"
         let adaptiveRequested = RenderingOptimizations.adaptiveMeshEnabled
         let skyFanRequested = RenderingOptimizations.skyFanEnabled
-        finiteSkySupport = GameWorldFiniteSkySupport.requested
-            && !cornerRequested && !copyRequested && !probeRequested && !adaptiveRequested
+        let skyRequested = GameWorldFiniteSkySupport.requested
+        let skyCompatible = !cornerRequested && !copyRequested && !probeRequested && !adaptiveRequested
+        finiteSkySupport = skyRequested && skyCompatible
             ? GameWorldFiniteSkySupport(device: layer.device, library: library,
                 colorFormat: layer.configuration.colorFormat, depthFormat: layer.configuration.depthFormat) : nil
+        finiteSkySupportUnavailable = !skyRequested ? .qaDisabled
+            : !skyCompatible ? .incompatibleConfiguration
+            : finiteSkySupport == nil ? .pipelineUnavailable : nil
+        finiteSkyTelemetry = GameWorldFiniteSkyTelemetry(requested: skyRequested,
+            available: finiteSkySupport != nil, unavailableReason: finiteSkySupportUnavailable)
         adaptiveMesh = adaptiveRequested ? GameWorldAdaptiveMesh(device: layer.device, library: library,
                                                                  colorFormat: layer.configuration.colorFormat,
                                                                  depthFormat: layer.configuration.depthFormat,
@@ -469,9 +477,7 @@ final class GameWorldRenderer: @unchecked Sendable {
         if GameWorldSourceGuardBand.configuredScale > 1 {
             log.info("Source-only guard band enabled: scale=\(GameWorldSourceGuardBand.configuredScale). Display projection and eye spacing unchanged; fixed-size source loses angular resolution.")
         }
-        if GameWorldFiniteSkySupport.requested {
-            log.info("FINITE SKY SUPPORT EXPERIMENT: \(self.finiteSkySupport == nil ? "unavailable or incompatible path flags; unchanged rendering" : "enabled, final source ownership plus 0.8*far support sphere; no unseen coverage", privacy: .public)")
-        }
+        log.info("Finite sky support: requested=\(skyRequested) available=\(self.finiteSkySupport != nil) reason=\(self.finiteSkySupportUnavailable?.rawValue ?? "ready", privacy: .public); partial physical improvement, no unseen coverage")
         if cornerRequested {
             log.info("Corner-depth precompute requested: \(precompute == nil ? "unavailable, using the single-pass pipeline" : "enabled", privacy: .public)")
         }
@@ -1118,11 +1124,20 @@ final class GameWorldRenderer: @unchecked Sendable {
                 source = (sourceEye, worldUniforms(eye: sourceEye, stageFromHead: stageFromHead, headFromEye: view.transform,
                                                    projection: projection))
             }
-            if copyDecision == nil, singleSource == nil, let finiteSkySupport, let source,
-               source.eye.kind == .actual,
-               finiteSkySupport.encode(commands: commands, pass: pass, viewport: map.viewport,
+            let skyOutcome: GameWorldFiniteSkyTelemetry.Outcome
+            if let unavailable = finiteSkySupportUnavailable { skyOutcome = unavailable }
+            else if singleSource != nil { skyOutcome = .singleSourceDiagnostic }
+            else if copyDecision != nil { skyOutcome = .sourceCopyActive }
+            else if let source, source.eye.kind == .actual, let finiteSkySupport {
+                skyOutcome = finiteSkySupport.encode(commands: commands, pass: pass, viewport: map.viewport,
                     projection: projection, far: drawable.depthRange.x, uniforms: source.uniforms,
-                    color: source.eye.color, depth: source.eye.depth) != nil {
+                    color: source.eye.color, depth: source.eye.depth) != nil ? .encoded : .encodeUnavailable
+            } else { skyOutcome = .noQualifiedActualSource }
+            finiteSkyTelemetry.record(view: eye, outcome: skyOutcome, source: source.map {
+                .init(eye: $0.eye.viewIndex, game: $0.eye.gameFrame,
+                      request: $0.eye.requestFrame, head: $0.eye.headFrame)
+            })
+            if skyOutcome == .encoded, let source {
                 encodedViews += 1
                 if eye == 0 { finiteSkyFirstEye = true }
                 // Ownership and depth repair have finished. This new pass has
@@ -1222,6 +1237,10 @@ final class GameWorldRenderer: @unchecked Sendable {
         }
         return (encodedViews, copyDecision != nil, finiteSkyFirstEye)
     }
+
+    /// Synchronized compact snapshot read by the existing lifecycle report.
+    /// CPU encode outcomes are deliberately separate from GPU/pixel acceptance.
+    func finiteSkySupportStatus() -> [String: Any] { finiteSkyTelemetry.reportValue }
 
     private func worldUniforms(eye: GameWorldSourceEye, stageFromHead: simd_float4x4,
                                headFromEye: simd_float4x4, projection: simd_float4x4) -> GameWorldUniforms {

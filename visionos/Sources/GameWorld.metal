@@ -195,9 +195,9 @@ fragment float4 gameWorldFragment(GameWorldVertex in [[stage_in]],
 }
 
 // ===========================================================================
-// Experimental paths, all DEFAULT OFF. Everything above this line is the legacy
-// pipeline and is unchanged; the functions below are reached only through the
-// opt-in pipelines GameWorldRenderer creates for the matching environment flag.
+// Additional paths. Finite sky support is enabled normally after a physical
+// partial-improvement A/B, with QA disable and compatibility guards. The other
+// paths below remain opt-in. Legacy shader functions above stay unchanged.
 // ===========================================================================
 
 // ---- MUGUET_COMPOSITOR_FINITE_SKY_SUPPORT: explicit final ownership + repair ----

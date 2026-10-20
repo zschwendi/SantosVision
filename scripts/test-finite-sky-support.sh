@@ -13,6 +13,6 @@ pathlib.Path(sys.argv[1]).write_text('import simd\n' + source[start:end] + '\n')
 PY
 cp visionos/Tests/FiniteSkySupportMetalValidation.swift "$out/build/main.swift"
 xcrun swiftc -O -D SV_GAME_RUNTIME "$out/build/GameWorldUniforms.swift" \
-    visionos/Sources/GameWorldFiniteSkySupport.swift "$out/build/main.swift" \
+    visionos/Sources/GameWorldFiniteSkyPolicy.swift visionos/Sources/GameWorldFiniteSkySupport.swift "$out/build/main.swift" \
     -o "$out/build/finite-sky-support-validation"
 "$out/build/finite-sky-support-validation" "$PWD" "$out"

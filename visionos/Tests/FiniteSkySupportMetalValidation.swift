@@ -311,7 +311,7 @@ require(pool.statistics.textures == 6 && pool.statistics.busy == 6, "Resize lost
 let result: [String: Any] = ["passed": true, "device": device.name,
     "scope": "Actual offscreen Mac Metal of production optional helper and shaders; not Vision Pro system composition or proof of screenshot causality.",
     "physical_capture": capture.path, "cases": cases, "ownership_pool_bounds_passed": true,
-    "default_off": !GameWorldFiniteSkySupport.requested]
+    "finite_sky_requested_by_current_launch_policy": GameWorldFiniteSkySupport.requested]
 try FileManager.default.createDirectory(at: destination, withIntermediateDirectories: true)
 try JSONSerialization.data(withJSONObject: result, options: [.prettyPrinted, .sortedKeys]).write(to: destination.appendingPathComponent("result.json"))
 print("PASS \(cases.count) actual Mac Metal finite-sky support cases; RGB and all finite/uncovered depths preserved")

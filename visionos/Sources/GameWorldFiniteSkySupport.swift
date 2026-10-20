@@ -3,15 +3,15 @@ import Foundation
 import Metal
 import simd
 
-/// DEFAULT-OFF hypothesis test for exact-clear sky submitted at the compositor's
-/// finite far boundary. This does not create unseen sky or repair disocclusion.
+/// Finite support partially reduced sky holes in physical build7 A/B. It is
+/// enabled normally, with an explicit QA disable, and creates no unseen sky.
 /// A depth-tested MRT records the final source owner, then a depth-only pass
 /// gives only surviving sky a finite support sphere. RGB and finite-world depth
 /// are unchanged, including geometry farther away than the support sphere.
 final class GameWorldFiniteSkySupport: @unchecked Sendable {
     static var requested: Bool {
-        ProcessInfo.processInfo.environment["MUGUET_COMPOSITOR_FINITE_SKY_SUPPORT"] == "1"
-            || ProcessInfo.processInfo.arguments.contains("--sv-world-finite-sky-support")
+        GameWorldFiniteSkyPolicy.requested(environment: ProcessInfo.processInfo.environment,
+                                          arguments: ProcessInfo.processInfo.arguments)
     }
 
     private let worldPipeline: any MTLRenderPipelineState
