@@ -1,5 +1,21 @@
 # Physical feedback and next fixes — October 20, 2026
 
+## Build 7 live test, 10:35–10:42 MDT
+
+Exact signed candidate `743ba8f` (executable SHA256 `d31aa8fb7c9272dc25ac3208f130f4116be9352c1b5e62666866bd2e16fb1515`) installed in place successfully. Own-app inspection confirms version 7 and retained game data. The normal run presented both immersive eyes. Its current-camera crop restoration advanced to 1,035 restores with zero failures, unqualified callbacks or dropped ownership. This establishes live qualification; it does not by itself establish visual aim correctness. One 10-second sample measured 37.02ms mean compositor GPU command-buffer time, excluding guest rendering and system display.
+
+The user's new physical report is more specific:
+
+- Flat play and third-person immersion look good. Preserve third-person head free-look: avatar, weapon and aiming remain stick driven.
+- First-person needs selectable actual head-directed aim versus head-check free-look. The visible reticle appears binocularly aligned, but is often absent or leaves the view while the gun points elsewhere. Couple the actual shot ray, weapon and reticle; moving only the dot is insufficient.
+- Weapon wheel and WASTED remain doubled. Map, health and money are outside the useful immersive field. They need a qualified HUD route and comfortable placement, separately from viewmodels.
+- Fast turns still expose top/bottom/peripheral black borders; some sky holes remain closer to the viewer. Increase useful source coverage and reduce source/compositor delay independently.
+- Immersive appearance improved, but black speckles on the character and much worse clarity than flat remain unacceptable.
+
+The default shader contains a 4×4 ordered near-body fade at 0.15–0.45m that can expose opaque black after reprojection. This is a candidate speckle mechanism, not confirmed causality. The normal-run capture's nearest source geometry is 1.776m and its third-person character does not reproduce the close first-person artifact. Obtain the afflicted gun/body pose with paired real color/depth and a headset image before changing the fade.
+
+A separate finite-sky-only process was launched after this baseline; its visual outcome remains pending. No guard band, corner-precompute, adaptive mesh or single-source mode was enabled. Receipts and captures are in `target/verification/device-session-20261020/candidate7/`, including `normal-ready-feedback-receipt.json`. First-person head aim, full HUD routing, coherent stereo and performance acceptance remain unfinished.
+
 Signed r6 is installed. This session produced two registered source/output color and Float32 depth images and a matching late-color trace. The user's subsequent 19 screenshots are preserved, with hashes and capture metadata, in `target/verification/device-session-20261020/feedback-images/manifest.json`. Originals remain in Downloads. The folder was copied through Finder after direct Downloads reads stalled; no unrelated media was opened.
 
 ## Screenshot provenance and findings
