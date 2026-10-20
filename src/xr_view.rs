@@ -18,6 +18,9 @@ use crate::{HostState, RT};
 #[allow(dead_code)] // Inactive prerequisite; no live packet adapter is installed.
 pub(crate) mod packet_trace;
 
+#[path = "xr_projection_restore.rs"]
+mod projection_restore;
+
 const ACTIVE_CVIEWPORT: u64 = 19_237_856;
 const CAMERA_OFFSET: u64 = 192;
 const PROJECTION_OFFSET: u64 = 320;
@@ -287,6 +290,14 @@ struct State {
     projection_clones_already_current: u64,
     projection_clone_failures: u64,
     original_primary_projection_scalars: Option<[f32; 11]>,
+    // A pending semantic crop reconciliation survives UI disable/recenter.
+    // Only a CURRENT certified primary callback may consume it; no saved
+    // pointer is dereferenced by set_active or the native camera enable API.
+    primary_crop_owner: Option<projection_restore::Owner>,
+    primary_crop_restores: u64,
+    primary_crop_dropped: u64,
+    primary_crop_unqualified: u64,
+    primary_crop_failures: u64,
     unmatched_near_world: VecDeque<UnmatchedViewport>,
     emitted_commands: u64,
     emitted_presents: u64,
@@ -559,7 +570,58 @@ fn projection_state_is_current(mem: &SharedMemory, viewport: u64, projection: &[
         && read_u8(mem,viewport.saturating_add(928)) == reverse_z(projection).map(u8::from)
 }
 
-fn update_viewport(caller: &mut Caller<'_, HostState>, viewport: u64, camera: Option<&[f32; 16]>, projection: Option<&[f32; 16]>) -> Result<()> {
+fn primary_projection_snapshot(mem: &SharedMemory, source: u64, store: u64) -> Option<projection_restore::Snapshot> {
+    let viewport = source.checked_add(16)?;
+    let address = viewport.checked_add(816)?;
+    address.checked_add(56).filter(|end| *end <= mem.data_size() as u64)?;
+    let words: Vec<u32> = crate::read_bytes(mem, address, 56).chunks_exact(4)
+        .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap())).collect();
+    let reverse = match read_u8(mem, viewport.checked_add(928)?)? { 0 => false, 1 => true, _ => return None };
+    Some(projection_restore::Snapshot { source, store,
+        geometry: projection_restore::WindowGeometry::from_words(words.try_into().ok()?)?,
+        fields: read_projection_scalars(mem, viewport)?,
+        projection: read_matrix(mem, viewport.checked_add(PROJECTION_OFFSET)?)?, reverse })
+}
+
+/// A guest-thread operation at the live primary callback, never from Swift's
+/// enable/disable thread. Re-read all authority after the stack helper calls.
+/// Only crop words change; current game lens and depth direction are retained.
+fn restore_primary_projection(caller: &mut Caller<'_, HostState>, mem: &SharedMemory,
+    restore: projection_restore::Restore) -> Result<bool> {
+    let stack_get = caller.get_export("emscripten_stack_get_current").and_then(|e| e.into_func())
+        .context("missing crop restore stack getter")?.typed::<(), i64>(&mut *caller)?;
+    let allocate = caller.get_export("_emscripten_stack_alloc").and_then(|e| e.into_func())
+        .context("missing crop restore stack allocator")?.typed::<i64, i64>(&mut *caller)?;
+    let stack_restore = caller.get_export("_emscripten_stack_restore").and_then(|e| e.into_func())
+        .context("missing crop restore stack restore")?.typed::<i64, ()>(&mut *caller)?;
+    let set_projection = caller.get_export("mp:XRSetViewportProjection").and_then(|e| e.into_func())
+        .context("missing crop restore projection setter")?.typed::<(i64, i64), ()>(&mut *caller)?;
+    let stack = crate::guest_call_scope::call(caller, crate::guest_call_scope::Kind::Ordinary,
+        |caller| stack_get.call(caller, ()))?;
+    let scratch = crate::guest_call_scope::call(caller, crate::guest_call_scope::Kind::Ordinary,
+        |caller| allocate.call(caller, 64))? as u64;
+    let result = (|| {
+        anyhow::ensure!(scratch != 0 && scratch.checked_add(64).is_some_and(|end| end <= mem.data_size() as u64),
+            "crop restore scratch outside guest memory");
+        if read_u64(mem, ACTIVE_CVIEWPORT) != Some(restore.before.source)
+            || !primary_projection_snapshot(mem, restore.before.source,
+                crate::guest_call_scope::producer_store_lifetime(caller.data()))
+                .is_some_and(|current| restore.before.matches(current)) { return Ok(false); }
+        let viewport = restore.before.source + 16;
+        let bytes: Vec<u8> = restore.fields[2..6].iter().flat_map(|v| v.to_le_bytes()).collect();
+        anyhow::ensure!(crate::write_bytes(mem, scratch, &matrix_bytes(&restore.projection)), "crop restore scratch write failed");
+        anyhow::ensure!(crate::write_bytes(mem, viewport + 880, &bytes), "crop restore fields write failed");
+        crate::guest_call_scope::call(caller, crate::guest_call_scope::Kind::Ordinary,
+            |caller| set_projection.call(caller, (viewport as i64, scratch as i64)))?;
+        Ok(true)
+    })();
+    let restored = crate::guest_call_scope::call(caller, crate::guest_call_scope::Kind::Ordinary,
+        |caller| stack_restore.call(caller, stack));
+    match (result, restored) { (Ok(value), Ok(())) => Ok(value), (Err(error), _) => Err(error), (_, Err(error)) => Err(error.into()) }
+}
+
+fn update_viewport(caller: &mut Caller<'_, HostState>, viewport: u64, camera: Option<&[f32; 16]>, projection: Option<&[f32; 16]>,
+    primary: Option<(projection_restore::Snapshot, u64)>) -> Result<()> {
     let scalars = projection.map(|p| projection_scalars(p).context("unsupported finite eye projection")).transpose()?;
     let stack_get = caller.get_export("emscripten_stack_get_current").and_then(|e| e.into_func()).context("missing stack getter")?
         .typed::<(), i64>(&mut *caller)?;
@@ -579,6 +641,11 @@ fn update_viewport(caller: &mut Caller<'_, HostState>, viewport: u64, camera: Op
         if scalars.is_some() {
             anyhow::ensure!(viewport.checked_add(929).is_some_and(|end| end <= mem.data_size() as u64), "projection scalar fields outside guest memory");
         }
+        let primary_is_current = |caller: &Caller<'_, HostState>| primary.is_none_or(|(before, epoch)|
+            view_epoch_is_active(epoch) && read_u64(mem, ACTIVE_CVIEWPORT) == Some(before.source)
+                && primary_projection_snapshot(mem, before.source, crate::guest_call_scope::producer_store_lifetime(caller.data()))
+                    .is_some_and(|current| before.matches(current)));
+        anyhow::ensure!(primary_is_current(caller), "primary projection ownership changed before setter");
         if let Some(camera) = camera { anyhow::ensure!(crate::write_bytes(mem, scratch, &matrix_bytes(camera)), "camera scratch write failed"); }
         if let Some(projection) = projection {
             anyhow::ensure!(crate::write_bytes(mem, scratch + 64, &matrix_bytes(projection)), "projection scratch write failed");
@@ -586,6 +653,7 @@ fn update_viewport(caller: &mut Caller<'_, HostState>, viewport: u64, camera: Op
         // Setters regenerate the inverse, dependent matrices and frustum planes.
         if camera.is_some() { crate::guest_call_scope::call(caller, crate::guest_call_scope::Kind::Ordinary, |caller| set_camera.call(caller, (viewport as i64, scratch as i64)))?; }
         if let (Some(projection),Some(fields)) = (projection,scalars) {
+            anyhow::ensure!(primary_is_current(caller), "primary projection ownership changed during camera setter");
             let bytes: Vec<u8> = fields.into_iter().flat_map(f32::to_le_bytes).collect();
             anyhow::ensure!(crate::write_bytes(mem,viewport + 872,&bytes), "projection scalar write failed");
             anyhow::ensure!(crate::write_bytes(mem,viewport + 928,&[reverse_z(projection).context("unsupported depth direction")? as u8]), "projection direction write failed");
@@ -606,10 +674,29 @@ pub fn camera_post(caller: &mut Caller<'_, HostState>, source: u64, _frame: u64)
     let mem = &RT.get().context("missing runtime")?.mem;
     let active_source = read_u64(mem, ACTIVE_CVIEWPORT).unwrap_or(0);
     let mut state = lock_world_state();
-    let provenance_epoch = EPOCH.load(Ordering::Acquire);
     state.camera_calls += 1;
     if source == 0 || source != active_source { return Ok(()); }
     state.main_camera_calls += 1;
+    let owner = state.primary_crop_owner.take();
+    drop(state);
+    let store = crate::guest_call_scope::producer_store_lifetime(caller.data());
+    if let Some(owner) = owner {
+        let restore = primary_projection_snapshot(mem, source, store).and_then(|before| owner.restore(before));
+        match restore.map(|restore| restore_primary_projection(caller, mem, restore)).transpose() {
+            Ok(Some(true)) => lock_world_state().primary_crop_restores += 1,
+            Ok(_) => lock_world_state().primary_crop_dropped += 1,
+            Err(error) => {
+                let mut state = lock_world_state();
+                state.primary_crop_failures += 1;
+                state.last_error = Some(format!("primary projection crop restoration failed: {error}"));
+                return Ok(());
+            }
+        }
+    }
+    if read_u64(mem, ACTIVE_CVIEWPORT) != Some(source) { return Ok(()); }
+    let before_projection = if world_camera_enabled() { primary_projection_snapshot(mem, source, store) } else { None };
+    let mut state = lock_world_state();
+    let provenance_epoch = EPOCH.load(Ordering::Acquire);
     let Some(viewport) = source.checked_add(16) else { return Ok(()); };
     let Some(camera) = read_matrix(mem, viewport + CAMERA_OFFSET).filter(rigid) else { return Ok(()); };
     let Some(projection) = read_matrix(mem, viewport + PROJECTION_OFFSET) else { return Ok(()); };
@@ -647,7 +734,21 @@ pub fn camera_post(caller: &mut Caller<'_, HostState>, source: u64, _frame: u64)
     } else { None };
     drop(state);
     if let Some((desired_camera, desired_projection)) = override_matrices.filter(|_| view_epoch_is_active(provenance_epoch)) {
-        match update_viewport(caller, viewport, Some(&desired_camera), desired_projection.as_ref()) {
+        let crop_owner = before_projection.and_then(|before| desired_projection.and_then(|projection|
+            projection_scalars(&projection).and_then(|fields| projection_restore::Owner::acquire(before, fields))));
+        let Some(crop_owner) = crop_owner else {
+            let mut state = lock_world_state();
+            state.primary_crop_unqualified += 1;
+            state.last_error = Some("primary camera crop is not qualified for safe XR ownership".to_owned());
+            return Ok(());
+        };
+        // Retain prospective ownership before guest execution. If a setter
+        // traps after scalar writes, next callback may still reconcile only
+        // those exact words. A failure before any writes simply fails the
+        // last-written comparison and drops the record without touching memory.
+        lock_world_state().primary_crop_owner = Some(crop_owner);
+        match update_viewport(caller, viewport, Some(&desired_camera), desired_projection.as_ref(),
+            before_projection.map(|before| (before, provenance_epoch))) {
             Ok(()) => {
                 if !view_epoch_is_active(provenance_epoch)
                     || !crate::xr::commit_camera_pose(prepared.expect("guarded prepared pose")) { return Ok(()); }
@@ -806,7 +907,7 @@ pub fn current_view(caller: &mut Caller<'_, HostState>, viewport: u64, _set_wind
     if let Some((saved, derived)) = clone {
         let already_current = read_matrix(mem,viewport + PROJECTION_OFFSET) == Some(derived.projection_from_eye)
             && projection_state_is_current(mem,viewport,&derived.projection_from_eye);
-        let result = if already_current { Ok(()) } else { update_viewport(caller,viewport,None,Some(&derived.projection_from_eye)) };
+        let result = if already_current { Ok(()) } else { update_viewport(caller,viewport,None,Some(&derived.projection_from_eye),None) };
         let mut state = lock_world_state();
         if view_epoch_is_active(derived.provenance_epoch) {
             match result {
@@ -990,6 +1091,9 @@ pub fn status_json() -> serde_json::Value {
         "unmatched_near_world":unmatched,
         "rendering_method":"one eye per natural game frame; two views use alternate-eye rendering, not simultaneous stereo"});
     status["projection_clones_already_current"] = serde_json::json!(state.projection_clones_already_current);
+    status["primary_crop_restoration"] = serde_json::json!({"pending":state.primary_crop_owner.is_some(),
+        "restored":state.primary_crop_restores,"dropped":state.primary_crop_dropped,
+        "unqualified":state.primary_crop_unqualified,"failures":state.primary_crop_failures});
     status["original_primary_projection_scalars_872_to_912"] = serde_json::json!(state.original_primary_projection_scalars);
     status["eye_projection_scalars_872_to_912"] = serde_json::json!(state.last_main.and_then(|main|projection_scalars(&main.view.projection_from_eye)));
     status
@@ -998,6 +1102,132 @@ pub fn status_json() -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn crop_fixture_geometry() -> projection_restore::WindowGeometry {
+        let mut words = [0.,0.,1.,1.,0.,1.,0.,0.,1.,1.,0.,1.,0.,0.].map(f32::to_bits);
+        words[12] = 1920; words[13] = 1080;
+        projection_restore::WindowGeometry::from_words(words).unwrap()
+    }
+    fn crop_fixture_snapshot() -> projection_restore::Snapshot {
+        let fields = [0.05,10_000.,1.,1.,0.,0.,50.,0.46630767,0.8289914,1.7777778,1.7777778];
+        projection_restore::Snapshot { store:1,source:8192,geometry:crop_fixture_geometry(), fields,
+            projection:projection_restore::guest_projection(fields,false).unwrap(),reverse:false }
+    }
+    #[test]
+    fn crop_cleanup_authority_survives_disable_and_recenter_metadata_invalidation() {
+        let game = crop_fixture_snapshot();
+        let eye = [0.1,999.9341,1.,1.,-0.267949,-0.087487,95.2,1.09,1.36,1.24,1.24];
+        let mut state = State::default();
+        state.primary_crop_owner = projection_restore::Owner::acquire(game,eye);
+        // This is the exact invalidator called by set_active/enable/disable.
+        invalidate_state(&mut state);
+        assert!(state.primary_crop_owner.is_some());
+        let mut live = game; live.fields[2..6].copy_from_slice(&eye[2..6]);
+        live.projection = projection_restore::guest_projection(live.fields,false).unwrap();
+        let plan = state.primary_crop_owner.take().unwrap().restore(live).unwrap();
+        assert_eq!(plan.fields[2..6],game.fields[2..6]);
+        assert!(state.primary_crop_owner.is_none());
+        // Reenable binds only a new live, legitimate baseline, not old metadata.
+        state.primary_crop_owner = projection_restore::Owner::acquire(
+            projection_restore::Snapshot { fields:plan.fields,projection:plan.projection,..live },eye);
+        invalidate_state(&mut state);
+        assert!(state.primary_crop_owner.take().unwrap().restore(live).is_some());
+    }
+
+    #[cfg(feature = "jit")]
+    #[test]
+    fn crop_restore_calls_actual_guest_setter_and_revalidates_after_guest_stack_helpers() {
+        use std::sync::{Arc,atomic::{AtomicUsize,Ordering as AtomicOrdering}};
+        use wasmtime::{Engine,Linker,MemoryType,Module,Store};
+        use wasm_encoder::{CodeSection,EntityType,ExportKind,ExportSection,Function,FunctionSection,
+            ImportSection,Instruction as I,TypeSection,ValType};
+        // A real Wasmtime Caller reenters the exact production restoration
+        // driver. The tiny typed setter stands in for the certified original
+        // setter; no game module, GPU, runtime singleton or device is started.
+        let mut module = wasm_encoder::Module::new(); let mut types = TypeSection::new();
+        types.ty().function([],[ValType::I32]);
+        types.ty().function([],[ValType::I64]);
+        types.ty().function([ValType::I64],[ValType::I64]);
+        types.ty().function([ValType::I64],[]);
+        types.ty().function([ValType::I64,ValType::I64],[]); module.section(&types);
+        let mut imports = ImportSection::new();
+        for (name,ty) in [("run",0),("get",1),("alloc",2),("restore",3),("projection",4)] {
+            imports.import("fixture",name,EntityType::Function(ty));
+        } module.section(&imports);
+        let mut functions = FunctionSection::new(); functions.function(0); module.section(&functions);
+        let mut exports = ExportSection::new();
+        for (name,index) in [("outer",5),("emscripten_stack_get_current",1),("_emscripten_stack_alloc",2),
+                ("_emscripten_stack_restore",3),("mp:XRSetViewportProjection",4)] {
+            exports.export(name,ExportKind::Func,index);
+        } module.section(&exports);
+        let mut code = CodeSection::new(); let mut outer = Function::new([]);
+        outer.instruction(&I::Call(0)).instruction(&I::End); code.function(&outer); module.section(&code);
+        let mut config = wasmtime::Config::new(); config.shared_memory(true);
+        let engine = Engine::new(&config).unwrap(); let module = Module::new(&engine,module.finish()).unwrap();
+        for changed_during_allocation in 0..3 {
+            let mem = SharedMemory::new(&engine,MemoryType::shared(300,300)).unwrap();
+            let source = 8192u64; let viewport = source + 16;
+            let mut geometry = [0.,0.,1.,1.,0.,1.,0.,0.,1.,1.,0.,1.,0.,0.].map(f32::to_bits);
+            geometry[12] = 1920; geometry[13] = 1080;
+            let bytes:Vec<u8> = geometry.into_iter().flat_map(u32::to_le_bytes).collect();
+            assert!(crate::write_bytes(&mem,viewport+816,&bytes));
+            assert!(crate::write_bytes(&mem,viewport+928,&[0]));
+            assert!(crate::write_bytes(&mem,ACTIVE_CVIEWPORT,&source.to_le_bytes()));
+            let mut game = crop_fixture_snapshot();
+            let eye = [0.1,999.9341,1.,1.,-0.267949,-0.087487,95.2,1.09,1.36,1.24,1.24];
+            game.fields[0] = 0.15; game.fields[1] = 20_000.; // Fresh game zoom/range.
+            game.projection = projection_restore::guest_projection(game.fields,false).unwrap();
+            let mut live = game; live.fields[2..6].copy_from_slice(&eye[2..6]);
+            live.projection = projection_restore::guest_projection(live.fields,false).unwrap();
+            let bytes:Vec<u8> = live.fields.into_iter().flat_map(f32::to_le_bytes).collect();
+            assert!(crate::write_bytes(&mem,viewport+872,&bytes));
+            assert!(crate::write_bytes(&mem,viewport+PROJECTION_OFFSET,&matrix_bytes(&live.projection)));
+            let calls = Arc::new(AtomicUsize::new(0)); let restored_stack = Arc::new(AtomicUsize::new(0));
+            let mut linker = Linker::new(&engine); let run_mem = mem.clone();
+            linker.func_wrap("fixture","run",move |mut caller:Caller<'_,HostState>| -> wasmtime::Result<i32> {
+                let store = crate::guest_call_scope::producer_store_lifetime(caller.data());
+                let original = projection_restore::Snapshot { store,..game };
+                let owner = projection_restore::Owner::acquire(original,eye).unwrap();
+                let before = primary_projection_snapshot(&run_mem,source,store).unwrap();
+                let plan = owner.restore(before).unwrap();
+                restore_primary_projection(&mut caller,&run_mem,plan).map(i32::from)
+                    .map_err(wasmtime::Error::from_anyhow)
+            }).unwrap();
+            linker.func_wrap("fixture","get",||4096i64).unwrap();
+            let alloc_mem = mem.clone();
+            linker.func_wrap("fixture","alloc",move |size:i64| {
+                assert_eq!(size,64);
+                match changed_during_allocation {
+                    1=>assert!(crate::write_bytes(&alloc_mem,viewport+888,&0.125f32.to_le_bytes())),
+                    2=>assert!(crate::write_bytes(&alloc_mem,ACTIVE_CVIEWPORT,&(source+4096).to_le_bytes())),
+                    _=>{},
+                } 4096i64
+            }).unwrap();
+            let stack_sink = restored_stack.clone();
+            linker.func_wrap("fixture","restore",move |stack:i64| {assert_eq!(stack,4096);stack_sink.fetch_add(1,AtomicOrdering::Relaxed);}).unwrap();
+            let setter_mem = mem.clone(); let sink = calls.clone();
+            linker.func_wrap("fixture","projection",move |pointer:i64,scratch:i64| {
+                assert_eq!(pointer,viewport as i64);
+                // The production driver changes ONLY crop before dispatch.
+                assert_eq!(read_projection_scalars(&setter_mem,viewport).unwrap().map(f32::to_bits),game.fields.map(f32::to_bits));
+                let bytes = crate::read_bytes(&setter_mem,scratch as u64,64);
+                assert!(crate::write_bytes(&setter_mem,viewport+PROJECTION_OFFSET,&bytes));
+                sink.fetch_add(1,AtomicOrdering::Relaxed);
+            }).unwrap();
+            let mut store = Store::new(&engine,HostState::new(0));
+            let instance = linker.instantiate(&mut store,&module).unwrap();
+            let outer = instance.get_typed_func::<(),i32>(&mut store,"outer").unwrap();
+            assert_eq!(outer.call(&mut store,()).unwrap(),i32::from(changed_during_allocation==0));
+            assert_eq!(calls.load(AtomicOrdering::Relaxed),usize::from(changed_during_allocation==0));
+            assert_eq!(restored_stack.load(AtomicOrdering::Relaxed),1);
+            if changed_during_allocation==0 {
+                assert_eq!(read_projection_scalars(&mem,viewport).unwrap().map(f32::to_bits),game.fields.map(f32::to_bits));
+                assert!(projection_restore::same_matrix(&read_matrix(&mem,viewport+PROJECTION_OFFSET).unwrap(),
+                    &projection_restore::guest_projection(game.fields,false).unwrap()));
+            } else {
+                assert!(projection_restore::same_matrix(&read_matrix(&mem,viewport+PROJECTION_OFFSET).unwrap(),&live.projection));
+            }
+        }
+    }
     fn pose() -> crate::xr::CameraUpdate {
         crate::xr::CameraUpdate { frame: 1, heading_degrees: 90., pitch_degrees: 0., roll_degrees: 0., relative_position_meters: [0.2, 0.1, -0.3] }
     }
