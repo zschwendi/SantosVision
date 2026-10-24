@@ -36,6 +36,39 @@ pub struct WorldFrame {
     pub depth_far: f32,
 }
 
+/// Additive lease sidecar; the original 288-byte WorldFrame ABI is unchanged.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SVWorldOpticsFrame {
+    pub abi_version:u32, pub byte_size:u32,
+    pub lease:u64, pub provenance_epoch:u64, pub game_frame:u64,
+    pub request_frame:u64, pub head_frame:u64, pub camera_sequence:u64,
+    pub scope_sequence:u64, pub presentation_time:f64,
+    pub magnification:f32, pub reference_fov_degrees:f32, pub actual_fov_degrees:f32,
+    pub source_eye:u32, pub view_count:u32, pub flags:u32, pub reserved:[u32;4],
+}
+const _:()=assert!(std::mem::size_of::<SVWorldOpticsFrame>()==112);
+const _:()=assert!(std::mem::offset_of!(SVWorldOpticsFrame,presentation_time)==64);
+const _:()=assert!(std::mem::offset_of!(SVWorldOpticsFrame,magnification)==72);
+const _:()=assert!(std::mem::offset_of!(SVWorldOpticsFrame,source_eye)==84);
+const _:()=assert!(std::mem::offset_of!(SVWorldOpticsFrame,view_count)==88);
+const _:()=assert!(std::mem::offset_of!(SVWorldOpticsFrame,flags)==92);
+const _:()=assert!(std::mem::offset_of!(SVWorldOpticsFrame,reserved)==96);
+
+#[derive(Clone, Copy, Default)]
+struct FrameOptics { camera_sequence:u64, optics:crate::xr_view::ScopeOptics }
+impl FrameOptics {
+    fn describe(self,lease:u64,epoch:u64,frame:WorldFrame)->SVWorldOpticsFrame {
+        SVWorldOpticsFrame {abi_version:1,byte_size:112,lease,provenance_epoch:epoch,
+            game_frame:frame.game_frame,request_frame:frame.request_frame,head_frame:frame.head_frame,
+            camera_sequence:self.camera_sequence,scope_sequence:self.optics.scope_sequence,
+            presentation_time:frame.presentation_time,magnification:self.optics.magnification,
+            reference_fov_degrees:self.optics.reference_fov_degrees,actual_fov_degrees:self.optics.actual_fov_degrees,
+            source_eye:frame.view_index,view_count:frame.view_count,
+            flags:u32::from(self.optics.scope_sequence!=0),reserved:[0;4]}
+    }
+}
+
 /// Additive ABI: a pair is published by one certified render transaction. The
 /// existing per-eye frame ABI and its reserved field remain unchanged.
 #[repr(C)]
@@ -61,7 +94,7 @@ impl FrozenPreUiDepth {
 #[derive(Clone)]
 struct Ready { slot: Arc<Slot>, frame: WorldFrame, generation: u64, provenance_epoch: u64,
     pair_epoch: u64, ready_at: Instant, snapshot_submit_to_gpu_completion_seconds: Option<f64>,
-    hud: Option<Arc<crate::xr_hud::HudImages>> }
+    hud: Option<Arc<crate::xr_hud::HudImages>>, optics:FrameOptics }
 impl Ready {
     #[cfg(test)]
     fn depth_texture(&self) -> &Texture { &self.slot.depth }
@@ -228,6 +261,7 @@ pub(crate) fn reject(reason: String) {
 pub(crate) fn shares_screen_rays(color: &crate::xr_view::WorldView, depth: &crate::xr_view::WorldView) -> bool {
     let close = |a: f32, b: f32| a.is_finite() && b.is_finite() && (a - b).abs() <= 0.00002;
     color.provenance_epoch == depth.provenance_epoch
+        && color.optics == depth.optics
         && color.camera_sequence == depth.camera_sequence
         && color.request_frame == depth.request_frame && color.head_pose_frame == depth.head_pose_frame
         && color.eye_index == depth.eye_index && color.view_count == depth.view_count
@@ -401,7 +435,7 @@ pub(crate) fn publish_pair(device: &Device, queue: &Queue, sources: [PairSource<
                 let ready_at = Instant::now();
                 let eyes = std::array::from_fn(|index| Ready { slot: slots[index].clone(),
                     frame: published[index], generation, provenance_epoch, pair_epoch: scene_epoch,
-                    ready_at, snapshot_submit_to_gpu_completion_seconds, hud:None });
+                    ready_at, snapshot_submit_to_gpu_completion_seconds, hud:None, optics:FrameOptics::default() });
                 frames.latest = [Some(eyes[0].clone()), Some(eyes[1].clone())];
                 frames.latest_pair = Some(ReadyPair { eyes, scene_epoch, ready_at });
                 frames.published += 2;
@@ -433,9 +467,19 @@ pub(crate) fn publish_with_frozen_depth(device: &Device, queue: &Queue, color: &
 /// stencil samples as the original final-target HUD writes. Its private texture
 /// is never rebound by the game and is retained by this exact completed lease.
 pub(crate) fn publish_with_hud(device:&Device, queue:&Queue, color:&Texture,
-    depth:&Texture, frozen_depth:Option<FrozenPreUiDepth>, mut frame:WorldFrame,
+    depth:&Texture, frozen_depth:Option<FrozenPreUiDepth>, frame:WorldFrame,
     provenance_epoch:u64, hud:Option<Arc<crate::xr_hud::HudImages>>) {
+    publish_with_hud_and_optics(device,queue,color,depth,frozen_depth,frame,provenance_epoch,hud,0,
+        crate::xr_view::ScopeOptics::default());
+}
+
+pub(crate) fn publish_with_hud_and_optics(device:&Device, queue:&Queue, color:&Texture,
+    depth:&Texture, frozen_depth:Option<FrozenPreUiDepth>, mut frame:WorldFrame,
+    provenance_epoch:u64, hud:Option<Arc<crate::xr_hud::HudImages>>,
+    camera_sequence:u64,optics:crate::xr_view::ScopeOptics) {
+    let optics=FrameOptics{camera_sequence,optics};
     let result = (|| -> anyhow::Result<()> {
+        anyhow::ensure!(optics.optics.valid(),"invalid immutable optical frame metadata");
         if let Some(images)=&hud { let hud=&images.contribution; anyhow::ensure!(hud.format()==TextureFormat::Rgba16Float
             && hud.width()==color.width() && hud.height()==color.height()
             && hud.sample_count()==1 && hud.depth_or_array_layers()==1
@@ -510,7 +554,7 @@ pub(crate) fn publish_with_hud(device:&Device, queue:&Queue, color:&Texture,
                 let index = frame.view_index as usize;
                 if hud.is_some(){crate::xr_hud::record_result(true,None);}
                 frames.latest[index] = Some(Ready { slot, frame, generation, provenance_epoch,
-                    pair_epoch: 0, ready_at: Instant::now(), snapshot_submit_to_gpu_completion_seconds, hud });
+                    pair_epoch: 0, ready_at: Instant::now(), snapshot_submit_to_gpu_completion_seconds, hud, optics });
                 frames.published += 1;
                 if used_frozen_depth { frames.frozen_depth_handoffs += 1; }
                 else { frames.copied_depth_snapshots += 1; }
@@ -568,6 +612,21 @@ pub extern "C" fn sv_world_frame_hud_v1(world_lease:u64, output:*mut crate::xr_h
         color_texture:texture,world_color_texture:match metal_pointer(&images.world){Some(pointer)=>pointer,None=>return -1},presentation_time:ready.frame.presentation_time,
         width:hud.width(),height:hud.height(),source_eye:ready.frame.view_index,flags:1,
         angular_width_degrees:60.,distance_metres:2.,reserved:[0;2]};0
+}
+
+/// Reads the optical state retained by this completed lease. No latest-camera
+/// lookup is allowed: changing zoom must not relabel an older source image.
+#[no_mangle]
+pub extern "C" fn sv_world_frame_optics_v1(world_lease:u64,output:*mut SVWorldOpticsFrame)->i32 {
+    if output.is_null() || (output as usize)%std::mem::align_of::<SVWorldOpticsFrame>()!=0{return -1;}
+    let out=unsafe{&mut *output};
+    if out.abi_version!=1 || out.byte_size!=112{return -1;}
+    // Clear stale caller tokens even on an unavailable/released lease.
+    *out=SVWorldOpticsFrame{abi_version:1,byte_size:112,magnification:1.,..Default::default()};
+    let Ok(frames)=FRAMES.lock()else{return -1;};
+    let Some(ready)=frames.leases.get(&world_lease)else{return -1;};
+    if ready.generation!=frames.generation || !crate::xr_view::view_epoch_is_active(ready.provenance_epoch){return 1;}
+    *out=ready.optics.describe(world_lease,ready.provenance_epoch,ready.frame);0
 }
 
 #[no_mangle]
@@ -779,7 +838,7 @@ mod tests {
         crate::xr_view::WorldView { provenance_epoch: 4, camera_sequence: 9,
             request_frame: 8, head_pose_frame: 8, presentation_time_seconds: 100.25,
             eye_index: 0, view_count: 2, game_from_eye: identity, game_from_stage: identity,
-            projection_from_eye: identity, depth_reverse_z: true, headset_applied: true }
+            projection_from_eye: identity, depth_reverse_z: true, headset_applied: true, optics:crate::xr_view::ScopeOptics::default() }
     }
 
     #[test]
@@ -854,7 +913,7 @@ mod tests {
             request_frame: 8, head_pose_frame: 8, presentation_time_seconds: 1.,
             eye_index: 0, view_count: 2, game_from_eye: identity, game_from_stage: identity,
             projection_from_eye: [1.,0.,0.,0., 0.,1.777778,0.,0., 0.,0.,-1.0001,-1., 0.,0.,-0.10001,0.],
-            depth_reverse_z: false, headset_applied: true };
+            depth_reverse_z: false, headset_applied: true, optics:crate::xr_view::ScopeOptics::default() };
         let mut depth = color;
         for i in [2, 6, 10, 14] { depth.projection_from_eye[i] = color.projection_from_eye[i + 1] - color.projection_from_eye[i]; }
         depth.depth_reverse_z = true;
@@ -1132,7 +1191,8 @@ mod tests {
         assert_eq!(crate::xr_view::sv_xr_world_camera_set_enabled(1), 0);
         let epoch = crate::xr_view::view_epoch();
         let before_publish = Instant::now();
-        publish(&device, &queue, &color, &depth, frame, epoch);
+        let optics=crate::xr_view::ScopeOptics{scope_sequence:7,magnification:4.7344828,reference_fov_degrees:45.,actual_fov_degrees:10.};
+        publish_with_hud_and_optics(&device,&queue,&color,&depth,None,frame,epoch,None,123,optics);
         device.poll(PollType::Wait { submission_index: None, timeout: Some(std::time::Duration::from_secs(10)) }).unwrap();
         {
             let frames = FRAMES.lock().unwrap();
@@ -1144,6 +1204,24 @@ mod tests {
         assert_eq!(sv_world_acquire_frame(0, &mut frame), 0);
         assert_eq!(frame.game_frame, 42); assert_ne!(frame.color_texture, 0); assert_ne!(frame.depth_texture, 0);
         let token = frame.lease;
+        let mut optical=SVWorldOpticsFrame{abi_version:1,byte_size:112,..Default::default()};
+        assert_eq!(sv_world_frame_optics_v1(token,&mut optical),0);
+        assert_eq!((optical.lease,optical.provenance_epoch,optical.game_frame,optical.request_frame,optical.head_frame),
+            (token,epoch,42,40,40));
+        assert_eq!((optical.camera_sequence,optical.scope_sequence,optical.source_eye,optical.view_count,optical.flags),(123,7,0,1,1));
+        assert_eq!((optical.magnification,optical.reference_fov_degrees,optical.actual_fov_degrees),(optics.magnification,45.,10.));
+        // A newer identity-mode publication cannot mutate an already leased optic.
+        publish(&device,&queue,&color,&depth,WorldFrame{game_frame:43,..frame},epoch);
+        device.poll(PollType::Wait { submission_index:None,timeout:Some(Duration::from_secs(10)) }).unwrap();
+        assert_eq!(sv_world_frame_optics_v1(token,&mut optical),0);
+        assert_eq!((optical.game_frame,optical.magnification,optical.scope_sequence),(42,optics.magnification,7));
+        let mut ordinary=WorldFrame{abi_version:1,byte_size:288,..Default::default()};
+        assert_eq!(sv_world_acquire_frame(0,&mut ordinary),0);
+        assert_eq!(sv_world_frame_optics_v1(ordinary.lease,&mut optical),0);
+        assert_eq!((optical.flags,optical.magnification,optical.scope_sequence),(0,1.,0));
+        assert_eq!(sv_world_release_frame(ordinary.lease),0);
+        assert_eq!(sv_world_frame_optics_v1(ordinary.lease,&mut optical),-1);
+        assert_eq!((optical.lease,optical.flags,optical.magnification),(0,0,1.));
         // The live game target changes while the compositor holds the prior image.
         upload(&color, &[0, 0, 255, 255].repeat(4)); upload(&depth, &0.75f32.to_le_bytes().repeat(4));
         let slot = FRAMES.lock().unwrap().leases[&token].slot.clone();
@@ -1177,6 +1255,8 @@ mod tests {
         assert!(!renderer_connected()); // Historical completion is not a fresh live connection.
         FRAMES.lock().unwrap().latest[0].as_mut().unwrap().ready_at = Instant::now();
         reset(); assert!(!renderer_connected());
+        assert_eq!(sv_world_frame_optics_v1(token,&mut optical),1);
+        assert_eq!((optical.lease,optical.flags,optical.magnification),(0,0,1.));
         assert_eq!(sv_world_complete_frame(&token, 1, 4), 1); // Completion from a closed scene is stale.
         for token in tokens { assert_eq!(sv_world_release_frame(token), 0); assert_eq!(sv_world_release_frame(token), -1); }
         // A previously dequeued game image cannot adopt a reopened generation.

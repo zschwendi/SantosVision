@@ -175,7 +175,7 @@ fn bounded_summary(report: &Value, persistence: Value) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-    fn view() -> WorldView { WorldView { headset_applied:true, camera_sequence:7,
+    fn view() -> WorldView { WorldView { headset_applied:true, optics:crate::xr_view::ScopeOptics::default(), camera_sequence:7,
         request_frame:4, head_pose_frame:3, provenance_epoch:2, presentation_time_seconds:1.,
         eye_index:0, view_count:2, game_from_eye:[0.;16], game_from_stage:[0.;16],
         projection_from_eye:[0.;16], depth_reverse_z:true } }

@@ -64,6 +64,106 @@ pub struct WorldView {
     pub projection_from_eye: [f32; 16],
     pub depth_reverse_z: bool,
     pub headset_applied: bool,
+    /// Immutable optical state used for this exact source image, not latest UI state.
+    pub optics: ScopeOptics,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ScopeOptics {
+    pub scope_sequence: u64,
+    pub magnification: f32,
+    pub reference_fov_degrees: f32,
+    pub actual_fov_degrees: f32,
+}
+impl Default for ScopeOptics {
+    fn default() -> Self { Self { scope_sequence:0, magnification:1., reference_fov_degrees:0., actual_fov_degrees:0. } }
+}
+impl ScopeOptics {
+    pub(crate) fn valid(self)->bool {
+        if self.scope_sequence==0 {return self==Self::default();}
+        if self.reference_fov_degrees!=45. || !self.actual_fov_degrees.is_finite()
+            || !(5. ..=45.).contains(&self.actual_fov_degrees) {return false;}
+        let expected=((f64::from(self.reference_fov_degrees).to_radians()*0.5).tan()
+            /(f64::from(self.actual_fov_degrees).to_radians()*0.5).tan()) as f32;
+        self.magnification.to_bits()==expected.to_bits()
+    }
+}
+
+/// Scale clip X/Y about the projection's own forward-ray principal point.
+/// Multiplication changes neither clip Z nor W, including their exact bits.
+fn optical_projection(mut projection:[f32;16], magnification:f32)->Option<[f32;16]> {
+    if projection.iter().any(|v|!v.is_finite()) || !magnification.is_finite()
+        || !(1. ..=10.).contains(&magnification) || projection[11] == 0. { return None; }
+    if magnification==1. {return Some(projection);}
+    let center = [projection[8]/projection[11], projection[9]/projection[11]];
+    if center.iter().any(|v|!v.is_finite()) { return None; }
+    // Use the algebraically equivalent form around c. For a canonical pinhole
+    // its principal-point column remains bit-identical at every magnification.
+    for col in 0..4 { for row in 0..2 {
+        let index=col*4+row;
+        projection[index] = if col==2 { projection[index] } else {
+            magnification*projection[index]+(1.-magnification)*center[row]*projection[col*4+3]
+        };
+    }}
+    projection.iter().all(|v|v.is_finite()).then_some(projection)
+}
+
+/// Ephemeral live pointers are never copied into WorldView or frame leases.
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+struct OpticalAuthority {
+    camera:u64, metadata:u64, helper:u64, helper_metadata:u64,
+    scope_sequence:u64, reference_bits:u32, actual_bits:u32,
+}
+impl OpticalAuthority {
+    fn optics(self)->Option<ScopeOptics> {
+        let reference=f32::from_bits(self.reference_bits);
+        let actual=f32::from_bits(self.actual_bits);
+        let m=((f64::from(reference).to_radians()*0.5).tan()
+            /(f64::from(actual).to_radians()*0.5).tan()) as f32;
+        (m.is_finite() && (1. ..=10.).contains(&m)).then_some(ScopeOptics {
+            scope_sequence:self.scope_sequence,magnification:m,
+            reference_fov_degrees:reference,actual_fov_degrees:actual })
+    }
+}
+
+fn optical_authority_from(camera:u64,scope_sequence:u64,
+    mut read:impl FnMut(u64,usize)->Option<u64>)->Option<OpticalAuthority> {
+    if camera==0 || scope_sequence==0{return None;}
+    let metadata=read(camera.checked_add(568)?,8)?;
+    if metadata==0 || read(camera.checked_add(16)?,8)?!=metadata{return None;}
+    let (expected_helper,min_fov)=match read(metadata.checked_add(8)?,4)? as u32 {
+        0xec22d348=>(0x26ea93d8,5.),0x8c40fb35=>(0xe2159f28,7.5),
+        0x64e68b46=>(0x49f800ae,10.),_=>return None,
+    };
+    if read(metadata.checked_add(28)?,4)? as u32!=expected_helper{return None;}
+    let helper=read(camera.checked_add(576)?,8)?;
+    if helper==0{return None;}
+    let helper_metadata=read(helper.checked_add(32)?,8)?;
+    if helper_metadata==0 || read(helper_metadata.checked_add(8)?,4)? as u32!=expected_helper{return None;}
+    let reference_bits=read(metadata.checked_add(32)?,4)? as u32;
+    let actual_bits=read(camera.checked_add(160)?,4)? as u32;
+    if reference_bits!=45f32.to_bits(){return None;}
+    let actual=f32::from_bits(actual_bits);
+    if !actual.is_finite() || !(min_fov..=45.).contains(&actual){return None;}
+    let result=OpticalAuthority{camera,metadata,helper,helper_metadata,scope_sequence,reference_bits,actual_bits};
+    result.optics()?;Some(result)
+}
+
+fn optical_authority(mem:&SharedMemory,epoch:u64)->Option<OpticalAuthority> {
+    let (camera,scope_sequence)=crate::xr_aim::qualified_scope_camera_for_optics(epoch)?;
+    let authority=optical_authority_from(camera,scope_sequence,|address,width| {
+        match width {4=>read_u32(mem,address).map(u64::from),8=>read_u64(mem,address),_=>None}
+    })?;
+    (crate::xr_aim::qualified_scope_camera_for_optics(epoch)==Some((camera,scope_sequence))).then_some(authority)
+}
+
+fn qualified_projection_optics(authority:OpticalAuthority,before:projection_restore::Snapshot)->Option<ScopeOptics> {
+    // Exact original RegeneratePerspective arithmetic and exact propagated
+    // native FOV scalar. No zoom-control/global camera FOV substitutes qualify.
+    if before.fields[6].to_bits()!=authority.actual_bits
+        || !projection_restore::guest_projection(before.fields,before.reverse)
+            .is_some_and(|p|same_matrix_bits(&p,&before.projection)) {return None;}
+    authority.optics()
 }
 
 /// A scene epoch may only be minted at a certified render-only guest boundary
@@ -157,7 +257,8 @@ fn remember_derived_consumed_request(state: &mut State, primary: WorldView, deri
     }
     let requested_projection = request.views[primary.eye_index as usize].projection_from_eye;
     if reverse_z(&requested_projection) != Some(true)
-        || !same_matrix_bits(&primary.projection_from_eye, &for_game_depth(requested_projection, false)) {
+        || !optical_projection(for_game_depth(requested_projection,false),primary.optics.magnification)
+            .is_some_and(|expected|same_matrix_bits(&primary.projection_from_eye,&expected)) {
         return false;
     }
     let mut expected = primary;
@@ -290,6 +391,7 @@ struct State {
     projection_clones_already_current: u64,
     projection_clone_failures: u64,
     original_primary_projection_scalars: Option<[f32; 11]>,
+    last_optics_qualification:Option<&'static str>,
     // A pending semantic crop reconciliation survives UI disable/recenter.
     // Only a CURRENT certified primary callback may consume it; no saved
     // pointer is dereferenced by set_active or the native camera enable API.
@@ -679,8 +781,8 @@ fn restore_primary_projection(caller: &mut Caller<'_, HostState>, mem: &SharedMe
     match (result, restored) { (Ok(value), Ok(())) => Ok(value), (Err(error), _) => Err(error), (_, Err(error)) => Err(error.into()) }
 }
 
-fn update_viewport(caller: &mut Caller<'_, HostState>, viewport: u64, camera: Option<&[f32; 16]>, projection: Option<&[f32; 16]>,
-    primary: Option<(projection_restore::Snapshot, u64)>) -> Result<()> {
+fn update_viewport(caller: &mut Caller<'_, HostState>, mem:&SharedMemory, viewport: u64, camera: Option<&[f32; 16]>, projection: Option<&[f32; 16]>,
+    primary: Option<(projection_restore::Snapshot, u64)>, optics:Option<(OpticalAuthority,u64)>) -> Result<()> {
     let scalars = projection.map(|p| projection_scalars(p).context("unsupported finite eye projection")).transpose()?;
     let stack_get = caller.get_export("emscripten_stack_get_current").and_then(|e| e.into_func()).context("missing stack getter")?
         .typed::<(), i64>(&mut *caller)?;
@@ -695,7 +797,6 @@ fn update_viewport(caller: &mut Caller<'_, HostState>, viewport: u64, camera: Op
     let stack = crate::guest_call_scope::call(caller, crate::guest_call_scope::Kind::Ordinary, |caller| stack_get.call(caller, ()))?;
     let result = (|| {
         let scratch = crate::guest_call_scope::call(caller, crate::guest_call_scope::Kind::Ordinary, |caller| allocate.call(caller, 128))? as u64;
-        let mem = &RT.get().context("missing runtime")?.mem;
         anyhow::ensure!(scratch != 0 && scratch.checked_add(128).is_some_and(|end| end <= mem.data_size() as u64), "camera scratch outside guest memory");
         if scalars.is_some() {
             anyhow::ensure!(viewport.checked_add(929).is_some_and(|end| end <= mem.data_size() as u64), "projection scalar fields outside guest memory");
@@ -705,6 +806,9 @@ fn update_viewport(caller: &mut Caller<'_, HostState>, viewport: u64, camera: Op
                 && primary_projection_snapshot(mem, before.source, crate::guest_call_scope::producer_store_lifetime(caller.data()))
                     .is_some_and(|current| before.matches(current)));
         anyhow::ensure!(primary_is_current(caller), "primary projection ownership changed before setter");
+        let optics_is_current=||optics.is_none_or(|(before,epoch)|view_epoch_is_active(epoch)
+            && optical_authority(mem,epoch)==Some(before));
+        anyhow::ensure!(optics_is_current(),"native optical identity changed before setter");
         if let Some(camera) = camera { anyhow::ensure!(crate::write_bytes(mem, scratch, &matrix_bytes(camera)), "camera scratch write failed"); }
         if let Some(projection) = projection {
             anyhow::ensure!(crate::write_bytes(mem, scratch + 64, &matrix_bytes(projection)), "projection scratch write failed");
@@ -713,12 +817,14 @@ fn update_viewport(caller: &mut Caller<'_, HostState>, viewport: u64, camera: Op
         if camera.is_some() { crate::guest_call_scope::call(caller, crate::guest_call_scope::Kind::Ordinary, |caller| set_camera.call(caller, (viewport as i64, scratch as i64)))?; }
         if let (Some(projection),Some(fields)) = (projection,scalars) {
             anyhow::ensure!(primary_is_current(caller), "primary projection ownership changed during camera setter");
+            anyhow::ensure!(optics_is_current(),"native optical identity changed during camera setter");
             let bytes: Vec<u8> = fields.into_iter().flat_map(f32::to_le_bytes).collect();
             anyhow::ensure!(crate::write_bytes(mem,viewport + 872,&bytes), "projection scalar write failed");
             anyhow::ensure!(crate::write_bytes(mem,viewport + 928,&[reverse_z(projection).context("unsupported depth direction")? as u8]), "projection direction write failed");
             // Calling RegenerateNearFarClip afterward would replace the custom
             // matrix. SetProjection instead regenerates its inverses/frustums.
             crate::guest_call_scope::call(caller, crate::guest_call_scope::Kind::Ordinary, |caller| set_projection.call(caller, (viewport as i64, (scratch + 64) as i64)))?;
+            anyhow::ensure!(optics_is_current(),"native optical identity changed during projection setter");
         }
         Ok(())
     })();
@@ -754,7 +860,13 @@ pub fn camera_post(caller: &mut Caller<'_, HostState>, source: u64, _frame: u64)
     }
     if read_u64(mem, ACTIVE_CVIEWPORT) != Some(source) { return Ok(()); }
     let before_projection = if world_camera_enabled() { primary_projection_snapshot(mem, source, store) } else { None };
+    let optical_authority=if world_camera_enabled(){optical_authority(mem,EPOCH.load(Ordering::Acquire))}else{None};
+    let source_optics=optical_authority.and_then(|authority|before_projection.and_then(|before|
+        qualified_projection_optics(authority,before))).unwrap_or_default();
     let mut state = lock_world_state();
+    state.last_optics_qualification=Some(if source_optics.scope_sequence!=0 {"qualified same-camera optical FOV"}
+        else if optical_authority.is_some() {"native camera FOV and primary projection are not exact"}
+        else {"no fresh qualified local scoped camera/metadata"});
     let provenance_epoch = EPOCH.load(Ordering::Acquire);
     let Some(viewport) = source.checked_add(16) else { return Ok(()); };
     let Some(camera) = read_matrix(mem, viewport + CAMERA_OFFSET).filter(rigid) else { return Ok(()); };
@@ -782,12 +894,13 @@ pub fn camera_post(caller: &mut Caller<'_, HostState>, source: u64, _frame: u64)
     let mut view = WorldView { provenance_epoch, camera_sequence: state.sequence, request_frame: request.map(|r| r.frame).unwrap_or(0),
         head_pose_frame: prepared.map(|pose| pose.update.frame).unwrap_or(0), presentation_time_seconds: request.map(|r| r.presentation_time_seconds).unwrap_or(0.),
         eye_index, view_count: request.map(|r| r.view_count).unwrap_or(1), game_from_eye: camera, game_from_stage: identity(),
-        projection_from_eye: projection, depth_reverse_z, headset_applied: false };
+        projection_from_eye: projection, depth_reverse_z, headset_applied: false, optics:crate::xr_view::ScopeOptics::default() };
     let override_matrices = if ready && world_camera_enabled() && request.is_some() {
         prepared.filter(|pose| rigid(&pose.relative) && pose.relative[12..15].iter().all(|n| n.abs() <= 5.)).map(|pose| {
             let head_from_eye = request.map(|r| r.views[eye_index as usize].head_from_eye).unwrap_or_else(identity);
             let desired_camera = multiply(&multiply(&camera, &pose.relative), &head_from_eye);
-            let desired_projection = request.and_then(|r| reverse_z(&projection).map(|direction| for_game_depth(r.views[eye_index as usize].projection_from_eye, direction)));
+            let desired_projection = request.and_then(|r| reverse_z(&projection).and_then(|direction|
+                optical_projection(for_game_depth(r.views[eye_index as usize].projection_from_eye,direction),source_optics.magnification)));
             (desired_camera, desired_projection)
         })
     } else { None };
@@ -806,8 +919,9 @@ pub fn camera_post(caller: &mut Caller<'_, HostState>, source: u64, _frame: u64)
         // those exact words. A failure before any writes simply fails the
         // last-written comparison and drops the record without touching memory.
         lock_world_state().primary_crop_owner = Some(crop_owner);
-        match update_viewport(caller, viewport, Some(&desired_camera), desired_projection.as_ref(),
-            before_projection.map(|before| (before, provenance_epoch))) {
+        match update_viewport(caller, mem, viewport, Some(&desired_camera), desired_projection.as_ref(),
+            before_projection.map(|before| (before, provenance_epoch)),
+            optical_authority.filter(|_|source_optics.scope_sequence!=0).map(|authority|(authority,provenance_epoch))) {
             Ok(()) => {
                 if !view_epoch_is_active(provenance_epoch)
                     || !crate::xr::commit_camera_pose(prepared.expect("guarded prepared pose")) { return Ok(()); }
@@ -819,6 +933,7 @@ pub fn camera_post(caller: &mut Caller<'_, HostState>, source: u64, _frame: u64)
                 view.game_from_stage = multiply(&desired_camera, &rigid_inverse(&stage_from_eye));
                 view.presentation_time_seconds = native_pose.presentation_time_seconds;
                 view.headset_applied = true;
+                view.optics=source_optics;
                 let mut state = lock_world_state();
                 if provenance_epoch != EPOCH.load(Ordering::Acquire) { return Ok(()); }
                 if let Some(consumed) = request { remember_consumed_request(&mut state, view, consumed); }
@@ -967,7 +1082,7 @@ pub fn current_view(caller: &mut Caller<'_, HostState>, viewport: u64, _set_wind
     if let Some((saved, derived)) = clone {
         let already_current = read_matrix(mem,viewport + PROJECTION_OFFSET) == Some(derived.projection_from_eye)
             && projection_state_is_current(mem,viewport,&derived.projection_from_eye);
-        let result = if already_current { Ok(()) } else { update_viewport(caller,viewport,None,Some(&derived.projection_from_eye),None) };
+        let result = if already_current { Ok(()) } else { update_viewport(caller,mem,viewport,None,Some(&derived.projection_from_eye),None,None) };
         let mut state = lock_world_state();
         if view_epoch_is_active(derived.provenance_epoch) {
             match result {
@@ -1116,7 +1231,9 @@ fn describe(view: WorldView) -> serde_json::Value {
         "head_pose_frame":view.head_pose_frame, "eye_index":view.eye_index, "view_count":view.view_count,
         "presentation_time_seconds":view.presentation_time_seconds, "game_from_eye":view.game_from_eye,
         "game_from_stage":view.game_from_stage,
-        "projection_from_eye":view.projection_from_eye, "depth_reverse_z":view.depth_reverse_z, "headset_applied":view.headset_applied})
+        "projection_from_eye":view.projection_from_eye, "depth_reverse_z":view.depth_reverse_z, "headset_applied":view.headset_applied,
+        "optics":{"scope_sequence":view.optics.scope_sequence,"magnification":view.optics.magnification,
+            "reference_fov_degrees":view.optics.reference_fov_degrees,"actual_fov_degrees":view.optics.actual_fov_degrees}})
 }
 
 pub fn status_json() -> serde_json::Value {
@@ -1155,6 +1272,7 @@ pub fn status_json() -> serde_json::Value {
         "restored":state.primary_crop_restores,"dropped":state.primary_crop_dropped,
         "unqualified":state.primary_crop_unqualified,"failures":state.primary_crop_failures});
     status["original_primary_projection_scalars_872_to_912"] = serde_json::json!(state.original_primary_projection_scalars);
+    status["last_optics_qualification"]=serde_json::json!(state.last_optics_qualification);
     status["eye_projection_scalars_872_to_912"] = serde_json::json!(state.last_main.and_then(|main|projection_scalars(&main.view.projection_from_eye)));
     status["motion_aim"] = crate::xr_motion_aim::status_json();
     status
@@ -1163,6 +1281,114 @@ pub fn status_json() -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn optics_fixture()->BTreeMap<(u64,usize),u64> {
+        BTreeMap::from([((0x1000+568,8),0x2000),((0x1000+16,8),0x2000),
+            ((0x2000+8,4),0xec22d348),((0x2000+28,4),0x26ea93d8),
+            ((0x1000+576,8),0x3000),((0x3000+32,8),0x4000),
+            ((0x4000+8,4),0x26ea93d8),((0x2000+32,4),45f32.to_bits() as u64),
+            ((0x1000+160,4),10f32.to_bits() as u64)])
+    }
+    #[test]
+    fn scope_optics_require_exact_same_camera_metadata_helper_and_original_fov() {
+        let memory=optics_fixture();
+        let read=|memory:&BTreeMap<(u64,usize),u64>|optical_authority_from(0x1000,9,|a,w|memory.get(&(a,w)).copied());
+        let authority=read(&memory).unwrap();let optics=authority.optics().unwrap();
+        assert_eq!(optics.scope_sequence,9);assert!((optics.magnification-4.7344828).abs()<0.00001);
+        for key in memory.keys() {let mut changed=memory.clone();changed.insert(*key,0);assert!(read(&changed).is_none(),"{key:?}");}
+        for actual in [f32::NAN,0.,4.99,45.01,f32::INFINITY] {
+            let mut changed=memory.clone();changed.insert((0x1000+160,4),actual.to_bits() as u64);assert!(read(&changed).is_none());
+        }
+        let mut game=crop_fixture_snapshot();game.fields[6]=10.;game.fields[7]=(5f32.to_radians()).tan();
+        game.projection=projection_restore::guest_projection(game.fields,false).unwrap();
+        assert_eq!(qualified_projection_optics(authority,game),Some(optics));
+        let mut stale=game;stale.fields[6]=f32::from_bits(10f32.to_bits()+1);
+        assert!(qualified_projection_optics(authority,stale).is_none());
+        stale=game;stale.projection[0]=f32::from_bits(stale.projection[0].to_bits()+1);
+        assert!(qualified_projection_optics(authority,stale).is_none());
+    }
+    #[test]
+    fn scope_optical_clip_scaling_preserves_principal_point_depth_and_identity_exactly() {
+        let mut source=projection();source[0]=0.73;source[5]=0.9;source[8]=-0.27;source[9]=-0.087;
+        assert!(same_matrix_bits(&optical_projection(source,1.).unwrap(),&source));
+        for m in [1.01,2.,4.7344828,9.48705] {
+            let optical=optical_projection(source,m).unwrap();
+            assert_eq!(optical[0],source[0]*m);assert_eq!(optical[5],source[5]*m);
+            for index in [2,3,6,7,8,9,10,11,14,15] {assert_eq!(optical[index].to_bits(),source[index].to_bits());}
+            assert!(projection_scalars(&optical).is_some());
+        }
+        for m in [0.,0.99,10.01,f32::NAN,f32::INFINITY] {assert!(optical_projection(source,m).is_none());}
+    }
+    #[cfg(feature="jit")]
+    #[test]
+    fn optical_projection_uses_actual_host_setters_and_restores_current_native_zoom_crop() {
+        use wasmtime::{Engine,Linker,MemoryType,Module,Store};
+        use wasm_encoder::{CodeSection,EntityType,ExportKind,ExportSection,Function,FunctionSection,
+            ImportSection,Instruction as I,TypeSection,ValType};
+        let mut module=wasm_encoder::Module::new();let mut types=TypeSection::new();
+        types.ty().function([],[]);types.ty().function([],[ValType::I64]);
+        types.ty().function([ValType::I64],[ValType::I64]);types.ty().function([ValType::I64],[]);
+        types.ty().function([ValType::I64,ValType::I64],[]);module.section(&types);
+        let mut imports=ImportSection::new();for (name,ty) in [("run",0),("get",1),("alloc",2),("restore",3),("camera",4),("projection",4)] {
+            imports.import("fixture",name,EntityType::Function(ty));
+        }module.section(&imports);
+        let mut functions=FunctionSection::new();functions.function(0);module.section(&functions);
+        let mut exports=ExportSection::new();for(name,index)in [("outer",6),("emscripten_stack_get_current",1),("_emscripten_stack_alloc",2),
+            ("_emscripten_stack_restore",3),("mp:XRSetViewportCameraMtx",4),("mp:XRSetViewportProjection",5)] {
+            exports.export(name,ExportKind::Func,index);
+        }module.section(&exports);
+        let mut code=CodeSection::new();let mut outer=Function::new([]);outer.instruction(&I::Call(0)).instruction(&I::End);
+        code.function(&outer);module.section(&code);
+        let mut config=wasmtime::Config::new();config.shared_memory(true);let engine=Engine::new(&config).unwrap();
+        let module=Module::new(&engine,module.finish()).unwrap();
+        let mem=SharedMemory::new(&engine,MemoryType::shared(300,300)).unwrap();
+        let source=8192u64;let viewport=source+16;let mut game=crop_fixture_snapshot();
+        game.fields[6]=10.;game.fields[7]=5f32.to_radians().tan();
+        game.projection=projection_restore::guest_projection(game.fields,false).unwrap();
+        let mut geometry=[0.,0.,1.,1.,0.,1.,0.,0.,1.,1.,0.,1.,0.,0.].map(f32::to_bits);
+        geometry[12]=1920;geometry[13]=1080;
+        for(address,bytes)in [(viewport+816,geometry.into_iter().flat_map(u32::to_le_bytes).collect::<Vec<_>>()),
+            (viewport+872,game.fields.into_iter().flat_map(f32::to_le_bytes).collect()),
+            (viewport+PROJECTION_OFFSET,matrix_bytes(&game.projection).to_vec()),
+            (ACTIVE_CVIEWPORT,source.to_le_bytes().to_vec())] {assert!(crate::write_bytes(&mem,address,&bytes));}
+        assert!(crate::write_bytes(&mem,viewport+928,&[0]));
+        sv_xr_world_camera_set_enabled(1);let epoch=view_epoch();
+        let desired=optical_projection(for_game_depth(projection(),false),4.7344828).unwrap();
+        let mut linker=Linker::new(&engine);let run_mem=mem.clone();
+        linker.func_wrap("fixture","run",move |mut caller:Caller<'_,HostState>|->wasmtime::Result<()> {
+            let store=crate::guest_call_scope::producer_store_lifetime(caller.data());
+            let before=primary_projection_snapshot(&run_mem,source,store).unwrap();
+            let owner=projection_restore::Owner::acquire(before,projection_scalars(&desired).unwrap()).unwrap();
+            update_viewport(&mut caller,&run_mem,viewport,Some(&identity()),Some(&desired),Some((before,epoch)),None)
+                .map_err(wasmtime::Error::from_anyhow)?;
+            assert!(same_matrix_bits(&read_matrix(&run_mem,viewport+PROJECTION_OFFSET).unwrap(),&desired));
+            assert_eq!(read_projection_scalars(&run_mem,viewport).unwrap(),projection_scalars(&desired).unwrap());
+            // Next native camera update recomputes its own 30-degree lens but
+            // retains XR-owned crop. Production restoration must keep that lens.
+            let mut fresh=game.fields;fresh[6]=30.;fresh[7]=15f32.to_radians().tan();
+            fresh[2..6].copy_from_slice(&projection_scalars(&desired).unwrap()[2..6]);
+            let p=projection_restore::guest_projection(fresh,false).unwrap();
+            assert!(crate::write_bytes(&run_mem,viewport+872,&fresh.into_iter().flat_map(f32::to_le_bytes).collect::<Vec<_>>()));
+            assert!(crate::write_bytes(&run_mem,viewport+PROJECTION_OFFSET,&matrix_bytes(&p)));
+            let current=primary_projection_snapshot(&run_mem,source,store).unwrap();
+            assert!(restore_primary_projection(&mut caller,&run_mem,owner.restore(current).unwrap()).unwrap());
+            let restored=read_projection_scalars(&run_mem,viewport).unwrap();
+            assert_eq!(restored[6],30.);assert_eq!(restored[7],fresh[7]);
+            assert_eq!(restored[2..6],game.fields[2..6]);Ok(())
+        }).unwrap();
+        linker.func_wrap("fixture","get",||4096i64).unwrap();
+        linker.func_wrap("fixture","alloc",|size:i64|{assert!(matches!(size,64|128));4096i64}).unwrap();
+        linker.func_wrap("fixture","restore",|stack:i64|assert_eq!(stack,4096)).unwrap();
+        for(name,offset)in [("camera",CAMERA_OFFSET),("projection",PROJECTION_OFFSET)] {
+            let target=mem.clone();linker.func_wrap("fixture",name,move|pointer:i64,scratch:i64|{
+                assert_eq!(pointer,viewport as i64);let bytes=crate::read_bytes(&target,scratch as u64,64);
+                assert!(crate::write_bytes(&target,viewport+offset,&bytes));
+            }).unwrap();
+        }
+        let mut store=Store::new(&engine,HostState::new(0));let instance=linker.instantiate(&mut store,&module).unwrap();
+        instance.get_typed_func::<(),()>(&mut store,"outer").unwrap().call(&mut store,()).unwrap();
+        sv_xr_world_camera_set_enabled(0);
+    }
     fn crop_fixture_geometry() -> projection_restore::WindowGeometry {
         let mut words = [0.,0.,1.,1.,0.,1.,0.,0.,1.,1.,0.,1.,0.,0.].map(f32::to_bits);
         words[12] = 1920; words[13] = 1080;
@@ -1684,7 +1910,7 @@ mod tests {
     }
     fn view(eye_index: u32, camera_sequence: u64) -> WorldView {
         WorldView { provenance_epoch:1, camera_sequence, request_frame:1, head_pose_frame:1,presentation_time_seconds:1.,eye_index,view_count:2,
-            game_from_eye:identity(),game_from_stage:identity(),projection_from_eye:projection(),depth_reverse_z:true,headset_applied:true }
+            game_from_eye:identity(),game_from_stage:identity(),projection_from_eye:projection(),depth_reverse_z:true,headset_applied:true, optics:crate::xr_view::ScopeOptics::default() }
     }
     #[test]
     fn ring_present_alignment_keeps_loading_slots_and_world_after_ui_switch() {

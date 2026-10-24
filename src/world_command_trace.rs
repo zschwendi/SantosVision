@@ -219,7 +219,7 @@ mod tests {
     use super::*;
     fn view() -> WorldView { WorldView { provenance_epoch:1,camera_sequence:2,request_frame:3,head_pose_frame:4,
         presentation_time_seconds:1.,eye_index:1,view_count:2,game_from_eye:[0.;16],game_from_stage:[0.;16],
-        projection_from_eye:[0.;16],depth_reverse_z:true,headset_applied:true } }
+        projection_from_eye:[0.;16],depth_reverse_z:true,headset_applied:true, optics:crate::xr_view::ScopeOptics::default() } }
     fn record(op:u32) -> Value { json!({"opcode":op,"operands":[7,8,9],"operands_complete":true}) }
     fn arm(trace:&mut CommandTrace) { trace.command(7,record(7)); trace.present(10,Some(&view()),true); }
 

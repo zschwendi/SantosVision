@@ -4,6 +4,7 @@
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
+use std::hash::{Hash,Hasher};
 use wasmtime::{AsContextMut, Caller, Ref, Table};
 use crate::HostState;
 
@@ -39,9 +40,10 @@ struct ScopeObservation {
     original_first_person_aim_active: Option<bool>,
     gameplay_fov_degrees: Option<f32>,
     zoom_control: Option<f32>,
+    identity:Option<[u64;2]>, scope_sequence:u64,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 struct ScopeCandidate {
     factory: u64, ped: u64, director: u64, camera: u64, camera_vtable: u64,
     camera_owner: u64, manager: u64, physical: u64, weapon: u64,
@@ -49,6 +51,14 @@ struct ScopeCandidate {
 }
 impl ScopeCandidate {
     fn equipped_scope(self) -> bool { self.info_flags & 8 != 0 || self.component_scope != 0 }
+    fn identity(self)->[u64;2] {
+        // A comparison commitment only; no guest pointer is retained or later
+        // dereferenced. Current semantics are requalified before every use.
+        [0x6173687461727363u64,0x6f70746963732d31].map(|salt| {
+            let mut hash=std::collections::hash_map::DefaultHasher::new();
+            salt.hash(&mut hash);self.hash(&mut hash);hash.finish()
+        })
+    }
 }
 
 // Exact original41682 +82071's physical-weapon branch. Unknown inventory-only
@@ -87,22 +97,45 @@ fn scope_candidate(mut read: impl FnMut(u64, usize) -> Option<u64>) -> Option<Sc
         manager, physical, weapon, info, info_flags, component, component_info, component_scope })
 }
 
-fn read_scope_candidate() -> Option<ScopeCandidate> {
+fn read_atomic_guest_word(address:u64,width:usize)->Option<u64> {
+    if !matches!(width,1|4|8){return None;}
     let runtime = crate::RT.get()?;
     let (base, length) = crate::mem_base_len(&runtime.mem);
     // RT owns the shared allocation for this entire read. No mutable byte slice
     // is borrowed while other guest threads may write the memory.
-    scope_candidate(|address, width| {
-        let offset = usize::try_from(address).ok()?;
-        if offset % width != 0 || offset.checked_add(width)? > length { return None; }
-        let pointer = unsafe { base.add(offset) };
-        Some(match width {
-            1 => unsafe { &*pointer.cast::<AtomicU8>() }.load(Ordering::Relaxed) as u64,
-            4 => unsafe { &*pointer.cast::<AtomicU32>() }.load(Ordering::Relaxed) as u64,
-            8 => unsafe { &*pointer.cast::<AtomicU64>() }.load(Ordering::Relaxed),
-            _ => return None,
-        })
+    let offset = usize::try_from(address).ok()?;
+    if offset % width != 0 || offset.checked_add(width)? > length { return None; }
+    let pointer = unsafe { base.add(offset) };
+    Some(match width {
+        1 => unsafe { &*pointer.cast::<AtomicU8>() }.load(Ordering::Relaxed) as u64,
+        4 => unsafe { &*pointer.cast::<AtomicU32>() }.load(Ordering::Relaxed) as u64,
+        8 => unsafe { &*pointer.cast::<AtomicU64>() }.load(Ordering::Relaxed),
+        _ => return None,
     })
+}
+fn read_scope_candidate() -> Option<ScopeCandidate> {
+    scope_candidate(read_atomic_guest_word)
+}
+
+fn read_scope_identity(candidate:ScopeCandidate)->Option<[u64;2]> {
+    scope_identity_from(candidate,read_atomic_guest_word)
+}
+fn scope_identity_from(candidate:ScopeCandidate,mut read:impl FnMut(u64,usize)->Option<u64>)->Option<[u64;2]> {
+    let camera=candidate.camera;
+    let metadata=read(camera.checked_add(568)?,8)?;
+    let base=read(camera.checked_add(16)?,8)?;
+    let helper=read(camera.checked_add(576)?,8)?;
+    if metadata==0 || base!=metadata || helper==0{return None;}
+    let helper_metadata=read(helper.checked_add(32)?,8)?;
+    if helper_metadata==0{return None;}
+    let words=[metadata,base,helper,helper_metadata,
+        read(metadata.checked_add(8)?,4)?,
+        read(metadata.checked_add(28)?,4)?,
+        read(metadata.checked_add(32)?,4)?,
+        read(helper_metadata.checked_add(8)?,4)?];
+    Some(candidate.identity().map(|seed| {
+        let mut hash=std::collections::hash_map::DefaultHasher::new();seed.hash(&mut hash);words.hash(&mut hash);hash.finish()
+    }))
 }
 
 #[repr(C)]
@@ -146,11 +179,42 @@ struct AimState {
     last_error: Option<String>,
     scope: Option<(ScopeObservation, u64, Instant)>,
     gameplay_ui: Option<(bool, u64, Instant)>,
+    scope_sequence:u64,
 }
 static STATE: Mutex<AimState> = Mutex::new(AimState {
     sequence: 0, samples: 0, hidden: 0, failures: 0, latest: None, last_error: None,
-    scope: None, gameplay_ui: None,
+    scope: None, gameplay_ui: None,scope_sequence:0,
 });
+
+fn record_scope(state:&mut AimState,mut observation:ScopeObservation,epoch:u64,now:Instant) {
+    if observation.active==Some(true) && observation.identity.is_some() {
+        let same=fresh_scope(state,now,epoch,true).filter(|previous|
+            previous.active==Some(true) && previous.identity==observation.identity && previous.scope_sequence!=0);
+        observation.scope_sequence=if let Some(previous)=same {previous.scope_sequence} else {
+            if let Some(next)=state.scope_sequence.checked_add(1) {state.scope_sequence=next;next} else {0}
+        };
+        if observation.scope_sequence==0 {observation=ScopeObservation::default();}
+    }
+    state.scope=Some((observation,epoch,now));
+}
+
+/// Stack-only camera authority for the actual qualified primary callback.
+/// Fresh script mode alone is insufficient: the live local camera/weapon must
+/// still match the exact identity observed across the certified original calls.
+pub(crate) fn qualified_scope_camera_for_optics(epoch:u64)->Option<(u64,u64)> {
+    let current=|| {
+        let state=STATE.lock().unwrap_or_else(|p|p.into_inner());
+        fresh_scope(&state,Instant::now(),epoch,reticle_ready_for_epoch(epoch))
+            .filter(|scope|scope.active==Some(true)&&scope.scope_sequence!=0)
+    };
+    let observation=current()?;
+    let candidate=read_scope_candidate()?;
+    if candidate.camera_vtable!=FIRST_PERSON_AIM_VTABLE || !candidate.equipped_scope()
+        || observation.identity!=read_scope_identity(candidate) {return None;}
+    let after=current()?;
+    (after.identity==observation.identity && after.scope_sequence==observation.scope_sequence)
+        .then_some((candidate.camera,observation.scope_sequence))
+}
 
 pub(crate) fn record_gameplay_ui_eligibility(alive: Option<bool>, epoch: u64) {
     STATE.lock().unwrap_or_else(|p| p.into_inner()).gameplay_ui = alive.map(|alive| (alive, epoch, Instant::now()));
@@ -331,6 +395,7 @@ pub fn status_json() -> serde_json::Value {
         "scope_observation_view_epoch":scope_epoch,
         "scope_gameplay_fov_degrees":scope.and_then(|s|s.gameplay_fov_degrees),
         "scope_zoom_control":scope.and_then(|s|s.zoom_control),
+        "scope_sequence":scope.map(|s|s.scope_sequence),
         "scope_zoom_control_applied":false,
         "gameplay_ui_eligible":gameplay_ui.map(|(alive,_,_)|alive),
         "gameplay_ui_age_seconds":gameplay_ui_age,
@@ -375,17 +440,19 @@ pub(crate) fn observe_native_scoped_optic(caller: &mut Caller<'_, HostState>, ep
         let table = caller.get_export("__indirect_function_table").and_then(|e|e.into_table())
             .ok_or_else(||anyhow::anyhow!("original command table unavailable"))?;
         let original_active = invoke_first_person_aim(caller, table, certified)?;
+        let identity=read_scope_identity(before);
         // These are diagnostics, not magnification. Original26805 divides one
         // metadata FOV by zoom_control then clamps it; no optical ratio is assumed.
         let gameplay_fov_degrees = invoke_scope_float(caller, table, certified, GAMEPLAY_FOV_TABLE_SLOT).ok();
         let zoom_control = invoke_scope_float(caller, table, certified, AIM_ZOOM_TABLE_SLOT).ok();
-        anyhow::ensure!(read_scope_candidate() == Some(before) && reticle_ready_for_epoch(epoch),
+        anyhow::ensure!(read_scope_candidate() == Some(before) && read_scope_identity(before)==identity && reticle_ready_for_epoch(epoch),
             "scope identity or immersive epoch changed across original getters");
         Ok(ScopeObservation { active: Some(original_active), equipped: Some(equipped),
-            original_first_person_aim_active: Some(original_active), gameplay_fov_degrees, zoom_control })
+            original_first_person_aim_active: Some(original_active), gameplay_fov_degrees, zoom_control,
+            identity,scope_sequence:0 })
     })().unwrap_or_default();
     let active = observation.active == Some(true);
-    STATE.lock().unwrap_or_else(|p|p.into_inner()).scope = Some((observation, epoch, Instant::now()));
+    record_scope(&mut STATE.lock().unwrap_or_else(|p|p.into_inner()),observation,epoch,Instant::now());
     active
 }
 
@@ -490,6 +557,16 @@ mod tests {
         ]);
         let read = |memory:&BTreeMap<(u64,usize),u64>| scope_candidate(|a,w|memory.get(&(a,w)).copied());
         let original = read(&memory).unwrap(); assert!(original.equipped_scope());
+        for(key,value)in [((0x5000+568,8),0xd000),((0x5000+16,8),0xd000),
+            ((0x5000+576,8),0xe000),((0xe000+32,8),0xf000),
+            ((0xd000+8,4),0xec22d348),((0xd000+28,4),0x26ea93d8),
+            ((0xd000+32,4),45f32.to_bits() as u64),((0xf000+8,4),0x26ea93d8)] {memory.insert(key,value);}
+        let identity=|m:&BTreeMap<(u64,usize),u64>|scope_identity_from(original,|a,w|m.get(&(a,w)).copied());
+        let stable=identity(&memory).unwrap();
+        memory.insert((0x5000+160,4),5f32.to_bits() as u64);assert_eq!(identity(&memory),Some(stable));
+        memory.insert((0x5000+160,4),30f32.to_bits() as u64);assert_eq!(identity(&memory),Some(stable));
+        memory.insert((0xd000+8,4),0x8c40fb35);assert_ne!(identity(&memory),Some(stable));
+        memory.insert((0xd000+8,4),0xec22d348);assert_eq!(identity(&memory),Some(stable));
         // Built-in flag short-circuits an absent runtime component, like41682.
         memory.insert((0xa000+2248,1),4); assert!(read(&memory).is_none());
         memory.insert((0x9000+304,8),0); assert!(!read(&memory).unwrap().equipped_scope());
@@ -517,6 +594,23 @@ mod tests {
         assert!(fresh_scope(&state,now,8,true).is_none());assert!(fresh_scope(&state,now,7,false).is_none());
         let unknown=AimState {scope:Some((ScopeObservation::default(),7,now)),..Default::default()};
         assert_eq!(fresh_scope(&unknown,now,7,true).unwrap().active,None);
+    }
+    #[test]
+    fn scoped_optic_sequence_tracks_identity_entry_epoch_and_freshness_not_zoom() {
+        let now=Instant::now();let mut state=AimState::default();
+        let sample=ScopeObservation{active:Some(true),identity:Some([10,20]),gameplay_fov_degrees:Some(45.),..Default::default()};
+        record_scope(&mut state,sample,7,now);let initial=state.scope.unwrap().0.scope_sequence;assert_ne!(initial,0);
+        let zoomed=ScopeObservation{gameplay_fov_degrees:Some(10.),zoom_control:Some(7.),..sample};
+        record_scope(&mut state,zoomed,7,now+Duration::from_millis(30));assert_eq!(state.scope.unwrap().0.scope_sequence,initial);
+        record_scope(&mut state,ScopeObservation{identity:Some([10,21]),..zoomed},7,now+Duration::from_millis(60));
+        let changed=state.scope.unwrap().0.scope_sequence;assert!(changed>initial);
+        record_scope(&mut state,ScopeObservation::default(),7,now+Duration::from_millis(70));
+        record_scope(&mut state,sample,7,now+Duration::from_millis(80));let reentry=state.scope.unwrap().0.scope_sequence;assert!(reentry>changed);
+        record_scope(&mut state,sample,8,now+Duration::from_millis(90));let epoch=state.scope.unwrap().0.scope_sequence;assert!(epoch>reentry);
+        record_scope(&mut state,sample,8,now+Duration::from_millis(191));assert!(state.scope.unwrap().0.scope_sequence>epoch);
+        state.scope_sequence=u64::MAX;state.scope=None;record_scope(&mut state,sample,8,now);
+        assert_eq!(state.scope.unwrap().0.scope_sequence,0);assert_eq!(state.scope_sequence,u64::MAX);
+        record_scope(&mut state,sample,8,now);assert_eq!(state.scope.unwrap().0.scope_sequence,0);
     }
 
     #[test]

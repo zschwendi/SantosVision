@@ -4688,8 +4688,8 @@ impl Gpu {
             game_from_stage: view.game_from_stage, depth_near: near, depth_far: far,
             ..Default::default()
         };
-        crate::world_frame::publish_with_hud(&self.device, &self.queue, &color,
-            &depth, frozen_depth, frame, view.provenance_epoch,hud);
+        crate::world_frame::publish_with_hud_and_optics(&self.device, &self.queue, &color,
+            &depth, frozen_depth, frame, view.provenance_epoch,hud,view.camera_sequence,view.optics);
     }
 
     fn log_fps(&mut self) {
@@ -4920,7 +4920,7 @@ mod frozen_world_depth_policy_tests {
             eye_index: 0, view_count: 2, game_from_eye: identity, game_from_stage: identity,
             projection_from_eye: [0.732051,0.,0.,0., 0.,0.9125127,0.,0.,
                 -0.267949,-0.087487,0.00010001659,-1., 0.,0.,0.10001,0.],
-            depth_reverse_z: true, headset_applied: true }
+            depth_reverse_z: true, headset_applied: true, optics:crate::xr_view::ScopeOptics::default() }
     }
 
     #[test]

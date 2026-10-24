@@ -651,7 +651,7 @@ mod tests {
     }
     #[test]fn capture_diagnostics_retain_immersive_failure_after_return_to_window(){
         let mut audit=CaptureAudit::default();let mut view=crate::xr_view::WorldView{provenance_epoch:7,camera_sequence:11,request_frame:1,head_pose_frame:12,presentation_time_seconds:100.,eye_index:0,view_count:2,
-            game_from_eye:identity(),game_from_stage:identity(),projection_from_eye:identity(),depth_reverse_z:false,headset_applied:true};
+            game_from_eye:identity(),game_from_stage:identity(),projection_from_eye:identity(),depth_reverse_z:false,headset_applied:true, optics:crate::xr_view::ScopeOptics::default()};
         audit.record(view,"accepted",Some((3,[1,4,12,13],Some(20.),Some(0.))));
         audit.record(view,"no_fresh_right_accessory",Some((0,[0;4],Some(0.),Some(-100000.))));
         view.headset_applied=false;view.head_pose_frame=0;

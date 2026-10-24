@@ -23,7 +23,7 @@ fn view() -> crate::xr_view::WorldView {
         camera_sequence: 1, request_frame: 1, head_pose_frame: 1,
         presentation_time_seconds: 1., eye_index: 0, view_count: 2,
         game_from_eye: identity, game_from_stage: identity,
-        projection_from_eye: identity, depth_reverse_z: true, headset_applied: true }
+        projection_from_eye: identity, depth_reverse_z: true, headset_applied: true, optics:crate::xr_view::ScopeOptics::default() }
 }
 
 fn arm(g: &mut Gpu) {
