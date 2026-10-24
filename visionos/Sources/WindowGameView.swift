@@ -90,6 +90,14 @@ struct WindowGameView: View {
         return runtime.hasGameData ? "Ready to play" : "Game files required"
     }
 
+    private var senseWindowUtilitiesVisible: Bool {
+        #if SV_GAME_RUNTIME
+        runtime.senseGameplayUtilitiesVisible && !world.isOpening && !world.isImmersiveActive
+        #else
+        runtime.senseGameplayUtilitiesVisible
+        #endif
+    }
+
     var body: some View {
         ZStack {
             // Keep this view mounted across launcher/play transitions. The
@@ -131,13 +139,6 @@ struct WindowGameView: View {
             }
             #endif
         }
-        .overlay(alignment: .bottomLeading) {
-            if runtime.senseGameplayUtilitiesVisible {
-                SenseGameplayUtilities(runtime: runtime)
-                    .padding(.leading, 18)
-                    .padding(.bottom, 18)
-            }
-        }
         .frame(minWidth: 640, minHeight: 360)
         .background(.black)
         .background(GameWindowGeometry(isGameplay: runtime.startupAttempted))
@@ -145,6 +146,13 @@ struct WindowGameView: View {
         .tint(SantosTheme.accent)
         .onChange(of: scenePhase, initial: true) { _, phase in
             runtime.setWindowSceneActive(phase == .active)
+        }
+        .ornament(visibility: senseWindowUtilitiesVisible ? .visible : .hidden,
+                  attachmentAnchor: .scene(.bottom), contentAlignment: .top) {
+            if senseWindowUtilitiesVisible {
+                SenseGameplayUtilities(runtime: runtime)
+                    .padding(.top, 12)
+            }
         }
         .ornament(visibility: runtime.hasStarted ? .visible : .hidden,
                   attachmentAnchor: .scene(.topTrailing)) {
@@ -360,7 +368,7 @@ struct SantosSettingsView: View {
                         set: { runtime.setDrawSetupOverhead($0) }))
                         .disabled(!runtime.canChangeRenderingOptimizations)
                     if runtime.hasStarted {
-                        Text("Graphics, sound and look sensitivity apply at the next launch. Quit the game, reopen Los Santos, change them before Play, then launch again. Apply in the pause controls sends GTA’s own Apply command; it does not apply launcher settings.").font(.caption).foregroundStyle(.secondary)
+                        Text("Graphics, sound and look sensitivity apply at the next launch. Quit the game, reopen Los Santos, change them before Play, then launch again. In GTA’s Settings menu, use Square to apply GTA settings.").font(.caption).foregroundStyle(.secondary)
                     }
                     if !runtime.playSettingsStatus.isEmpty {
                         Text(runtime.playSettingsStatus).font(.caption).foregroundStyle(.secondary)
@@ -440,7 +448,7 @@ struct SantosPauseControls: View {
 }
 
 /// Compact gameplay-only alternatives to controls absent from Sense hardware.
-/// This is a sibling overlay of the flat drawable, not part of the Start menu.
+/// The flat game hosts this in a native window ornament outside its picture.
 struct SenseGameplayUtilities: View {
     @ObservedObject var runtime: NativeRuntimeModel
     var body: some View {
