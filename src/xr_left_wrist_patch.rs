@@ -38,7 +38,7 @@ pub fn generate(original:&[u8],wanted:&[(&str,&str)])->Result<Artifact>{
         "changed_original_bodies":[76735,82184,76770,76778,38481,38548,28266,44415,44355],
         "rewrite":"instrumented38481 left native38506 flags constant0 -> muguet_motion_arms_v1.left_request_flags(I64 token,I64 TLS)->I32; right baked256 unchanged",
         "native_flag_semantics":"flags256 -> original38548 ArmGoal+90 bit0 -> original3551 copies target basis; flags0 keeps native wrist",
-        "host_policy":"256 only for a calibrated grip-to-native-hand lease with matching controller identity and rig; otherwise 0",
+        "host_policy":"256 only for a committed calibrated grip-to-native-hand lease with matching controller model fingerprint (product, vendor, fixed left hand; not a unit serial) and rig; otherwise 0",
         "physical_acceptance":false});
     let wasm=instrument(&base.wasm,config,Some(&manifest))?;Ok(Artifact{wasm,manifest})
 }

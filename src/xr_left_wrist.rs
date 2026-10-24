@@ -8,8 +8,12 @@
 //! hand bone in the same skeleton reference. Translation is the measured real
 //! offset, bounded by the actual native forearm; orientation is measured, never
 //! an assumed axis map. A calibrated target G*grip_from_hand is transported into
-//! original38548 with native request flags256 only while controller identity,
-//! rig and the left-flags artifact all match. Otherwise the existing
+//! original38548 with native request flags256 only while the controller
+//! fingerprint, rig and left-flags artifact all match. The fingerprint is the
+//! GameController product category, vendor name and fixed left hand: it
+//! distinguishes controller models, NOT physical units (no per-unit serial is
+//! exposed). A successful capture stays pending until the card explicitly
+//! commits it; any other session end discards it. Otherwise the existing
 //! position-only path (flags0, native wrist) remains. No bone, goal, request
 //! or solver state is written here; this module retains values only.
 use super::*;
@@ -29,12 +33,14 @@ type W=[f64;16];
 #[repr(u32)]
 #[derive(Clone,Copy,Debug,PartialEq,Eq)]
 pub(super) enum Reason{None=0,NoFirstPersonWeaponFrame=1,LeftControllerNotTracked=2,LeftHandRigUnqualified=3,LeftIkBlendingOut=4,
-    ControllerIdentityMissing=5,HoldStill=6,CaptureTimeout=7,GripTooFarFromHand=8,TrackingChanged=9,SessionExpired=10,Unsupported=11,RigChanged=12,NotRigid=13}
+    ControllerIdentityMissing=5,HoldStill=6,CaptureTimeout=7,GripTooFarFromHand=8,TrackingChanged=9,SessionExpired=10,Unsupported=11,RigChanged=12,NotRigid=13,
+    NoPostIkObservation=14,ControllerChanged=15}
 impl Reason{fn name(self)->&'static str{match self{Self::None=>"none",Self::NoFirstPersonWeaponFrame=>"no_first_person_weapon_frame",
     Self::LeftControllerNotTracked=>"left_controller_not_tracked",Self::LeftHandRigUnqualified=>"left_hand_rig_unqualified",Self::LeftIkBlendingOut=>"left_ik_still_blending_out",
     Self::ControllerIdentityMissing=>"controller_identity_missing",Self::HoldStill=>"hold_still",Self::CaptureTimeout=>"capture_timeout",
     Self::GripTooFarFromHand=>"grip_farther_than_native_forearm",Self::TrackingChanged=>"tracking_changed",Self::SessionExpired=>"session_expired",
-    Self::Unsupported=>"unsupported_artifact",Self::RigChanged=>"rig_changed",Self::NotRigid=>"non_rigid_pose"}}}
+    Self::Unsupported=>"unsupported_artifact",Self::RigChanged=>"rig_changed",Self::NotRigid=>"non_rigid_pose",
+    Self::NoPostIkObservation=>"no_post_ik_observation_before_deadline",Self::ControllerChanged=>"controller_fingerprint_changed"}}}
 
 /// Native rig identity: skeleton size, converted left hand/auxiliary bones and
 /// the live native hand->auxiliary transform used by every left request.
@@ -42,6 +48,7 @@ impl Reason{fn name(self)->&'static str{match self{Self::None=>"none",Self::NoFi
 pub(super) struct Rig{pub bone_count:u32,pub hand:u16,pub aux:u16,pub hand_from_aux:[f32;16]}
 impl Rig{pub(super) fn matches(&self,o:&Rig)->bool{self.bone_count==o.bone_count&&self.hand==o.hand&&self.aux==o.aux&&close(&self.hand_from_aux,&o.hand_from_aux)}}
 #[derive(Clone,Copy,Debug,PartialEq)]
+/// `controller` is the product/vendor/left-hand fingerprint, not a unit serial.
 pub(super) struct Calibration{pub grip_from_hand:[f32;16],pub controller:u64,pub rig:Rig,pub forearm_m:f32,pub samples:u32}
 #[derive(Clone,Copy,Debug)]
 pub(super) struct NativeSample{pub grip:[f32;16],pub hand:[f32;16],pub forearm_m:f64,pub rig:Rig,pub native_hand:bool,pub camera_sequence:u64,pub tracking:u64,pub view_epoch:u64}
@@ -76,17 +83,21 @@ pub(super) fn average(samples:&[W])->Option<W>{
     let out=from_quaternion(q.map(|v|v/n),t.map(|v|v/samples.len()as f64));rigid64(&out).then_some(out)
 }
 
+/// One capture window, pinned to the controller fingerprint it started with.
 #[derive(Default)]
-pub(super) struct Capture{samples:Vec<W>,first:Option<(u64,u64,Rig)>,last_sequence:u64,pub restarts:u32,pub last_reason:Option<Reason>}
+pub(super) struct Capture{controller:u64,samples:Vec<W>,first:Option<(u64,u64,Rig)>,last_sequence:u64,pub restarts:u32,pub last_reason:Option<Reason>}
 #[derive(Debug,PartialEq)]
 pub(super) enum Step{Waiting(Reason),Collected(usize),Done(Calibration),Failed(Reason)}
 impl Capture{
+    pub(super) fn new(controller:u64)->Self{Self{controller,..Self::default()}}
     fn reset(&mut self,reason:Reason){if !self.samples.is_empty(){self.restarts+=1;}self.samples.clear();self.first=None;self.last_reason=Some(reason);}
     pub(super) fn count(&self)->usize{self.samples.len()}
     /// One post-IK observation. Only a new camera generation adds a sample;
     /// motion, tracking/view epoch or rig change restarts the still window.
     pub(super) fn add(&mut self,s:&NativeSample,controller:u64)->Step{
         if controller==0{return Step::Failed(Reason::ControllerIdentityMissing);}
+        // Never mix samples across controller fingerprints: restart on change.
+        if controller!=self.controller{self.reset(Reason::ControllerChanged);self.controller=controller;}
         if !s.native_hand{self.reset(Reason::LeftIkBlendingOut);return Step::Waiting(Reason::LeftIkBlendingOut);}
         let(g,h)=(wide(&s.grip),wide(&s.hand));if !rigid64(&g)||!rigid64(&h){self.reset(Reason::NotRigid);return Step::Waiting(Reason::NotRigid);}
         let gh=mul(&inverse64(&g),&h);
@@ -102,32 +113,63 @@ impl Capture{
         if self.samples.len()<REQUIRED_SAMPLES{return Step::Collected(self.samples.len());}
         let Some(mean)=average(&self.samples)else{self.reset(Reason::NotRigid);return Step::Waiting(Reason::NotRigid)};
         let rig=self.first.map_or(s.rig,|f|f.2);
-        Step::Done(Calibration{grip_from_hand:mean.map(|v|v as f32),controller,rig,forearm_m:s.forearm_m as f32,samples:self.samples.len()as u32})
+        Step::Done(Calibration{grip_from_hand:mean.map(|v|v as f32),controller:self.controller,rig,forearm_m:s.forearm_m as f32,samples:self.samples.len()as u32})
     }
 }
 
-struct Session{serial:u64,heartbeat:Instant,capture:Option<(Instant,Capture)>}
+/// A successful capture is only `pending` until the card commits it.
+struct Session{serial:u64,heartbeat:Instant,capture:Option<(Instant,Capture)>,pending:Option<Calibration>}
 #[derive(Default)]
 pub(super) struct State{controller:u64,calibration:Option<Calibration>,session:Option<Session>,serial:u64,
     observed:Option<(Instant,Result<bool,Reason>)>,result:Option<(u64,Result<(),Reason>)>,last_left_token:u32,applied:Option<Instant>}
 impl State{
+    /// Session heartbeat and the capture deadline are enforced on every state
+    /// access, not only when a post-IK observation arrives. An expired session
+    /// drops any uncommitted capture with it.
     fn expire(&mut self,now:Instant){
         if self.session.as_ref().is_some_and(|s|now.saturating_duration_since(s.heartbeat)>SESSION_HEARTBEAT){
             let serial=self.session.take().map_or(0,|s|s.serial);self.result=Some((serial,Err(Reason::SessionExpired)));
         }
+        let observed=self.observed.map(|o|o.0);
+        let Some(session)=self.session.as_mut()else{return};
+        let Some((started,capture))=session.capture.as_ref()else{return};
+        if now.saturating_duration_since(*started)<=CAPTURE_TIMEOUT{return;}
+        // The observer stopped (no first-person gun frame, mode change) when no
+        // fresh post-IK observation exists at the deadline.
+        let stalled=observed.is_none_or(|at|at<*started||now.saturating_duration_since(at)>OBSERVATION_AGE);
+        let reason=if stalled{Reason::NoPostIkObservation}else{match capture.last_reason{Some(Reason::None)|None=>Reason::CaptureTimeout,Some(r)=>r}};
+        let serial=session.serial;session.capture=None;self.result=Some((serial,Err(reason)));
     }
     pub(super) fn open(&mut self,now:Instant,supported:bool)->u64{
         if !supported{return 0;}self.expire(now);
-        self.serial=self.serial.wrapping_add(1).max(1);self.session=Some(Session{serial:self.serial,heartbeat:now,capture:None});self.serial
+        self.serial=self.serial.wrapping_add(1).max(1);self.session=Some(Session{serial:self.serial,heartbeat:now,capture:None,pending:None});self.serial
     }
     pub(super) fn capture(&mut self,session:u64,now:Instant)->i32{
         self.expire(now);let controller=self.controller;let ready=self.native_hand_ready(now);
         let Some(s)=self.session.as_mut().filter(|s|s.serial==session&&session!=0)else{return -1};
         if controller==0{return -4;}if !ready{return -2;}
-        s.heartbeat=now;s.capture=Some((now,Capture::default()));self.result=None;0
+        s.heartbeat=now;s.capture=Some((now,Capture::new(controller)));s.pending=None;self.result=None;0
     }
+    /// Ends the session, discarding any uncommitted capture.
     pub(super) fn close(&mut self,session:u64)->i32{
         if self.session.as_ref().is_some_and(|s|session==0||s.serial==session){self.session=None;0}else{-1}
+    }
+    /// Adopts this session's successful capture and ends the session.
+    /// 0 committed; -1 no such session (nothing changes); -2 nothing to commit
+    /// (session stays open).
+    pub(super) fn commit(&mut self,session:u64,now:Instant)->i32{
+        self.expire(now);
+        let Some(s)=self.session.as_mut().filter(|s|s.serial==session&&session!=0)else{return -1};
+        let Some(calibration)=s.pending.take()else{return -2};
+        self.calibration=Some(calibration);self.session=None;0
+    }
+    /// Fingerprint changes restart, and loss fails, an active capture.
+    pub(super) fn set_controller(&mut self,fingerprint:u64,now:Instant){
+        self.expire(now);self.controller=fingerprint;
+        let Some(session)=self.session.as_mut()else{return};let serial=session.serial;
+        let Some((_,capture))=session.capture.as_mut()else{return};
+        if fingerprint==0{session.capture=None;self.result=Some((serial,Err(Reason::ControllerIdentityMissing)));}
+        else if fingerprint!=capture.controller{capture.reset(Reason::ControllerChanged);capture.controller=fingerprint;}
     }
     pub(super) fn suspends(&mut self,now:Instant)->bool{self.expire(now);self.session.is_some()}
     fn native_hand_ready(&self,now:Instant)->bool{self.observed.is_some_and(|(at,r)|now.saturating_duration_since(at)<=OBSERVATION_AGE&&r==Ok(true))}
@@ -142,12 +184,11 @@ impl State{
         self.expire(now);self.observed=Some((now,observed.as_ref().map(|s|s.native_hand).map_err(|r|*r)));
         let controller=self.controller;
         let Some(session)=self.session.as_mut()else{return};let serial=session.serial;
-        let Some((started,capture))=session.capture.as_mut()else{return};
+        let Some((_,capture))=session.capture.as_mut()else{return};
         let step=match &observed{Ok(s)=>capture.add(s,controller),Err(r)=>{capture.reset(*r);Step::Waiting(*r)}};
         let finished=match step{
-            Step::Done(c)=>{self.calibration=Some(c);Some(Ok(()))}
+            Step::Done(c)=>{session.pending=Some(c);Some(Ok(()))}
             Step::Failed(r)=>Some(Err(r)),
-            _ if now.saturating_duration_since(*started)>CAPTURE_TIMEOUT=>Some(Err(match capture.last_reason{Some(Reason::None)|None=>Reason::CaptureTimeout,Some(r)=>r})),
             _=>None};
         if let Some(result)=finished{session.capture=None;self.result=Some((serial,result));}
     }
@@ -164,7 +205,7 @@ impl State{
             (None,_,_)=>(0,if supported{observed_reason}else{Reason::Unsupported}),
             (Some(_),Some((_,c)),_)=>(3,c.last_reason.unwrap_or(Reason::None)),
             (Some(_),None,Some((_,Ok(()))))=>(4,Reason::None),
-            (Some(_),None,_)=>(if self.native_hand_ready(now){2}else{1},if self.controller==0{Reason::ControllerIdentityMissing}else{observed_reason}),
+            (Some(_),None,_)=>(if self.native_hand_ready(now)&&self.controller!=0{2}else{1},if self.controller==0{Reason::ControllerIdentityMissing}else{observed_reason}),
         };
         let failure=match result{Some((_,Err(r)))=>r as u32,_=>0};
         let summary=self.calibration.map(|c|{let m=wide(&c.grip_from_hand);(translation(&m) as f32,rotation_deg(&m,&wide(&identity())) as f32)});
@@ -234,7 +275,7 @@ pub(super) fn observe<M:Memory>(mem:&M){
 pub(super) fn status()->serde_json::Value{
     let supported=supported();let mut s=state();let now=Instant::now();let snap=s.snapshot_without_heartbeat(now,supported);
     serde_json::json!({"supported":supported,"phase":snap.phase,"reason":reason_name(snap.reason),"last_failure":reason_name(snap.failure),"calibration_present":snap.flags&4!=0,
-        "controller_matches":snap.flags&8!=0,"eligible":snap.flags&2!=0,"native_hand_shown":snap.flags&16!=0,"calibrated_target_applied":snap.flags&32!=0,
+        "controller_fingerprint_matches":snap.flags&8!=0,"controller_fingerprint_scope":"GameController product category, vendor and fixed left hand; not a per-unit serial","eligible":snap.flags&2!=0,"native_hand_shown":snap.flags&16!=0,"calibrated_target_applied":snap.flags&32!=0,
         "grip_to_hand_translation_m":snap.translation_m,"grip_to_hand_rotation_degrees":snap.rotation_degrees,"samples":s.calibration.map(|c|c.samples),
         "authority":"left target transport only; not visible alignment acceptance"})
 }
@@ -267,7 +308,7 @@ pub(super) fn export(c:&Calibration)->SVLeftWristCalibration{
     SVLeftWristCalibration{version:1,size:128,controller:c.controller,bone_count:c.rig.bone_count,hand:c.rig.hand,aux:c.rig.aux,samples:c.samples,
         forearm_m:c.forearm_m,hand_from_aux:pack(&c.rig.hand_from_aux),grip_from_hand:pack(&c.grip_from_hand)}
 }
-/// Persisted values are re-validated: rigid, nonzero identity and a measured
+/// Persisted values are re-validated: rigid, nonzero controller fingerprint and a measured
 /// offset no longer than the measured native forearm it was captured with.
 pub(super) fn import(v:&SVLeftWristCalibration)->Option<Calibration>{
     if v.version!=1||v.size!=128||v.controller==0||v.bone_count==0||v.bone_count>MAX_BONES||u32::from(v.hand)>=v.bone_count
@@ -277,14 +318,19 @@ pub(super) fn import(v:&SVLeftWristCalibration)->Option<Calibration>{
     Some(Calibration{grip_from_hand:g,controller:v.controller,rig:Rig{bone_count:v.bone_count,hand:v.hand,aux:v.aux,hand_from_aux:k},forearm_m:v.forearm_m,samples:v.samples})
 }
 
+/// Product/vendor/fixed-hand fingerprint of the current left controller; 0 none.
 #[no_mangle]
-pub extern "C" fn sv_xr_left_wrist_controller_v1(identity:u64)->i32{state().controller=identity;0}
+pub extern "C" fn sv_xr_left_wrist_controller_v1(fingerprint:u64)->i32{state().set_controller(fingerprint,Instant::now());0}
 #[no_mangle]
 pub extern "C" fn sv_xr_left_wrist_open_v1()->u64{let supported=supported();state().open(Instant::now(),supported)}
 #[no_mangle]
 pub extern "C" fn sv_xr_left_wrist_capture_v1(session:u64)->i32{if !supported(){return -3;}state().capture(session,Instant::now())}
+/// Ends the session and discards any uncommitted capture.
 #[no_mangle]
 pub extern "C" fn sv_xr_left_wrist_close_v1(session:u64)->i32{state().close(session)}
+/// Adopts this session's successful capture, then ends the session.
+#[no_mangle]
+pub extern "C" fn sv_xr_left_wrist_commit_v1(session:u64)->i32{state().commit(session,Instant::now())}
 /// # Safety
 /// `out` must point to writable storage of at least `size` bytes.
 #[no_mangle]
@@ -357,16 +403,64 @@ pub unsafe extern "C" fn sv_xr_left_wrist_import_v1(input:*const SVLeftWristCali
         st.observe(Ok(NativeSample{native_hand:false,..sample(0,&grip(0),0.)}),now);assert_eq!(st.capture(session,now),-2);assert_eq!(st.snapshot(now,true).reason,Reason::LeftIkBlendingOut as u32);
         st.observe(Ok(sample(0,&grip(0),0.)),now);assert_eq!(st.snapshot(now,true).phase,2);assert_eq!(st.capture(session+1,now),-1);assert_eq!(st.capture(session,now),0);
         for i in 1..=REQUIRED_SAMPLES as u64{assert_ne!(st.snapshot(now,true).phase,4);st.observe(Ok(sample(i,&grip(i),0.2)),now);}
-        let snap=st.snapshot(now,true);assert_eq!((snap.phase,snap.result_session,snap.flags&4!=0),(4,session,true));
-        // While the card is open no calibrated target is produced.
-        assert!(st.calibrated_hand(&narrow(&grip(0)),&rig(),true,now).is_none());assert_eq!(st.close(session),0);
-        assert!(st.calibrated_hand(&narrow(&grip(0)),&rig(),true,now).is_some());
+        // Captured but still pending: nothing is applied or reported present.
+        let snap=st.snapshot(now,true);assert_eq!((snap.phase,snap.result_session,snap.flags&4!=0),(4,session,false));
+        assert!(st.calibrated_hand(&narrow(&grip(0)),&rig(),true,now).is_none(),"card open: no calibrated target");
+        assert_eq!(st.commit(session+1,now),-1);assert_eq!(st.commit(session,now),0);assert!(!st.suspends(now),"commit ends the session");
+        assert!(st.snapshot(now,true).flags&4!=0);assert!(st.calibrated_hand(&narrow(&grip(0)),&rig(),true,now).is_some());
+        assert_eq!(st.commit(session,now),-1,"a commit cannot be repeated");
+    }
+    /// Success immediately followed by Crown/Window/expiry before the card
+    /// acknowledged it: the capture is discarded and nothing changes.
+    #[test]fn uncommitted_success_is_discarded_by_close_or_expiry_and_keeps_previous_calibration(){
+        let now=Instant::now();let previous={let mut c=Capture::new(55);let Step::Done(cal)=capture_all(&mut c,40)else{panic!()};cal};
+        let run=|st:&mut State,session:u64|{st.observe(Ok(sample(0,&grip(0),0.)),now);assert_eq!(st.capture(session,now),0);
+            for i in 1..=REQUIRED_SAMPLES as u64{st.observe(Ok(sample(i,&mul(&grip(i),&rot([0.,0.,1.],20.)),0.)),now);}assert_eq!(st.snapshot(now,true).phase,4);};
+        let mut st=State{controller:55,calibration:Some(previous),..State::default()};let session=st.open(now,true);run(&mut st,session);
+        assert_eq!(st.close(session),0);assert_eq!(st.calibration,Some(previous),"Crown/Window close discards the uncommitted capture");
+        assert_eq!(st.commit(session,now),-1,"a closed session cannot be committed afterward");
+        let mut st=State{controller:55,..State::default()};let session=st.open(now,true);run(&mut st,session);
+        let later=now+SESSION_HEARTBEAT+Duration::from_millis(10);assert!(!st.suspends(later));assert!(st.calibration.is_none(),"expiry discards it");
+        assert_eq!(st.commit(session,later),-1);
+        let mut st=State{controller:55,..State::default()};let session=st.open(now,true);assert_eq!(st.commit(session,now),-2,"nothing to commit");assert!(st.suspends(now));
+    }
+    /// The observer can stop (gun holstered, mode change) while the card keeps
+    /// polling; the deadline still ends the capture with a meaningful reason.
+    #[test]fn capture_deadline_fires_without_any_new_post_ik_observation(){
+        let now=Instant::now();let mut st=State{controller:55,..State::default()};let session=st.open(now,true);
+        st.observe(Ok(sample(0,&grip(0),0.)),now);assert_eq!(st.capture(session,now),0);
+        for i in 1..=4u64{st.observe(Ok(sample(i,&grip(i),0.)),now+Duration::from_millis(30*i));}
+        for step in 1..=8u64{assert_eq!(st.snapshot(now+Duration::from_millis(500*step),true).phase,3,"heartbeat only");}
+        let snap=st.snapshot(now+CAPTURE_TIMEOUT+Duration::from_millis(1),true);
+        assert_eq!((snap.phase,snap.failure,snap.result_session,snap.samples),(1,Reason::NoPostIkObservation as u32,session,0));
+        assert!(st.calibration.is_none());assert!(st.session.as_ref().is_some_and(|s|s.pending.is_none()));
+        // Retry needs a fresh native hand; Cancel still works.
+        let t=now+CAPTURE_TIMEOUT+Duration::from_millis(100);assert_eq!(st.capture(session,t),-2);
+        st.observe(Ok(sample(9,&grip(9),0.)),t);assert_eq!(st.capture(session,t),0);assert_eq!(st.snapshot(t,true).phase,3);assert_eq!(st.close(session),0);
+    }
+    /// Samples are never mixed across controller fingerprints; loss fails.
+    #[test]fn controller_fingerprint_change_restarts_and_loss_fails_the_capture(){
+        let now=Instant::now();let mut st=State{controller:55,..State::default()};let session=st.open(now,true);
+        st.observe(Ok(sample(0,&grip(0),0.)),now);assert_eq!(st.capture(session,now),0);
+        for i in 1..=8u64{st.observe(Ok(sample(i,&grip(i),0.)),now);}assert_eq!(st.snapshot(now,true).samples,8);
+        st.set_controller(56,now);let snap=st.snapshot(now,true);assert_eq!((snap.phase,snap.samples,snap.reason),(3,0,Reason::ControllerChanged as u32));
+        for i in 9..9+REQUIRED_SAMPLES as u64{st.observe(Ok(sample(i,&grip(i),0.)),now);}
+        assert_eq!(st.snapshot(now,true).phase,4);assert_eq!(st.commit(session,now),0);assert_eq!(st.calibration.map(|c|c.controller),Some(56));
+        // Capture::add also re-pins defensively if the fingerprint arrives with a sample.
+        let mut c=Capture::new(55);for i in 0..5{c.add(&sample(i,&grip(i),0.),55);}assert_eq!(c.count(),5);
+        c.add(&sample(5,&grip(5),0.),57);assert_eq!((c.count(),c.last_reason,c.controller),(1,Some(Reason::ControllerChanged),57));
+        let session=st.open(now,true);st.observe(Ok(sample(30,&grip(30),0.)),now);assert_eq!(st.capture(session,now),0);
+        for i in 31..35u64{st.observe(Ok(sample(i,&grip(i),0.)),now);}
+        st.set_controller(0,now);let snap=st.snapshot(now,true);
+        assert_eq!((snap.phase,snap.failure,snap.reason),(1,Reason::ControllerIdentityMissing as u32,Reason::ControllerIdentityMissing as u32),"not ready without a fingerprint");
+        assert_eq!(st.capture(session,now),-4,"no retry without a recognised controller");assert_eq!(st.commit(session,now),-2);
+        assert_eq!(st.calibration.map(|c|c.controller),Some(56),"previous calibration unchanged");
     }
     #[test]fn expiry_failure_timeout_and_mismatches_keep_position_fallback(){
         let now=Instant::now();let mut st=State{controller:55,..State::default()};let session=st.open(now,true);
         st.observe(Ok(sample(0,&grip(0),0.)),now);assert_eq!(st.capture(session,now),0);
         // The card keeps polling (heartbeat) while tracking is lost.
-        for step in 1..=9u64{let t=now+Duration::from_millis(500*step);assert_eq!(st.snapshot(t,true).phase,3);st.observe(Err(Reason::LeftControllerNotTracked),t);}
+        for step in 1..=8u64{let t=now+Duration::from_millis(500*step);assert_eq!(st.snapshot(t,true).phase,3);st.observe(Err(Reason::LeftControllerNotTracked),t);}
         let snap=st.snapshot(now+Duration::from_millis(4500),true);assert_eq!((snap.phase,snap.failure,snap.result_session),(1,Reason::LeftControllerNotTracked as u32,session));
         assert!(st.calibration.is_none());let later=now+CAPTURE_TIMEOUT+SESSION_HEARTBEAT+Duration::from_secs(1);assert!(!st.suspends(later));
         assert_eq!(st.result.map(|r|r.1),Some(Err(Reason::SessionExpired)));

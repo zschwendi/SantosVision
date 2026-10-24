@@ -26,10 +26,14 @@ game's own wrist angle.
 3. While the card is open, no left request is issued, so GTA's own left hand is
    shown. Put the left controller exactly where that hand is, at the same
    angle. Hold still, look at **Confirm** and pull the right trigger.
-4. The card reports progress and a brief **Left hand calibrated**, then closes.
+4. The card reports progress. A successful native capture is then explicitly
+   committed, and only after that does the card show a brief **Left hand
+   calibrated** and close.
    Cancel, Circle or Start cancels the card. Crown, Window, GTA's pause menu,
    tracking loss and quitting also close or fail the card cleanly, and the
    previous setting is kept.
+   If the Crown or Window comes before the commit, even right after a successful
+   capture, the capture is discarded and nothing is saved or claimed.
 
 ## Native semantics
 
@@ -65,6 +69,25 @@ and 3°) of the first one. Any of the following restarts the still window:
 The capture is rejected if the measured offset is longer than the measured
 native forearm.
 
+Controller fingerprint during a capture:
+
+- The capture is pinned to the controller fingerprint it started with.
+- A fingerprint change restarts it: samples are never mixed.
+- Losing the fingerprint (0) fails it.
+
+The 4 s capture deadline is enforced on every state access, including the
+card's heartbeat, not only when a post-IK observation arrives. So if the
+observer stops (gun holstered, mode change), the capture still ends, with
+`no_post_ik_observation_before_deadline`. Retrying needs a fresh native hand;
+Cancel always works.
+
+Commit and discard: a successful capture stays **pending** in the session.
+
+- `commit` adopts it and ends the session.
+- `close`, heartbeat expiry and every other exit discard it.
+
+The app saves to UserDefaults only after a successful commit.
+
 No anatomical axes, angle constants or arbitrary offsets are used: the
 translation is the real measured offset.
 
@@ -72,8 +95,11 @@ translation is the real measured offset.
 
 A calibration applies only while all of these match:
 
-- **Controller identity**: GameController product category, vendor and fixed
-  left hand.
+- **Controller fingerprint**: GameController product category, vendor name and
+  fixed left hand. GameController exposes no persistent per-unit serial, so
+  this identifies a controller **model**, not a physical unit. Two units of the
+  same model share it, and a calibration applies to any left controller of that
+  model. It measures how the player holds that model.
 - **Rig**: bone count, converted left hand and auxiliary bones, and the live
   hand→auxiliary transform.
 - **Artifact**: the running module is the left-wrist artifact.
@@ -110,7 +136,9 @@ the Settings action stays hidden.
 C ABI (in `RuntimeBridge.h`, structures of 56 and 128 bytes):
 
 - `sv_xr_left_wrist_controller_v1`
-- `_open_v1`, `_capture_v1`, `_close_v1`
+- `_open_v1`, `_capture_v1`
+- `_commit_v1`: adopts this session's successful capture, then ends the session
+- `_close_v1`: ends the session and discards any uncommitted capture
 - `_state_v1`, the card heartbeat; a session expires 1.5 s after polling stops
 - `_export_v1`, `_import_v1`
 
@@ -129,15 +157,24 @@ C ABI (in `RuntimeBridge.h`, structures of 56 and 128 bytes):
   2 mm. The checks cover:
   - stillness, epoch and rig restarts;
   - blend-out waiting and the forearm bound;
-  - a missing controller identity;
+  - a missing controller fingerprint, a fingerprint change restarting a
+    capture, and loss failing one;
   - session-only acknowledgement, failure and timeout;
+  - the capture deadline firing with no new observation;
+  - a successful capture discarded by close or expiry, and adopted only by
+    commit;
   - heartbeat expiry;
   - controller, rig and artifact mismatch falling back to position-only;
   - persistence round trip and corruption rejection;
   - native-hand qualification from memory.
-- **Swift flow.** 34 checks covering the pending entry, the open gate, Confirm
-  only once native-ready, success only on a native phase-4 result for this
-  session, failure and retry, every exit path, and the settings wording.
+- **Swift flow.** 44 checks covering:
+  - the pending entry and the open gate;
+  - Confirm only once native-ready;
+  - success only after a native phase-4 result for this session is committed;
+  - Crown or Window right after success, before and after the commit;
+  - a refused commit;
+  - failure and retry, and every exit path;
+  - the model-scoped settings wording.
 - **Regressions.** All Swift sources typecheck against the physical XROS27 SDK
   in both game and diagnostic configurations; the only warning is the existing
   `mac1` deprecation. Existing suites pass: xr_motion 46, xr_view 60, xr_aim 10,

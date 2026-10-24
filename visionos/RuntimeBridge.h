@@ -127,8 +127,9 @@ uint32_t sv_xr_motion_arms_enabled_v1(void);
 /* Explicit left grip-to-native-hand calibration. phase: 0 idle, 1 card open
    waiting, 2 GTA's own left hand shown, 3 capturing, 4 captured. failure: last
    failed capture reason for result_session, cleared by the next capture.
-   flags: 1 supported, 2 eligible, 4 calibration present, 8 controller matches,
-   16 native hand shown, 32 calibrated target recently applied. */
+   flags: 1 supported, 2 eligible, 4 committed calibration present, 8 controller
+   fingerprint matches, 16 native hand shown, 32 calibrated target recently
+   applied. A successful capture (phase 4) stays pending until committed. */
 typedef struct {
     uint32_t version, size;
     uint64_t session, result_session;
@@ -147,12 +148,18 @@ typedef struct {
     float hand_from_aux[12], grip_from_hand[12];
 } SVLeftWristCalibration;
 _Static_assert(sizeof(SVLeftWristCalibration) == 128, "SVLeftWristCalibration ABI layout must match Rust");
-/* Product and fixed-hand identity of the current left Sense controller; 0 none. */
-int32_t sv_xr_left_wrist_controller_v1(uint64_t identity);
+/* GameController product category + vendor + fixed left hand fingerprint of
+   the current left controller; 0 none. Not a per-unit serial: two units of the
+   same model share it. A change restarts, and 0 fails, an active capture. */
+int32_t sv_xr_left_wrist_controller_v1(uint64_t fingerprint);
 /* Opening suspends left arm requests so GTA's own left hand is shown. */
 uint64_t sv_xr_left_wrist_open_v1(void);
 int32_t sv_xr_left_wrist_capture_v1(uint64_t session);
+/* Ends the session and discards any uncommitted capture. */
 int32_t sv_xr_left_wrist_close_v1(uint64_t session);
+/* Adopts this session's successful capture and ends the session: 0 committed,
+   -1 no such session, -2 nothing to commit (session stays open). */
+int32_t sv_xr_left_wrist_commit_v1(uint64_t session);
 /* Reading state is the open card's heartbeat. */
 int32_t sv_xr_left_wrist_state_v1(SVLeftWristState *state, uint32_t byte_size);
 int32_t sv_xr_left_wrist_export_v1(SVLeftWristCalibration *calibration, uint32_t byte_size);
