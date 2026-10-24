@@ -41,3 +41,28 @@ preservation fixtures were not repeated for this host-only observation change.
 The next active first-person report must identify the earliest failed gate before
 selecting a behavior fix. Parent work: `w-14dea40fb6e248138ad507f85cf4384b`;
 bounded diagnosis: `w-d4257e6867c44a12a6a20c9bda091884`.
+
+The active candidate15 capture at 04:03:33 UTC resolves the first handoff:
+camera accepted 3563/5929 calls; the current exact-head right Sense packet was
+23 ms old and the native first-person witness was 14 ms old. Both local request
+hooks ran 2049 times. Each arm issued and committed one request and applied two
+private targets, then stopped issuing requests for about 41 seconds. The current
+right request fails stable unsupported-weapon qualification; the left fails its
+shared right-attachment prerequisite. Its old stale-generation target record is
+downstream of that stopped request stream, not evidence of the current cause.
+
+`last_unsupported_weapon` now records the exact stable rejection category,
+weapon byte491 flags, attachment flags and bone indices when observed. This adds
+no unsupported branch or pose acceptance. It distinguishes cached native muzzle
+geometry from attachment identity/state/orientation problems before selecting a
+behavior change. Nine focused arm tests pass, including the new category fixture
+and retained distinction between unsupported identity and transient pose mismatch.
+
+The preIK seam itself has no solver bootstrap cycle: original0x015d6671 is at
+control depth zero before the load/test of manager+272. All 85 earlier branches
+exit explicit inner blocks; none return from the function. The right host request
+uses converted skeleton tags without requiring an existing solver; native38506
+allocates38474 into manager+272 and registers it through38464. The subsequent
+left request can use that solver. `NATIVE_MODE` requires an independent76735 or
+82184 private-frame observation and may be absent while unarmed, but it is fresh
+and true in this active report. No first-person gate was relaxed.

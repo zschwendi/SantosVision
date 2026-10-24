@@ -17,6 +17,9 @@ static INPUT:Mutex<Option<WeaponInput>>=Mutex::new(None);
 static LEFT_INPUT:Mutex<Option<(u32,(u64,u64,u64),Instant)>>=Mutex::new(None);
 static STATUS:AtomicU32=AtomicU32::new(0);
 static SUPPORT:Mutex<Option<(bool,u64,Instant)>>=Mutex::new(None);
+#[derive(Clone)]
+struct WeaponSupportObservation{supported:bool,reason:&'static str,weapon_flags:Option<u8>,attachment_flags:Option<u32>,expected_bone:u16,attachment_bone:Option<u16>}
+static LAST_UNSUPPORTED:Mutex<Option<(WeaponSupportObservation,u64,Instant)>>=Mutex::new(None);
 #[derive(Default)]
 struct ArmAudit{request_hooks:u64,local_request_hooks:u64,requested:u64,committed:u64,target_hooks:u64,local_target_hooks:u64,applied:u64,last_request:Option<(Instant,&'static str,bool)>,last_target:Option<(Instant,&'static str,bool)>,last_qualified_request:Option<(Instant,&'static str,bool)>,last_qualified_target:Option<(Instant,&'static str,bool)>,last_immersive_request:Option<(Instant,&'static str,bool)>,last_immersive_target:Option<(Instant,&'static str,bool)>}
 static AUDIT:std::sync::LazyLock<Mutex<[ArmAudit;2]>>=std::sync::LazyLock::new(||Mutex::new([ArmAudit::default(),ArmAudit::default()]));
@@ -40,11 +43,12 @@ pub(crate) fn native_fallback_active()->bool{
 pub(crate) fn invalidate_inputs(){LEASES.lock().unwrap_or_else(|p|p.into_inner()).clear();*INPUT.lock().unwrap_or_else(|p|p.into_inner())=None;*LEFT_INPUT.lock().unwrap_or_else(|p|p.into_inner())=None;*SUPPORT.lock().unwrap_or_else(|p|p.into_inner())=None;STATUS.store(0,Ordering::Relaxed);}
 pub fn status_json()->serde_json::Value{
     let audit={let a=AUDIT.lock().unwrap_or_else(|p|p.into_inner());serde_json::json!({"left":audit_json(&a[0]),"right":audit_json(&a[1])})};
+    let unsupported=LAST_UNSUPPORTED.lock().unwrap_or_else(|p|p.into_inner()).as_ref().map(|(o,e,at)|serde_json::json!({"reason":o.reason,"age_ms":at.elapsed().as_millis(),"view_epoch":e,"weapon_flags_491":o.weapon_flags,"attachment_flags_124":o.attachment_flags,"expected_attachment_bone":o.expected_bone,"actual_attachment_bone":o.attachment_bone}));
     let input=INPUT.lock().unwrap_or_else(|p|p.into_inner()).clone();let left=*LEFT_INPUT.lock().unwrap_or_else(|p|p.into_inner());
     serde_json::json!({"enabled":crate::xr_motion_aim::arms_enabled(),"right_target_active":input.as_ref().is_some_and(|i|i.at.elapsed()<=MAX_AGE),
         "left_position_active":left.is_some_and(|(_,g,at)|at.elapsed()<=MAX_AGE&&g.0==crate::xr_view::view_epoch()),
         "right_input_generation":input.as_ref().map(|i|serde_json::json!({"view_epoch":i.generation.0,"camera_sequence":i.generation.1,"hand_sequence":i.generation.2,"tracking_epoch":i.tracking,"age_ms":i.at.elapsed().as_millis()})),
-        "left_orientation_policy":"native wrist; tracked grip translation only","unsupported_weapon_native_fallback":native_fallback_active(),
+        "left_orientation_policy":"native wrist; tracked grip translation only","unsupported_weapon_native_fallback":native_fallback_active(),"last_unsupported_weapon":unsupported,
         "right_input_state":match STATUS.load(Ordering::Relaxed){0=>"inactive",1=>"waiting for qualified request and exact tracking packet",2=>"native target accepted; waiting for weapon pose agreement",3=>"actual weapon ray ready",_=>"live weapon or packet qualification pending"},
         "pose_agreement_translation_m":0.03,"pose_agreement_rotation_degrees":3,"ray_is_impact":false,"hook_diagnostics":audit})
 }
@@ -208,17 +212,27 @@ fn arm_attachment<M:Memory>(s:&mut Snapshot<'_,M>,ped:u64,skel:u64,arm:u32,hand:
 }
 /// Distinguish a stable unsupported native branch from a temporarily changing
 /// pose bank. Only this narrow observation permits ordinary firing fallback.
-fn unsupported_weapon<M:Memory>(s:&mut Snapshot<'_,M>,ped:u64,bone:u16)->Option<bool>{
-    let wm=s.u64(ped.checked_add(4344)?)?;if wm==0{return Some(true);}
-    let physical=s.u64(wm.checked_add(120)?)?;if physical==0{return Some(true);}
-    let weapon=s.u64(physical.checked_add(864)?)?;if weapon==0{return Some(true);}
-    if s.u64(weapon.checked_add(88)?)?!=physical{return Some(true);}
-    if s.u32((weapon.checked_add(491)?)&!3)?&(4<<24)!=0{return Some(true);}
-    if s.u64(physical.checked_add(400)?)?!=physical.checked_add(96)?{return Some(true);}
-    let drawable=s.u64(physical.checked_add(80)?)?;if drawable==0{return Some(true);}
-    let extension=s.u64(drawable.checked_add(72)?)?;if extension==0{return Some(true);}
-    if s.u64(extension)?!=ped||s.u16(extension.checked_add(120)?)?!=bone{return Some(true);}
-    let flags=s.u32(extension.checked_add(124)?)?;Some(flags&15!=2||flags&0x8000!=0)
+#[cfg(test)]fn unsupported_weapon<M:Memory>(s:&mut Snapshot<'_,M>,ped:u64,bone:u16)->Option<bool>{
+    weapon_support_observation(s,ped,bone).map(|o|!o.supported)
+}
+fn weapon_support_observation<M:Memory>(s:&mut Snapshot<'_,M>,ped:u64,bone:u16)->Option<WeaponSupportObservation>{
+    let mut o=WeaponSupportObservation{supported:false,reason:"unobserved",weapon_flags:None,attachment_flags:None,expected_bone:bone,attachment_bone:None};
+    macro_rules! reject{($reason:literal)=>{{o.reason=$reason;return Some(o);}}}
+    let wm=s.u64(ped.checked_add(4344)?)?;if wm==0{reject!("weapon_manager_absent");}
+    let physical=s.u64(wm.checked_add(120)?)?;if physical==0{reject!("equipped_physical_weapon_absent");}
+    let weapon=s.u64(physical.checked_add(864)?)?;if weapon==0{reject!("equipped_weapon_runtime_absent");}
+    if s.u64(weapon.checked_add(88)?)?!=physical{reject!("weapon_physical_identity_mismatch");}
+    let weapon_flags=(s.u32((weapon.checked_add(491)?)&!3)?>>24)as u8;o.weapon_flags=Some(weapon_flags);
+    if weapon_flags&4!=0{reject!("cached_native_muzzle_frame");}
+    if s.u64(physical.checked_add(400)?)?!=physical.checked_add(96)?{reject!("physical_transform_source_not_embedded");}
+    let drawable=s.u64(physical.checked_add(80)?)?;if drawable==0{reject!("weapon_drawable_absent");}
+    let extension=s.u64(drawable.checked_add(72)?)?;if extension==0{reject!("attachment_extension_absent");}
+    if s.u64(extension)?!=ped{reject!("attachment_parent_not_local_ped");}
+    let attachment_bone=s.u16(extension.checked_add(120)?)?;o.attachment_bone=Some(attachment_bone);
+    if attachment_bone!=bone{reject!("attachment_bone_not_native_hand_auxiliary");}
+    let flags=s.u32(extension.checked_add(124)?)?;o.attachment_flags=Some(flags);
+    if flags&15!=2{reject!("attachment_state_not_two");}if flags&0x8000!=0{reject!("alternate_attachment_orientation");}
+    o.supported=true;o.reason="qualified_standard_physical_frame";Some(o)
 }
 fn manager<M:Memory>(s:&mut Snapshot<'_,M>,m:u64)->Option<(u64,u64)>{
     let factory=s.u64(20_159_720)?;let ped=s.u64(factory.checked_add(8)?)?;
@@ -253,7 +267,7 @@ pub(crate) fn host_hook(caller:&mut wasmtime::Caller<'_,crate::HostState>,name:&
             let Some((hand,bone))=read.u32(position+16).zip(read.u32(position+20)).filter(|(h,b)|*h<65535&&*b<65535)else{return Ok(())};
             audit.gate="live_attachment_or_bone_chain";
             let Some(attachment)=arm_attachment(&mut read,ped,skel,arm,hand as u16,bone as u16)else{
-                if arm==1&&unsupported_weapon(&mut read,ped,bone as u16)==Some(true)&&read.unchanged(){audit.gate="unsupported_native_weapon";*SUPPORT.lock().unwrap_or_else(|p|p.into_inner())=Some((false,candidate.view_epoch,Instant::now()));}return Ok(());
+                if arm==1{if let Some(observed)=weapon_support_observation(&mut read,ped,bone as u16).filter(|o|!o.supported){if read.unchanged(){audit.gate="unsupported_native_weapon";*SUPPORT.lock().unwrap_or_else(|p|p.into_inner())=Some((false,candidate.view_epoch,Instant::now()));*LAST_UNSUPPORTED.lock().unwrap_or_else(|p|p.into_inner())=Some((observed,candidate.view_epoch,Instant::now()));}}}return Ok(());
             };
             if arm==1{*SUPPORT.lock().unwrap_or_else(|p|p.into_inner())=Some((true,candidate.view_epoch,Instant::now()));}
             audit.gate="desired_hand_or_left_grip";
@@ -368,6 +382,13 @@ pub(crate) fn host_hook(caller:&mut wasmtime::Caller<'_,crate::HostState>,name:&
         mem.u64(22_400,22_112);assert!(attachment(&mut Snapshot::new(&mem),1024,10_000,5,6).is_none());mem.u64(22_400,22_096);
         mem.put(28_120,7);assert!(attachment(&mut Snapshot::new(&mem),1024,10_000,5,6).is_none());mem.put(28_120,6);
         mem.put(15_000+6*64+48,8f32.to_bits());assert!(attachment(&mut Snapshot::new(&mem),1024,10_000,5,6).is_none());assert_eq!(unsupported_weapon(&mut Snapshot::new(&mem),1024,6),Some(false));assert!(!s.unchanged());
+    }
+    #[test]fn unsupported_observation_identifies_native_branch_without_accepting_transient_pose_failure(){
+        let m=native_fixture();let observe=||weapon_support_observation(&mut Snapshot::new(&m),1024,6).unwrap();
+        assert!(observe().supported);m.put(24_488,4<<24);let o=observe();assert!(!o.supported);assert_eq!(o.reason,"cached_native_muzzle_frame");assert_eq!(o.weapon_flags,Some(4));
+        m.put(24_488,0);m.put(28_124,0x9002);let o=observe();assert_eq!(o.reason,"alternate_attachment_orientation");assert_eq!(o.attachment_flags,Some(0x9002));
+        m.put(28_124,0x1002);m.put(28_120,7);let o=observe();assert_eq!(o.reason,"attachment_bone_not_native_hand_auxiliary");assert_eq!((o.expected_bone,o.attachment_bone),(6,Some(7)));
+        m.put(28_120,6);m.put(15_000+6*64+48,8f32.to_bits());assert!(observe().supported);assert!(attachment(&mut Snapshot::new(&m),1024,10_000,5,6).is_none());
     }
     #[test]fn native_private_target_preserves_padding_metadata_and_left_basis(){
         let m=TestMemory::default();for i in 0..24{m.put(4000+i*4,0xa5a5_0000+i as u32);}
