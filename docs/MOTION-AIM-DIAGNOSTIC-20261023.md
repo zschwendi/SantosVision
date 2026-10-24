@@ -91,6 +91,10 @@ its age; it is neither a current aim sample nor an impact observation.
    pause/input field layouts; other AOTs retain the original hash rejection.
 5. Enable the separately opt-in Swift motion provider when launching this
    diagnostic. A normal AOT never enables gameplay motion from a preview flag.
+   Gameplay additionally requires launch environment `MUGUET_XR_MOTION_AIM=1`.
+   A matching diagnostic AOT without that flag passes original frame pointers,
+   reports no calculation scope, allows native firing and leaves triggers alone.
+   Status reports AOT certification and gameplay activation separately.
 
 Generation validates the entire output module, every untouched function against
 normal function-index remapping, original type/import/function relationships,

@@ -53,7 +53,7 @@ pub(crate) fn call<S, T, E>(store: &mut S, kind: Kind,
     invoke: impl FnOnce(&mut S) -> Result<T, E>) -> Result<T, E>
 where S: AsContextMut<Data = HostState> {
     if !observing() {
-        if !crate::xr_motion_aim::diagnostic_enabled() { return invoke(store); }
+        if !crate::xr_motion_aim::gameplay_enabled() { return invoke(store); }
         let prefix=store.as_context().data().motion_aim.boundary_prefix();
         let result=invoke(store);
         if result.is_err() { store.as_context_mut().data_mut().motion_aim.recover_boundary(&prefix); }

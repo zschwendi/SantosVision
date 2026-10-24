@@ -60,6 +60,7 @@ pub(crate) fn status_json() -> serde_json::Value {
         "spatial_left_controls_available": SPATIAL_HANDS.load(Ordering::Relaxed) & 1 != 0,
         "spatial_right_controls_available": SPATIAL_HANDS.load(Ordering::Relaxed) & 2 != 0,
         "motion_aim_diagnostic_enabled": crate::xr_motion_aim::diagnostic_enabled(),
+        "motion_aim_gameplay_enabled": crate::xr_motion_aim::gameplay_enabled(),
         "menu_navigation_inferred": MENU_NAVIGATION.load(Ordering::Relaxed),
         "menu_navigation": MENU_NAVIGATION.load(Ordering::Relaxed),
         "menu_context_source": if GUEST_CONTEXT_AVAILABLE.load(Ordering::Relaxed) { "verified_guest_pause_state" } else { "escape_fallback" },

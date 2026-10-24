@@ -7,7 +7,7 @@
 //! copy of the ORIGINAL successful CalculateFiringVector output, not an impact.
 
 use std::time::{Duration, Instant};
-use std::sync::{atomic::{AtomicBool,AtomicU64, Ordering}, Mutex};
+use std::sync::{atomic::{AtomicBool,AtomicU64, Ordering}, LazyLock,Mutex};
 
 pub const IMPORT_MODULE: &str = "muguet_motion_aim_v1";
 static DIAGNOSTIC_ENABLED: AtomicBool = AtomicBool::new(false);
@@ -18,6 +18,10 @@ static NATIVE_MODE:Mutex<Option<(bool,Instant,u64,u64)>>=Mutex::new(None);
 static IK_PERMIT:Mutex<Option<(u64,u64,Instant)>>=Mutex::new(None);
 static FIRE_GATE:Mutex<FireGate>=Mutex::new(FireGate {release_required:true,was_motion:false});
 pub fn diagnostic_enabled() -> bool { DIAGNOSTIC_ENABLED.load(Ordering::Acquire) }
+static GAMEPLAY_REQUESTED:LazyLock<bool>=LazyLock::new(||std::env::var("MUGUET_XR_MOTION_AIM").as_deref()==Ok("1"));
+/// Certificate acceptance and gameplay activation are deliberately independent.
+/// Cache only launch intent; an early status read cannot cache certificatefalse.
+pub fn gameplay_enabled()->bool {diagnostic_enabled()&&*GAMEPLAY_REQUESTED}
 
 #[derive(Clone,Copy)]
 enum FireScope { Native, Motion {ready:bool} }
@@ -34,7 +38,7 @@ impl FireGate {
 /// Called ONLY for spatial-controller on-foot gameplay fire in a motion AOT.
 /// Window, menu, vehicle acceleration and the standard pad path bypass this.
 pub(crate) fn filter_spatial_trigger(value:f32)->f32 {
-    if !diagnostic_enabled()||!crate::xr_view::world_camera_enabled(){return value;}
+    if !gameplay_enabled()||!crate::xr_view::world_camera_enabled(){return value;}
     let now=Instant::now();let epoch=crate::xr_view::view_epoch();
     let mode=*NATIVE_MODE.lock().unwrap_or_else(|p|p.into_inner());
     let scope=match mode.filter(|(_,at,_,e)|*e==epoch&&now.duration_since(*at)<=MAX_AGE) {
@@ -88,7 +92,7 @@ pub(crate) fn invalidate_camera() {
 /// commit. The Swift ring must return the EXACT accepted head frame; no latest
 /// hand snapshot is borrowed later by native IK/shot reads.
 pub(crate) fn capture_camera(view: crate::xr_view::WorldView, base_camera:[f32;16]) {
-    if !diagnostic_enabled() { return; }
+    if !gameplay_enabled() { return; }
     if LATEST_CAMERA_SEQUENCE.fetch_max(view.camera_sequence,Ordering::AcqRel)>view.camera_sequence{return;}
     {
         let mut candidate=CANDIDATE.lock().unwrap_or_else(|p|p.into_inner());
@@ -126,7 +130,7 @@ pub(crate) fn capture_camera(view: crate::xr_view::WorldView, base_camera:[f32;1
 pub fn status_json()->serde_json::Value {
     let candidate=CANDIDATE.lock().unwrap_or_else(|p|p.into_inner());
     let ack=LAST_ACK.lock().unwrap_or_else(|p|p.into_inner());
-    serde_json::json!({"diagnostic_aot_enabled":diagnostic_enabled(),
+    serde_json::json!({"diagnostic_aot_certified":diagnostic_enabled(),"gameplay_motion_active":gameplay_enabled(),
         "candidate":candidate.as_ref().map(|c|serde_json::json!({"view_epoch":c.view_epoch,
             "camera_sequence":c.camera_sequence,"head_frame":c.head_frame,"hand_sequence":c.hand_sequence,
             "tracking_epoch":c.tracking_epoch,"age_ms":c.recorded_at.elapsed().as_millis()})),
@@ -140,6 +144,7 @@ pub(crate) fn host_hook(caller:&mut wasmtime::Caller<'_,crate::HostState>,name:&
     params:&[wasmtime::Val],results:&mut[wasmtime::Val],mem:&wasmtime::SharedMemory)->anyhow::Result<()> {
     use wasmtime::Val;
     anyhow::ensure!(diagnostic_enabled(),"motion imports require matching separately compiled AOT certificate");
+    if !gameplay_enabled(){return inactive_hook(name,params,results);}
     let arg=|index:usize|->anyhow::Result<u64>{match params.get(index){Some(Val::I64(v))=>Ok(*v as u64),Some(Val::I32(v))=>Ok(*v as u32 as u64),_=>anyhow::bail!("motion hook argument absent/type mismatch")}};
     let make_identity=|tls:u64|Identity{store:crate::guest_call_scope::producer_store_lifetime(caller.data()),pthread:caller.data().pthread,tls};
     match name {
@@ -236,6 +241,20 @@ pub(crate) fn host_hook(caller:&mut wasmtime::Caller<'_,crate::HostState>,name:&
             results[0]=Val::I32(i32::from(allowed));
         },
         _=>anyhow::bail!("unknown motion diagnostic import {name}"),
+    }Ok(())
+}
+fn inactive_hook(name:&str,params:&[wasmtime::Val],results:&mut[wasmtime::Val])->anyhow::Result<()> {
+    use wasmtime::Val;
+    match name {
+        "private_frame"=>{
+            anyhow::ensure!(params.len()==6&&results.len()==1,"inactive motion frame ABI mismatch");
+            let Some(Val::I64(original))=params.get(2) else{anyhow::bail!("inactive motion frame pointer ABI mismatch")};
+            results[0]=Val::I64(*original);
+        },
+        "calculation_begin"=>{anyhow::ensure!(params.len()==5&&results.len()==1,"inactive motion begin ABI mismatch");results[0]=Val::I64(0);},
+        "calculation_complete"=>{anyhow::ensure!(params.len()==7&&results.is_empty(),"inactive motion completion ABI mismatch");},
+        "allow_fire"=>{anyhow::ensure!(params.len()==5&&results.len()==1,"inactive motion fire ABI mismatch");results[0]=Val::I32(1);},
+        _=>anyhow::bail!("unknown inactive motion diagnostic import {name}"),
     }Ok(())
 }
 fn ranges_overlap(a:u64,an:u64,b:u64,bn:u64)->bool {
@@ -576,5 +595,15 @@ mod tests {
         assert_eq!(gate.apply(0.,FireScope::Motion{ready:true}),0.);
         assert_eq!(gate.apply(1.,FireScope::Motion{ready:true}),1.);
         assert_eq!(gate.apply(1.,FireScope::Native),1.);
+    }
+    #[test]
+    fn certified_but_unrequested_motion_hooks_preserve_native_inputs_and_firing(){
+        use wasmtime::Val;
+        let mut result=[Val::I64(-1)];let args=[Val::I32(1),Val::I64(77),Val::I64(999),Val::I64(-1),Val::I64(0),Val::I32(1)];
+        inactive_hook("private_frame",&args,&mut result).unwrap();assert_eq!(result[0].i64(),Some(999));
+        inactive_hook("calculation_begin",&vec![Val::I64(-1);5],&mut result).unwrap();assert_eq!(result[0].i64(),Some(0));
+        inactive_hook("calculation_complete",&vec![Val::I64(-1);7],&mut []).unwrap();
+        inactive_hook("allow_fire",&vec![Val::I64(-1);5],&mut result).unwrap();assert_eq!(result[0].i32(),Some(1));
+        assert!(inactive_hook("unknown",&[],&mut []).is_err());
     }
 }
