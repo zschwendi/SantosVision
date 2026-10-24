@@ -359,7 +359,7 @@ struct SantosSettingsView: View {
                         .disabled(!runtime.canChangePlaySettings)
                     Text("Adjusts the right stick's look speed. GTA's own mouse sensitivity also applies.")
                         .font(.caption).foregroundStyle(.secondary)
-                    Text("DualSense: click the touchpad to change camera. Sense: click both sticks together to change camera; hold left stick click and move that stick for D-pad. Tap left stick click for normal L3. The compact bottom-left gameplay buttons provide Phone, Change view and all four D-pad directions. Start opens Resume, Window, Settings and Quit. In GTA menus: Cross selects, Circle goes back, Square applies, Triangle means Yes, and R1 means No.")
+                    Text("DualSense: click the touchpad to change camera. Sense: click both sticks together to change camera; hold left stick click and move that stick for D-pad. Tap left stick click for normal L3. The Phone and View buttons sit below the game. Look at a native button and press either Sense trigger to select it. Start opens Resume, Window, Settings and Quit. In GTA menus: Cross selects, Circle goes back, Square applies, Triangle means Yes, and R1 means No.")
                         .font(.caption).foregroundStyle(.secondary)
                 }
                 Section {
@@ -453,17 +453,9 @@ struct SenseGameplayUtilities: View {
     @ObservedObject var runtime: NativeRuntimeModel
     var body: some View {
         HStack(spacing: 6) {
-            ForEach(SantosSenseUtilityAction.allCases) { action in
-                Button {
-                    _ = runtime.performSenseUtility(action)
-                } label: {
-                    Image(systemName: action.symbol)
-                        .font(.system(size: 17, weight: .medium))
-                        .frame(width: 44, height: 44)
-                }
-                .buttonStyle(SenseUtilityButtonStyle(runtime: runtime, action: action))
-                .accessibilityLabel(action.title)
-                .help(action.title)
+            ForEach([SantosSenseUtilityAction.phone, .changeView]) { action in
+                SenseUtilityControl(runtime: runtime, action: action)
+                    .frame(width: 108, height: 48)
             }
         }
         .padding(8)
@@ -473,17 +465,63 @@ struct SenseGameplayUtilities: View {
     }
 }
 
-private struct SenseUtilityButtonStyle: ButtonStyle {
+/// A system control is the event target, rather than an image inside a custom
+/// SwiftUI ButtonStyle. Its own interaction explicitly permits UIKit's
+/// gaze/trigger events while the adjacent Metal canvas retains raw game input.
+/// Sense's system indirect select is a trigger; Cross remains a GTA action.
+private struct SenseUtilityControl: UIViewRepresentable {
     let runtime: NativeRuntimeModel
     let action: SantosSenseUtilityAction
-    func makeBody(configuration: Configuration) -> some View {
-        configuration.label
-            .background(configuration.isPressed ? SantosTheme.glow.opacity(0.35) : SantosTheme.surface.opacity(0.6),
-                        in: RoundedRectangle(cornerRadius: 12))
-            .hoverEffect()
-            .onChange(of: configuration.isPressed) { _, pressed in
-                runtime.setFlatSenseUtilityPressed(action, pressed: pressed)
-            }
+
+    func makeCoordinator() -> Coordinator { Coordinator(runtime: runtime, action: action) }
+
+    func makeUIView(context: Context) -> UIButton {
+        var configuration = UIButton.Configuration.tinted()
+        configuration.title = action == .changeView ? "View" : action.title
+        configuration.image = UIImage(systemName: action.symbol)
+        configuration.imagePadding = 8
+        configuration.cornerStyle = .capsule
+        configuration.baseForegroundColor = .white
+        configuration.baseBackgroundColor = UIColor(red: 0.62, green: 0.43, blue: 1, alpha: 1)
+        let button = UIButton(configuration: configuration)
+        button.accessibilityLabel = action.title
+        button.accessibilityHint = "Look at this button and press either Sense trigger, or pinch."
+        button.isPointerInteractionEnabled = true
+        let controllerEvents = GCEventInteraction()
+        controllerEvents.handledEventTypes = .gamepad
+        controllerEvents.receivesEventsInView = true
+        button.addInteraction(controllerEvents)
+        button.addTarget(context.coordinator, action: #selector(Coordinator.beginUtilityPress), for: [.touchDown, .touchDragEnter])
+        button.addTarget(context.coordinator, action: #selector(Coordinator.endUtilityPress),
+                         for: [.touchUpInside, .touchUpOutside, .touchCancel, .touchDragExit])
+        button.addTarget(context.coordinator, action: #selector(Coordinator.activate), for: .primaryActionTriggered)
+        return button
+    }
+
+    func updateUIView(_ button: UIButton, context: Context) {
+        context.coordinator.runtime = runtime
+    }
+
+    static func dismantleUIView(_ button: UIButton, coordinator: Coordinator) {
+        coordinator.endUtilityPress()
+    }
+
+    @MainActor final class Coordinator: NSObject {
+        var runtime: NativeRuntimeModel
+        let action: SantosSenseUtilityAction
+        init(runtime: NativeRuntimeModel, action: SantosSenseUtilityAction) {
+            self.runtime = runtime
+            self.action = action
+        }
+        @objc func beginUtilityPress() { runtime.setFlatSenseUtilityPressed(action, pressed: true) }
+        @objc func endUtilityPress() { runtime.setFlatSenseUtilityPressed(action, pressed: false) }
+        @objc func activate() {
+            // Assistive/system activation may emit only primaryActionTriggered.
+            // Acquire before enqueueing and release even without a touch-up.
+            beginUtilityPress()
+            defer { endUtilityPress() }
+            runtime.activateFlatSenseUtility(action)
+        }
     }
 }
 

@@ -153,6 +153,11 @@ final class NativeRuntimeModel: ObservableObject {
     private var senseUtilityInteractionActive: Bool { senseUtilityOwnership.interactionActive }
     private var heldSenseUtilityDirections: Set<SantosSenseUtilityAction> = []
     private var releasedSenseUtilityDirections: [SantosSenseUtilityAction: Double] = [:]
+    private var flatSenseUtilityPrimaryActions: UInt64 = 0
+    private var flatSenseUtilityQueuedActions: UInt64 = 0
+    private var flatSenseUtilityRejectedActions: UInt64 = 0
+    private var flatSenseUtilityLastAction: UInt32 = 0
+    private var flatSenseUtilityLastActionUptime: Double = 0
     private var pauseWindowActions: [Bool: (token: UUID, action: () -> Void)] = [:]
     let windowGameMode: Bool
     let isLinked = NativeRuntime.isLinked
@@ -554,6 +559,16 @@ final class NativeRuntimeModel: ObservableObject {
         if owned != senseUtilityInteractionActive { updateNativeControlsOwnership() }
     }
 
+    /// Called only by the flat system control's primary-action event. Counts
+    /// distinguish UIKit delivery from a native queue/lifecycle rejection.
+    func activateFlatSenseUtility(_ action: SantosSenseUtilityAction) {
+        flatSenseUtilityPrimaryActions &+= 1
+        flatSenseUtilityLastAction = action.rawValue
+        flatSenseUtilityLastActionUptime = ProcessInfo.processInfo.systemUptime
+        if performSenseUtility(action) { flatSenseUtilityQueuedActions &+= 1 }
+        else { flatSenseUtilityRejectedActions &+= 1 }
+    }
+
     /// Returns true for directions even when a lifecycle gate rejects the hold,
     /// so release handlers never turn a rejected/finished hold into a tap.
     @discardableResult
@@ -904,6 +919,14 @@ final class NativeRuntimeModel: ObservableObject {
             "native_controls_input_policy_v2": NativeControlsOwnership.shared.readPolicy(),
             "native_controls_selection": nativeControlsSelection,
             "sense_gameplay_utilities_visible": senseGameplayUtilitiesVisible,
+            "flat_sense_utility_ui": [
+                "primary_action_events": flatSenseUtilityPrimaryActions,
+                "queued_actions": flatSenseUtilityQueuedActions,
+                "rejected_actions": flatSenseUtilityRejectedActions,
+                "last_action": flatSenseUtilityLastAction,
+                "last_action_uptime_seconds": flatSenseUtilityLastActionUptime,
+                "system_select": "gaze_and_either_sense_trigger",
+            ],
             "native_controls_status": nativeControlsStatus,
             "window_attached": windowIsAttached,
             "window_scene_active": windowSceneIsActive,
