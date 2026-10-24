@@ -18,6 +18,10 @@ int32_t sv_runtime_set_active(uint32_t active);
 /* Bounded menu key pulse: 1 Escape, 2 Enter, 3 Space/Apply, 4 Yes/Y, 5 No/N.
  * Returns -1 for unsupported action or full queue. */
 int32_t sv_runtime_menu_action(uint32_t action);
+/* Atomic cumulative physical Start presses, shared with full status JSON. */
+uint64_t sv_native_menu_press_count_v1(void);
+/* UI D-pad holds: action8..11, pressed0/1. Refresh <250ms;0success,-1invalid. */
+int32_t sv_native_utility_dpad_v1(uint32_t action, uint32_t pressed);
 /* Pre-start live 2D window surface. Pass a live CAMetalLayer pointer on visionOS.
  * Metal retains the layer; Swift must keep its owning UIView alive and attached
  * for presentation. Returns 0 on success, -1 for null, repeated, unsupported or

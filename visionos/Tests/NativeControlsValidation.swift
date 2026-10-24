@@ -18,17 +18,55 @@ import Foundation
         require(router.update(NativeControlsInput(x: 1), selection: 1, now: 1.2).selection == 1, "Held direction initial repeat delay")
         require(router.update(NativeControlsInput(x: 1), selection: 1, now: 1.36).selection == 2, "Repeat advances highlight")
         _ = router.update(NativeControlsInput(), selection: 2, now: 2)
-        require(router.update(NativeControlsInput(y: -1), selection: 2, now: 2.1).selection == 6, "Down chooses row below")
-        _ = router.update(NativeControlsInput(), selection: 6, now: 3)
-        require(router.update(NativeControlsInput(confirm: true), selection: 6, now: 3.1).activate, "Cross activates highlighted action")
-        require(!router.update(NativeControlsInput(confirm: true), selection: 6, now: 3.2).activate, "Held Cross cannot queue repeated actions")
-        _ = router.update(NativeControlsInput(), selection: 6, now: 4)
-        require(router.update(NativeControlsInput(back: true), selection: 6, now: 4.1).dismiss, "Circle resumes or dismisses settings")
-        require(SantosControlAction.camera.menuAction == 6, "Camera routes to gameplay-aware native key path")
-        require(SantosControlAction.phone.menuAction == 7, "Phone routes to gameplay-aware native key path")
-        require(SantosControlAction.resume.menuAction == 13, "Resume is state aware, never a blind Escape toggle")
-        require(Set(SantosControlAction.allCases.map(\.rawValue)).count == 18, "Every visible cell has unique selection")
-        require(SantosControlAction.zoomIn.menuAction == 15 && SantosControlAction.zoomOut.menuAction == 16, "Map zoom reaches the real wheel queue")
+        require(router.update(NativeControlsInput(y: -1), selection: 2, now: 2.1).selection == 0, "Down chooses row below")
+        _ = router.update(NativeControlsInput(), selection: 0, now: 3)
+        require(router.update(NativeControlsInput(confirm: true), selection: 0, now: 3.1).activate, "Cross activates highlighted action")
+        require(!router.update(NativeControlsInput(confirm: true), selection: 0, now: 3.2).activate, "Held Cross cannot queue repeated actions")
+        _ = router.update(NativeControlsInput(), selection: 0, now: 4)
+        require(router.update(NativeControlsInput(back: true), selection: 0, now: 4.1).dismiss, "Circle resumes or dismisses settings")
+        require(SantosControlAction.allCases == [.resume, .window, .settings, .quit], "Only four actual app pause actions remain")
+        require(SantosSenseUtilityAction.phone.rawValue == 7 && SantosSenseUtilityAction.changeView.rawValue == 6,
+                "Gameplay phone and view actions preserve their actual queue IDs")
+        require(SantosSenseUtilityAction.allCases.count == 6, "Gameplay utility strip contains only phone, view and directions")
+        require([SantosSenseUtilityAction.up, .down, .left, .right].map(\.rawValue) == [8, 9, 10, 11],
+                "Onscreen D-pad uses the real native directional queue")
+        var gate = NativeControlsActivationGate()
+        let selectedWindow = gate.deferController(.window, now: 1)!
+        require(gate.resolve(selectedWindow, now: 1.08) == .window,
+                "Raw Cross captures the selected action, rather than reading a later changing highlight")
+        require(!gate.direct(now: 1.1), "Late system event cannot duplicate a raw controller activation")
+        let selectedResume = gate.deferController(.resume, now: 2)!
+        require(gate.direct(now: 2.01), "Actual gaze/pinch Button action gets priority")
+        require(gate.resolve(selectedResume, now: 2.08) == nil, "Gaze/pinch cancels the raw Cross fallback")
+        require(gate.deferController(.resume, now: 2.02) == nil,
+                "A late raw snapshot cannot activate a different highlight after actual Button UI activation")
+        let stale = gate.deferController(.quit, now: 3)!
+        let current = gate.deferController(.settings, now: 3.01)!
+        require(gate.resolve(stale, now: 3.08) == nil && gate.resolve(current, now: 3.09) == .settings,
+                "Superseded controller confirmation cannot dispatch stale Quit")
+        let cancelled = gate.deferController(.quit, now: 4)!
+        gate.cancel()
+        require(gate.resolve(cancelled, now: 4.08) == nil, "Closing controls cancels pending activation")
+        var gazeOnly = NativeControlsRouter()
+        _ = gazeOnly.update(NativeControlsInput(), selection: 0, now: 0)
+        require(!gazeOnly.update(NativeControlsInput(confirm: true), selection: 0, now: 0.1).activate,
+                "Gaze click without stick navigation cannot speculatively activate default Resume")
+        require(gazeOnly.update(NativeControlsInput(), selection: 0, now: 1).confirmReleased,
+                "Controller release is observable after a long held native gaze click")
+        var directed = NativeControlsRouter()
+        _ = directed.update(NativeControlsInput(), selection: 0, now: 0)
+        _ = directed.update(NativeControlsInput(x: 1), selection: 0, now: 0.1)
+        let pressed = directed.update(NativeControlsInput(confirm: true), selection: 1, now: 0.2)
+        require(pressed.activate && !pressed.confirmReleased, "Navigated raw Cross captures action on press, but is not a release")
+        require(directed.update(NativeControlsInput(), selection: 1, now: 1).confirmReleased,
+                "Fallback waits for release, so a held UIKit Button has time to receive its real action")
+        var presses = NativeMenuPressObserver()
+        require(presses.consume(1)?.toggle == true, "Fast Start poll opens controls immediately")
+        require(presses.consume(1) == nil && presses.consume(0) == nil,
+                "Duplicate and stale full status snapshots cannot double-toggle controls")
+        require(presses.consume(3)?.toggle == false && presses.count == 3,
+                "Two presses arriving between UI samples preserve parity")
+        require(presses.consume(4)?.toggle == true, "Next fresh physical press is handled once")
         print("Native controls policy: \(checks) checks passed")
     }
 }

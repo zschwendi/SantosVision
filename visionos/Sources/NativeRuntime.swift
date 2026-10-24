@@ -113,11 +113,19 @@ final class NativeRuntimeModel: ObservableObject {
     @Published var gameControlsVisible = false { didSet { updateNativeControlsOwnership() } }
     @Published var nativeSettingsPresented = false { didSet { updateNativeControlsOwnership() } }
     @Published private(set) var nativeControlsSelection = 0
-    @Published private(set) var nativeControlsActivation: UInt64 = 0
+    @Published private(set) var senseGameplayUtilitiesVisible = false
     @Published private(set) var nativeControlsStatus = ""
+    private var fastMenuPolling: Task<Void, Never>?
+    private var nativeMenuPressObserver = NativeMenuPressObserver()
     private var nativeControlsTask: Task<Void, Never>?
     private var nativeControlsRouter = NativeControlsRouter()
-    private var handledNativeControlsActivation: UInt64 = 0
+    private var nativeControlsActivationGate = NativeControlsActivationGate()
+    private var pendingNativeControlsConfirmation: NativeControlsActivationGate.Pending?
+    private var nativeControlsConfirmation: Task<Void, Never>?
+    private var senseUtilityInteractionActive = false
+    private var heldSenseUtilityDirections: Set<SantosSenseUtilityAction> = []
+    private var releasedSenseUtilityDirections: [SantosSenseUtilityAction: Double] = [:]
+    private var pauseWindowActions: [Bool: (token: UUID, action: () -> Void)] = [:]
     let windowGameMode: Bool
     let isLinked = NativeRuntime.isLinked
     let gameRoot: URL
@@ -409,12 +417,18 @@ final class NativeRuntimeModel: ObservableObject {
     }
 
     private func updateNativeControlsOwnership() {
-        let owns = gameControlsVisible || nativeSettingsPresented
-        NativeControlsOwnership.shared.set(owns)
+        let modal = gameControlsVisible || nativeSettingsPresented
+        NativeControlsOwnership.shared.set(modal || senseUtilityInteractionActive)
         nativeControlsRouter = NativeControlsRouter()
+        nativeControlsSelection = 0
+        nativeControlsActivationGate.cancel()
+        pendingNativeControlsConfirmation = nil
+        nativeControlsConfirmation?.cancel()
+        nativeControlsConfirmation = nil
+        updateSenseUtilitiesVisibility()
         nativeControlsTask?.cancel()
         nativeControlsTask = nil
-        guard owns else { return }
+        guard modal else { return }
         nativeControlsTask = Task { @MainActor [weak self] in
             while !Task.isCancelled {
                 guard let self else { return }
@@ -425,23 +439,127 @@ final class NativeRuntimeModel: ObservableObject {
                 if self.nativeSettingsPresented {
                     if event.dismiss { self.nativeSettingsPresented = false }
                 } else if event.dismiss {
-                    self.sendMenuAction(13)
-                    self.gameControlsVisible = false
-                } else if event.activate {
-                    self.nativeControlsActivation &+= 1
+                    self.performPauseAction(.resume)
+                } else {
+                    if event.activate, let action = SantosControlAction(rawValue: event.selection) {
+                        self.pendingNativeControlsConfirmation = self.nativeControlsActivationGate.deferController(action,
+                            now: ProcessInfo.processInfo.systemUptime)
+                    }
+                    if event.confirmReleased, let activation = self.pendingNativeControlsConfirmation {
+                        self.pendingNativeControlsConfirmation = nil
+                        self.nativeControlsConfirmation?.cancel()
+                        self.nativeControlsConfirmation = Task { @MainActor [weak self] in
+                            // UIKit Button actions happen on release, including
+                            // held gaze clicks. Give that real hit first choice.
+                            do { try await Task.sleep(for: .milliseconds(80)) } catch { return }
+                            guard let self, self.gameControlsVisible, !self.nativeSettingsPresented,
+                                  let selected = self.nativeControlsActivationGate.resolve(activation,
+                                      now: ProcessInfo.processInfo.systemUptime) else { return }
+                            self.performPauseAction(selected)
+                        }
+                    }
                 }
                 do { try await Task.sleep(for: .milliseconds(16)) } catch { return }
             }
         }
     }
 
-    func selectNativeControl(_ action: SantosControlAction) { nativeControlsSelection = action.rawValue }
+    func registerPauseWindowAction(token: UUID, immersive: Bool, action: @escaping () -> Void) {
+        pauseWindowActions[immersive] = (token, action)
+    }
 
-    func consumeNativeControlActivation(_ sequence: UInt64, immersive: Bool) -> Bool {
-        guard sequence > handledNativeControlsActivation, immersive == compositorOwnsHeadTracking,
-              gameControlsVisible, !nativeSettingsPresented else { return false }
-        handledNativeControlsActivation = sequence
+    func unregisterPauseWindowAction(token: UUID, immersive: Bool) {
+        if pauseWindowActions[immersive]?.token == token { pauseWindowActions.removeValue(forKey: immersive) }
+    }
+
+    func activatePauseButton(_ action: SantosControlAction) {
+        guard gameControlsVisible, !nativeSettingsPresented, !isQuitting else { return }
+        guard nativeControlsActivationGate.direct(now: ProcessInfo.processInfo.systemUptime) else { return }
+        pendingNativeControlsConfirmation = nil
+        nativeControlsConfirmation?.cancel()
+        nativeControlsConfirmation = nil
+        nativeControlsSelection = action.rawValue
+        performPauseAction(action)
+    }
+
+    private func performPauseAction(_ action: SantosControlAction) {
+        guard hasStarted, !isQuitting else { return }
+        switch action {
+        case .resume:
+            guard sendMenuAction(13) else { return }
+            gameControlsVisible = false
+        case .window:
+            guard let handler = pauseWindowActions[compositorOwnsHeadTracking] else {
+                nativeControlsStatus = "Window is not ready. Try Resume, then Start."
+                return
+            }
+            _ = sendMenuAction(13)
+            handler.action()
+        case .settings:
+            nativeSettingsPresented = true
+        case .quit:
+            Task { await quitGame() }
+        }
+    }
+
+    func setSenseUtilityInteractionActive(_ active: Bool) {
+        if !active { clearSenseUtilityDirections() }
+        guard active != senseUtilityInteractionActive else { return }
+        senseUtilityInteractionActive = active
+        updateNativeControlsOwnership()
+    }
+
+    /// Returns true for directions even when a lifecycle gate rejects the hold,
+    /// so release handlers never turn a rejected/finished hold into a tap.
+    @discardableResult
+    func setSenseUtilityPressed(_ action: SantosSenseUtilityAction, pressed: Bool) -> Bool {
+        guard action.isDirection else { return false }
+        if pressed {
+            guard senseGameplayUtilitiesVisible else { return true }
+            #if SV_GAME_RUNTIME
+            guard sv_native_utility_dpad_v1(action.rawValue, 1) == 0 else { return true }
+            #endif
+            heldSenseUtilityDirections.insert(action)
+        } else {
+            if heldSenseUtilityDirections.remove(action) != nil {
+                releasedSenseUtilityDirections[action] = ProcessInfo.processInfo.systemUptime
+            }
+            #if SV_GAME_RUNTIME
+            _ = sv_native_utility_dpad_v1(action.rawValue, 0)
+            #endif
+        }
         return true
+    }
+
+    private func clearSenseUtilityDirections() {
+        for action in heldSenseUtilityDirections { _ = setSenseUtilityPressed(action, pressed: false) }
+        heldSenseUtilityDirections.removeAll()
+    }
+
+    private func refreshSenseUtilityDirections() {
+        guard senseGameplayUtilitiesVisible else { clearSenseUtilityDirections(); return }
+        #if SV_GAME_RUNTIME
+        for action in heldSenseUtilityDirections { _ = sv_native_utility_dpad_v1(action.rawValue, 1) }
+        #endif
+    }
+
+    @discardableResult
+    func performSenseUtility(_ action: SantosSenseUtilityAction) -> Bool {
+        guard senseGameplayUtilitiesVisible else { return false }
+        if action.isDirection, heldSenseUtilityDirections.contains(action)
+            || ProcessInfo.processInfo.systemUptime - (releasedSenseUtilityDirections[action] ?? -.infinity) < 0.2 {
+            return true // Button release must not append a second tap after its hold.
+        }
+        return sendMenuAction(action.rawValue) // Also supports accessibility-only activation.
+    }
+
+    private func updateSenseUtilitiesVisibility() {
+        let spatial = SpatialGamepadInput.shared.report
+        let connected = spatial["left_controls_available"] as? Bool == true
+            || spatial["right_controls_available"] as? Bool == true
+        senseGameplayUtilitiesVisible = connected && hasStarted && !engineFailed && !isQuitting
+            && !gameControlsVisible && !nativeSettingsPresented && isActive
+        if !senseGameplayUtilitiesVisible { clearSenseUtilityDirections() }
     }
 
     func setWindowAttached(_ attached: Bool) {
@@ -460,6 +578,11 @@ final class NativeRuntimeModel: ObservableObject {
             worldGpuTiming = nil
         }
         isActive = active
+        if !active, senseUtilityInteractionActive {
+            senseUtilityInteractionActive = false
+            NativeControlsOwnership.shared.set(gameControlsVisible || nativeSettingsPresented)
+        }
+        updateSenseUtilitiesVisibility()
         #if SV_GAME_RUNTIME
         _ = sv_runtime_set_window_visible(windowIsAttached && windowSceneIsActive ? 1 : 0)
         #endif
@@ -647,7 +770,29 @@ final class NativeRuntimeModel: ObservableObject {
         recordReport()
     }
 
+    private func observeMenuPressCount(_ presses: UInt64) {
+        guard let event = nativeMenuPressObserver.consume(presses) else { return }
+        menuPressCount = event.count
+        if event.toggle { gameControlsVisible.toggle() }
+        Task { await cloudSaves.backupNow() }
+    }
+
+    private func startFastMenuPolling() {
+        fastMenuPolling?.cancel()
+        fastMenuPolling = Task { @MainActor [weak self] in
+            while !Task.isCancelled {
+                guard let self else { return }
+                #if SV_GAME_RUNTIME
+                self.observeMenuPressCount(sv_native_menu_press_count_v1())
+                #endif
+                self.refreshSenseUtilityDirections()
+                do { try await Task.sleep(for: .milliseconds(50)) } catch { return }
+            }
+        }
+    }
+
     private func startPolling() {
+        startFastMenuPolling()
         polling?.cancel()
         polling = Task { [weak self] in
             while !Task.isCancelled {
@@ -660,11 +805,8 @@ final class NativeRuntimeModel: ObservableObject {
                    let state = object["state"] as? String {
                     if let controller = object["controller"] as? [String: Any],
                        let presses = (controller["menu_press_count"] as? NSNumber)?.uint64Value,
-                       presses != self.menuPressCount {
-                        let delta = presses &- self.menuPressCount
-                        self.menuPressCount = presses
-                        if delta % 2 == 1 { self.gameControlsVisible.toggle() }
-                        Task { await self.cloudSaves.backupNow() }
+                       presses > self.menuPressCount {
+                        self.observeMenuPressCount(presses)
                     }
                     self.engineFailed = state == "failed"
                     self.status = "Native engine state: \(state)."
@@ -689,6 +831,7 @@ final class NativeRuntimeModel: ObservableObject {
             .flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }
         let controllers = GCController.controllers().filter { $0.extendedGamepad != nil }
         let controllerNames = controllers.map { $0.vendorName ?? "Game controller" }
+        updateSenseUtilitiesVisibility()
         let spatialControllers = SpatialGamepadInput.shared.report
         let leftSpatial = spatialControllers["left_controls_available"] as? Bool == true
         let rightSpatial = spatialControllers["right_controls_available"] as? Bool == true
@@ -709,6 +852,7 @@ final class NativeRuntimeModel: ObservableObject {
             "window_scene_policy": "single_instance_main",
             "native_controls_owns_input": NativeControlsOwnership.shared.read(),
             "native_controls_selection": nativeControlsSelection,
+            "sense_gameplay_utilities_visible": senseGameplayUtilitiesVisible,
             "native_controls_status": nativeControlsStatus,
             "window_attached": windowIsAttached,
             "window_scene_active": windowSceneIsActive,

@@ -24,6 +24,13 @@ static BUTTON_EVENTS: AtomicU64 = AtomicU64::new(0);
 static WHEEL_EVENTS: AtomicU64 = AtomicU64::new(0);
 static LOOK_EVENTS: AtomicU64 = AtomicU64::new(0);
 static MENU_PRESS_COUNT: AtomicU64 = AtomicU64::new(0);
+/// Lightweight native UI poll; avoids serializing the full runtime report just
+/// to notice Start. The same cumulative counter remains in status_json.
+#[no_mangle]
+pub extern "C" fn sv_native_menu_press_count_v1() -> u64 {
+    MENU_PRESS_COUNT.load(Ordering::Relaxed)
+}
+
 // 0 absent, 1 established extended gamepad, 2 spatial controls. Hand bits are
 // available validated controls, not Bluetooth pairing or tracked pose claims.
 static INPUT_PROFILE: AtomicU64 = AtomicU64::new(0);
@@ -102,6 +109,7 @@ struct State {
     blocked_context_buttons: u8,
     spatial_router: spatial::Router,
     native_controls_require_neutral: bool,
+    utility_source: Option<Option<spatial::SpatialIdentity>>,
 }
 static STATE: Mutex<Option<State>> = Mutex::new(None);
 
@@ -203,6 +211,29 @@ fn physical_sample_for_owner(sample: Option<Sample>, owns: bool, require_neutral
     }
     sample
 }
+
+const UTILITY_DPAD_WATCHDOG: Duration = Duration::from_millis(250);
+static UTILITY_DPAD: Mutex<[Option<Instant>; 4]> = Mutex::new([None; 4]);
+
+/// Directional UI holds are refreshed by the UI's 50ms heartbeat. They share
+/// the real D-pad mapping below, including Down's held character-wheel action.
+#[no_mangle]
+pub extern "C" fn sv_native_utility_dpad_v1(action: u32, pressed: u32) -> i32 {
+    if !(8..=11).contains(&action) || pressed > 1 { return -1; }
+    UTILITY_DPAD.lock().unwrap()[action as usize - 8] = (pressed == 1).then(Instant::now);
+    0
+}
+
+fn utility_dpad(now: Instant) -> u8 {
+    let mut held = UTILITY_DPAD.lock().unwrap();
+    let mut directions = 0;
+    for (index, stamp) in held.iter_mut().enumerate() {
+        if stamp.is_some_and(|at| now.saturating_duration_since(at) >= UTILITY_DPAD_WATCHDOG) { *stamp = None; }
+        if stamp.is_some() { directions |= 1 << index; }
+    }
+    directions
+}
+fn clear_utility_dpad() { *UTILITY_DPAD.lock().unwrap() = [None; 4]; }
 
 const SWITCH_HOLD: Duration = Duration::from_millis(300);
 const STICK_DEADZONE: f32 = 0.3;
@@ -356,7 +387,10 @@ fn poll_sample(gp: Option<Sample>) -> bool {
     let mut guard = STATE.lock().unwrap();
     let st = guard.get_or_insert_with(|| State { held: HashSet::new(), buttons: 0, last: Instant::now(), down_since: None,
         menu_navigation: MENU_NAVIGATION.load(Ordering::Relaxed), menu_button_down: false, blocked_context_buttons: 0,
-        spatial_router: spatial::Router::default(), native_controls_require_neutral: false });
+        spatial_router: spatial::Router::default(), native_controls_require_neutral: false, utility_source: None });
+    let source = gp.map(|sample| sample.spatial);
+    if !connected || source != st.utility_source { clear_utility_dpad(); }
+    st.utility_source = source;
     let gp = physical_sample_for_owner(gp, native_controls_own_input(), &mut st.native_controls_require_neutral);
     let gp = gp.map(|sample| st.spatial_router.apply(sample, Instant::now()));
     if gp.is_none() { st.spatial_router = spatial::Router::default(); }
@@ -430,15 +464,6 @@ fn poll_sample(gp: Option<Sample>) -> bool {
             if pressed(LEFT_SHOULDER) { keys.insert("Tab"); }
             if gp.right_click { keys.insert("KeyC"); }
         }
-        if gp.dpad & 1 != 0 { keys.insert("ArrowUp"); }
-        if gp.dpad & 2 != 0 {
-            let since = *st.down_since.get_or_insert_with(Instant::now);
-            if !menu && since.elapsed() >= SWITCH_HOLD { keys.insert("AltLeft"); } else { keys.insert("ArrowDown"); }
-        } else {
-            st.down_since = None;
-        }
-        if gp.dpad & 4 != 0 { keys.insert("ArrowLeft"); }
-        if gp.dpad & 8 != 0 { keys.insert("ArrowRight"); }
         if !menu {
             if gp.camera { keys.insert("KeyV"); }
         }
@@ -457,9 +482,19 @@ fn poll_sample(gp: Option<Sample>) -> bool {
     } else {
         st.menu_button_down = false;
         st.blocked_context_buttons = 0;
-        st.down_since = None;
         HORN_PAD.store(false, Ordering::Relaxed);
     }
+    // UI holds bypass physical modal filtering intentionally, but still use
+    // the identical direction/character-wheel semantics and normal key diff.
+    let directions = gp.as_ref().map_or(0, |sample| sample.dpad) | utility_dpad(Instant::now());
+    if directions & 1 != 0 { keys.insert("ArrowUp"); }
+    if directions & 2 != 0 {
+        let since = *st.down_since.get_or_insert_with(Instant::now);
+        if !menu && !phone_instantiated && since.elapsed() >= SWITCH_HOLD { keys.insert("AltLeft"); }
+        else { keys.insert("ArrowDown"); }
+    } else { st.down_since = None; }
+    if directions & 4 != 0 { keys.insert("ArrowLeft"); }
+    if directions & 8 != 0 { keys.insert("ArrowRight"); }
     if !keys.is_empty() || buttons != 0 || looking || (in_car && HORN_PAD.load(Ordering::Relaxed)) {
         ACTIVE_INPUT_SAMPLES.fetch_add(1, Ordering::Relaxed);
     }
@@ -488,6 +523,7 @@ fn release(st: State) {
 
 /// Release held controller input when the native application's scene deactivates.
 pub fn suspend() {
+    clear_utility_dpad();
     if let Some(state) = STATE.lock().unwrap().take() {
         MENU_NAVIGATION.store(state.menu_navigation, Ordering::Relaxed);
         release(state);

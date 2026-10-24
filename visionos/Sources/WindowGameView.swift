@@ -131,6 +131,13 @@ struct WindowGameView: View {
             }
             #endif
         }
+        .overlay(alignment: .bottomLeading) {
+            if runtime.senseGameplayUtilitiesVisible {
+                SenseGameplayUtilities(runtime: runtime)
+                    .padding(.leading, 18)
+                    .padding(.bottom, 18)
+            }
+        }
         .frame(minWidth: 640, minHeight: 360)
         .background(.black)
         .background(GameWindowGeometry(isGameplay: runtime.startupAttempted))
@@ -156,8 +163,7 @@ struct WindowGameView: View {
         .ornament(visibility: runtime.hasStarted && runtime.gameControlsVisible ? .visible : .hidden,
                   attachmentAnchor: .scene(.bottom), contentAlignment: .top) {
             SantosPauseControls(runtime: runtime,
-                windowAction: { runtime.gameControlsVisible = false },
-                settingsAction: { runtime.nativeSettingsPresented = true })
+                windowAction: { runtime.gameControlsVisible = false })
                 .padding(.top, 12)
         }
         .sheet(isPresented: $runtime.nativeSettingsPresented) { SantosSettingsView(runtime: runtime) }
@@ -345,7 +351,7 @@ struct SantosSettingsView: View {
                         .disabled(!runtime.canChangePlaySettings)
                     Text("Adjusts the right stick's look speed. GTA's own mouse sensitivity also applies.")
                         .font(.caption).foregroundStyle(.secondary)
-                    Text("DualSense: click the touchpad to change camera. Sense: click both sticks together to change camera; hold left stick click and move that stick for D-pad. Tap left stick click for normal L3. Start opens these controls, with Phone, Change camera and all four D-pad directions. In GTA menus: Cross selects, Circle goes back, Square applies, Triangle means Yes, and R1 means No.")
+                    Text("DualSense: click the touchpad to change camera. Sense: click both sticks together to change camera; hold left stick click and move that stick for D-pad. Tap left stick click for normal L3. The compact bottom-left gameplay buttons provide Phone, Change view and all four D-pad directions. Start opens Resume, Window, Settings and Quit. In GTA menus: Cross selects, Circle goes back, Square applies, Triangle means Yes, and R1 means No.")
                         .font(.caption).foregroundStyle(.secondary)
                 }
                 Section {
@@ -381,6 +387,7 @@ struct SantosSettingsView: View {
         }
         .frame(width: 560, height: 540)
         .tint(SantosTheme.accent)
+        .handlesGameControllerEvents(matching: .gamepad, withOptions: .receivesEventsInView(true))
     }
 
     private func quitGame() {
@@ -391,63 +398,85 @@ struct SantosSettingsView: View {
 struct SantosPauseControls: View {
     @ObservedObject var runtime: NativeRuntimeModel
     let windowAction: () -> Void
-    let settingsAction: () -> Void
     var immersive = false
+    @State private var registration = UUID()
 
     var body: some View {
         VStack(spacing: 12) {
-            LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 8), count: 4), spacing: 8) {
+            LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 10) {
                 ForEach(SantosControlAction.allCases) { action in
                     Button {
-                        runtime.selectNativeControl(action)
-                        perform(action)
+                        runtime.activatePauseButton(action)
                     } label: {
                         Label(action.title, systemImage: action.symbol)
-                            .font(.caption)
-                            .frame(maxWidth: .infinity, minHeight: 38)
-                            .padding(.horizontal, 4)
+                            .frame(maxWidth: .infinity, minHeight: 48)
                     }
                     .buttonStyle(.bordered)
                     .tint(action.rawValue == runtime.nativeControlsSelection ? SantosTheme.glow : SantosTheme.accent)
-                    .overlay(RoundedRectangle(cornerRadius: 14).stroke(
+                    .overlay(RoundedRectangle(cornerRadius: 16).stroke(
                         action.rawValue == runtime.nativeControlsSelection ? SantosTheme.glow : .clear, lineWidth: 2))
                     .accessibilityAddTraits(action.rawValue == runtime.nativeControlsSelection ? .isSelected : [])
                 }
             }
-            Text("Left stick / D-pad · Move highlight    Cross · Use highlighted button    Circle / Start · Resume")
-                .font(.caption2).foregroundStyle(.secondary)
-            Text("Map zoom + / − sends the game’s mouse wheel. GTA Apply saves GTA menu changes.")
-                .font(.caption2).foregroundStyle(.secondary)
-            Text("Sense: both stick clicks · Camera    Hold left stick click + stick · D-pad")
-                .font(.caption2).foregroundStyle(.secondary)
+            Text("Look and click · or stick + Cross\nCircle / Start · Resume")
+                .font(.caption2).foregroundStyle(.secondary).multilineTextAlignment(.center)
             if !runtime.nativeControlsStatus.isEmpty { Text(runtime.nativeControlsStatus).font(.caption) }
         }
-        .frame(width: 600)
+        .frame(width: 340)
         .padding(16)
         .glassBackgroundEffect()
         .tint(SantosTheme.accent)
         .disabled(runtime.isQuitting)
-        .onChange(of: runtime.nativeControlsActivation) { _, sequence in
-            guard runtime.consumeNativeControlActivation(sequence, immersive: immersive) else { return }
-            if let action = SantosControlAction(rawValue: runtime.nativeControlsSelection) { perform(action) }
+        // Keep real system gaze/pinch routing in the native UI. Gameplay's
+        // Metal view remains exclusive GC input; modal ownership blocks leaks.
+        .handlesGameControllerEvents(matching: .gamepad, withOptions: .receivesEventsInView(true))
+        .onAppear {
+            runtime.registerPauseWindowAction(token: registration, immersive: immersive, action: windowAction)
+        }
+        .onDisappear {
+            runtime.unregisterPauseWindowAction(token: registration, immersive: immersive)
         }
     }
+}
 
-    private func perform(_ action: SantosControlAction) {
-        switch action {
-        case .window:
-            _ = runtime.sendMenuAction(13)
-            windowAction()
-        case .settings:
-            settingsAction()
-        case .quit:
-            Task { await runtime.quitGame() }
-        default:
-            guard let id = action.menuAction, runtime.sendMenuAction(id) else { return }
-            if action == .resume || action == .camera || action == .phone {
-                runtime.gameControlsVisible = false
+/// Compact gameplay-only alternatives to controls absent from Sense hardware.
+/// This is a sibling overlay of the flat drawable, not part of the Start menu.
+struct SenseGameplayUtilities: View {
+    @ObservedObject var runtime: NativeRuntimeModel
+    var body: some View {
+        HStack(spacing: 6) {
+            ForEach(SantosSenseUtilityAction.allCases) { action in
+                Button {
+                    _ = runtime.performSenseUtility(action)
+                } label: {
+                    Image(systemName: action.symbol)
+                        .font(.system(size: 17, weight: .medium))
+                        .frame(width: 44, height: 44)
+                }
+                .buttonStyle(SenseUtilityButtonStyle(runtime: runtime, action: action))
+                .accessibilityLabel(action.title)
+                .help(action.title)
             }
         }
+        .padding(8)
+        .glassBackgroundEffect(in: RoundedRectangle(cornerRadius: 18))
+        .handlesGameControllerEvents(matching: .gamepad, withOptions: .receivesEventsInView(true))
+        .onDisappear { runtime.setSenseUtilityInteractionActive(false) }
+    }
+}
+
+private struct SenseUtilityButtonStyle: ButtonStyle {
+    let runtime: NativeRuntimeModel
+    let action: SantosSenseUtilityAction
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .background(configuration.isPressed ? SantosTheme.glow.opacity(0.35) : SantosTheme.surface.opacity(0.6),
+                        in: RoundedRectangle(cornerRadius: 12))
+            .hoverEffect()
+            .onChange(of: configuration.isPressed) { _, pressed in
+                runtime.setSenseUtilityInteractionActive(pressed)
+                _ = runtime.setSenseUtilityPressed(action, pressed: pressed)
+            }
     }
 }
 

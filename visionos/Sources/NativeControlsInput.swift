@@ -23,33 +23,16 @@ struct NativeControlsInput: Sendable {
     var neutral: Bool { abs(x) < 0.3 && abs(y) < 0.3 && !confirm && !back && !pause }
 }
 
+/// The Start panel contains only app-level pause actions.
 enum SantosControlAction: Int, CaseIterable, Identifiable {
-    case resume, window, settings, camera
-    case phone, up, down, quit
-    case left, right, select, back
-    case apply, yes, no, tab
-    case zoomIn, zoomOut
+    case resume, window, settings, quit
     var id: Int { rawValue }
     var title: String {
         switch self {
         case .resume: "Resume"
         case .window: "Window"
         case .settings: "Settings"
-        case .camera: "Change camera"
-        case .phone: "Phone"
-        case .up: "D-pad up"
-        case .down: "D-pad down"
         case .quit: "Quit game"
-        case .left: "D-pad left"
-        case .right: "D-pad right"
-        case .select: "Select"
-        case .back: "Back"
-        case .apply: "Apply"
-        case .yes: "Yes"
-        case .no: "No"
-        case .tab: "Tab"
-        case .zoomIn: "Map zoom +"
-        case .zoomOut: "Map zoom −"
         }
     }
     var symbol: String {
@@ -57,42 +40,80 @@ enum SantosControlAction: Int, CaseIterable, Identifiable {
         case .resume: "play.fill"
         case .window: "arrow.down.right.and.arrow.up.left"
         case .settings: "gearshape"
-        case .camera: "camera.rotate"
-        case .phone: "iphone"
-        case .up: "arrow.up"
-        case .down: "arrow.down"
         case .quit: "power"
-        case .left: "arrow.left"
-        case .right: "arrow.right"
-        case .select: "checkmark"
-        case .back: "arrow.uturn.backward"
-        case .apply: "checkmark.circle"
-        case .yes: "y.circle"
-        case .no: "n.circle"
-        case .tab: "arrow.right.to.line"
-        case .zoomIn: "plus.magnifyingglass"
-        case .zoomOut: "minus.magnifyingglass"
         }
     }
-    var menuAction: UInt32? {
+}
+
+/// Shared by the flat SwiftUI strip and the immersive compositor hit targets.
+/// Values intentionally match the existing additive native menu-action ABI.
+enum SantosSenseUtilityAction: UInt32, CaseIterable, Identifiable, Sendable {
+    case phone = 7, changeView = 6, up = 8, down = 9, left = 10, right = 11
+    var id: UInt32 { rawValue }
+    var title: String {
         switch self {
-        case .resume: 13
-        case .camera: 6
-        case .phone: 7
-        case .up: 8
-        case .down: 9
-        case .left: 10
-        case .right: 11
-        case .select: 2
-        case .back: 12
-        case .apply: 3
-        case .yes: 4
-        case .no: 5
-        case .tab: 14
-        case .zoomIn: 15
-        case .zoomOut: 16
-        default: nil
+        case .phone: "Phone"
+        case .changeView: "Change view"
+        case .up: "D-pad up"
+        case .down: "D-pad down"
+        case .left: "D-pad left"
+        case .right: "D-pad right"
         }
+    }
+    var isDirection: Bool { [.up, .down, .left, .right].contains(self) }
+    var symbol: String {
+        switch self {
+        case .phone: "iphone"
+        case .changeView: "camera.rotate"
+        case .up: "arrow.up"
+        case .down: "arrow.down"
+        case .left: "arrow.left"
+        case .right: "arrow.right"
+        }
+    }
+}
+
+/// A controller Cross can also arrive as the system's gaze/pinch Button event.
+/// Prefer that actual hit target; the raw controller fallback captures its
+/// selected action now and is cancelled by a direct UI activation.
+struct NativeControlsActivationGate {
+    struct Pending: Equatable { let sequence: UInt64; let action: SantosControlAction }
+    private var sequence: UInt64 = 0
+    private var pending: Pending?
+    private var lastDirectTime = -Double.infinity
+    mutating func deferController(_ action: SantosControlAction, now: Double) -> Pending? {
+        guard now - lastDirectTime >= 0.15 else { return nil }
+        sequence &+= 1
+        let value = Pending(sequence: sequence, action: action)
+        pending = value
+        return value
+    }
+    mutating func direct(now: Double) -> Bool {
+        pending = nil
+        guard now - lastDirectTime >= 0.15 else { return false }
+        lastDirectTime = now
+        return true
+    }
+    mutating func resolve(_ value: Pending, now: Double) -> SantosControlAction? {
+        guard pending == value else { return nil }
+        pending = nil
+        lastDirectTime = now
+        return value.action
+    }
+    mutating func cancel() { pending = nil }
+}
+
+/// Fast atomic polling and slower full status snapshots share this observer.
+/// Ignore duplicate/older snapshots, rather than wrapping subtraction toggling
+/// the controls a second time after an already handled physical Start press.
+struct NativeMenuPressObserver {
+    private(set) var count: UInt64 = 0
+    struct Event { let count: UInt64; let toggle: Bool }
+    mutating func consume(_ next: UInt64) -> Event? {
+        guard next > count else { return nil }
+        let delta = next - count
+        count = next
+        return Event(count: next, toggle: delta % 2 == 1)
     }
 }
 
@@ -102,26 +123,31 @@ struct NativeControlsRouter {
     private var armed = false
     private var previous = NativeControlsInput()
     private var lastDirection = 0
+    private var usedNavigation = false
     private var nextRepeat: Double = 0
-    struct Result { var selection: Int; var activate = false; var dismiss = false }
+    struct Result { var selection: Int; var activate = false; var confirmReleased = false; var dismiss = false }
     mutating func update(_ input: NativeControlsInput, selection: Int, now: Double) -> Result {
-        var result = Result(selection: selection)
+        var result = Result(selection: min(max(selection, 0), SantosControlAction.allCases.count - 1))
         guard armed else {
             armed = input.neutral
             previous = input
             return result
         }
-        result.activate = input.confirm && !previous.confirm
+        result.confirmReleased = !input.confirm && previous.confirm
         result.dismiss = (input.back && !previous.back) || (input.pause && !previous.pause)
         let direction: Int
-        if abs(input.y) >= abs(input.x), abs(input.y) > 0.5 { direction = input.y > 0 ? -4 : 4 }
+        if abs(input.y) >= abs(input.x), abs(input.y) > 0.5 { direction = input.y > 0 ? -2 : 2 }
         else if abs(input.x) > 0.5 { direction = input.x > 0 ? 1 : -1 }
         else { direction = 0 }
         if direction != 0, direction != lastDirection || now >= nextRepeat {
             let count = SantosControlAction.allCases.count
-            result.selection = (selection + direction + count) % count
+            result.selection = (result.selection + direction + count) % count
             nextRepeat = now + (direction == lastDirection ? 0.14 : 0.35)
         }
+        usedNavigation = usedNavigation || direction != 0
+        // Raw Cross is a fallback only after deliberate controller navigation.
+        // Plain gaze clicks use UIKit, including a hold until Button release.
+        result.activate = usedNavigation && input.confirm && !previous.confirm
         lastDirection = direction
         previous = input
         return result

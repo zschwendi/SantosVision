@@ -96,6 +96,98 @@ mod pad {
             suspend();
         }
         #[test]
+        fn held_ui_down_runs_real_character_wheel_mapping_under_physical_ownership() {
+            suspend();
+            TEST_NATIVE_CONTROLS_OWN_INPUT.store(false, Ordering::Relaxed);
+            MENU_NAVIGATION.store(false, Ordering::Relaxed);
+            let neutral = spatial::spatial_sample(3, 0, [0.0; 6], 42).unwrap();
+            poll_sample(Some(neutral));
+            crate::input::take();
+            TEST_NATIVE_CONTROLS_OWN_INPUT.store(true, Ordering::Relaxed);
+            assert_eq!(sv_native_utility_dpad_v1(9, 1), 0);
+            poll_sample(Some(neutral));
+            assert!(crate::input::take().contains(&Event::Key("ArrowDown".into(), true)));
+            STATE.lock().unwrap().as_mut().unwrap().down_since = Some(Instant::now() - SWITCH_HOLD);
+            assert_eq!(sv_native_utility_dpad_v1(9, 1), 0); // UI heartbeat refresh.
+            poll_sample(Some(neutral));
+            let events = crate::input::take();
+            assert!(events.contains(&Event::Key("ArrowDown".into(), false)));
+            assert!(events.contains(&Event::Key("AltLeft".into(), true)), "Held UI Down must open the actual GTA character wheel, not repeat a120ms tap");
+            assert_eq!(sv_native_utility_dpad_v1(9, 0), 0);
+            poll_sample(Some(neutral));
+            assert!(crate::input::take().contains(&Event::Key("AltLeft".into(), false)));
+            TEST_NATIVE_CONTROLS_OWN_INPUT.store(false, Ordering::Relaxed);
+            suspend();
+            crate::input::take();
+        }
+        #[test]
+        fn ui_direction_watchdog_disconnect_replacement_and_suspend_emit_releases() {
+            suspend();
+            TEST_NATIVE_CONTROLS_OWN_INPUT.store(false, Ordering::Relaxed);
+            MENU_NAVIGATION.store(false, Ordering::Relaxed);
+            let neutral = spatial::spatial_sample(3, 0, [0.0; 6], 42).unwrap();
+            poll_sample(Some(neutral));
+            crate::input::take();
+            assert_eq!(sv_native_utility_dpad_v1(8, 1), 0);
+            poll_sample(Some(neutral));
+            assert!(crate::input::take().contains(&Event::Key("ArrowUp".into(), true)));
+            UTILITY_DPAD.lock().unwrap()[0] = Some(Instant::now() - UTILITY_DPAD_WATCHDOG);
+            poll_sample(Some(neutral));
+            assert!(crate::input::take().contains(&Event::Key("ArrowUp".into(), false)), "A stalled UI heartbeat must release actual held input within250ms");
+            assert_eq!(sv_native_utility_dpad_v1(8, 1), 0);
+            poll_sample(Some(neutral));
+            crate::input::take();
+            poll_sample(None);
+            assert!(crate::input::take().contains(&Event::Key("ArrowUp".into(), false)));
+            assert_eq!(utility_dpad(Instant::now()), 0);
+            poll_sample(Some(neutral));
+            assert_eq!(sv_native_utility_dpad_v1(10, 1), 0);
+            poll_sample(Some(neutral));
+            crate::input::take();
+            let replacement = spatial::spatial_sample(3, 0, [0.0; 6], 99).unwrap();
+            poll_sample(Some(replacement));
+            assert!(crate::input::take().contains(&Event::Key("ArrowLeft".into(), false)));
+            assert_eq!(utility_dpad(Instant::now()), 0);
+            assert_eq!(sv_native_utility_dpad_v1(11, 1), 0);
+            poll_sample(Some(replacement));
+            crate::input::take();
+            suspend();
+            assert!(crate::input::take().contains(&Event::Key("ArrowRight".into(), false)));
+            assert_eq!(utility_dpad(Instant::now()), 0);
+        }
+        #[test]
+        fn utility_hold_api_rejects_invalid_controls_and_preserves_heartbeat_age_bound() {
+            clear_utility_dpad();
+            for (action, pressed) in [(7,1), (12,1), (8,2), (u32::MAX,0)] {
+                assert_eq!(sv_native_utility_dpad_v1(action, pressed), -1);
+            }
+            assert_eq!(utility_dpad(Instant::now()), 0);
+            assert_eq!(sv_native_utility_dpad_v1(10,1), 0);
+            let at = UTILITY_DPAD.lock().unwrap()[2].unwrap();
+            assert_eq!(utility_dpad(at + Duration::from_millis(249)), 4);
+            assert_eq!(utility_dpad(at + Duration::from_millis(250)), 0);
+            clear_utility_dpad();
+        }
+        #[test]
+        fn fast_native_start_counter_matches_actual_physical_poll_edges() {
+            suspend();
+            TEST_NATIVE_CONTROLS_OWN_INPUT.store(false, Ordering::Relaxed);
+            let neutral = spatial::spatial_sample(3, 0, [0.0; 6], 42).unwrap();
+            poll_sample(Some(neutral));
+            let before = sv_native_menu_press_count_v1();
+            let menu = spatial::spatial_sample(3, 1 << 9, [0.0; 6], 42).unwrap();
+            poll_sample(Some(menu));
+            assert_eq!(sv_native_menu_press_count_v1(), before + 1);
+            poll_sample(Some(menu));
+            assert_eq!(sv_native_menu_press_count_v1(), before + 1, "Holding Start cannot generate repeated native menu activations");
+            poll_sample(Some(neutral));
+            poll_sample(Some(menu));
+            assert_eq!(sv_native_menu_press_count_v1(), before + 2);
+            suspend();
+            MENU_NAVIGATION.store(false, Ordering::Relaxed);
+            crate::input::take();
+        }
+        #[test]
         fn native_modal_releases_actual_inputs_keeps_app_actions_and_requires_rearm() {
             suspend();
             MENU_NAVIGATION.store(false, Ordering::Relaxed);

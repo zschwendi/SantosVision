@@ -65,14 +65,13 @@ struct ImmersiveGameControls: View {
         VStack(spacing: 14) {
             Text("Los Santos").font(.title3.bold())
             SantosPauseControls(runtime: runtime,
-                windowAction: { Task { await returnToWindow() } },
-                settingsAction: { runtime.nativeSettingsPresented = true }, immersive: true)
+                windowAction: { Task { await returnToWindow() } }, immersive: true)
             if !world.hasPresentedFrames {
                 Text(world.status).font(.caption).foregroundStyle(.secondary)
             }
         }
         .padding(18)
-        .handlesGameControllerEvents(matching: .gamepad, withOptions: .receivesEventsInView(false))
+        .handlesGameControllerEvents(matching: .gamepad, withOptions: .receivesEventsInView(true))
         .onChange(of: controlsScenePhase, initial: true) { _, phase in
             runtime.setNativeControlsSceneActive(phase == .active)
         }
