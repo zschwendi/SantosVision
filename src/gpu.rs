@@ -46,6 +46,10 @@ mod texture_view_cache_tests;
 #[path="xr_hud_gpu_tests.rs"]
 mod xr_hud_gpu_tests;
 
+#[cfg(all(test, target_os = "macos"))]
+#[path = "xr_foreground_depth_metal_tests.rs"]
+mod xr_foreground_depth_metal_tests;
+
 /// A frozen pre-UI depth copy belongs to its qualified camera/present, not to
 /// subsequent contents of the live source texture. Ordinary source clears do
 /// not modify the copy. Other mutations and unqualified geometry still revoke
