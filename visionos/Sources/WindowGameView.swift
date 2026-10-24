@@ -236,7 +236,7 @@ struct WindowGameView: View {
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .background(SantosTheme.surface.opacity(0.45), in: RoundedRectangle(cornerRadius: 22))
             HStack {
-                Text(shortStatus).font(.caption).foregroundStyle(.secondary)
+                Text("\(shortStatus) · \(AppBuildInfo.label)").font(.caption).foregroundStyle(.secondary)
                 Spacer()
                 Label(runtime.controllerSummary, systemImage: "gamecontroller").font(.caption).foregroundStyle(.secondary)
             }

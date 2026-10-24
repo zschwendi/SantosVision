@@ -111,7 +111,8 @@ struct LauncherView: View {
                     playButton
                     Button("Import other game data…") { picking = true }.font(.caption)
                 }
-                Text("proudly made by c22dev").font(.caption).foregroundStyle(.secondary)
+                Text("proudly made by c22dev · Build \(Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "unknown")")
+                    .font(.caption).foregroundStyle(.secondary)
             }
             .padding(24)
             .frame(maxWidth: .infinity)

@@ -336,6 +336,8 @@ private struct LauncherView: View {
             }
             Text("Use the Digital Crown or Close tracking test to leave immersion.")
                 .font(.caption).foregroundStyle(.secondary)
+            Text(AppBuildInfo.label)
+                .font(.caption).foregroundStyle(.secondary)
         }
         .padding(30)
         }
