@@ -61,7 +61,7 @@ fn describe_bones(b:Bones,target:&[f32;16])->serde_json::Value{serde_json::json!
     "actual_to_desired_m":distance(&b.actual,target),"goal_to_desired_m":distance(&b.goal,target),"upper_to_desired_m":distance(&b.upper,target),
     "goal_active_byte":b.active,"goal_orientation_flags":b.orientation,"request_blend_weight":b.blend})}
 fn describe_target(t:&Target)->serde_json::Value{serde_json::json!({"age_ms":t.at.elapsed().as_millis(),"view_epoch":t.generation.0,"camera_sequence":t.generation.1,"hand_sequence":t.generation.2,
-    "desired_hand_world":position(&t.desired),"desired_hand_x_axis":&t.desired[..3],"stock_target_world":position(&t.stock),"reference_world":position(&t.reference),
+    "desired_hand_world":position(&t.desired),"desired_hand_x_axis":t.capability.full_pose().then_some(&t.desired[..3]),"orientation_qualified":t.capability.full_pose(),"stock_target_world":position(&t.stock),"reference_world":position(&t.reference),
     "request_blend_weight":t.blend,"capability":t.capability.name(),"before_native_blend":t.before.map(|b|describe_bones(b,&t.desired))})}
 pub(super) fn status()->serde_json::Value{
     let targets=TARGETS.lock().unwrap_or_else(|p|p.into_inner()).clone();let rendered=RENDERED.lock().unwrap_or_else(|p|p.into_inner()).clone();
