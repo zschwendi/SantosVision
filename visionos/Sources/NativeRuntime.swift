@@ -91,6 +91,33 @@ private enum NativeRuntime {
     #endif
 }
 
+// BEGIN NativeSenseUtilityOwnership (standalone validation uses this actual block)
+struct NativeSenseUtilityOwnership {
+    private(set) var flatActions = Set<SantosSenseUtilityAction>()
+    private(set) var immersiveDirections = Set<SantosSenseUtilityAction>()
+    private(set) var immersiveActive = false
+    var directions: Set<SantosSenseUtilityAction> {
+        immersiveDirections.union(flatActions.filter(\.isDirection))
+    }
+    var interactionActive: Bool { immersiveActive || !immersiveDirections.isEmpty || !flatActions.isEmpty }
+    mutating func setFlat(_ action: SantosSenseUtilityAction, pressed: Bool) {
+        if pressed { flatActions.insert(action) } else { flatActions.remove(action) }
+    }
+    mutating func clearFlat() { flatActions.removeAll() }
+    mutating func setImmersiveDirection(_ action: SantosSenseUtilityAction, pressed: Bool) {
+        guard action.isDirection else { return }
+        if pressed { immersiveDirections.insert(action) } else { immersiveDirections.remove(action) }
+    }
+    mutating func setImmersiveActive(_ active: Bool) {
+        immersiveActive = active
+        if !active { immersiveDirections.removeAll() }
+    }
+    mutating func clear() {
+        flatActions.removeAll(); immersiveDirections.removeAll(); immersiveActive = false
+    }
+}
+// END NativeSenseUtilityOwnership
+
 @MainActor
 final class NativeRuntimeModel: ObservableObject {
     @Published private(set) var status = "The native game runtime has not been checked."
@@ -122,7 +149,8 @@ final class NativeRuntimeModel: ObservableObject {
     private var nativeControlsActivationGate = NativeControlsActivationGate()
     private var pendingNativeControlsConfirmation: NativeControlsActivationGate.Pending?
     private var nativeControlsConfirmation: Task<Void, Never>?
-    private var senseUtilityInteractionActive = false
+    private var senseUtilityOwnership = NativeSenseUtilityOwnership()
+    private var senseUtilityInteractionActive: Bool { senseUtilityOwnership.interactionActive }
     private var heldSenseUtilityDirections: Set<SantosSenseUtilityAction> = []
     private var releasedSenseUtilityDirections: [SantosSenseUtilityAction: Double] = [:]
     private var pauseWindowActions: [Bool: (token: UUID, action: () -> Void)] = [:]
@@ -503,10 +531,27 @@ final class NativeRuntimeModel: ObservableObject {
     }
 
     func setSenseUtilityInteractionActive(_ active: Bool) {
-        if !active { clearSenseUtilityDirections() }
-        guard active != senseUtilityInteractionActive else { return }
-        senseUtilityInteractionActive = active
-        updateNativeControlsOwnership()
+        let owned = senseUtilityInteractionActive
+        senseUtilityOwnership.setImmersiveActive(active)
+        synchronizeSenseUtilityDirections()
+        if owned != senseUtilityInteractionActive { updateNativeControlsOwnership() }
+    }
+
+    /// Flat buttons are independent owners. Releasing one must not release a
+    /// second flat button or the same direction held in the immersive scene.
+    func setFlatSenseUtilityPressed(_ action: SantosSenseUtilityAction, pressed: Bool) {
+        if pressed, !senseGameplayUtilitiesVisible { return }
+        let owned = senseUtilityInteractionActive
+        senseUtilityOwnership.setFlat(action, pressed: pressed)
+        synchronizeSenseUtilityDirections()
+        if owned != senseUtilityInteractionActive { updateNativeControlsOwnership() }
+    }
+
+    func clearFlatSenseUtilityPressed() {
+        let owned = senseUtilityInteractionActive
+        senseUtilityOwnership.clearFlat()
+        synchronizeSenseUtilityDirections()
+        if owned != senseUtilityInteractionActive { updateNativeControlsOwnership() }
     }
 
     /// Returns true for directions even when a lifecycle gate rejects the hold,
@@ -514,26 +559,34 @@ final class NativeRuntimeModel: ObservableObject {
     @discardableResult
     func setSenseUtilityPressed(_ action: SantosSenseUtilityAction, pressed: Bool) -> Bool {
         guard action.isDirection else { return false }
-        if pressed {
-            guard senseGameplayUtilitiesVisible else { return true }
-            #if SV_GAME_RUNTIME
-            guard sv_native_utility_dpad_v1(action.rawValue, 1) == 0 else { return true }
-            #endif
-            heldSenseUtilityDirections.insert(action)
-        } else {
-            if heldSenseUtilityDirections.remove(action) != nil {
-                releasedSenseUtilityDirections[action] = ProcessInfo.processInfo.systemUptime
-            }
+        if pressed, !senseGameplayUtilitiesVisible { return true }
+        let owned = senseUtilityInteractionActive
+        senseUtilityOwnership.setImmersiveDirection(action, pressed: pressed)
+        synchronizeSenseUtilityDirections()
+        if owned != senseUtilityInteractionActive { updateNativeControlsOwnership() }
+        return true
+    }
+
+    private func synchronizeSenseUtilityDirections() {
+        let wanted = senseUtilityOwnership.directions
+        for action in heldSenseUtilityDirections.subtracting(wanted) {
+            releasedSenseUtilityDirections[action] = ProcessInfo.processInfo.systemUptime
             #if SV_GAME_RUNTIME
             _ = sv_native_utility_dpad_v1(action.rawValue, 0)
             #endif
         }
-        return true
+        for action in wanted.subtracting(heldSenseUtilityDirections) {
+            #if SV_GAME_RUNTIME
+            _ = sv_native_utility_dpad_v1(action.rawValue, 1)
+            #endif
+        }
+        heldSenseUtilityDirections = wanted
     }
 
     private func clearSenseUtilityDirections() {
-        for action in heldSenseUtilityDirections { _ = setSenseUtilityPressed(action, pressed: false) }
-        heldSenseUtilityDirections.removeAll()
+        senseUtilityOwnership.clear()
+        synchronizeSenseUtilityDirections()
+        NativeControlsOwnership.shared.set(modal: gameControlsVisible || nativeSettingsPresented, utility: false)
     }
 
     private func refreshSenseUtilityDirections() {
@@ -578,10 +631,7 @@ final class NativeRuntimeModel: ObservableObject {
             worldGpuTiming = nil
         }
         isActive = active
-        if !active, senseUtilityInteractionActive {
-            senseUtilityInteractionActive = false
-            NativeControlsOwnership.shared.set(gameControlsVisible || nativeSettingsPresented)
-        }
+        if !active, senseUtilityInteractionActive { clearSenseUtilityDirections() }
         updateSenseUtilitiesVisibility()
         #if SV_GAME_RUNTIME
         _ = sv_runtime_set_window_visible(windowIsAttached && windowSceneIsActive ? 1 : 0)

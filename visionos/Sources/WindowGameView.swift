@@ -461,7 +461,7 @@ struct SenseGameplayUtilities: View {
         .padding(8)
         .glassBackgroundEffect(in: RoundedRectangle(cornerRadius: 18))
         .handlesGameControllerEvents(matching: .gamepad, withOptions: .receivesEventsInView(true))
-        .onDisappear { runtime.setSenseUtilityInteractionActive(false) }
+        .onDisappear { runtime.clearFlatSenseUtilityPressed() }
     }
 }
 
@@ -474,8 +474,7 @@ private struct SenseUtilityButtonStyle: ButtonStyle {
                         in: RoundedRectangle(cornerRadius: 12))
             .hoverEffect()
             .onChange(of: configuration.isPressed) { _, pressed in
-                runtime.setSenseUtilityInteractionActive(pressed)
-                _ = runtime.setSenseUtilityPressed(action, pressed: pressed)
+                runtime.setFlatSenseUtilityPressed(action, pressed: pressed)
             }
     }
 }
