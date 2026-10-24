@@ -85,6 +85,13 @@ pub(super) struct Snapshot {
 }
 
 impl Snapshot {
+    /// A current original game lens, before any XR projection replacement.
+    /// Custom/unexplained crops and non-native matrices confer no range authority.
+    pub(super) fn native_far_plane(self) -> Option<f32> {
+        (self.is_fresh_game_projection() && self.crop() == self.geometry.crop
+            && (1. ..=20_000.).contains(&self.fields[1])).then_some(self.fields[1])
+    }
+
     fn crop(self) -> [u32; 4] {
         let crop: [f32; 4] = self.fields[2..6].try_into().unwrap();
         crop.map(f32::to_bits)
@@ -164,6 +171,26 @@ mod tests {
     }
     fn eye_fields() -> [f32; 11] {
         [0.1, 999.9341, 1., 1., -0.26794896, -0.08748719, 95.2383, 1.095875, 1.366025, 1.2465153, 1.2465153]
+    }
+
+    #[test]
+    fn original_far_authority_requires_exact_native_lens_and_window_crop() {
+        let original = baseline();
+        assert_eq!(original.native_far_plane(), Some(10_000.));
+        let mut extended = original; extended.fields[1] = 20_000.;
+        extended.projection = guest_projection(extended.fields, false).unwrap();
+        assert_eq!(extended.native_far_plane(), Some(20_000.));
+        for far in [0., f32::INFINITY, 20_001., f32::NAN] {
+            let mut invalid = original; invalid.fields[1] = far;
+            assert!(invalid.native_far_plane().is_none());
+        }
+        let mut changed = original; changed.fields[4] = 0.1;
+        changed.projection = guest_projection(changed.fields, false).unwrap();
+        assert!(changed.native_far_plane().is_none(), "XR/custom crop is not original lens authority");
+        changed = original; changed.projection[0] += 0.01;
+        assert!(changed.native_far_plane().is_none(), "custom matrix is not native lens authority");
+        changed = original; changed.store = 0;
+        assert!(changed.native_far_plane().is_none());
     }
     fn next_camera(mut snapshot: Snapshot, eye: [f32; 11]) -> Snapshot {
         snapshot.fields[2..6].copy_from_slice(&eye[2..6]);

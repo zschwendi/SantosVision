@@ -93,6 +93,8 @@ _Static_assert(sizeof(SVXRAimSnapshot) == 104, "SVXRAimSnapshot ABI layout must 
 int32_t sv_xr_get_aim_snapshot(SVXRAimSnapshot *snapshot, uint32_t byte_size);
 /* 1=current qualified native scope, 0=ordinary, -1=unknown/stale. */
 int32_t sv_xr_native_scope_active(void);
+/* Fresh exact original game-camera far plane in metres, or 0 when unavailable. */
+float sv_xr_native_far_plane_metres(void);
 /* Immutable source optics belonging to one acquired world lease. */
 typedef struct {
     uint32_t abi_version, byte_size;

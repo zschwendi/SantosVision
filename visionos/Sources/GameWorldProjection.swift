@@ -29,7 +29,7 @@ enum GameWorldProjection {
         projection[2][3] = -1
         let near = projection[3][2] / (projection[2][2] + 1)
         let far = projection[3][2] / projection[2][2]
-        guard near.isFinite, far.isFinite, near > 0, far > near, far <= 1002 else { return nil }
+        guard near.isFinite, far.isFinite, near > 0, far > near, far <= GameWorldDepthRange.maximumReconstructedFar else { return nil }
 
         let inverse = original.inverse
         guard (0..<4).allSatisfy({ c in (0..<4).allSatisfy { inverse[c][$0].isFinite } }) else { return nil }

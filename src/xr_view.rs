@@ -391,6 +391,7 @@ struct State {
     projection_clones_already_current: u64,
     projection_clone_failures: u64,
     original_primary_projection_scalars: Option<[f32; 11]>,
+    native_far_plane: Option<(f32, Instant)>,
     last_optics_qualification:Option<&'static str>,
     // A pending semantic crop reconciliation survives UI disable/recenter.
     // Only a CURRENT certified primary callback may consume it; no saved
@@ -459,6 +460,19 @@ fn lock_world_state() -> std::sync::MutexGuard<'static, State> {
     STATE.lock().unwrap_or_else(|poison| poison.into_inner())
 }
 
+fn fresh_native_far_plane(observation: Option<(f32, Instant)>, now: Instant) -> f32 {
+    observation.filter(|(far, at)| far.is_finite() && (1. ..=20_000.).contains(far)
+        && now.checked_duration_since(*at).is_some_and(|age| age <= Duration::from_secs(2)))
+        .map(|(far, _)| far).unwrap_or(0.)
+}
+
+/// Read-only current original lens authority; no guest pointer escapes camera_post.
+/// Zero means unknown/stale, allowing the launcher to retain its bounded fallback.
+#[no_mangle]
+pub extern "C" fn sv_xr_native_far_plane_metres() -> f32 {
+    fresh_native_far_plane(lock_world_state().native_far_plane, Instant::now())
+}
+
 pub fn world_camera_enabled() -> bool { ENABLED.load(Ordering::Acquire) && crate::xr::is_active() }
 
 /// Pure atomic check, safe under the frame publisher's lock. The native C frame
@@ -485,6 +499,7 @@ fn invalidate_state(state: &mut State) {
     state.last_main = None;
     state.last_current = None;
     state.original_primary_projection_scalars = None;
+    state.native_far_plane = None;
     state.unmatched_near_world.clear();
     state.last_emitted = None;
     state.frame_world = None;
@@ -648,9 +663,10 @@ fn projection_scalars(p: &[f32; 16]) -> Option<[f32; 11]> {
     let (near_denominator, far_denominator) = if reverse { (z + 1., z) } else { (z, z + 1.) };
     let near = (p[14] as f64 / near_denominator) as f32;
     let far = (p[14] as f64 / far_denominator) as f32;
-    // Native requests use a finite 1km far plane. Allow its f32 reconstruction
-    // error, while excluding infinite/oblique projections from these shaders.
-    if !near.is_finite() || !far.is_finite() || near <= 0. || far <= near || far > 1002. { return None; }
+    // Qualified native lenses use up to20km. The guest's forward-Z f32 rebuild
+    // rounds p22 near-1 before flipping depth, so reserve a bounded2.56% range
+    // reconstruction envelope. This never widens the whole-clip ray budget.
+    if !near.is_finite() || !far.is_finite() || near <= 0. || far <= near || far > 20_512. { return None; }
     let tan_y = 1. / p[5];
     let tan_x = 1. / p[0];
     let aspect = p[5] / p[0];
@@ -859,11 +875,14 @@ pub fn camera_post(caller: &mut Caller<'_, HostState>, source: u64, _frame: u64)
         }
     }
     if read_u64(mem, ACTIVE_CVIEWPORT) != Some(source) { return Ok(()); }
-    let before_projection = if world_camera_enabled() { primary_projection_snapshot(mem, source, store) } else { None };
+    let native_projection = primary_projection_snapshot(mem, source, store);
+    let native_far = native_projection.and_then(|snapshot| snapshot.native_far_plane());
+    let before_projection = if world_camera_enabled() { native_projection } else { None };
     let optical_authority=if world_camera_enabled(){optical_authority(mem,EPOCH.load(Ordering::Acquire))}else{None};
     let source_optics=optical_authority.and_then(|authority|before_projection.and_then(|before|
         qualified_projection_optics(authority,before))).unwrap_or_default();
     let mut state = lock_world_state();
+    state.native_far_plane = native_far.map(|far| (far, Instant::now()));
     state.last_optics_qualification=Some(if source_optics.scope_sequence!=0 {"qualified same-camera optical FOV"}
         else if optical_authority.is_some() {"native camera FOV and primary projection are not exact"}
         else {"no fresh qualified local scoped camera/metadata"});
@@ -1272,6 +1291,7 @@ pub fn status_json() -> serde_json::Value {
         "restored":state.primary_crop_restores,"dropped":state.primary_crop_dropped,
         "unqualified":state.primary_crop_unqualified,"failures":state.primary_crop_failures});
     status["original_primary_projection_scalars_872_to_912"] = serde_json::json!(state.original_primary_projection_scalars);
+    status["native_original_far_plane_metres"] = serde_json::json!(fresh_native_far_plane(state.native_far_plane, Instant::now()));
     status["last_optics_qualification"]=serde_json::json!(state.last_optics_qualification);
     status["eye_projection_scalars_872_to_912"] = serde_json::json!(state.last_main.and_then(|main|projection_scalars(&main.view.projection_from_eye)));
     status["motion_aim"] = crate::xr_motion_aim::status_json();
@@ -1723,6 +1743,46 @@ mod tests {
         let mut rounded=p;rounded[10]=-1.0000499486923218;rounded[14]=-0.05000250041484833;
         let scalars=projection_scalars(&rounded).unwrap();
         assert!((scalars[0]-0.05).abs()<1e-6 && scalars[1]>1001. && scalars[1]<1002.);
+    }
+
+    #[test]
+    fn native_far_authority_is_fresh_bounded_and_invalidated_with_lifecycle() {
+        let now = Instant::now();
+        assert_eq!(fresh_native_far_plane(Some((10_000., now)), now), 10_000.);
+        assert_eq!(fresh_native_far_plane(Some((20_000., now)), now + Duration::from_secs(2)), 20_000.);
+        assert_eq!(fresh_native_far_plane(Some((10_000., now)), now + Duration::from_millis(2001)), 0.);
+        assert_eq!(fresh_native_far_plane(Some((10_000., now + Duration::from_secs(1))), now), 0.);
+        for far in [f32::NAN, f32::INFINITY, 0., 20_001.] {
+            assert_eq!(fresh_native_far_plane(Some((far, now)), now), 0.);
+        }
+        let mut state = State::default(); state.native_far_plane = Some((10_000., now));
+        invalidate_state(&mut state); assert!(state.native_far_plane.is_none());
+    }
+
+    #[test]
+    fn extended_finite_depth_preserves_actual_scalar_rebuild_and_clone_admission() {
+        for near in [0.05f32, 0.1, 0.15] { for far in [10_000f32, 20_000.] {
+            let mut p = projection();
+            p[10] = near / (far - near); p[14] = near * far / (far - near);
+            p[8] = -0.26810136; p[9] = -0.08746173;
+            for reverse in [false, true] {
+                let primary = for_game_depth(p, reverse);
+                let fields = projection_scalars(&primary).expect("bounded original source range");
+                assert!(fields[1] > far * 0.975 && fields[1] < far * 1.025);
+                let rebuilt = rebuilt_reverse_eye_projection(&primary).expect("actual guest f32 scalar rebuild");
+                assert!(projection_scalars(&rebuilt).is_some());
+                let mut source_view = view(0, 3); source_view.projection_from_eye = primary;
+                source_view.depth_reverse_z = reverse;
+                let saved = SavedViewport { pointer:1000, source:984, view:source_view,
+                    base_camera:identity(), base_projection:primary };
+                let derived = reverse_clone_view(&identity(), &rebuilt, &saved).expect("exact extended clone admission");
+                assert!(derived.depth_reverse_z);
+                let expected = if reverse { primary } else { flip_projection_depth(primary) };
+                assert!(same_matrix_bits(&derived.projection_from_eye, &expected));
+            }
+        } }
+        let mut p = projection(); p[10] = 0.1 / (30_000. - 0.1); p[14] = 3_000. / (30_000. - 0.1);
+        assert!(projection_scalars(&p).is_none());
     }
     #[test]
     fn opaque_reverse_clone_replaces_requested_fov_and_excludes_near_variants_or_other_cameras() {

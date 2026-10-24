@@ -195,6 +195,6 @@ enum GameWorldScopeOptics {
         guard reversed || (z < 0 && w < 0) else { return false }
         let near = w / (reversed ? z + 1 : z)
         let far = w / (reversed ? z : z + 1)
-        return near.isFinite && far.isFinite && near > 0 && far > near && far <= 1002
+        return near.isFinite && far.isFinite && near > 0 && far > near && far <= GameWorldDepthRange.maximumReconstructedFar
     }
 }
