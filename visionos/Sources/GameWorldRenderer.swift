@@ -20,6 +20,12 @@ struct GameWorldConfiguration: CompositorLayerConfiguration {
             configuration.depthFormat = .depth32Float
         }
         configuration.isFoveationEnabled = false
+        let interactionFormats = capabilities.supportedTrackingAreasFormats
+        if interactionFormats.contains(.r16Uint) { configuration.trackingAreasFormat = .r16Uint }
+        else if interactionFormats.contains(.r8Uint) { configuration.trackingAreasFormat = .r8Uint }
+        if configuration.trackingAreasFormat != .invalid {
+            configuration.trackingAreasUsage.formUnion(.renderTarget)
+        }
         if GameWorldDebugCapture.requestedPrefix() != nil {
             configuration.colorUsage.formUnion([.renderTarget, .shaderRead])
             configuration.depthUsage.formUnion([.renderTarget, .shaderRead])
@@ -375,6 +381,7 @@ final class GameWorldRenderer: @unchecked Sendable {
     private let pipeline: any MTLRenderPipelineState
     private let reticle: GameWorldReticle?
     private let hud: GameWorldHUD?
+    private let senseUtilities: GameWorldSenseUtilities?
     /// Optional exact corner-depth precompute (MUGUET_COMPOSITOR_CORNER_PRECOMPUTE=1); nil keeps the
     /// single-pass pipeline above. Off by default.
     private let cornerPrecompute: (kernel: any MTLComputePipelineState, pipeline: any MTLRenderPipelineState,
@@ -428,7 +435,8 @@ final class GameWorldRenderer: @unchecked Sendable {
     private let log = Logger(subsystem: "com.zephyrstudios.santosvision", category: "GameCompositor")
     private let probeLog = Logger(subsystem: "com.zephyrstudios.santosvision", category: "GameCompositorProbe")
 
-    init(layer: LayerRenderer, report: @escaping @Sendable (GameWorldEvent) -> Void) throws {
+    init(layer: LayerRenderer, utilityAtlas: (any MTLTexture)? = nil,
+         report: @escaping @Sendable (GameWorldEvent) -> Void) throws {
         self.layer = layer
         self.report = report
         guard let queue = layer.device.makeCommandQueue(), let library = layer.device.makeDefaultLibrary(),
@@ -465,6 +473,11 @@ final class GameWorldRenderer: @unchecked Sendable {
             && !ProcessInfo.processInfo.arguments.contains("--sv-world-single-source-stereo")
             ? GameWorldHUD(device: layer.device, library: library,
                 colorFormat: layer.configuration.colorFormat, depthFormat: layer.configuration.depthFormat) : nil
+        senseUtilities = !copyRequested && !probeRequested
+            && !ProcessInfo.processInfo.arguments.contains("--sv-world-single-source-stereo")
+            ? utilityAtlas.flatMap { GameWorldSenseUtilities(device: layer.device, library: library, atlas: $0,
+                colorFormat: layer.configuration.colorFormat, depthFormat: layer.configuration.depthFormat,
+                trackingFormat: layer.configuration.trackingAreasFormat) } : nil
         // The probe compares mesh against copy, so it needs the copy pipeline even when the
         // game-facing copy flag is off; with the probe on, no game frame reaches either path.
         sourceCopy = copyRequested || probeRequested
@@ -583,6 +596,8 @@ final class GameWorldRenderer: @unchecked Sendable {
         stopLock.unlock()
         motionTracking.setActive(active)
     }
+
+    func setSenseUtilitiesVisible(_ visible: Bool) { senseUtilities?.setVisible(visible) }
 
     private var isStopped: Bool {
         stopLock.lock()
@@ -861,6 +876,11 @@ final class GameWorldRenderer: @unchecked Sendable {
                 }
             }
             leases += drawableLeases
+            if let senseUtilities {
+                senseUtilities.encode(drawable: drawable, commands: commands, tracked: stageFromHead != nil)
+            } else {
+                GameWorldSenseUtilities.clearTracking(drawable: drawable, commands: commands)
+            }
             drawable.encodePresent(commandBuffer: commands)
         }
         let completedLeases = leases

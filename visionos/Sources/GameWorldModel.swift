@@ -3,6 +3,7 @@ import Combine
 import CompositorServices
 import Foundation
 import OSLog
+import SwiftUI
 
 @MainActor
 final class GameWorldModel: ObservableObject {
@@ -24,6 +25,9 @@ final class GameWorldModel: ObservableObject {
     private var diagnosticRenderingMethod: String?
     private var recordedStatusKeys = Set<String>()
     private weak var runtime: NativeRuntimeModel?
+    private var senseUtilityVisibilityObservation: AnyCancellable?
+    private var senseUtilityLayer: LayerRenderer?
+    private var senseUtilityInteraction = GameWorldSenseUtilityInteraction<SpatialEventCollection.Event.ID>()
     private let log = Logger(subsystem: "com.zephyrstudios.santosvision", category: "GameWorldStatus")
 
     func startRenderer(_ layer: LayerRenderer, runtime: NativeRuntimeModel) {
@@ -42,7 +46,8 @@ final class GameWorldModel: ObservableObject {
         recordState("renderer_constructor_started")
         let token = generation
         do {
-            let renderer = try GameWorldRenderer(layer: layer) { [weak self] event in
+            let atlas = GameWorldSenseUtilities.makeAtlas(device: layer.device)
+            let renderer = try GameWorldRenderer(layer: layer, utilityAtlas: atlas) { [weak self] event in
                 Task { @MainActor [weak self] in
                     guard let self, self.generation == token else { return }
                     switch event {
@@ -81,6 +86,10 @@ final class GameWorldModel: ObservableObject {
                         self.runtime?.recordWorldGpuTiming(timing)
                         return
                     case .ended(let reason):
+                        self.senseUtilityVisibilityObservation = nil
+                        self.senseUtilityLayer?.onSpatialEvent = { _ in }
+                        self.senseUtilityLayer = nil
+                        self.clearSenseUtilityInteraction()
                         self.renderer = nil
                         self.startup = nil
                         self.isImmersiveActive = false
@@ -91,6 +100,19 @@ final class GameWorldModel: ObservableObject {
                 }
             }
             self.renderer = renderer
+            senseUtilityLayer = layer
+            layer.onSpatialEvent = { [weak self] events in
+                guard let self, self.generation == token else { return }
+                self.handleSenseUtilityEvents(events)
+            }
+            renderer.setSenseUtilitiesVisible(runtime.senseGameplayUtilitiesVisible)
+            senseUtilityVisibilityObservation = runtime.$senseGameplayUtilitiesVisible.removeDuplicates().sink { [weak self] visible in
+                Task { @MainActor [weak self] in
+                    guard let self, self.generation == token else { return }
+                    self.renderer?.setSenseUtilitiesVisible(visible)
+                    if !visible { self.clearSenseUtilityInteraction() }
+                }
+            }
             recordState("renderer_constructor_succeeded")
             renderer.setActive(appActive)
             startup = Task {
@@ -118,6 +140,7 @@ final class GameWorldModel: ObservableObject {
         let changed = appActive != active
         appActive = active
         renderer?.setActive(active)
+        if !active { clearSenseUtilityInteraction() }
         if changed { recordState("scene_activity_changed", detail: "active=\(active)") }
         if active, renderer != nil { XRHeadTracking.shared.resume() }
     }
@@ -131,12 +154,58 @@ final class GameWorldModel: ObservableObject {
     func stopRenderer(reason: String = "requested") {
         recordState("renderer_stop_requested", detail: reason)
         generation = UUID()
+        senseUtilityVisibilityObservation = nil
+        senseUtilityLayer?.onSpatialEvent = { _ in }
+        senseUtilityLayer = nil
+        clearSenseUtilityInteraction()
         startup?.cancel()
         startup = nil
         renderer?.stop()
         renderer = nil
         runtime?.endWorldTracking()
         recordState("renderer_detached")
+    }
+
+    private func clearSenseUtilityInteraction() {
+        for action in senseUtilityInteraction.activeActions {
+            _ = runtime?.setSenseUtilityPressed(action, pressed: false)
+        }
+        senseUtilityInteraction.clear()
+        runtime?.setSenseUtilityInteractionActive(false)
+    }
+
+    private func handleSenseUtilityEvents(_ events: SpatialEventCollection) {
+        guard let runtime, runtime.senseGameplayUtilitiesVisible, renderer != nil, appActive else {
+            clearSenseUtilityInteraction()
+            return
+        }
+        for event in events {
+            let previousActions = senseUtilityInteraction.activeActions
+            let action = GameWorldSenseUtilityLayout.action(identifier: event.trackingAreaIdentifier.rawValue)
+            switch event.phase {
+            case .active:
+                senseUtilityInteraction.update(event.id, action: action)
+                runtime.setSenseUtilityInteractionActive(senseUtilityInteraction.isActive)
+            case .ended:
+                if let pressed = senseUtilityInteraction.end(event.id, action: action) {
+                    // The explicit native action bypasses physical ownership;
+                    // release ownership only after queuing the intended action.
+                    _ = runtime.performSenseUtility(pressed)
+                }
+                runtime.setSenseUtilityInteractionActive(senseUtilityInteraction.isActive)
+            case .cancelled:
+                senseUtilityInteraction.cancel(event.id)
+                runtime.setSenseUtilityInteractionActive(senseUtilityInteraction.isActive)
+            @unknown default: break
+            }
+            let currentActions = senseUtilityInteraction.activeActions
+            for action in previousActions.subtracting(currentActions) {
+                _ = runtime.setSenseUtilityPressed(action, pressed: false)
+            }
+            for action in currentActions.subtracting(previousActions) {
+                _ = runtime.setSenseUtilityPressed(action, pressed: true)
+            }
+        }
     }
 
     private func recordState(_ stage: String, detail: String? = nil, appendEvent: Bool = true) {

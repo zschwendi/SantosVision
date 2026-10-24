@@ -1,6 +1,43 @@
 #include <metal_stdlib>
 using namespace metal;
 
+struct GameWorldSenseUtilityUniforms {
+    float4x4 clipFromHead;
+    float2 center;
+    float2 halfSize;
+    float distance;
+    uint atlasIndex;
+    uint trackingValue;
+    uint padding;
+};
+struct GameWorldSenseUtilityVertex { float4 position [[position]]; float2 uv; };
+struct GameWorldSenseUtilityOutput { float4 color [[color(0)]]; uint tracking [[color(1)]]; };
+vertex GameWorldSenseUtilityVertex gameWorldSenseUtilityVertex(uint id [[vertex_id]],
+        constant GameWorldSenseUtilityUniforms &u [[buffer(0)]]) {
+    const float2 corners[4] = {float2(-1,-1),float2(-1,1),float2(1,-1),float2(1,1)};
+    const float2 p = corners[id];
+    GameWorldSenseUtilityVertex out;
+    out.position = u.clipFromHead * float4(u.center + p * u.halfSize, -u.distance, 1);
+    out.uv = float2(p.x * .5 + .5, .5 - p.y * .5);
+    return out;
+}
+fragment GameWorldSenseUtilityOutput gameWorldSenseUtilityFragment(GameWorldSenseUtilityVertex in [[stage_in]],
+        constant GameWorldSenseUtilityUniforms &u [[buffer(0)]], texture2d<float> atlas [[texture(0)]]) {
+    // A rounded square leaves the rest of the world and its depth untouched.
+    const float2 q = abs(in.uv - .5) - .39;
+    const float edge = length(max(q, 0.0)) + min(max(q.x,q.y),0.0) - .10;
+    if (edge > 0) { discard_fragment(); }
+    constexpr sampler s(filter::linear, address::clamp_to_edge);
+    const float2 uv = float2((float(u.atlasIndex) + in.uv.x) / 6.0, in.uv.y);
+    const float4 glyph = atlas.sample(s, uv);
+    const float border = step(-.012, edge);
+    const float3 background = mix(float3(.025,.035,.038),float3(.11,.15,.16),border);
+    GameWorldSenseUtilityOutput out;
+    out.color = float4(glyph.rgb + background * (1-glyph.a), 1);
+    out.tracking = u.trackingValue;
+    return out;
+}
+
 struct GameWorldHUDUniforms {
     float4x4 clipFromHead;
     float2 halfSize;
