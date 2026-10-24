@@ -1,18 +1,24 @@
-# SantosVision icon
+# Los Santos icon
 
-Original neon sunglasses, palm reflections, and **FIVE** lettering, generated
-for this project on 2026-10-12 with the built-in `image_gen` tool. No external
-reference image, game asset, logo file, or font file was supplied. This records
-the asset's provenance; it is not a legal clearance opinion.
+The current catalog selects **santos-five-visor.png**: an original neon Vision
+Pro visor with palm/sunset reflections and FIVE lettering. It was introduced
+in commit `5baebf1` for build 12 and remains selected in signed build 22.
+The current PNG was visually inspected during the October 24 request audit.
 
-The final artwork is
-`Assets.xcassets/AppIcon.solidimagestack/Back.solidimagestacklayer/Content.imageset/santos-five-palms.png`.
-Its SHA-256 is
-`cde5a2a4bd62439c9ae894c6de6685ff703c3140cc038dc0a567f0eda0caa51a`.
-The generated image was reframed by the image tool for circular-mask clearance,
-then resized from 1254 to 1024 pixels with `sips`. The artwork is opaque. The
-required second visionOS layer is a transparent 1024-pixel PNG, created as an
-empty asset; no artificial foreground depth is claimed.
+Current artwork: `Assets.xcassets/AppIcon.solidimagestack/Back.solidimagestacklayer/Content.imageset/santos-five-visor.png`.
+SHA-256: `9f73e55f316442b4b9ac904bdc50fd609a17b401a88ff6f695f305ce08e1218c`.
+
+The built-in image_gen edit used the project's own generated sunglasses icon,
+without loading a game logo, artwork or font file. Its edit prompt was:
+
+> Replace neon sunglasses with a recognizable Apple Vision Pro single curved smoked glass visor, silver rim and pale strap in the same bold painted comic style. Preserve FIVE lettering, neon green palette, palm tree sunset reflections, dark green background and safe outer icon margins. No Apple logo, new text, photorealism or game characters/artwork.
+
+The opaque generated square was resized to 1024×1024 with sips. The earlier
+sunglasses PNG is retained as santos-five-palms.png; it is not the selected
+catalog image. The required second visionOS layer is a transparent PNG.
+Receipt: `target/verification/device-session-20261024/playability12/icon-edit-receipt.json`.
+
+The following prompts document the historical sunglasses source.
 
 ## Generation prompt
 

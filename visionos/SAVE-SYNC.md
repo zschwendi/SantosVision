@@ -72,10 +72,15 @@ The signed app needs its own iCloud Documents container in the Apple Developer
 account, matching `com.apple.developer.icloud-services = CloudDocuments`,
 `com.apple.developer.icloud-container-identifiers`, and
 `com.apple.developer.ubiquity-container-identifiers`. The same container ID
-must be passed to `.live(...)`. The current `visionos/project.yml` has no
-iCloud entitlement and no existing container is inferred from the bundle ID.
-Provisioning and physical Vision Pro testing are integration gates. Do not
-claim cloud transport works from a host-only test.
+must be passed to `.live(...)`. The current `visionos/project.yml` selects `SantosVision.entitlements`, which
+explicitly requests `iCloud.com.zephyrstudios.santosvision`. Signed build 22
+was checked for CloudDocuments and matching iCloud/ubiquity container
+entitlements, and installed in place on the provisioned Vision Pro. Receipt:
+`target/verification/device-session-20261024/first-person22-device/signed-cloud-entitlements.json`.
+That verifies configuration/provisioning, not a story-save cloud round trip.
+The last received play configuration was Sandbox/developer mode ON; use
+Story Mode for actual progress-save acceptance. Do not claim cloud transport
+or overwrite recovery works from a host-only test.
 
 Host verification, without simulator or device:
 

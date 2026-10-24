@@ -25,8 +25,8 @@ The coordinator owns integration and the complete player experience. Parent:
 | Phone arrow pad only appears with phone, as an upright directional ornament; phone button closes phone | **Partial.** User previously accepted window behavior; immersive phone/open-transition failures remain. | Controls/lifecycle regression; preserve the working window path. |
 | Front of app feels concise and deliberate | **Needs revision.** User asks to trim front-end clutter again. | Coordinator after startup/menu crash repair; no replacement wall of diagnostic controls. |
 | Original police-siren/Rockstar startup presentation instead of the current legal-only experience | **Missing asset confirmed.** The engine references platform:/movies/rockstar_logos, but none of the fourteen supplied archives contains the movie. Requires the original intro from the user's own copy; no new Rockstar asset bundled. | Coordinator; use the user's installed game assets, without embedding new proprietary assets in the app. |
-| Reliable iCloud save sync with redundant recovery | **Source exists; full save/restore acceptance remains unverified.** | Inspect existing CloudSaveModel/recovery evidence and test actual save, restore and overwrite recovery. |
-| Vision Pro on the app icon instead of sunglasses | **Still pending.** The shipped custom FIVE sunglasses asset does not satisfy the later icon revision. | Asset follow-up after playability blockers. |
+| Reliable iCloud save sync with redundant recovery | **Configured in signed build 22; story save/restore remains unverified.** CloudDocuments container/entitlements are present. Last received play configuration is Sandbox/developer mode ON; it does not establish a story-save round trip. | Inspect existing CloudSaveModel/recovery evidence and test actual save, restore and overwrite recovery. |
+| Vision Pro on the app icon instead of sunglasses | **Implemented and visually checked.** Asset catalog selects santos-five-visor.png, introduced by 5baebf1 in build 12 and retained in signed build 22. The prior audit entry was stale. | Keep the selected visor asset; APP-ICON.md provenance corrected. |
 
 ## Behavior explicitly worth preserving
 
@@ -36,9 +36,11 @@ The coordinator owns integration and the complete player experience. Parent:
   launcher hides and duplicate windows are constrained.
 - DualSense touchpad camera cycling was explicitly confirmed working earlier.
 - The working windowed phone controls must survive utility cleanup.
-- Los Santos naming, normal sound, 75 percent look sensitivity and the developer
-  mode control already have source implementations. Verify their current saved
-  state when touching startup; do not assume they solve any blocker above.
+- Last received device configuration (build 21, 08:16:09Z): master volume
+  100 percent, look sensitivity 75 percent, developer mode ON / Sandbox,
+  Clarity 2560×1440 and a 60 FPS cap. Build 22 preserves those saved choices.
+  Turn developer mode off before Play for an actual story-save test; the
+  developer toggle exists near the bottom of Settings.
 
 ## Completion rule
 
