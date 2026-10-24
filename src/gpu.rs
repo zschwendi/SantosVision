@@ -4037,9 +4037,12 @@ impl Gpu {
     }
     fn clear_ds(&mut self, id: u32, mip: u32, slice: u32, flags: u32, depth: f32, stencil: u32) {
         let Some((fmt, three)) = self.tex(id).map(|t| (t.format, t.desc.dim == TextureDimension::D3)) else { return };
-        self.mark_depth_dirty(id);
         let d = (flags & 1 != 0).then(|| depth.clamp(0.0, 1.0));
         if d.is_some() && mip == 0 && slice == 0 { self.invalidate_world_depth_inner(id, serde_json::json!("clear_ds"), WorldDepthChange::LiveClear); }
+        // After the invalidation: closing a foreground overlay regenerates the
+        // proxy for its post-write snapshot, and this pending clear must not
+        // inherit that clean flag.
+        self.mark_depth_dirty(id);
         let st = (flags & 2 != 0 && has_stencil(fmt)).then_some(stencil);
         if d.is_none() && st.is_none() { return; }
         if three { self.materialize_clears(id); self.clear_ds_now(id, mip, slice, d, st); return; }
@@ -4085,6 +4088,8 @@ impl Gpu {
             }),
             timestamp_writes: None, occlusion_query_set: None, multiview_mask: None,
         });
+        // The invalidation above can have refreshed the proxy before this clear.
+        self.mark_depth_dirty(id);
     }
     fn clear_uav(&mut self, id: u32, values: [u32; 4]) {
         let Some((res, is_buf, a)) = self.view_obj(id).map(|v| (v.res, v.is_buf, v.a)) else { return };
@@ -4667,6 +4672,16 @@ impl Gpu {
         // rule would have, so FP colour never pairs world-only depth there.
         let fp_sessions = std::mem::take(&mut self.fp_sessions);
         let mut fp_images = std::mem::take(&mut self.fp_images);
+        // A colour-only opaque first-person draw has no qualified depth
+        // coverage, even when no overlay opened or earlier writes combined
+        // directly into live world depth. Reject the whole present rather than
+        // returning those pixels with background depth.
+        if let Some(reason) = fp_sessions.poisoned {
+            self.foreground_recycle(fp_images);
+            fg::note_withdrawal(reason);
+            crate::world_frame::reject(format!("first-person opaque colour has no qualified depth coverage: {reason}"));
+            return;
+        }
         for overlay in fp_sessions.overlays.iter().filter(|overlay| overlay.draws > 0) {
             if let Err(reason) = fp_sessions.publishable(overlay.target) {
                 if saved.remove(&overlay.target).is_some() { fg::note_withdrawal(reason); }
@@ -4892,6 +4907,11 @@ impl Gpu {
     /// Before the draw is encoded. True only when an attributed first-person
     /// depth write is accounted for here and bypasses the generic rule.
     fn foreground_pre_draw(&mut self, vs: &Program, ps: Option<&Program>) -> bool {
+        // set_active resets last_foreground without an ending ring marker; a mark
+        // consumed before that reset must not attribute later-epoch commands.
+        if self.foreground.is_some_and(|mark| !crate::xr_view::view_epoch_is_active(mark.view.provenance_epoch)) {
+            self.foreground_set(None);
+        }
         if self.foreground.is_none() && self.fp_sessions.is_empty() && !self.foreground_capture_live() { return false; }
         let ds = self.s.ds.clone();
         let may_write = ds.tex != 0 && ds.flags & 1 == 0 && self.state(self.s.dss.0).is_some_and(|state|
@@ -4905,7 +4925,15 @@ impl Gpu {
         // Attribution alone (capture) keeps every existing rule unchanged.
         if !fg::merge_requested() { return false; }
         fg::gpu_status().foreground_draws += 1;
-        if !may_write { return false; }
+        if !may_write {
+            // Opaque first-person colour without a depth write keeps the frozen
+            // world depth under it in any merge: never merge this present.
+            if self.foreground_opaque_colour(ps) {
+                self.fp_sessions.poison("foreground_opaque_colour_without_depth_write");
+                fg::note_generic("foreground_opaque_colour_without_depth_write");
+            }
+            return false;
+        }
         fg::gpu_status().foreground_depth_draws += 1;
         if let Err(reason) = self.foreground_draw_qualifies(&mark, ps) { return self.foreground_generic(ds.tex, reason); }
         // A clear issued before this draw belongs to the image before it.
@@ -4928,6 +4956,16 @@ impl Gpu {
             }
             fg::logic::Decision::Generic(reason) => { fg::note_generic(reason); false }
         }
+    }
+
+    /// Unblended colour written to a bound target by this pixel shader.
+    fn foreground_opaque_colour(&self, ps: Option<&Program>) -> bool {
+        let Some(program) = ps else { return false; };
+        let blend = self.state(self.s.blend.0);
+        self.s.rt.iter().enumerate().any(|(slot, rt)| rt.tex != 0 && program.info.outputs.contains(&(slot as u32)) && {
+            let (state, write) = blend_for(blend.as_deref(), slot);
+            state.is_none() && !write.is_empty()
+        })
     }
 
     fn foreground_generic(&mut self, target: u32, reason: &'static str) -> bool {

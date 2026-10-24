@@ -51,7 +51,8 @@ basis, projection and projection state are the parent's, bit for bit.
   call. A binding opened inside a call that exits without its restoration
   (normal return, error, LongJmp, trap, panic) is revoked when `call` returns,
   before any stack_restore/setThrew recovery. Mailbox calls and their
-  descendants suspend attribution; they neither carry nor revoke it.
+  descendants suspend attribution. A SetCurrent inside mailbox work can revoke
+  it conservatively; rebinding still requires the complete native certificate.
 - Each tagged Emit records an immutable `ForegroundMark { generation, family,
   view }` keyed by the exact ring command address, only on change, next to
   the existing view markers. Reset converts pending marks to "ended" in place.
@@ -98,6 +99,16 @@ Snapshots use the existing exact depth proxy (`textureLoad` to R32Float). The
 merge is a fullscreen pass with an explicit unfilterable layout. Its WGSL
 validates with the naga that wgpu uses, and `merge_reference` is its CPU
 reference. Bracketing images are pooled; reuse is ordered on the one queue.
+
+Independent review found three additional cases, repaired before candidate 23:
+depth clears must dirty their cached proxy after an overlay-closing snapshot;
+epoch-inactive GPU marks must expire before a capture can trigger; and an
+attributed opaque colour draw without a depth write poisons the entire present.
+The last case refuses publication even if no overlay opened or earlier writes
+combined directly into live world depth. It does not assume that an earlier
+prepass covered the colour. Supporting such a prepass needs actual evidence.
+Depth-only and translucent passes still require the physical capture below;
+the merge remains default off.
 
 ## Bounded capture to settle the actual render order
 

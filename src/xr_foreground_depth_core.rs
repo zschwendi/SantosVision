@@ -223,12 +223,23 @@ pub struct Sessions {
     pub combined_draws: u64,
     pub generic_draws: u64,
     pub last_generic: Option<&'static str>,
+    /// Sticky for the present: no overlay may open or publish after this.
+    pub poisoned: Option<&'static str>,
 }
 
 impl Sessions {
     pub fn is_empty(&self) -> bool { self.overlays.is_empty() }
     fn find(&mut self, target: u32) -> Option<&mut Overlay> { self.overlays.iter_mut().find(|overlay| overlay.target == target) }
     pub fn overlay(&self, target: u32) -> Option<Overlay> { self.overlays.iter().find(|overlay| overlay.target == target).copied() }
+
+    /// An attributed draw left first-person colour without depth: every overlay
+    /// of this present is rejected and none may open later.
+    pub fn poison(&mut self, reason: &'static str) {
+        if self.poisoned.is_none() { self.poisoned = Some(reason); }
+        for overlay in &mut self.overlays {
+            if !matches!(overlay.phase, Phase::Rejected(_)) { overlay.phase = Phase::Rejected(reason); }
+        }
+    }
 
     pub fn reject(&mut self, target: u32, reason: &'static str) {
         if let Some(overlay) = self.find(target) {
@@ -244,6 +255,7 @@ impl Sessions {
     }
 
     pub fn foreground_depth_draw(&mut self, target: u32, identity: u64, relation: Relation, generation: u64, family: u32) -> Decision {
+        if let Some(reason) = self.poisoned { return self.generic(target, reason); }
         match relation {
             Relation::LiveSame => {
                 // A qualified world write after a foreground overlay was a
@@ -298,6 +310,7 @@ impl Sessions {
     /// rejected it. `Open` means the caller snapshots the post image now.
     pub fn publishable(&self, target: u32) -> Result<Overlay, &'static str> {
         let overlay = self.overlays.iter().find(|overlay| overlay.target == target).ok_or("no_foreground_overlay")?;
+        if let Some(reason) = self.poisoned { return Err(reason); }
         match overlay.phase {
             Phase::Open | Phase::Closed if overlay.draws > 0 => Ok(*overlay),
             Phase::Open | Phase::Closed => Err("overlay_without_foreground_write"),
@@ -559,6 +572,24 @@ mod tests {
         s.foreground_depth_draw(9, 1, Relation::FrozenSame, 5, STREAM_PED);
         assert!(!s.foreign_write(9));
         assert_eq!(s.publishable(9), Err("foreign_writer_during_pre_snapshot"));
+    }
+
+    #[test]
+    fn opaque_colour_without_depth_poisons_every_overlay_of_the_present() {
+        const R: &str = "foreground_opaque_colour_without_depth_write";
+        let mut s = Sessions::default();
+        assert_eq!(s.foreground_depth_draw(9, 1, Relation::FrozenSame, 5, STREAM_PED), Decision::OpenOverlay);
+        s.opened(9);
+        s.poison(R);
+        assert_eq!(s.publishable(9), Err(R));
+        assert_eq!(s.foreground_depth_draw(9, 1, Relation::FrozenSame, 5, STREAM_PED), Decision::Generic(R));
+        // Poison before any overlay also excludes live combining: the opaque
+        // colour has no proven depth coverage anywhere in this present.
+        let mut s = Sessions::default();
+        s.poison(R);
+        assert_eq!(s.foreground_depth_draw(10, 1, Relation::FrozenSame, 5, SKINNED), Decision::Generic(R));
+        assert_eq!(s.foreground_depth_draw(11, 1, Relation::LiveSame, 5, SKINNED), Decision::Generic(R));
+        assert!(s.overlays.is_empty());
     }
 
     /// Reverse-Z raster simulation of the frozen-world overlay: GTA clears depth

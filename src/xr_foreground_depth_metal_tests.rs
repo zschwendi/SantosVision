@@ -137,3 +137,49 @@ fn metal_foreground_pool_reuse_cannot_change_an_already_encoded_merge() {
     assert_eq!(read(&mut g, &second), expected(&world, &second_before, &second_after));
     assert_eq!(g.errors.load(Ordering::Relaxed), 0);
 }
+
+#[test]
+fn metal_foreground_clear_refreshes_proxy_after_snapshot_closes_overlay() {
+    let mut g = gpu();
+    g.create_texture(1, 2, 8, 8, 1, 1, 1, 40, BIND_DS | BIND_SRV, 1);
+    g.clear_ds(1, 0, 0, 1, 0.6, 0);
+    g.materialize_clears(1);
+    let (proxy, _) = g.depth_proxy(1, false).unwrap();
+    assert_eq!(read(&mut g, &proxy), vec![0.6f32.to_bits(); 64]);
+    let target = g.tex(1).unwrap().tex.clone();
+    let before = image(&g, 8, 8, &vec![1.0; 64]);
+    g.fp_sessions = sessions();
+    g.fp_sessions.overlays[0].phase = fg::logic::Phase::Open;
+    g.fp_images.insert(1, ForegroundImages { target, before, after: None });
+    // Closing the overlay snapshots 0.6 through depth_proxy. That cached image
+    // must become dirty again before later shader reads of the new clear.
+    g.clear_ds(1, 0, 0, 1, 0.0, 0);
+    g.materialize_clears(1);
+    let after = g.fp_images.get(&1).unwrap().after.as_ref().unwrap().clone();
+    assert_eq!(read(&mut g, &after), vec![0.6f32.to_bits(); 64]);
+    let (cleared, _) = g.depth_proxy(1, false).unwrap();
+    assert_eq!(read(&mut g, &cleared), vec![0.0f32.to_bits(); 64]);
+    assert_eq!(g.errors.load(Ordering::Relaxed), 0);
+}
+
+#[test]
+fn metal_foreground_colour_without_depth_refuses_publication_without_an_overlay() {
+    let mut g = gpu();
+    const REASON: &str = "foreground_opaque_colour_without_depth_write";
+    for live_first in [false, true] {
+        g.fp_sessions = Default::default();
+        if live_first {
+            assert_eq!(g.fp_sessions.foreground_depth_draw(1, 1,
+                fg::logic::Relation::LiveSame, 1, fg::logic::STREAM_PED), fg::logic::Decision::Combined);
+        }
+        g.fp_sessions.poison(REASON);
+        assert!(g.fp_sessions.overlays.is_empty());
+        let before = crate::world_frame::status_json()["dropped"].as_u64().unwrap();
+        g.publish_world_frame(0);
+        let after = crate::world_frame::status_json();
+        assert_eq!(after["dropped"].as_u64(), Some(before + 1));
+        assert!(after["error"].as_str().unwrap().contains(REASON));
+        assert!(g.fp_sessions.poisoned.is_none(), "poison is consumed per present");
+    }
+    assert_eq!(g.errors.load(Ordering::Relaxed), 0);
+}
