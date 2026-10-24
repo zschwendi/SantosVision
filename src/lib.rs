@@ -25,6 +25,9 @@ pub mod world_ui;
 pub mod world_command_trace;
 pub mod xr;
 pub mod xr_aim;
+pub mod xr_motion_aim;
+#[cfg(feature = "jit")]
+pub mod xr_motion_patch;
 pub mod xr_foreground;
 #[cfg(feature = "jit")]
 pub mod xr_foreground_scope;
@@ -71,10 +74,11 @@ pub struct Runtime {
 pub struct HostState {
     pub pthread: u64,
     guest_calls: guest_call_scope::StoreLifetime,
+    motion_aim: xr_motion_aim::StoreState,
 }
 impl HostState {
     pub fn new(pthread: u64) -> Self {
-        Self { pthread, guest_calls: guest_call_scope::StoreLifetime::new() }
+        Self { pthread, guest_calls: guest_call_scope::StoreLifetime::new(), motion_aim: xr_motion_aim::StoreState::default() }
     }
 }
 
@@ -151,6 +155,27 @@ pub fn desktop_main() -> Result<()> {
         let m = compile_patched(&engine, std::path::Path::new(wasm))?;
         std::fs::write(out, m.serialize()?)?;
         eprintln!("[host] precompiled {wasm} -> {out}");
+        return Ok(());
+    }
+    #[cfg(feature = "jit")]
+    if argv.get(1).map(String::as_str) == Some("--precompile-visionos-motion") {
+        let wasm=argv.get(2).context("--precompile-visionos-motion <original.wasm> <separate.cwasm>")?;
+        let out=argv.get(3).context("--precompile-visionos-motion <original.wasm> <separate.cwasm>")?;
+        anyhow::ensure!(!std::path::Path::new(out).exists(),"motion diagnostic output must be a new file");
+        let artifact=xr_motion_patch::generate(&std::fs::read(wasm)?,mp::COMMANDS)?;
+        let mut config=engine_config_for(true);config.target("aarch64-apple-visionos").map_err(anyhow::Error::from)?;
+        unsafe{config.cranelift_flag_enable("has_lse")};
+        let engine=Engine::new(&config).map_err(anyhow::Error::from)?;
+        let code=engine.precompile_module(&artifact.wasm).map_err(anyhow::Error::from)?;
+        let mut manifest=artifact.manifest;
+        manifest["aot_sha256"]=xr_motion_patch::sha256(&code)?.into();
+        manifest["patched_wasm_sha256"]=xr_motion_patch::sha256(&artifact.wasm)?.into();
+        manifest["host_build_requirement"]="MUGUET_MOTION_AOT_SHA256 must equal aot_sha256".into();
+        use std::io::Write;
+        std::fs::OpenOptions::new().write(true).create_new(true).open(out)?.write_all(&code)?;
+        std::fs::OpenOptions::new().write(true).create_new(true).open(format!("{out}.motion.json"))?
+            .write_all(&serde_json::to_vec_pretty(&manifest)?)?;
+        eprintln!("[host] separate motion diagnostic AOT written to {out}; normal game AOT unchanged");
         return Ok(());
     }
     #[cfg(feature = "jit")]
@@ -288,6 +313,7 @@ pub(crate) fn load_module(engine: &Engine, _startup: &config::Startup) -> Result
     }
     let (start, end) = (&raw const START, &raw const END);
     let code = std::ptr::slice_from_raw_parts(start, end as usize - start as usize);
+    crate::xr_motion_aim::qualify_embedded_aot(unsafe { &*code })?;
     unsafe { Module::deserialize_raw(engine, std::ptr::NonNull::new(code as *mut [u8]).unwrap()) }
         .map_err(anyhow::Error::from)
         .context("embedded game code")

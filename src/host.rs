@@ -106,6 +106,14 @@ pub fn call(mut caller: Caller<'_, HostState>, idx: usize, params: &[Val], resul
         *r = default_val(&t);
     }
 
+    // Private-frame hooks run exactly at a native read/join. Delivering a
+    // mailbox BEFORE them could reenter the engine between pointer selection
+    // and its use. They perform no guest calls; normal imports keep the existing
+    // mailbox scheduling policy. Unqualified diagnostic imports fail closed.
+    if rt.imports[idx].module == crate::xr_motion_aim::IMPORT_MODULE {
+        return crate::xr_motion_aim::host_hook(&mut caller,name,params,results,mem);
+    }
+
     // Preserve normal runtime scheduling until a safe polling/liveness boundary
     // is certified for every producer. The true policy is test-only groundwork.
     deliver_pending_mailbox::<false>(&mut caller, name, mem)?;

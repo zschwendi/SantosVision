@@ -52,7 +52,13 @@ fn observing() -> bool {
 pub(crate) fn call<S, T, E>(store: &mut S, kind: Kind,
     invoke: impl FnOnce(&mut S) -> Result<T, E>) -> Result<T, E>
 where S: AsContextMut<Data = HostState> {
-    if !observing() { return invoke(store); }
+    if !observing() {
+        if !crate::xr_motion_aim::diagnostic_enabled() { return invoke(store); }
+        let prefix=store.as_context().data().motion_aim.boundary_prefix();
+        let result=invoke(store);
+        if result.is_err() { store.as_context_mut().data_mut().motion_aim.recover_boundary(&prefix); }
+        return result;
+    }
     let before = ledger::Execution::capture(store.as_context().data());
     let guard = ledger::Guard::enter(before, kind);
     // No TLS RefCell borrow or lock is held while invoking/reentering Wasmtime.

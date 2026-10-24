@@ -107,6 +107,10 @@ fn sha256(bytes: &[u8]) -> [u8; 32] {
 }
 
 fn verify_embedded_abi() -> bool {
+    // A separate motion host can accept only the exact AOT hash pinned and
+    // verified during load_module. Its generator preserves these source fields;
+    // arbitrary new AOTs still cannot borrow the original layout certificate.
+    if crate::xr_motion_aim::diagnostic_enabled() { return true; }
     #[cfg(all(target_os = "visionos", not(feature = "jit"), game_code))]
     {
         extern "C" {

@@ -372,6 +372,7 @@ pub fn set_active(_active: bool) {
     let mut state = lock_world_state();
     invalidate_state(&mut state);
     LAST_EMITTED_TOKEN.store(0, Ordering::Release);
+    crate::xr_motion_aim::invalidate_camera();
 }
 
 fn invalidate_state(state: &mut State) {
@@ -773,6 +774,7 @@ pub fn camera_post(caller: &mut Caller<'_, HostState>, source: u64, _frame: u64)
         }
     }
     let saved = SavedViewport { pointer: viewport, source, view, base_camera: camera, base_projection: projection };
+    crate::xr_motion_aim::capture_camera(view,camera);
     let mut state = lock_world_state();
     if provenance_epoch != EPOCH.load(Ordering::Acquire) { return Ok(()); }
     state.last_main = Some(saved);
@@ -1096,6 +1098,7 @@ pub fn status_json() -> serde_json::Value {
         "unqualified":state.primary_crop_unqualified,"failures":state.primary_crop_failures});
     status["original_primary_projection_scalars_872_to_912"] = serde_json::json!(state.original_primary_projection_scalars);
     status["eye_projection_scalars_872_to_912"] = serde_json::json!(state.last_main.and_then(|main|projection_scalars(&main.view.projection_from_eye)));
+    status["motion_aim"] = crate::xr_motion_aim::status_json();
     status
 }
 

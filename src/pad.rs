@@ -42,6 +42,7 @@ pub(crate) fn exact_guest_abi_verified() -> bool {
 pub(crate) fn verified_guest_gameplay_context() -> bool {
     guest_context::read().is_some_and(|context| !context.paused)
 }
+pub(crate) fn spatial_controls_selected()->bool {INPUT_PROFILE.load(Ordering::Relaxed)==2}
 
 /// Cumulative sampling/mapping counters, independent of engine block readiness.
 /// Compare with input::status_json delivery counters to locate a broken path.
@@ -58,7 +59,7 @@ pub(crate) fn status_json() -> serde_json::Value {
         "input_profile": match INPUT_PROFILE.load(Ordering::Relaxed) { 1 => "extended_gamepad", 2 => "spatial_gamepad_buttons_v1", _ => "none" },
         "spatial_left_controls_available": SPATIAL_HANDS.load(Ordering::Relaxed) & 1 != 0,
         "spatial_right_controls_available": SPATIAL_HANDS.load(Ordering::Relaxed) & 2 != 0,
-        "motion_aim_enabled": false,
+        "motion_aim_diagnostic_enabled": crate::xr_motion_aim::diagnostic_enabled(),
         "menu_navigation_inferred": MENU_NAVIGATION.load(Ordering::Relaxed),
         "menu_navigation": MENU_NAVIGATION.load(Ordering::Relaxed),
         "menu_context_source": if GUEST_CONTEXT_AVAILABLE.load(Ordering::Relaxed) { "verified_guest_pause_state" } else { "escape_fallback" },
@@ -344,7 +345,8 @@ fn poll_sample(gp: Option<Sample>) -> bool {
         } else {
             if ly > STICK_DEADZONE { keys.insert("KeyW"); }
             if ly < -STICK_DEADZONE { keys.insert("KeyS"); }
-            if gp.right_trigger > 0.2 { buttons |= 1; }
+            let right_trigger=if gp.spatial.is_some() {crate::xr_motion_aim::filter_spatial_trigger(gp.right_trigger)}else{gp.right_trigger};
+            if right_trigger > 0.2 { buttons |= 1; }
             if gp.left_trigger > 0.2 { buttons |= 2; }
             if pressed(RIGHT_SHOULDER) { keys.insert("KeyQ"); }
             if gp.left_click { keys.insert("ControlLeft"); }
