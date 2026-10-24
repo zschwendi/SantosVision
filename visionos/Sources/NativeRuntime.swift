@@ -94,16 +94,21 @@ private enum NativeRuntime {
 // BEGIN NativeSenseUtilityOwnership (standalone validation uses this actual block)
 struct NativeSenseUtilityOwnership {
     private(set) var flatActions = Set<SantosSenseUtilityAction>()
+    private(set) var flatInteractions = Set<SantosSenseUtilityAction>()
     private(set) var immersiveDirections = Set<SantosSenseUtilityAction>()
     private(set) var immersiveActive = false
     var directions: Set<SantosSenseUtilityAction> {
         immersiveDirections.union(flatActions.filter(\.isDirection))
     }
-    var interactionActive: Bool { immersiveActive || !immersiveDirections.isEmpty || !flatActions.isEmpty }
+    var interactionActive: Bool { immersiveActive || !immersiveDirections.isEmpty || !flatActions.isEmpty || !flatInteractions.isEmpty }
     mutating func setFlat(_ action: SantosSenseUtilityAction, pressed: Bool) {
         if pressed { flatActions.insert(action) } else { flatActions.remove(action) }
     }
-    mutating func clearFlat() { flatActions.removeAll() }
+    mutating func setFlatInteraction(_ action: SantosSenseUtilityAction, pressed: Bool) {
+        if pressed { flatInteractions.insert(action) } else { flatInteractions.remove(action) }
+    }
+    mutating func clearFlatPhoneInteractions() { flatInteractions = flatInteractions.filter { !$0.isDirection } }
+    mutating func clearFlat() { flatActions.removeAll(); flatInteractions.removeAll() }
     mutating func setImmersiveDirection(_ action: SantosSenseUtilityAction, pressed: Bool) {
         guard action.isDirection else { return }
         if pressed { immersiveDirections.insert(action) } else { immersiveDirections.remove(action) }
@@ -113,7 +118,7 @@ struct NativeSenseUtilityOwnership {
         if !active { immersiveDirections.removeAll() }
     }
     mutating func clear() {
-        flatActions.removeAll(); immersiveDirections.removeAll(); immersiveActive = false
+        flatActions.removeAll(); flatInteractions.removeAll(); immersiveDirections.removeAll(); immersiveActive = false
     }
 }
 // END NativeSenseUtilityOwnership
@@ -141,6 +146,8 @@ final class NativeRuntimeModel: ObservableObject {
     @Published var nativeSettingsPresented = false { didSet { updateNativeControlsOwnership() } }
     @Published private(set) var nativeControlsSelection = 0
     @Published private(set) var senseGameplayUtilitiesVisible = false
+    @Published private(set) var sensePhoneNavigationVisible = false
+    private var sensePhoneInstantiated = false
     @Published private(set) var nativeControlsStatus = ""
     private var fastMenuPolling: Task<Void, Never>?
     private var nativeMenuPressObserver = NativeMenuPressObserver()
@@ -559,6 +566,21 @@ final class NativeRuntimeModel: ObservableObject {
         if owned != senseUtilityInteractionActive { updateNativeControlsOwnership() }
     }
 
+    /// A native arrow is a Peel-style one-shot key press, while its touch
+    /// lifecycle still owns controller input. It must never create a held key.
+    func setFlatSenseUtilityInteractionPressed(_ action: SantosSenseUtilityAction, pressed: Bool) {
+        if pressed, !senseGameplayUtilitiesVisible || (action.isDirection && !sensePhoneNavigationVisible) { return }
+        let owned = senseUtilityInteractionActive
+        senseUtilityOwnership.setFlatInteraction(action, pressed: pressed)
+        if owned != senseUtilityInteractionActive { updateNativeControlsOwnership() }
+    }
+
+    func clearFlatSensePhoneInteractions() {
+        let owned = senseUtilityInteractionActive
+        senseUtilityOwnership.clearFlatPhoneInteractions()
+        if owned != senseUtilityInteractionActive { updateNativeControlsOwnership() }
+    }
+
     /// Called only by the flat system control's primary-action event. Counts
     /// distinguish UIKit delivery from a native queue/lifecycle rejection.
     func activateFlatSenseUtility(_ action: SantosSenseUtilityAction) {
@@ -614,11 +636,13 @@ final class NativeRuntimeModel: ObservableObject {
     @discardableResult
     func performSenseUtility(_ action: SantosSenseUtilityAction) -> Bool {
         guard senseGameplayUtilitiesVisible else { return false }
+        guard !action.isDirection || sensePhoneNavigationVisible else { return false }
         if action.isDirection, heldSenseUtilityDirections.contains(action)
             || ProcessInfo.processInfo.systemUptime - (releasedSenseUtilityDirections[action] ?? -.infinity) < 0.2 {
             return true // Button release must not append a second tap after its hold.
         }
-        return sendMenuAction(action.rawValue) // Also supports accessibility-only activation.
+        let command: UInt32 = action == .phone && sensePhoneNavigationVisible ? 12 : action.rawValue
+        return sendMenuAction(command) // Phone toggles with the original Backspace action.
     }
 
     private func updateSenseUtilitiesVisibility() {
@@ -627,7 +651,9 @@ final class NativeRuntimeModel: ObservableObject {
             || spatial["right_controls_available"] as? Bool == true
         senseGameplayUtilitiesVisible = connected && hasStarted && !engineFailed && !isQuitting
             && !gameControlsVisible && !nativeSettingsPresented && isActive
+        sensePhoneNavigationVisible = senseGameplayUtilitiesVisible && sensePhoneInstantiated
         if !senseGameplayUtilitiesVisible { clearSenseUtilityDirections() }
+        else if !sensePhoneNavigationVisible { clearFlatSensePhoneInteractions() }
     }
 
     func setWindowAttached(_ attached: Bool) {
@@ -894,6 +920,9 @@ final class NativeRuntimeModel: ObservableObject {
         }
         let nativeStatus = lastStatus?.payload.data(using: .utf8)
             .flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }
+        // Native certifies the supported original game's phone instance state.
+        // Missing/unknown guest context deliberately keeps the popup hidden.
+        sensePhoneInstantiated = (nativeStatus?["controller"] as? [String: Any])?["phone_instantiated"] as? Bool == true
         let controllers = GCController.controllers().filter { $0.extendedGamepad != nil }
         let controllerNames = controllers.map { $0.vendorName ?? "Game controller" }
         updateSenseUtilitiesVisibility()
@@ -919,6 +948,7 @@ final class NativeRuntimeModel: ObservableObject {
             "native_controls_input_policy_v2": NativeControlsOwnership.shared.readPolicy(),
             "native_controls_selection": nativeControlsSelection,
             "sense_gameplay_utilities_visible": senseGameplayUtilitiesVisible,
+            "sense_phone_navigation_visible": sensePhoneNavigationVisible,
             "flat_sense_utility_ui": [
                 "primary_action_events": flatSenseUtilityPrimaryActions,
                 "queued_actions": flatSenseUtilityQueuedActions,

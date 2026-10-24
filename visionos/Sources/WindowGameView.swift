@@ -452,16 +452,61 @@ struct SantosPauseControls: View {
 struct SenseGameplayUtilities: View {
     @ObservedObject var runtime: NativeRuntimeModel
     var body: some View {
-        HStack(spacing: 6) {
-            ForEach([SantosSenseUtilityAction.phone, .changeView]) { action in
-                SenseUtilityControl(runtime: runtime, action: action)
-                    .frame(width: 108, height: 48)
+        HStack(alignment: .bottom, spacing: 10) {
+            mainButton(.phone)
+            if runtime.sensePhoneNavigationVisible {
+                SensePhoneArrowOrnament(runtime: runtime)
+                    .padding()
             }
+            mainButton(.changeView)
         }
         .padding(8)
-        .glassBackgroundEffect(in: RoundedRectangle(cornerRadius: 18))
         .handlesGameControllerEvents(matching: .gamepad, withOptions: .receivesEventsInView(true))
         .onDisappear { runtime.clearFlatSenseUtilityPressed() }
+    }
+
+    private func mainButton(_ action: SantosSenseUtilityAction) -> some View {
+        SenseUtilityControl(runtime: runtime, action: action)
+            .frame(width: 108, height: 48)
+            .glassBackgroundEffect(in: Capsule())
+            .overlay(alignment: .topTrailing) {
+                if action == .phone, runtime.sensePhoneNavigationVisible {
+                    Image(systemName: "xmark.circle.fill")
+                        .font(.system(size: 16, weight: .semibold))
+                        .symbolRenderingMode(.palette)
+                        .foregroundStyle(.white, .black)
+                        .allowsHitTesting(false)
+                        .accessibilityHidden(true)
+                }
+            }
+    }
+}
+
+/// Exact layout/metrics from current PeelApple Shared/Client's
+/// KeyboardArrowKeysOverlay + KeyboardMacroKeysOverlay: 164 x 78 points,
+/// blank/Left, Up/Down, blank/Right, with individual glass keys.
+private struct SensePhoneArrowOrnament: View {
+    let runtime: NativeRuntimeModel
+    private let spacing: CGFloat = 10
+    var body: some View {
+        HStack(spacing: spacing) {
+            VStack(spacing: spacing) { placeholder; arrow(.left) }
+            VStack(spacing: spacing) { arrow(.up); arrow(.down) }
+            VStack(spacing: spacing) { placeholder; arrow(.right) }
+        }
+        .onDisappear { runtime.clearFlatSensePhoneInteractions() }
+    }
+    private var placeholder: some View {
+        Color.clear.frame(width: 48, height: 34)
+            .allowsHitTesting(false).accessibilityHidden(true)
+    }
+    private func arrow(_ action: SantosSenseUtilityAction) -> some View {
+        let shape = RoundedRectangle(cornerRadius: 14, style: .continuous)
+        return SenseUtilityControl(runtime: runtime, action: action)
+            .frame(width: 48, height: 34)
+            .contentShape(shape)
+            .clipShape(shape)
+            .glassBackgroundEffect(in: shape)
     }
 }
 
@@ -476,15 +521,8 @@ private struct SenseUtilityControl: UIViewRepresentable {
     func makeCoordinator() -> Coordinator { Coordinator(runtime: runtime, action: action) }
 
     func makeUIView(context: Context) -> UIButton {
-        var configuration = UIButton.Configuration.tinted()
-        configuration.title = action == .changeView ? "View" : action.title
-        configuration.image = UIImage(systemName: action.symbol)
-        configuration.imagePadding = 8
-        configuration.cornerStyle = .capsule
-        configuration.baseForegroundColor = .white
-        configuration.baseBackgroundColor = UIColor(red: 0.62, green: 0.43, blue: 1, alpha: 1)
         let button = UIButton(configuration: configuration)
-        button.accessibilityLabel = action.title
+        updateAccessibility(button)
         button.accessibilityHint = "Look at this button and press either Sense trigger, or pinch."
         button.isPointerInteractionEnabled = true
         let controllerEvents = GCEventInteraction()
@@ -500,6 +538,29 @@ private struct SenseUtilityControl: UIViewRepresentable {
 
     func updateUIView(_ button: UIButton, context: Context) {
         context.coordinator.runtime = runtime
+        button.configuration = configuration
+        updateAccessibility(button)
+    }
+
+    private var configuration: UIButton.Configuration {
+        var value = action.isDirection ? UIButton.Configuration.plain() : .tinted()
+        value.title = action.isDirection ? nil : action == .changeView ? "View" : "Phone"
+        value.image = UIImage(systemName: action.symbol,
+                              withConfiguration: UIImage.SymbolConfiguration(pointSize: 17, weight: .semibold))
+        if action.isDirection {
+            value.contentInsets = .zero
+            value.baseForegroundColor = .label
+        } else {
+            value.imagePadding = 8
+            value.cornerStyle = .capsule
+            value.baseForegroundColor = .white
+            value.baseBackgroundColor = UIColor(red: 0.62, green: 0.43, blue: 1, alpha: 1)
+        }
+        return value
+    }
+
+    private func updateAccessibility(_ button: UIButton) {
+        button.accessibilityLabel = action == .phone && runtime.sensePhoneNavigationVisible ? "Close phone" : action.title
     }
 
     static func dismantleUIView(_ button: UIButton, coordinator: Coordinator) {
@@ -513,8 +574,8 @@ private struct SenseUtilityControl: UIViewRepresentable {
             self.runtime = runtime
             self.action = action
         }
-        @objc func beginUtilityPress() { runtime.setFlatSenseUtilityPressed(action, pressed: true) }
-        @objc func endUtilityPress() { runtime.setFlatSenseUtilityPressed(action, pressed: false) }
+        @objc func beginUtilityPress() { runtime.setFlatSenseUtilityInteractionPressed(action, pressed: true) }
+        @objc func endUtilityPress() { runtime.setFlatSenseUtilityInteractionPressed(action, pressed: false) }
         @objc func activate() {
             // Assistive/system activation may emit only primaryActionTriggered.
             // Acquire before enqueueing and release even without a touch-up.
