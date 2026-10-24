@@ -66,3 +66,15 @@ allocates38474 into manager+272 and registers it through38464. The subsequent
 left request can use that solver. `NATIVE_MODE` requires an independent76735 or
 82184 private-frame observation and may be absent while unarmed, but it is fresh
 and true in this active report. No first-person gate was relaxed.
+
+An ordinary Home-screen relaunch of candidate15 at 04:08:54 UTC exposed a
+separate startup defect: its debug launch environment was absent, disabling both
+native gameplay motion and Swift accessory acquisition despite a valid AOT
+certificate. A build may now explicitly opt into a compiled arms default with
+`MUGUET_XR_MOTION_ARMS_DEFAULT=1`; absent that setting, behavior stays off by
+default. Runtime `MUGUET_XR_MOTION_ARMS=0` disables it and `=1` enables the request.
+The matching AOT certificate is still mandatory. `sv_xr_motion_arms_enabled_v1`
+exports that actual qualified mode so Swift can acquire poses on normal launch.
+This does not implicitly activate the older body-aim experiment. The candidate16
+build must explicitly set the compiled default alongside its exact six-body AOT
+certificate. Resolver tests cover absent/disabled defaults and both overrides.

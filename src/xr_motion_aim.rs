@@ -53,8 +53,15 @@ fn packet_rejection(head:u64,presentation:f64,flags:u32,times:[f64;3],ids:[u64;4
 }
 pub fn diagnostic_enabled() -> bool { DIAGNOSTIC_ENABLED.load(Ordering::Acquire) }
 static GAMEPLAY_REQUESTED:LazyLock<bool>=LazyLock::new(||std::env::var("MUGUET_XR_MOTION_AIM").as_deref()==Ok("1"));
-static ARMS_REQUESTED:LazyLock<bool>=LazyLock::new(||std::env::var("MUGUET_XR_MOTION_ARMS").as_deref()==Ok("1"));
+fn resolve_arms_requested(runtime:Option<&str>,compiled_default:Option<&str>)->bool{
+    match runtime{Some("1")=>true,Some(_)=>false,None=>compiled_default==Some("1")}
+}
+static ARMS_REQUESTED:LazyLock<bool>=LazyLock::new(||resolve_arms_requested(std::env::var("MUGUET_XR_MOTION_ARMS").ok().as_deref(),option_env!("MUGUET_XR_MOTION_ARMS_DEFAULT")));
 pub fn arms_enabled()->bool{diagnostic_enabled()&&*ARMS_REQUESTED}
+/// Swift acquisition follows the native certificate-qualified mode, including
+/// an explicitly opted-in build's ordinary Home-screen launch without env vars.
+#[no_mangle]
+pub extern "C" fn sv_xr_motion_arms_enabled_v1()->u32{u32::from(arms_enabled())}
 /// Certificate acceptance and gameplay activation are deliberately independent.
 /// Cache only launch intent; an early status read cannot cache certificatefalse.
 pub fn gameplay_enabled()->bool {diagnostic_enabled()&&(*GAMEPLAY_REQUESTED||*ARMS_REQUESTED)}
@@ -206,6 +213,7 @@ pub fn status_json()->serde_json::Value {
     let candidate=CANDIDATE.lock().unwrap_or_else(|p|p.into_inner());
     let ack=LAST_ACK.lock().unwrap_or_else(|p|p.into_inner());
     serde_json::json!({"diagnostic_aot_certified":diagnostic_enabled(),"gameplay_motion_active":gameplay_enabled(),"native_arms":crate::xr_motion_arms::status_json(),
+        "compiled_arms_default":option_env!("MUGUET_XR_MOTION_ARMS_DEFAULT")==Some("1"),"arms_launch_requested":*ARMS_REQUESTED,
         "capture_diagnostics":capture,"scope_diagnostics":scope,
         "candidate":candidate.as_ref().map(|c|serde_json::json!({"view_epoch":c.view_epoch,
             "camera_sequence":c.camera_sequence,"head_frame":c.head_frame,"hand_sequence":c.hand_sequence,
@@ -624,6 +632,12 @@ pub fn rigid(m: &[f32; 16]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]fn normal_launch_arm_default_is_opt_in_and_runtime_overrides_are_explicit(){
+        for default in [None,Some("0"),Some("unexpected")]{assert!(!resolve_arms_requested(None,default));assert!(resolve_arms_requested(Some("1"),default));}
+        assert!(resolve_arms_requested(None,Some("1")));assert!(!resolve_arms_requested(Some("0"),Some("1")));
+        assert!(resolve_arms_requested(Some("1"),Some("1")));assert!(!resolve_arms_requested(Some("0"),None));
+        assert!(!resolve_arms_requested(Some("unexpected"),Some("1")));assert!(!resolve_arms_requested(Some("unexpected"),None));
+    }
     #[test]fn capture_diagnostics_distinguish_missing_exact_packet_from_stale_source(){
         let ids=[1,4,12,13];let times=[100.,99.99,99.98];
         assert_eq!(packet_rejection(12,100.,3,times,ids),None);
