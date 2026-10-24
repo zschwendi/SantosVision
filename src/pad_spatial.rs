@@ -71,15 +71,15 @@ pub(super) fn spatial_sample(hands: u32, buttons: u32, values: [f32; 6], left_de
     Some(sample)
 }
 
-/// Sense has no D-pad. Holding L3 reserves the left stick for D-pad actions;
-/// releasing an unused L3 press emits a 120 ms normal click. State belongs to
-/// the input lifecycle, and never survives a lost/replaced left controller.
+/// L3 remains a normal bounded click while its stick always moves the player.
+/// The native phone ornament supplies the missing D-pad. State belongs to the
+/// input lifecycle and never survives a lost/replaced left controller.
 #[derive(Default)]
 pub(super) struct Router {
     left_device: Option<u64>,
     require_release: bool,
     click_held: bool,
-    used_direction: bool,
+    click_consumed: bool,
     tap_until: Option<Instant>,
     camera_chord: bool,
     camera_until: Option<Instant>,
@@ -118,7 +118,7 @@ impl Router {
             sample.right_click = false;
         }
         if camera_chord || self.camera_until.is_some_and(|until| now < until) {
-            self.used_direction = true;
+            self.click_consumed = true;
             self.click_held = click;
             self.tap_until = None;
             sample.camera = true;
@@ -128,19 +128,10 @@ impl Router {
         }
         if click {
             if !self.click_held {
-                self.used_direction = false;
+                self.click_consumed = false;
                 self.tap_until = None;
             }
-            let [x, y] = sample.left_stick;
-            let mut directions = 0;
-            if y > 0.3 { directions |= 1; }
-            if y < -0.3 { directions |= 2; }
-            if x < -0.3 { directions |= 4; }
-            if x > 0.3 { directions |= 8; }
-            sample.dpad = directions;
-            sample.left_stick = [0.0; 2];
-            self.used_direction |= directions != 0;
-        } else if self.click_held && !self.used_direction {
+        } else if self.click_held && !self.click_consumed {
             self.tap_until = Some(now + Duration::from_millis(120));
         }
         self.click_held = click;
@@ -203,17 +194,17 @@ mod tests {
     }
 
     #[test]
-    fn modifier_routes_direction_without_moving_or_clicking_the_player() {
+    fn l3_preserves_movement_and_never_opens_phone_or_maps_virtual_directions() {
         let now = Instant::now();
         let mut router = Router::default();
         router.apply(left(false, [0.0; 2], 42), now);
         let held = router.apply(left(true, [0.8, -0.9], 42), now);
-        assert_eq!(held.dpad, 2 | 8);
-        assert_eq!(held.left_stick, [0.0; 2]);
+        assert_eq!(held.dpad, 0);
+        assert_eq!(held.left_stick, [0.8, -0.9]);
         assert!(!held.left_click);
         let released = router.apply(left(false, [0.0; 2], 42), now);
         assert_eq!(released.dpad, 0);
-        assert!(!released.left_click, "a directional chord must never emit L3 afterward");
+        assert!(released.left_click, "a normal L3 press still emits its bounded click");
     }
 
     #[test]

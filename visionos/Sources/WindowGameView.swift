@@ -371,7 +371,7 @@ struct SantosSettingsView: View {
                         .disabled(!runtime.canChangePlaySettings)
                     Text("Adjusts the right stick's look speed. GTA's own mouse sensitivity also applies.")
                         .font(.caption).foregroundStyle(.secondary)
-                    Text("DualSense: click the touchpad to change camera. Sense: click both sticks together to change camera; hold left stick click and move that stick for D-pad. Tap left stick click for normal L3. The Phone and View buttons sit below the game. Look at a native button and press either Sense trigger to select it. Start opens Resume, Window, Settings and Quit. In GTA menus: Cross selects, Circle goes back, Square applies, Triangle means Yes, and R1 means No.")
+                    Text("DualSense: click the touchpad to change camera. Sense: click both sticks together to change camera. Left stick always moves; its click is normal L3. Use the phone arrow buttons for D-pad navigation. The Phone and View buttons sit below the game. Look at a native button and press either Sense trigger to select it. Start opens Resume, Window, Settings and Quit. In GTA menus: Cross selects, Circle goes back, Square applies, Triangle means Yes, and R1 means No.")
                         .font(.caption).foregroundStyle(.secondary)
                 }
                 Section {

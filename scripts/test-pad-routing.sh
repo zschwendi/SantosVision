@@ -324,7 +324,7 @@ mod pad {
             crate::input::take();
         }
         #[test]
-        fn virtual_dpad_uses_actual_mapper_without_movement_or_delayed_l3() {
+        fn moving_with_l3_uses_actual_movement_and_never_opens_phone() {
             suspend();
             MENU_NAVIGATION.store(false, Ordering::Relaxed);
             IN_VEHICLE.store(false, Ordering::Relaxed);
@@ -334,15 +334,14 @@ mod pad {
             let chord = spatial::spatial_sample(3, 1 << 6, [0.8, 0.9, 0.0, 0.0, 0.0, 0.0], 42).unwrap();
             poll_sample(Some(chord));
             let events = crate::input::take();
-            assert!(events.contains(&Event::Key("ArrowUp".into(), true)));
-            assert!(events.contains(&Event::Key("ArrowRight".into(), true)));
-            assert!(!events.contains(&Event::Key("KeyW".into(), true)));
-            assert!(!events.contains(&Event::Key("KeyD".into(), true)));
+            assert!(!events.iter().any(|event| matches!(event, Event::Key(k, true) if k.starts_with("Arrow"))));
+            assert!(events.contains(&Event::Key("KeyW".into(), true)));
+            assert!(events.contains(&Event::Key("KeyD".into(), true)));
             poll_sample(Some(neutral));
             let events = crate::input::take();
-            assert!(events.contains(&Event::Key("ArrowUp".into(), false)));
-            assert!(events.contains(&Event::Key("ArrowRight".into(), false)));
-            assert!(!events.contains(&Event::Key("ControlLeft".into(), true)));
+            assert!(events.contains(&Event::Key("KeyW".into(), false)));
+            assert!(events.contains(&Event::Key("KeyD".into(), false)));
+            assert!(events.contains(&Event::Key("ControlLeft".into(), true)));
             suspend();
         }
     }
