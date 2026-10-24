@@ -30,15 +30,17 @@ struct GameImmersiveScene: CompositorContent {
             fallbackTask?.cancel()
             fallbackTask = Task { @MainActor in
                 // The window drawable pauses when the immersive camera owns
-                // presentation. Restore it if qualified game frames never arrive.
-                do { try await Task.sleep(for: .seconds(8)) }
-                catch { return }
-                if !Task.isCancelled, !world.hasPresentedFrames {
-                    world.failImmersiveTransition("Immersive view could not show a game frame. Returned to the game window.")
+                // presentation. Restore it after startup failure or sustained
+                // loss of actual, successfully completed game frames.
+                while !Task.isCancelled {
+                    do { try await Task.sleep(for: .milliseconds(250)) }
+                    catch { return }
+                    guard !Task.isCancelled, let request = world.takeFrameRecoveryRequest() else { continue }
                     openWindow(id: "main")
-                    world.stopRenderer(reason: "first game frame timed out after 8 seconds")
+                    guard let token = world.stopRendererForFrameRecovery(request) else { continue }
                     await dismissImmersiveSpace()
-                    world.isImmersiveActive = false
+                    world.finishFrameRecovery(generation: token)
+                    return
                 }
             }
         }

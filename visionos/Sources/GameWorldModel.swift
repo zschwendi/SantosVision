@@ -1,3 +1,44 @@
+import Foundation
+
+// BEGIN GameWorldFrameWatchdog (standalone validation uses this actual block)
+struct GameWorldFrameWatchdog {
+    enum Failure: String { case firstFrame = "first_frame_timeout", frameLoss = "game_frame_loss_timeout" }
+    static let firstFrameTimeout: Double = 8
+    static let frameLossTimeout: Double = 2
+    private(set) var running = false
+    private(set) var activeSince: Double?
+    private(set) var lastCompletion: Double?
+    private(set) var hasCompletedFrame = false
+    private(set) var recoveryRequested = false
+
+    mutating func start(at now: Double, active: Bool) {
+        self = Self()
+        running = true
+        setActive(active, at: now)
+    }
+    mutating func stop() { self = Self() }
+    mutating func setActive(_ active: Bool, at now: Double) {
+        guard running else { return }
+        activeSince = active && now.isFinite ? now : nil
+        lastCompletion = nil
+    }
+    mutating func completed(at uptime: Double, observedAt now: Double) {
+        guard running, !recoveryRequested, let activeSince,
+              uptime.isFinite, now.isFinite, uptime >= activeSince, uptime <= now else { return }
+        hasCompletedFrame = true
+        lastCompletion = max(lastCompletion ?? uptime, uptime)
+    }
+    mutating func takeFailure(at now: Double) -> Failure? {
+        guard running, !recoveryRequested, let activeSince, now.isFinite else { return nil }
+        let reference = max(activeSince, lastCompletion ?? activeSince)
+        let timeout = hasCompletedFrame ? Self.frameLossTimeout : Self.firstFrameTimeout
+        guard now - reference >= timeout else { return nil }
+        recoveryRequested = true
+        return hasCompletedFrame ? .frameLoss : .firstFrame
+    }
+}
+// END GameWorldFrameWatchdog
+
 #if SV_GAME_RUNTIME
 import Combine
 import CompositorServices
@@ -16,6 +57,7 @@ final class GameWorldModel: ObservableObject {
     private var startup: Task<Void, Never>?
     private var generation = UUID()
     private var appActive = true
+    private var frameWatchdog = GameWorldFrameWatchdog()
     private var lifecycle: [[String: Any]] = []
     private var latestRendererState: [String: Any] = [:]
     private var latestFiniteSkySupport: [String: Any] = [:]
@@ -39,6 +81,7 @@ final class GameWorldModel: ObservableObject {
         stopRenderer()
         self.runtime = runtime
         hasPresentedFrames = false
+        frameWatchdog.start(at: ProcessInfo.processInfo.systemUptime, active: appActive)
         runtime.beginWorldTracking()
         runtime.recordMetalCapabilities(layer.device)
         lastFailure = nil
@@ -60,6 +103,9 @@ final class GameWorldModel: ObservableObject {
                 Task { @MainActor [weak self] in
                     guard let self, self.generation == token else { return }
                     switch event {
+                    case .gameFrameCompleted(let uptime):
+                        self.frameWatchdog.completed(at: uptime, observedAt: ProcessInfo.processInfo.systemUptime)
+                        return
                     case .lifecycle(let event):
                         self.latestRendererState = event.reportValue
                         if event.stage == "view_request_rejected" {
@@ -163,6 +209,7 @@ final class GameWorldModel: ObservableObject {
     func setActive(_ active: Bool) {
         let changed = appActive != active
         appActive = active
+        if changed { frameWatchdog.setActive(active, at: ProcessInfo.processInfo.systemUptime) }
         renderer?.setActive(active)
         if !active {
             senseUtilityTrackingLive = false
@@ -178,9 +225,43 @@ final class GameWorldModel: ObservableObject {
         recordState("first_frame_timeout", detail: message)
     }
 
+    struct FrameRecoveryRequest {
+        fileprivate let generation: UUID
+        fileprivate let failure: GameWorldFrameWatchdog.Failure
+    }
+
+    func takeFrameRecoveryRequest() -> FrameRecoveryRequest? {
+        guard let failure = frameWatchdog.takeFailure(at: ProcessInfo.processInfo.systemUptime) else { return nil }
+        let message = failure == .firstFrame
+            ? "Immersive view could not show a game frame. Returned to the game window."
+            : "The immersive game view stopped updating. Returned to the game window."
+        lastFailure = message
+        status = message
+        recordState(failure.rawValue, detail: message)
+        return FrameRecoveryRequest(generation: generation, failure: failure)
+    }
+
+    /// The scene opens the main window before releasing immersive presentation.
+    /// A stale request must never stop a newer renderer or a manual return.
+    func stopRendererForFrameRecovery(_ request: FrameRecoveryRequest) -> UUID? {
+        guard request.generation == generation, frameWatchdog.recoveryRequested else { return nil }
+        let reason = request.failure == .firstFrame
+            ? "first game frame timed out after 8 seconds"
+            : "qualified game GPU completions stopped for 2 seconds"
+        stopRenderer(reason: reason)
+        return generation
+    }
+
+    func finishFrameRecovery(generation token: UUID) {
+        guard generation == token else { return }
+        isImmersiveActive = false
+        isOpening = false
+    }
+
     func stopRenderer(reason: String = "requested") {
         recordState("renderer_stop_requested", detail: reason)
         generation = UUID()
+        frameWatchdog.stop()
         senseUtilityVisibilityObservation = nil
         senseUtilityPhoneObservation = nil
         senseUtilityLayer?.onSpatialEvent = { _ in }
@@ -270,6 +351,10 @@ final class GameWorldModel: ObservableObject {
             "scene_active": appActive, "immersive_open": isImmersiveActive,
             "opening": isOpening, "has_presented_game_frames": hasPresentedFrames,
             "renderer_exists": renderer != nil, "generation": generation.uuidString,
+            "frame_watchdog": ["startup_timeout_seconds": GameWorldFrameWatchdog.firstFrameTimeout,
+                "ongoing_timeout_seconds": GameWorldFrameWatchdog.frameLossTimeout,
+                "has_completed_frame": frameWatchdog.hasCompletedFrame,
+                "recovery_requested": frameWatchdog.recoveryRequested],
             "renderer": latestRendererState, "events": lifecycle,
             "finite_sky_support": latestFiniteSkySupport,
             "hud_canvas": latestHUDCanvas,
