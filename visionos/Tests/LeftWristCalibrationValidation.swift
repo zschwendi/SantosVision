@@ -110,6 +110,18 @@ import Foundation
         require(Flow.reasonText(14).contains("first person") && Flow.reasonText(15).contains("changed"), "Deadline and fingerprint reasons explained")
         _ = idle.request()
         require(idle.settingsText(native: Flow.Native()).contains("opens by itself"), "Pending request explains the next immersive entry")
+        // Circle/Start reach cancel() through the modal router during the
+        // acknowledgement of an already committed success.
+        flow = Flow(); native = Flow.Native(supported: true, eligible: true, requiredSamples: 12)
+        _ = flow.request(); _ = flow.update(ready: true, native: native, now: 0); flow.opened(30)
+        native.session = 30; native.phase = 2; _ = flow.confirm(native: native)
+        native.phase = 4; native.resultSession = 30
+        _ = flow.update(ready: true, native: native, now: 1); _ = flow.commitResult(true, now: 1)
+        require(flow.cancel(.playerCancelled) == .close(30) && flow.stage == .idle && !flow.cardVisible,
+                "Circle/Start during the acknowledgement only closes the card")
+        native.calibrationPresent = true; native.controllerFingerprintMatches = true
+        require(!flow.settingsText(native: native).contains("unchanged") && flow.settingsText(native: native).contains("Calibrated"),
+                "A committed success is never reported as unchanged")
         print("PASS left wrist calibration flow: \(checks) checks")
     }
 }

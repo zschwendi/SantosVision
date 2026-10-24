@@ -74,6 +74,8 @@ Controller fingerprint during a capture:
 - The capture is pinned to the controller fingerprint it started with.
 - A fingerprint change restarts it: samples are never mixed.
 - Losing the fingerprint (0) fails it.
+- A successful capture still awaiting its commit is pinned the same way: a
+  changed or lost fingerprint discards it, and the card reports why.
 
 The 4 s capture deadline is enforced on every state access, including the
 card's heartbeat, not only when a post-IK observation arrives. So if the

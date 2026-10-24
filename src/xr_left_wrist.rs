@@ -163,10 +163,16 @@ impl State{
         let Some(calibration)=s.pending.take()else{return -2};
         self.calibration=Some(calibration);self.session=None;0
     }
-    /// Fingerprint changes restart, and loss fails, an active capture.
+    /// Fingerprint changes restart, and loss fails, an active capture. A
+    /// captured but uncommitted result is pinned the same way: a different or
+    /// lost fingerprint discards it, so commit can never adopt it.
     pub(super) fn set_controller(&mut self,fingerprint:u64,now:Instant){
         self.expire(now);self.controller=fingerprint;
         let Some(session)=self.session.as_mut()else{return};let serial=session.serial;
+        if session.pending.is_some_and(|c|c.controller!=fingerprint){
+            session.pending=None;
+            self.result=Some((serial,Err(if fingerprint==0{Reason::ControllerIdentityMissing}else{Reason::ControllerChanged})));
+        }
         let Some((_,capture))=session.capture.as_mut()else{return};
         if fingerprint==0{session.capture=None;self.result=Some((serial,Err(Reason::ControllerIdentityMissing)));}
         else if fingerprint!=capture.controller{capture.reset(Reason::ControllerChanged);capture.controller=fingerprint;}
@@ -281,7 +287,8 @@ pub(super) fn status()->serde_json::Value{
 }
 fn reason_name(code:u32)->&'static str{
     [Reason::None,Reason::NoFirstPersonWeaponFrame,Reason::LeftControllerNotTracked,Reason::LeftHandRigUnqualified,Reason::LeftIkBlendingOut,Reason::ControllerIdentityMissing,
-     Reason::HoldStill,Reason::CaptureTimeout,Reason::GripTooFarFromHand,Reason::TrackingChanged,Reason::SessionExpired,Reason::Unsupported,Reason::RigChanged,Reason::NotRigid]
+     Reason::HoldStill,Reason::CaptureTimeout,Reason::GripTooFarFromHand,Reason::TrackingChanged,Reason::SessionExpired,Reason::Unsupported,Reason::RigChanged,Reason::NotRigid,
+     Reason::NoPostIkObservation,Reason::ControllerChanged]
         .into_iter().find(|r|*r as u32==code).map_or("unknown",Reason::name)
 }
 impl State{
@@ -455,6 +462,30 @@ pub unsafe extern "C" fn sv_xr_left_wrist_import_v1(input:*const SVLeftWristCali
         assert_eq!((snap.phase,snap.failure,snap.reason),(1,Reason::ControllerIdentityMissing as u32,Reason::ControllerIdentityMissing as u32),"not ready without a fingerprint");
         assert_eq!(st.capture(session,now),-4,"no retry without a recognised controller");assert_eq!(st.commit(session,now),-2);
         assert_eq!(st.calibration.map(|c|c.controller),Some(56),"previous calibration unchanged");
+    }
+    /// A fingerprint change or loss after a successful capture but before the
+    /// card's commit discards the pending capture; commit cannot adopt it.
+    #[test]fn pending_success_is_discarded_by_fingerprint_change_or_loss_before_commit(){
+        let now=Instant::now();
+        let previous={let mut c=Capture::new(56);let mut last=Step::Waiting(Reason::None);
+            for i in 0..REQUIRED_SAMPLES as u64{last=c.add(&sample(i,&grip(i),0.),56);}let Step::Done(cal)=last else{panic!("no previous")};cal};
+        for(fingerprint,reason)in[(56u64,Reason::ControllerChanged),(0,Reason::ControllerIdentityMissing)]{
+            let mut st=State{controller:55,calibration:Some(previous),..State::default()};let session=st.open(now,true);
+            st.observe(Ok(sample(0,&grip(0),0.)),now);assert_eq!(st.capture(session,now),0);
+            for i in 1..=REQUIRED_SAMPLES as u64{st.observe(Ok(sample(i,&grip(i),0.)),now);}assert_eq!(st.snapshot(now,true).phase,4);
+            st.set_controller(fingerprint,now);let snap=st.snapshot(now,true);
+            assert_ne!(snap.phase,4,"no success is shown once the pinned fingerprint is gone");
+            assert_eq!((snap.failure,snap.result_session),(reason as u32,session));
+            assert_eq!(st.commit(session,now),-2,"commit cannot adopt a capture whose fingerprint changed or was lost");
+            assert_eq!(st.calibration,Some(previous),"previous calibration unchanged");assert!(st.suspends(now),"card stays open for retry or Cancel");
+        }
+        let mut st=State{controller:55,..State::default()};let session=st.open(now,true);
+        st.observe(Ok(sample(0,&grip(0),0.)),now);assert_eq!(st.capture(session,now),0);
+        for i in 1..=REQUIRED_SAMPLES as u64{st.observe(Ok(sample(i,&grip(i),0.)),now);}
+        st.set_controller(55,now);assert_eq!(st.commit(session,now),0,"re-announcing the same fingerprint keeps the capture");
+        assert_eq!(st.calibration.map(|c|c.controller),Some(55));
+        assert_eq!(reason_name(Reason::NoPostIkObservation as u32),"no_post_ik_observation_before_deadline");
+        assert_eq!(reason_name(Reason::ControllerChanged as u32),"controller_fingerprint_changed");
     }
     #[test]fn expiry_failure_timeout_and_mismatches_keep_position_fallback(){
         let now=Instant::now();let mut st=State{controller:55,..State::default()};let session=st.open(now,true);

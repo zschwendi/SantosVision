@@ -1,10 +1,12 @@
-//! Inactive guest-call cleanup prerequisite; this does not install foreground hooks.
+//! Cleanup at every host-to-guest boundary. Native motion-arm cleanup uses the
+//! active artifact's policy; first-person foreground depth has a separate,
+//! default-off guard that revokes bindings opened inside an exiting call.
 //!
-//! Production observation is permanently OFF. There is no environment switch,
-//! producer-scope API, attribution query, or new guest import. The signed patch5
-//! does not export __tls_base, so production TLS is explicitly unknown. Enabling
-//! this later requires certified producer hooks, actual instance/TLS identity and
-//! packet provenance; a selected script at TLS+3088 is a different identity.
+//! The legacy diagnostic ledger below remains permanently OFF in production.
+//! It supplies no foreground authority or known TLS identity. The optional
+//! foreground adapter qualifies its own exact native seam, Store/pthread,
+//! viewport, stack and immutable command provenance; it does not activate this
+//! ledger. A selected script at TLS+3088 is a different identity.
 //!
 //! One HostState is created per Store, and instantiate currently creates exactly
 //! one Instance in that Store. The nonce identifies that HostState lifetime, NOT

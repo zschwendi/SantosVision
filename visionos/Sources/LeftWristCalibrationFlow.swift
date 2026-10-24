@@ -45,7 +45,11 @@ struct LeftWristCalibrationFlow: Equatable {
     /// position-only left tracking resumes.
     mutating func cancel(_ exit: Exit) -> Command {
         let open = session
-        if stage != .idle {
+        // After a committed success the new setting is in effect; Circle or
+        // Start during the acknowledgement only closes the card.
+        var committed = false
+        if case .finished = stage { committed = true }
+        if stage != .idle, !committed {
             lastOutcome = switch exit {
             case .playerCancelled: "Calibration cancelled. Your previous left-hand setting is unchanged."
             case .leftImmersion: "Calibration stopped because immersive view closed. Your previous left-hand setting is unchanged."

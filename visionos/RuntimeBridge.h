@@ -150,7 +150,8 @@ typedef struct {
 _Static_assert(sizeof(SVLeftWristCalibration) == 128, "SVLeftWristCalibration ABI layout must match Rust");
 /* GameController product category + vendor + fixed left hand fingerprint of
    the current left controller; 0 none. Not a per-unit serial: two units of the
-   same model share it. A change restarts, and 0 fails, an active capture. */
+   same model share it. A change restarts, and 0 fails, an active capture; either
+   discards an uncommitted successful capture. */
 int32_t sv_xr_left_wrist_controller_v1(uint64_t fingerprint);
 /* Opening suspends left arm requests so GTA's own left hand is shown. */
 uint64_t sv_xr_left_wrist_open_v1(void);
