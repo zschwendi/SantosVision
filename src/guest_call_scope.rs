@@ -55,9 +55,13 @@ where S: AsContextMut<Data = HostState> {
     if !observing() {
         if !crate::xr_motion_aim::gameplay_enabled() { return invoke(store); }
         let prefix=store.as_context().data().motion_aim.boundary_prefix();
-        let result=invoke(store);
-        if result.is_err() { store.as_context_mut().data_mut().motion_aim.recover_boundary(&prefix); }
-        return result;
+        let arm_prefix=store.as_context_mut().data_mut().motion_arms.boundary_prefix();
+        let result=std::panic::catch_unwind(std::panic::AssertUnwindSafe(||invoke(store)));
+        match result{
+            Ok(result)=>{if result.is_err(){store.as_context_mut().data_mut().motion_aim.recover_boundary(&prefix);store.as_context_mut().data_mut().motion_arms.recover_boundary(&arm_prefix);}
+                else{store.as_context_mut().data_mut().motion_arms.finish_boundary(&arm_prefix);}return result;},
+            Err(panic)=>{store.as_context_mut().data_mut().motion_aim.recover_boundary(&prefix);store.as_context_mut().data_mut().motion_arms.recover_boundary(&arm_prefix);std::panic::resume_unwind(panic);}
+        }
     }
     let before = ledger::Execution::capture(store.as_context().data());
     let guard = ledger::Guard::enter(before, kind);

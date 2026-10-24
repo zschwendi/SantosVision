@@ -19,15 +19,30 @@ static IK_PERMIT:Mutex<Option<(u64,u64,Instant)>>=Mutex::new(None);
 static FIRE_GATE:Mutex<FireGate>=Mutex::new(FireGate {release_required:true,was_motion:false});
 pub fn diagnostic_enabled() -> bool { DIAGNOSTIC_ENABLED.load(Ordering::Acquire) }
 static GAMEPLAY_REQUESTED:LazyLock<bool>=LazyLock::new(||std::env::var("MUGUET_XR_MOTION_AIM").as_deref()==Ok("1"));
+static ARMS_REQUESTED:LazyLock<bool>=LazyLock::new(||std::env::var("MUGUET_XR_MOTION_ARMS").as_deref()==Ok("1"));
+pub fn arms_enabled()->bool{diagnostic_enabled()&&*ARMS_REQUESTED}
 /// Certificate acceptance and gameplay activation are deliberately independent.
 /// Cache only launch intent; an early status read cannot cache certificatefalse.
-pub fn gameplay_enabled()->bool {diagnostic_enabled()&&*GAMEPLAY_REQUESTED}
+pub fn gameplay_enabled()->bool {diagnostic_enabled()&&(*GAMEPLAY_REQUESTED||*ARMS_REQUESTED)}
 fn supported_motion_scope(first_person:bool,world_active:bool,spatial:bool,in_vehicle:bool,gameplay:bool)->bool {
     first_person&&world_active&&spatial&&!in_vehicle&&gameplay
 }
 fn current_supported_scope(first_person:bool)->bool {
     supported_motion_scope(first_person,crate::xr_view::world_camera_enabled(),crate::pad::spatial_controls_selected(),
         crate::pad::IN_VEHICLE.load(Ordering::Relaxed),crate::pad::verified_guest_gameplay_context())
+}
+/// Same accepted camera packet for native arm requests and targets. A later
+/// callback cannot borrow a replacement tracking generation or extend its age.
+pub(crate) fn native_arm_candidate(first_person:bool)->Option<CameraCandidate>{
+    if !gameplay_enabled()||!current_supported_scope(first_person){return None;}
+    if !NATIVE_MODE.lock().unwrap_or_else(|p|p.into_inner()).is_some_and(|(first,at,_,e)|first&&e==crate::xr_view::view_epoch()&&at.elapsed()<=MAX_AGE){return None;}
+    let candidate=CANDIDATE.lock().unwrap_or_else(|p|p.into_inner()).clone()?;
+    (candidate.valid(Instant::now(),crate::xr_view::view_epoch())&&tracking_still_live(&candidate)).then_some(candidate)
+}
+pub(crate) fn accept_native_arm_input(c:&CameraCandidate){
+    if arms_enabled()&&c.valid(Instant::now(),crate::xr_view::view_epoch())&&tracking_still_live(c){
+        *IK_PERMIT.lock().unwrap_or_else(|p|p.into_inner())=Some((c.view_epoch,c.tracking_epoch,Instant::now()));
+    }
 }
 
 #[derive(Clone,Copy)]
@@ -46,6 +61,10 @@ impl FireGate {
 /// Window, menu, vehicle acceleration and the standard pad path bypass this.
 pub(crate) fn filter_spatial_trigger(value:f32)->f32 {
     if !gameplay_enabled()||!crate::xr_view::world_camera_enabled(){return value;}
+    if !crate::pad::spatial_controls_selected()||!crate::pad::verified_guest_gameplay_context()||crate::pad::IN_VEHICLE.load(Ordering::Relaxed){
+        return FIRE_GATE.lock().unwrap_or_else(|p|p.into_inner()).apply(value,FireScope::Native);
+    }
+    if crate::xr_motion_arms::native_fallback_active(){return FIRE_GATE.lock().unwrap_or_else(|p|p.into_inner()).apply(value,FireScope::Native);}
     let now=Instant::now();let epoch=crate::xr_view::view_epoch();
     let mode=*NATIVE_MODE.lock().unwrap_or_else(|p|p.into_inner());
     let scope=match mode.filter(|(_,at,_,e)|*e==epoch&&now.duration_since(*at)<=MAX_AGE) {
@@ -55,6 +74,7 @@ pub(crate) fn filter_spatial_trigger(value:f32)->f32 {
             let permit=*IK_PERMIT.lock().unwrap_or_else(|p|p.into_inner());
             let ready=mode.is_some_and(|(first,at,_,e)|first&&e==epoch&&now.duration_since(at)<=MAX_AGE)
                 &&candidate.as_ref().is_some_and(|c|c.valid(now,epoch)&&tracking_still_live(c)
+                    &&(!arms_enabled()||crate::xr_motion_arms::camera_frame_for_candidate(c).is_some())
                     &&permit.is_some_and(|(e,tracking,at)|e==epoch&&tracking==c.tracking_epoch&&now.duration_since(at)<=MAX_AGE));
             FireScope::Motion{ready}
         }
@@ -64,6 +84,7 @@ pub(crate) fn filter_spatial_trigger(value:f32)->f32 {
 fn motion_ready(candidate:&CameraCandidate,now:Instant,epoch:u64)->bool{
     let permit=*IK_PERMIT.lock().unwrap_or_else(|p|p.into_inner());
     candidate.valid(now,epoch)&&tracking_still_live(candidate)
+        &&(!arms_enabled()||crate::xr_motion_arms::camera_frame_for_candidate(candidate).is_some())
         &&permit.is_some_and(|(e,tracking,at)|e==epoch&&tracking==candidate.tracking_epoch&&now.duration_since(at)<=MAX_AGE)
         &&!FIRE_GATE.lock().unwrap_or_else(|p|p.into_inner()).release_required
 }
@@ -87,6 +108,7 @@ pub(crate) fn qualify_embedded_aot(code: &[u8]) -> anyhow::Result<()> {
 }
 
 pub(crate) fn invalidate_camera() {
+    crate::xr_motion_arms::invalidate_inputs();
     LATEST_CAMERA_SEQUENCE.store(0,Ordering::Release);
     *CANDIDATE.lock().unwrap_or_else(|p|p.into_inner())=None;
     *LAST_ACK.lock().unwrap_or_else(|p|p.into_inner())=None;
@@ -123,7 +145,10 @@ pub(crate) fn capture_camera(view: crate::xr_view::WorldView, base_camera:[f32;1
         let candidate=CameraCandidate {view_epoch:view.provenance_epoch,camera_sequence:view.camera_sequence,
             head_frame:view.head_pose_frame,tracking_epoch:ids[1],hand_sequence:ids[3],
             original_game_from_camera:base_camera,game_from_stage:view.game_from_stage,
-            stage_from_aim:aim,aim_from_weapon:identity(),recorded_at:Instant::now(),
+            stage_from_aim:aim,stage_from_grip:floats[48..64].try_into().unwrap(),
+            left_grip:if flags&1!=0&&flags&(1<<8)==0&&times[1]<=times[0]+0.01&&times[0]-times[1]<=0.15 {
+                Some((floats[16..32].try_into().unwrap(),Duration::from_secs_f64((times[0]-times[1]).max(0.))))
+            }else{None},aim_from_weapon:identity(),recorded_at:Instant::now(),
             source_age_at_capture:Duration::from_secs_f64((times[0]-times[2]).max(0.))};
         if candidate.valid(Instant::now(),view.provenance_epoch) {
             let mut published=CANDIDATE.lock().unwrap_or_else(|p|p.into_inner());
@@ -137,7 +162,7 @@ pub(crate) fn capture_camera(view: crate::xr_view::WorldView, base_camera:[f32;1
 pub fn status_json()->serde_json::Value {
     let candidate=CANDIDATE.lock().unwrap_or_else(|p|p.into_inner());
     let ack=LAST_ACK.lock().unwrap_or_else(|p|p.into_inner());
-    serde_json::json!({"diagnostic_aot_certified":diagnostic_enabled(),"gameplay_motion_active":gameplay_enabled(),
+    serde_json::json!({"diagnostic_aot_certified":diagnostic_enabled(),"gameplay_motion_active":gameplay_enabled(),"native_arms":crate::xr_motion_arms::status_json(),
         "candidate":candidate.as_ref().map(|c|serde_json::json!({"view_epoch":c.view_epoch,
             "camera_sequence":c.camera_sequence,"head_frame":c.head_frame,"hand_sequence":c.hand_sequence,
             "tracking_epoch":c.tracking_epoch,"age_ms":c.recorded_at.elapsed().as_millis()})),
@@ -171,6 +196,11 @@ pub(crate) fn host_hook(caller:&mut wasmtime::Caller<'_,crate::HostState>,name:&
                 caller.data_mut().motion_aim.invalidate_inputs();return Ok(());
             }
             if !current_supported_scope(first_person){caller.data_mut().motion_aim.invalidate_inputs();return Ok(());}
+            if crate::xr_motion_arms::native_fallback_active(){return Ok(());}
+            // Full arm requests own the hand target. The old GunIk input would
+            // additionally rotate the torso toward the controller's distant
+            // point and fight that independent pose.
+            if arms_enabled()&&site==ReadSite::GunIk{return Ok(());}
             let current_sp=caller.get_export("__muguet_motion_stack_pointer").and_then(|e|e.into_global())
                 .and_then(|g|g.get(&mut *caller).i64()).map(|v|v as u64);
             // The SP global is intentionally not normally exported. The
@@ -227,7 +257,7 @@ pub(crate) fn host_hook(caller:&mut wasmtime::Caller<'_,crate::HostState>,name:&
             let (phase,task,ped,tls,first_person)=(arg(0)?,arg(1)?,arg(2)?,arg(3)?,arg(4)?!=0);
             anyhow::ensure!(phase<=1,"motion fire gate phase unknown");
             let identity=make_identity(tls);let epoch=crate::xr_view::view_epoch();
-            let scoped=current_supported_scope(first_person);
+            let scoped=current_supported_scope(first_person)&&!crate::xr_motion_arms::native_fallback_active();
             let candidate=CANDIDATE.lock().unwrap_or_else(|p|p.into_inner()).clone();
             let valid=scoped&&candidate.as_ref().is_some_and(|c|motion_ready(c,Instant::now(),epoch));
             let allowed=if phase==0{
@@ -278,6 +308,7 @@ fn tracking_still_live(candidate:&CameraCandidate)->bool {
         let flags=unsafe{sv_xr_motion_read_v1(candidate.head_frame,floats.as_mut_ptr(),80,times.as_mut_ptr(),3,ids.as_mut_ptr(),4)};
         flags&2!=0&&flags&(1<<9)==0&&ids==[1,candidate.tracking_epoch,candidate.head_frame,candidate.hand_sequence]
             &&floats[64..80].iter().zip(candidate.stage_from_aim).all(|(a,b)|a.to_bits()==b.to_bits())
+            &&floats[48..64].iter().zip(candidate.stage_from_grip).all(|(a,b)|a.to_bits()==b.to_bits())
     }
     #[cfg(not(target_os="visionos"))] {let _=candidate;false}
 }
@@ -329,6 +360,8 @@ pub struct CameraCandidate {
     pub original_game_from_camera: [f32; 16],
     pub game_from_stage: [f32; 16],
     pub stage_from_aim: [f32; 16],
+    pub stage_from_grip: [f32;16],
+    pub left_grip:Option<([f32;16],Duration)>,
     /// Calibrated aim-location -> native weapon frame, not grip == muzzle.
     pub aim_from_weapon: [f32; 16],
     pub recorded_at: Instant,
@@ -341,11 +374,23 @@ impl CameraCandidate {
             && now.checked_duration_since(self.recorded_at).and_then(|age|age.checked_add(self.source_age_at_capture))
                 .is_some_and(|age| age <= MAX_AGE)
             && [&self.original_game_from_camera, &self.game_from_stage,
-                &self.stage_from_aim, &self.aim_from_weapon].into_iter().all(|m| rigid(m))
+                &self.stage_from_aim, &self.stage_from_grip, &self.aim_from_weapon].into_iter().all(|m| rigid(m))
     }
     fn weapon(&self) -> [f32; 16] {
         multiply(&multiply(&self.game_from_stage, &self.stage_from_aim), &self.aim_from_weapon)
     }
+}
+pub(crate) fn left_grip_for_candidate(c:&CameraCandidate)->Option<[f32;16]>{
+    let(grip,source_age)=c.left_grip?;
+    if !rigid(&grip)||c.recorded_at.elapsed().checked_add(source_age)?>MAX_AGE{return None;}
+    #[cfg(target_os="visionos")]{
+        extern "C"{fn sv_xr_motion_read_v1(frame:u64,f:*mut f32,fn_:u32,t:*mut f64,tn:u32,id:*mut u64,idn:u32)->u32;}
+        let mut f=[0.;80];let mut t=[0.;3];let mut id=[0;4];
+        let flags=unsafe{sv_xr_motion_read_v1(c.head_frame,f.as_mut_ptr(),80,t.as_mut_ptr(),3,id.as_mut_ptr(),4)};
+        if flags&1==0||flags&(1<<8)!=0||id!=[1,c.tracking_epoch,c.head_frame,c.hand_sequence]
+            ||!f[16..32].iter().zip(grip).all(|(a,b)|a.to_bits()==b.to_bits()){return None;}Some(grip)
+    }
+    #[cfg(not(target_os="visionos"))]{None}
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -382,6 +427,12 @@ struct Calculation {
     origin_pointer: u64, target_pointer: u64,
     motion_generation: Option<(u64, u64, u64)>,
     source_generation: Option<(u64, u64, u64)>,
+    arm_frame:Option<[f32;16]>,
+}
+impl Calculation{
+    fn arm_frame_for_read(&mut self,site:ReadSite,sample:impl FnOnce()->Option<[f32;16]>)->Option<[f32;16]>{
+        match site{ReadSite::FireInitial=>{let frame=sample()?;self.arm_frame=Some(frame);Some(frame)},ReadSite::FireDominant=>self.arm_frame,ReadSite::GunIk=>None}
+    }
 }
 
 #[derive(Default)]
@@ -412,7 +463,7 @@ impl StoreState {
         let Some(token) = self.sequence.checked_add(1) else { self.clear(); return 0; };
         self.sequence = token;
         self.calculations.push(Calculation { token, identity, task, ped, origin_pointer,
-            target_pointer, motion_generation: None, source_generation:None });
+            target_pointer, motion_generation: None, source_generation:None,arm_frame:None });
         token
     }
 
@@ -434,9 +485,13 @@ impl StoreState {
             && lease.candidate.head_frame == candidate.head_frame
             && lease.candidate.tracking_epoch == candidate.tracking_epoch
             && lease.original_frame == frame);
-        if !same {
+        if !same || arms_enabled() {
             let mut private_frame = frame;
-            write_native_frame(&mut private_frame, &candidate.weapon());
+            let weapon=if arms_enabled(){
+                let calculation=self.calculations.last_mut()?;
+                calculation.arm_frame_for_read(site,||crate::xr_motion_arms::camera_frame_for_candidate(candidate))?
+            }else{candidate.weapon()};
+            write_native_frame(&mut private_frame, &weapon);
             self.lease = Some(Lease { identity, ped, candidate: candidate.clone(), original_frame: frame, private_frame });
         }
         let lease = self.lease.as_ref()?;
@@ -530,9 +585,18 @@ mod tests {
         let mut aim=identity();aim[12]=2.;aim[13]=3.;aim[14]=4.;
         CameraCandidate {view_epoch:7,camera_sequence:11,head_frame:12,tracking_epoch:4,hand_sequence:13,
             original_game_from_camera:identity(),game_from_stage:identity(),stage_from_aim:aim,
-            aim_from_weapon:identity(),recorded_at:now,source_age_at_capture:Duration::ZERO}
+            stage_from_grip:identity(),left_grip:None,aim_from_weapon:identity(),recorded_at:now,source_age_at_capture:Duration::ZERO}
     }
     fn frame() -> [u8; FRAME_BYTES] { let mut f=[0x55;FRAME_BYTES];write_native_frame(&mut f,&identity());f }
+    #[test]fn nested_arm_calculations_retain_their_own_actual_frame(){
+        let mut state=StoreState::default();state.begin(id(),20,10,100,200);
+        let mut parent=identity();parent[12]=1.;
+        assert_eq!(state.calculations.last_mut().unwrap().arm_frame_for_read(ReadSite::FireInitial,||Some(parent)),Some(parent));
+        state.begin(id(),21,10,101,201);let mut child=identity();child[12]=9.;
+        assert_eq!(state.calculations.last_mut().unwrap().arm_frame_for_read(ReadSite::FireInitial,||Some(child)),Some(child));
+        state.calculations.pop();
+        assert_eq!(state.calculations.last_mut().unwrap().arm_frame_for_read(ReadSite::FireDominant,||panic!("must not reread actual frame")),Some(parent));
+    }
     #[test]
     fn private_frame_preserves_opaque_words_and_uses_one_hand_generation() {
         let now=Instant::now();let c=candidate(now);let original=frame();let mut s=StoreState::default();

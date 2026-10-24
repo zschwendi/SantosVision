@@ -27,6 +27,9 @@ pub mod xr;
 pub mod xr_aim;
 pub mod xr_hud;
 pub mod xr_motion_aim;
+pub mod xr_motion_arms;
+#[cfg(feature = "jit")]
+pub mod xr_motion_arms_patch;
 #[cfg(feature = "jit")]
 pub mod xr_motion_patch;
 pub mod xr_foreground;
@@ -76,10 +79,11 @@ pub struct HostState {
     pub pthread: u64,
     guest_calls: guest_call_scope::StoreLifetime,
     motion_aim: xr_motion_aim::StoreState,
+    motion_arms: xr_motion_arms::StoreState,
 }
 impl HostState {
     pub fn new(pthread: u64) -> Self {
-        Self { pthread, guest_calls: guest_call_scope::StoreLifetime::new(), motion_aim: xr_motion_aim::StoreState::default() }
+        Self { pthread, guest_calls: guest_call_scope::StoreLifetime::new(), motion_aim: xr_motion_aim::StoreState::default(),motion_arms:xr_motion_arms::StoreState::default() }
     }
 }
 
@@ -159,18 +163,20 @@ pub fn desktop_main() -> Result<()> {
         return Ok(());
     }
     #[cfg(feature = "jit")]
-    if argv.get(1).map(String::as_str) == Some("--precompile-visionos-motion") {
+    if matches!(argv.get(1).map(String::as_str),Some("--precompile-visionos-motion"|"--precompile-visionos-motion-arms")) {
         let wasm=argv.get(2).context("--precompile-visionos-motion <original.wasm> <separate.cwasm>")?;
         let out=argv.get(3).context("--precompile-visionos-motion <original.wasm> <separate.cwasm>")?;
         anyhow::ensure!(!std::path::Path::new(out).exists(),"motion diagnostic output must be a new file");
-        let artifact=xr_motion_patch::generate(&std::fs::read(wasm)?,mp::COMMANDS)?;
+        let original=std::fs::read(wasm)?;
+        let (artifact_wasm,mut manifest)=if argv[1]=="--precompile-visionos-motion-arms"{
+            let a=xr_motion_arms_patch::generate(&original,mp::COMMANDS)?;(a.wasm,a.manifest)
+        }else{let a=xr_motion_patch::generate(&original,mp::COMMANDS)?;(a.wasm,a.manifest)};
         let mut config=engine_config_for(true);config.target("aarch64-apple-visionos").map_err(anyhow::Error::from)?;
         unsafe{config.cranelift_flag_enable("has_lse")};
         let engine=Engine::new(&config).map_err(anyhow::Error::from)?;
-        let code=engine.precompile_module(&artifact.wasm).map_err(anyhow::Error::from)?;
-        let mut manifest=artifact.manifest;
+        let code=engine.precompile_module(&artifact_wasm).map_err(anyhow::Error::from)?;
         manifest["aot_sha256"]=xr_motion_patch::sha256(&code)?.into();
-        manifest["patched_wasm_sha256"]=xr_motion_patch::sha256(&artifact.wasm)?.into();
+        manifest["patched_wasm_sha256"]=xr_motion_patch::sha256(&artifact_wasm)?.into();
         manifest["host_build_requirement"]="MUGUET_MOTION_AOT_SHA256 must equal aot_sha256".into();
         use std::io::Write;
         std::fs::OpenOptions::new().write(true).create_new(true).open(out)?.write_all(&code)?;

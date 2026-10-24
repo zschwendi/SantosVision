@@ -113,6 +113,9 @@ pub fn call(mut caller: Caller<'_, HostState>, idx: usize, params: &[Val], resul
     if rt.imports[idx].module == crate::xr_motion_aim::IMPORT_MODULE {
         return crate::xr_motion_aim::host_hook(&mut caller,name,params,results,mem);
     }
+    if rt.imports[idx].module == crate::xr_motion_arms::IMPORT_MODULE {
+        return crate::xr_motion_arms::host_hook(&mut caller,name,params,results,mem);
+    }
 
     // Preserve normal runtime scheduling until a safe polling/liveness boundary
     // is certified for every producer. The true policy is test-only groundwork.
