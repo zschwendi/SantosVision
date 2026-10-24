@@ -18,7 +18,8 @@ struct SourceGuardBandValidation {
         otherAsymmetricEye[2][0] = -physical[2][0]
         var checked = 0
         for original in [physical, otherAsymmetricEye] {
-            let canonical = GameWorldProjection.nativePinhole(original)!.matrix
+            let conversion = GameWorldProjection.nativePinhole(original)!
+            let canonical = conversion.matrix
             precondition(GameWorldSourceGuardBand.projection(original, scale: 1)! == canonical)
             let inverse = original.inverse
             for scale: Float in [1.05, 1.1, 1.2] {
@@ -31,10 +32,12 @@ struct SourceGuardBandValidation {
                             let eye = inverse * ndc
                             let expandedClip = source * eye
                             let expanded = expandedClip / expandedClip.w
-                            precondition(abs(expanded.x - ndc.x / scale) < 3e-5)
-                            precondition(abs(expanded.y - ndc.y / scale) < 3e-5)
-                            precondition(abs(expanded.z - ndc.z) < 3e-5)
-                            precondition(abs(expanded.x) <= 1 / scale + 3e-5 && abs(expanded.y) <= 1 / scale + 3e-5)
+                            let xyBudget = conversion.maximumRayError / scale + 2e-6
+                            let depthBudget = conversion.maximumDepthError + 2e-6
+                            precondition(abs(expanded.x - ndc.x / scale) <= xyBudget)
+                            precondition(abs(expanded.y - ndc.y / scale) <= xyBudget)
+                            precondition(abs(expanded.z - ndc.z) <= depthBudget)
+                            precondition(abs(expanded.x) <= 1 / scale + xyBudget && abs(expanded.y) <= 1 / scale + xyBudget)
                             checked += 1
                         }
                     }
