@@ -94,8 +94,12 @@ addendum's R1/R2 cases are repaired at `889bfe7`.
    capture-only and successful counters never prove visible alignment.
 
 Startup black pixels, scope/HUD fallback, peripheral coverage, image quality,
-temporal stereo, bare-hand/unarmed integration, original intro playback and an
+temporal stereo, unarmed Sense-driven hands, original intro playback and an
 actual story/cloud-save round trip remain open in the
 [request audit](USER-REQUEST-AUDIT-20261024.md). No simulator, banked reset,
 unrelated media, uninstall or unverified physical-performance claim was used in
 this candidate batch.
+
+The user confirmed Sense-driven hands, arms and gun as the first tracking
+priority. Natural bare-hand interaction is deferred; it is separate from the
+unfinished unarmed Sense-driven avatar hands.

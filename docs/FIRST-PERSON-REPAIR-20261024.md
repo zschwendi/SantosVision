@@ -34,6 +34,10 @@ working immersive checkpoint. The additional rollback tag is
 
 Passing source tests, receiving poses or writing private native targets does not
 prove visible hands, successful ADS, impact accuracy or physical stereo. Keep
-these outcomes distinct in each handoff. The user's optional clarification on
-bare-hand interaction is pending; Sense-driven visible arms remain the initial
-hands scope. Rendering screenshots are deferred until aiming and arms work.
+these outcomes distinct in each handoff. The user explicitly confirmed
+"Sense-driven hands and arms first." Prioritize visible controller-driven
+hands, arms and gun, with barrel, reticle and native shots in agreement during
+independent head and controller movement. Natural bare-hand interaction is
+deferred. Unarmed Sense-driven avatar hands remain an unfinished controller
+feature, distinct from natural bare-hand interaction. Rendering screenshots
+are deferred until aiming and arms work.
