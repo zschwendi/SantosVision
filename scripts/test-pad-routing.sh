@@ -48,6 +48,52 @@ mod pad {
         use super::*;
         use crate::input::Event;
         #[test]
+        fn phone_back_has_no_reload_or_held_face_leak_for_both_controller_profiles() {
+            for spatial in [false, true] {
+                suspend();
+                TEST_NATIVE_CONTROLS_OWN_INPUT.store(false, Ordering::Relaxed);
+                TEST_NATIVE_CONTROLS_POLICY.store(0, Ordering::Relaxed);
+                let neutral = if spatial { spatial::spatial_sample(3, 0, [0.0; 6], 42).unwrap() }
+                    else { Sample::default() };
+                let phone = || Some(guest_context::Context { paused: false, phone: true });
+                let gameplay = || Some(guest_context::Context { paused: false, phone: false });
+                poll_sample_in_context(Some(neutral), phone);
+                crate::input::take();
+                let circle = Sample { face_and_shoulders: CIRCLE, ..neutral };
+                poll_sample_in_context(Some(circle), phone);
+                let events = crate::input::take();
+                assert!(events.contains(&Event::Key("Backspace".into(), true)));
+                assert!(!events.contains(&Event::Key("KeyR".into(), true)));
+                poll_sample_in_context(Some(circle), gameplay);
+                let events = crate::input::take();
+                assert!(events.contains(&Event::Key("Backspace".into(), false)));
+                assert!(!events.contains(&Event::Key("KeyR".into(), true)));
+                poll_sample_in_context(Some(neutral), gameplay);
+                crate::input::take();
+                poll_sample_in_context(Some(circle), gameplay);
+                assert!(crate::input::take().contains(&Event::Key("KeyR".into(), true)));
+                suspend();
+            }
+        }
+        #[test]
+        fn verified_phone_close_queue_reaches_guest_under_transition_modal_ownership() {
+            suspend();
+            TEST_NATIVE_CONTROLS_OWN_INPUT.store(true, Ordering::Relaxed);
+            let held = Sample { right_trigger: 1.0, face_and_shoulders: CROSS, ..Sample::default() };
+            assert!(queue_menu_action(12));
+            crate::input::take();
+            poll_sample_in_context(Some(held), || Some(guest_context::Context { paused: false, phone: true }));
+            let events = crate::input::take();
+            assert!(events.contains(&Event::Key("Backspace".into(), true)));
+            assert!(!events.iter().any(|event| matches!(event, Event::Button(_, true))));
+            assert!(!events.contains(&Event::Key("ShiftLeft".into(), true)));
+            MENU_ACTIONS.lock().unwrap().active = Some(("Backspace", Instant::now() - Duration::from_millis(1)));
+            poll_sample_in_context(Some(held), || Some(guest_context::Context { paused: false, phone: false }));
+            assert!(crate::input::take().contains(&Event::Key("Backspace".into(), false)));
+            suspend();
+            TEST_NATIVE_CONTROLS_OWN_INPUT.store(false, Ordering::Relaxed);
+        }
+        #[test]
         fn partial_disconnect_and_suspend_emit_actual_releases_and_stop_look() {
             suspend();
             MENU_NAVIGATION.store(false, Ordering::Relaxed);

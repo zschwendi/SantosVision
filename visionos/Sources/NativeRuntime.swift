@@ -123,6 +123,34 @@ struct NativeSenseUtilityOwnership {
 }
 // END NativeSenseUtilityOwnership
 
+// BEGIN NativePhoneTransitionPolicy (standalone validation uses this actual block)
+struct NativePhoneTransitionPolicy {
+    enum Step: Equatable { case ready, wait, close, blocked }
+    let deadline: Double
+    private(set) var closeCommands = 0
+    private var closePoll: UInt64?
+    private var nextCloseTime = -Double.infinity
+    mutating func next(phone: Bool?, paused: Bool?, poll: UInt64?, active: Bool, now: Double) -> Step {
+        guard active, now.isFinite, now < deadline else { return .blocked }
+        guard let phone, let poll else { return .wait }
+        if !phone {
+            if let closePoll, poll <= closePoll { return .wait }
+            return .ready
+        }
+        // Backspace in a GTA menu can dismiss settings. Never substitute menu
+        // navigation for a verified gameplay-phone close.
+        guard paused == false else { return .blocked }
+        guard now >= nextCloseTime else { return .wait }
+        if let closePoll, poll <= closePoll { return .wait }
+        guard closeCommands < 3 else { return .blocked }
+        closeCommands += 1
+        closePoll = poll
+        nextCloseTime = now + 0.5
+        return .close
+    }
+}
+// END NativePhoneTransitionPolicy
+
 @MainActor
 final class NativeRuntimeModel: ObservableObject {
     @Published private(set) var status = "The native game runtime has not been checked."
@@ -147,7 +175,12 @@ final class NativeRuntimeModel: ObservableObject {
     @Published private(set) var nativeControlsSelection = 0
     @Published private(set) var senseGameplayUtilitiesVisible = false
     @Published private(set) var sensePhoneNavigationVisible = false
+    @Published private(set) var windowGameplayUtilitiesVisible = false
+    @Published private(set) var immersivePhonePreparationActive = false
+    @Published private(set) var immersivePhonePreparationStatus = ""
     private var sensePhoneInstantiated = false
+    private var sensePhoneContextKnown = false
+    private var immersivePhonePreparationToken: UUID?
     @Published private(set) var nativeControlsStatus = ""
     private var fastMenuPolling: Task<Void, Never>?
     private var nativeMenuPressObserver = NativeMenuPressObserver()
@@ -458,7 +491,7 @@ final class NativeRuntimeModel: ObservableObject {
 
     private func updateNativeControlsOwnership() {
         let modal = gameControlsVisible || nativeSettingsPresented
-        NativeControlsOwnership.shared.set(modal: modal, utility: senseUtilityInteractionActive)
+        NativeControlsOwnership.shared.set(modal: modal || immersivePhonePreparationActive, utility: senseUtilityInteractionActive)
         nativeControlsRouter = NativeControlsRouter()
         nativeControlsSelection = 0
         nativeControlsActivationGate.cancel()
@@ -569,7 +602,8 @@ final class NativeRuntimeModel: ObservableObject {
     /// A native arrow is a Peel-style one-shot key press, while its touch
     /// lifecycle still owns controller input. It must never create a held key.
     func setFlatSenseUtilityInteractionPressed(_ action: SantosSenseUtilityAction, pressed: Bool) {
-        if pressed, !senseGameplayUtilitiesVisible || (action.isDirection && !sensePhoneNavigationVisible) { return }
+        if pressed, !(windowGameplayUtilitiesVisible && isActive) || immersivePhonePreparationActive
+            || (action.isDirection && !sensePhoneNavigationVisible) { return }
         let owned = senseUtilityInteractionActive
         senseUtilityOwnership.setFlatInteraction(action, pressed: pressed)
         if owned != senseUtilityInteractionActive { updateNativeControlsOwnership() }
@@ -623,7 +657,7 @@ final class NativeRuntimeModel: ObservableObject {
     private func clearSenseUtilityDirections() {
         senseUtilityOwnership.clear()
         synchronizeSenseUtilityDirections()
-        NativeControlsOwnership.shared.set(modal: gameControlsVisible || nativeSettingsPresented, utility: false)
+        NativeControlsOwnership.shared.set(modal: gameControlsVisible || nativeSettingsPresented || immersivePhonePreparationActive, utility: false)
     }
 
     private func refreshSenseUtilityDirections() {
@@ -635,7 +669,8 @@ final class NativeRuntimeModel: ObservableObject {
 
     @discardableResult
     func performSenseUtility(_ action: SantosSenseUtilityAction) -> Bool {
-        guard senseGameplayUtilitiesVisible else { return false }
+        guard (senseGameplayUtilitiesVisible || windowGameplayUtilitiesVisible), isActive,
+              !immersivePhonePreparationActive else { return false }
         guard !action.isDirection || sensePhoneNavigationVisible else { return false }
         if action.isDirection, heldSenseUtilityDirections.contains(action)
             || ProcessInfo.processInfo.systemUptime - (releasedSenseUtilityDirections[action] ?? -.infinity) < 0.2 {
@@ -649,12 +684,72 @@ final class NativeRuntimeModel: ObservableObject {
         let spatial = SpatialGamepadInput.shared.report
         let connected = spatial["left_controls_available"] as? Bool == true
             || spatial["right_controls_available"] as? Bool == true
-        senseGameplayUtilitiesVisible = connected && hasStarted && !engineFailed && !isQuitting
-            && !gameControlsVisible && !nativeSettingsPresented && isActive
-        sensePhoneNavigationVisible = senseGameplayUtilitiesVisible && sensePhoneInstantiated
+        let ready = hasStarted && !engineFailed && !isQuitting && !gameControlsVisible && !nativeSettingsPresented
+        // Phone close remains reachable with DualSense, Sense or hand pinch.
+        // Inactive focus keeps the flat ornament present; accepting an action
+        // still requires the real active lifecycle above.
+        windowGameplayUtilitiesVisible = ready && (connected || sensePhoneInstantiated)
+        senseGameplayUtilitiesVisible = windowGameplayUtilitiesVisible && isActive
+        sensePhoneNavigationVisible = windowGameplayUtilitiesVisible && sensePhoneInstantiated
         if !senseGameplayUtilitiesVisible { clearSenseUtilityDirections() }
         else if !sensePhoneNavigationVisible { clearFlatSensePhoneInteractions() }
     }
+
+    /// Close only a freshly observed gameplay phone, then require a new native
+    /// poll to confirm it is gone before changing presentation ownership.
+    func preparePhoneForImmersiveTransition() async -> Bool {
+        guard hasStarted, !engineFailed, !isQuitting, isActive, !immersivePhonePreparationActive else { return false }
+        let token = UUID()
+        immersivePhonePreparationToken = token
+        immersivePhonePreparationActive = true
+        immersivePhonePreparationStatus = "Checking the game phone before immersive view…"
+        clearSenseUtilityDirections()
+        updateNativeControlsOwnership()
+        defer {
+            immersivePhonePreparationToken = nil
+            immersivePhonePreparationActive = false
+            updateNativeControlsOwnership()
+        }
+        var policy = NativePhoneTransitionPolicy(deadline: ProcessInfo.processInfo.systemUptime + 4)
+        while immersivePhonePreparationToken == token, !Task.isCancelled {
+            let result = await Task.detached { NativeRuntime.status() }.value
+            let object = result.payload.data(using: .utf8)
+                .flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }
+            let controller = object?["controller"] as? [String: Any]
+            let phone = result.code == 0 ? controller?["phone_instantiated"] as? Bool : nil
+            let paused = controller?["menu_navigation"] as? Bool
+            let poll = (controller?["poll_samples"] as? NSNumber)?.uint64Value
+            guard immersivePhonePreparationToken == token, !Task.isCancelled else { break }
+            if result.code == 0 {
+                lastStatus = result
+                nativeDetails = result.payload
+                sensePhoneContextKnown = phone != nil
+                if let phone { sensePhoneInstantiated = phone }
+            }
+            switch policy.next(phone: phone, paused: paused, poll: poll,
+                               active: isActive && !engineFailed && !isQuitting,
+                               now: ProcessInfo.processInfo.systemUptime) {
+            case .ready:
+                sensePhoneInstantiated = false
+                sensePhoneContextKnown = true
+                immersivePhonePreparationStatus = ""
+                updateSenseUtilitiesVisibility()
+                return true
+            case .close:
+                immersivePhonePreparationStatus = "Putting the phone away before immersive view…"
+                guard sendMenuAction(12) else { return false }
+            case .wait: break
+            case .blocked:
+                immersivePhonePreparationStatus = "Close the phone in the game, then try immersive view again."
+                return false
+            }
+            do { try await Task.sleep(for: .milliseconds(100)) } catch { break }
+        }
+        immersivePhonePreparationStatus = "Immersive view cancelled. The game is still in its window."
+        return false
+    }
+
+    func cancelPhonePreparation() { immersivePhonePreparationToken = nil }
 
     func setWindowAttached(_ attached: Bool) {
         windowIsAttached = attached
@@ -920,9 +1015,11 @@ final class NativeRuntimeModel: ObservableObject {
         }
         let nativeStatus = lastStatus?.payload.data(using: .utf8)
             .flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }
-        // Native certifies the supported original game's phone instance state.
-        // Missing/unknown guest context deliberately keeps the popup hidden.
-        sensePhoneInstantiated = (nativeStatus?["controller"] as? [String: Any])?["phone_instantiated"] as? Bool == true
+        // Unknown context cannot certify that a previously open phone closed.
+        // Retain its escape controls until the native getter reports false.
+        let phone = (nativeStatus?["controller"] as? [String: Any])?["phone_instantiated"] as? Bool
+        sensePhoneContextKnown = phone != nil
+        if let phone { sensePhoneInstantiated = phone }
         let controllers = GCController.controllers().filter { $0.extendedGamepad != nil }
         let controllerNames = controllers.map { $0.vendorName ?? "Game controller" }
         updateSenseUtilitiesVisibility()
@@ -949,6 +1046,10 @@ final class NativeRuntimeModel: ObservableObject {
             "native_controls_selection": nativeControlsSelection,
             "sense_gameplay_utilities_visible": senseGameplayUtilitiesVisible,
             "sense_phone_navigation_visible": sensePhoneNavigationVisible,
+            "window_gameplay_utilities_visible": windowGameplayUtilitiesVisible,
+            "phone_context_known": sensePhoneContextKnown,
+            "immersive_phone_preparation_active": immersivePhonePreparationActive,
+            "immersive_phone_preparation_status": immersivePhonePreparationStatus,
             "flat_sense_utility_ui": [
                 "primary_action_events": flatSenseUtilityPrimaryActions,
                 "queued_actions": flatSenseUtilityQueuedActions,

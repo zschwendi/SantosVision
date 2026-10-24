@@ -92,9 +92,9 @@ struct WindowGameView: View {
 
     private var senseWindowUtilitiesVisible: Bool {
         #if SV_GAME_RUNTIME
-        runtime.senseGameplayUtilitiesVisible && !world.isOpening && !world.isImmersiveActive
+        runtime.windowGameplayUtilitiesVisible && (!world.isImmersiveActive || !world.hasPresentedFrames)
         #else
-        runtime.senseGameplayUtilitiesVisible
+        runtime.windowGameplayUtilitiesVisible
         #endif
     }
 
@@ -123,16 +123,16 @@ struct WindowGameView: View {
             }
             #if SV_GAME_RUNTIME
             if runtime.hasStarted, !runtime.engineFailed,
-               (world.isOpening || world.isImmersiveActive), !world.hasPresentedFrames {
+               runtime.immersivePhonePreparationActive || ((world.isOpening || world.isImmersiveActive) && !world.hasPresentedFrames) {
                 VStack(spacing: 14) {
                     ProgressView()
-                    Text("Opening immersive view…").font(.headline)
-                    Text("Waiting for the first game frame.")
+                    Text(runtime.immersivePhonePreparationActive ? "Preparing immersive view…" : "Opening immersive view…").font(.headline)
+                    Text(runtime.immersivePhonePreparationActive ? runtime.immersivePhonePreparationStatus : "Waiting for the first game frame.")
                         .font(.caption).foregroundStyle(.secondary)
                     Button("Return to window", systemImage: "arrow.down.right.and.arrow.up.left") {
                         Task { await returnToWindow() }
                     }
-                    .disabled(world.isOpening)
+                    .disabled(world.isOpening && !runtime.immersivePhonePreparationActive)
                 }
                 .padding(24)
                 .glassBackgroundEffect()
@@ -175,6 +175,13 @@ struct WindowGameView: View {
                 .padding(.top, 12)
         }
         .sheet(isPresented: $runtime.nativeSettingsPresented) { SantosSettingsView(runtime: runtime) }
+        .ornament(visibility: !runtime.immersivePhonePreparationStatus.isEmpty && !runtime.immersivePhonePreparationActive ? .visible : .hidden,
+                  attachmentAnchor: .scene(.top), contentAlignment: .bottom) {
+            if !runtime.immersivePhonePreparationStatus.isEmpty, !runtime.immersivePhonePreparationActive {
+                Text(runtime.immersivePhonePreparationStatus)
+                    .font(.caption).padding(12).glassBackgroundEffect().padding(16)
+            }
+        }
         #if SV_GAME_RUNTIME
         .task {
             // Exercise the normal window-to-world transition after real window
@@ -246,6 +253,10 @@ struct WindowGameView: View {
     private func expandGame() async {
         guard runtime.hasStarted, !runtime.engineFailed, !world.isOpening, !world.isImmersiveActive else { return }
         world.isOpening = true
+        guard await runtime.preparePhoneForImmersiveTransition() else {
+            world.isOpening = false
+            return
+        }
         world.status = "Opening immersive Los Santos…"
         switch await openImmersiveSpace(id: GameWorldModel.spaceID) {
         case .opened:
@@ -265,6 +276,7 @@ struct WindowGameView: View {
     }
 
     private func returnToWindow() async {
+        runtime.cancelPhonePreparation()
         world.stopRenderer(reason: "window_transition_cancelled")
         await dismissImmersiveSpace()
         world.isImmersiveActive = false

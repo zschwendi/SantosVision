@@ -105,6 +105,7 @@ struct State {
     last: Instant,
     down_since: Option<Instant>,
     menu_navigation: bool,
+    phone_navigation: bool,
     menu_button_down: bool,
     blocked_context_buttons: u8,
     spatial_router: spatial::Router,
@@ -399,6 +400,10 @@ pub fn poll() -> bool {
 }
 
 fn poll_sample(gp: Option<Sample>) -> bool {
+    poll_sample_in_context(gp, guest_context::read)
+}
+
+fn poll_sample_in_context(gp: Option<Sample>, context: impl FnOnce() -> Option<guest_context::Context>) -> bool {
     let connected = gp.is_some();
     if ACTIVE.swap(connected, Ordering::Relaxed) != connected {
         eprintln!("[pad] controller {}", if connected { "connected" } else { "disconnected" });
@@ -406,13 +411,13 @@ fn poll_sample(gp: Option<Sample>) -> bool {
     if connected { CONNECTED_SAMPLES.fetch_add(1, Ordering::Relaxed); }
     let mut guard = STATE.lock().unwrap();
     let st = guard.get_or_insert_with(|| State { held: HashSet::new(), buttons: 0, last: Instant::now(), down_since: None,
-        menu_navigation: MENU_NAVIGATION.load(Ordering::Relaxed), menu_button_down: false, blocked_context_buttons: 0,
+        menu_navigation: MENU_NAVIGATION.load(Ordering::Relaxed), phone_navigation: false, menu_button_down: false, blocked_context_buttons: 0,
         spatial_router: spatial::Router::default(), native_controls_require_neutral: false, utility_source: None });
     let source = gp.map(|sample| sample.spatial);
     if !connected || source != st.utility_source { clear_utility_dpad(); }
     st.utility_source = source;
     let in_car = IN_VEHICLE.load(Ordering::Relaxed);
-    let guest = guest_context::read();
+    let guest = context();
     let ui_directions = utility_dpad(Instant::now());
     let wheel_navigation = ui_directions & 2 != 0 && !in_car
         && !guest.map_or(st.menu_navigation, |context| context.paused)
@@ -447,8 +452,9 @@ fn poll_sample(gp: Option<Sample>) -> bool {
     st.menu_button_down = menu_down;
     let escape_released = st.held.contains("Escape") && !menu_down && menu_key != Some("Escape");
     let (menu, phone_instantiated) = navigation_context(st.menu_navigation, escape_released, guest);
-    let context_changed = menu != st.menu_navigation;
+    let context_changed = menu != st.menu_navigation || phone_instantiated != st.phone_navigation;
     st.menu_navigation = menu;
+    st.phone_navigation = phone_instantiated;
     MENU_NAVIGATION.store(menu, Ordering::Relaxed);
     GUEST_CONTEXT_AVAILABLE.store(guest.is_some(), Ordering::Relaxed);
     PHONE_INSTANTIATED.store(phone_instantiated, Ordering::Relaxed);
@@ -483,7 +489,9 @@ fn poll_sample(gp: Option<Sample>) -> bool {
             if pressed(RIGHT_SHOULDER) { keys.insert("KeyQ"); }
             if gp.left_click { keys.insert("ControlLeft"); }
         }
-        face_keys(&mut keys, menu, in_car, pressed(CROSS), pressed(CIRCLE), pressed(SQUARE));
+        // A phone uses Enter/Backspace without gameplay sprint/reload chords.
+        // Leaving it must require a fresh face press before gameplay resumes.
+        face_keys(&mut keys, menu || phone_instantiated, in_car, pressed(CROSS), pressed(CIRCLE), pressed(SQUARE));
         if menu {
             if pressed(TRIANGLE) { keys.insert("KeyY"); }
             if pressed(RIGHT_SHOULDER) { keys.insert("KeyN"); }
