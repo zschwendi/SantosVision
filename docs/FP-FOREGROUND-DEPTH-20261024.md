@@ -1,5 +1,17 @@
 # First-person foreground depth — October 24, 2026
 
+## Actual capture correction
+
+Build 24's real present 2116 renders the initial gun/arms **before world
+geometry** on the same depth target, with no destructive clear before the
+world's depth freeze. The published raw depth visibly retains those gun/arm
+silhouettes. Thus the general missing-foreground-depth hypothesis below does
+not explain this captured arrangement. The current default-off merge does not
+handle the pre-world case: it would reject the initial attributed draws for
+an absent world record. Keep it off. Read
+[the actual capture findings](FIRST-PERSON-CAPTURE24-20261024.md) before acting
+on this original conditional implementation plan.
+
 Opus 5.5 source worker for parent `w-14dea40fb6e248138ad507f85cf4384b`
 (topic santosvision-immersive). Source change only, default OFF. Root owns
 AOT, signing, Metal/device validation and physical acceptance. No change to

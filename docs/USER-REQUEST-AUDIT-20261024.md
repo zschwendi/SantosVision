@@ -27,9 +27,11 @@ deferred; unarmed Sense-driven avatar hands remain within the controller scope.
 
 Latest player feedback: **visible hand/arm tracking does not work**. Treat this
 as failed acceptance, not a completed implementation awaiting confirmation.
-The normal immersive publication path still lacks qualified foreground depth
-for the corrected first-person gun/arms; the separate candidate's conditional
-foreground merge remains off until actual pass ordering is captured and handled.
+The first actual capture now shows gun/arm depth surviving into the published
+image without the conditional foreground merge. The earlier general missing-
+depth explanation does not hold for this captured arrangement. Controller
+request-to-visible-skeleton ownership remains unproven; keep the separate
+foreground merge off instead of treating it as the hand-tracking fix.
 The user also withdrew the immersive Phone button: phone utilities now belong
 only to the windowed presentation, reached through the existing pause/window flow.
 
@@ -43,8 +45,9 @@ establish progress on any of these visible failures.
 The retained 21:52:25Z run records 8.37 source versus 14.27 display vertical
 pixels per degree (about 1.71 display pixels per source texel). This establishes
 a detail shortfall, not the complete cause of the reported grain. Its capture
-flag is disabled; the earlier armed diagnostic session did not produce a
-retrieved manifest. Do not claim the player's subsequent run was captured.
+flag is disabled; that run was not captured. A subsequent explicitly rearmed
+session produced the validated capture described in
+[the capture findings](FIRST-PERSON-CAPTURE24-20261024.md).
 
 ## Current blockers and unfinished requests
 
@@ -54,7 +57,7 @@ retrieved manifest. Do not claim the player's subsequent run was captured.
 | Start in immersive must not crash; our settings must remain usable | **Source repair integrated; device acceptance pending.** Matching device crash is SwiftUI Missing app graph. The old sequence also crashes an isolated scene-only app; serialized restoration passes three cycles. GTA pause currently uses an explicit window fallback, not an immersive front-end compositor. | Coordinator with menus specialist; see SCENE-RETURN-STABILITY-20261024.md. Test Start, GTA tabs/Apply/save and return to immersive after closing GTA menu. |
 | First-person ADS in flat and immersive | **Source repair integrated; visible ADS unaccepted.** Sense L2 + R3 now reaches GTA's separate native sights toggle in both first-person views. Original L2-to-RMB mapping was already correct. Tracked-arm/sights interaction and wheel sign need a device check. | Dedicated Opus 5.5 `ads` task; test both first-person views. |
 | Sense can navigate GTA Settings and controls in every view | **Source repair integrated; hardware check pending.** GTA keeps the controller while its menu is open; L1/R1/Triangle send its actual Q/E/Tab bindings. Combined menu/ADS routing passes 39 tests. | Dedicated Opus 5.5 `menus` task; actual directions, tabs, confirm/cancel and Apply/save. |
-| Actual tracked gun, hands and arms | **Player acceptance failed; unfinished.** Installed 22 corrects head/eye cancellation in the two skinned model families, but its ordinary immersive publication lacks a qualified foreground-depth route. Signed 23-r2 adds calibrated left-wrist orientation and conditional actual foreground-depth integration, disabled by default. Five Metal/classifier and sixteen foreground CPU checks pass; actual game draw-order evidence is still needed. Unarmed Sense-driven hands remain unfinished. | Dedicated Opus 5.5 `hands` task; actual skeleton, attachments and first-person draw transform must agree. |
+| Actual tracked gun, hands and arms | **Player acceptance failed; unfinished.** Actual build-24 capture proves the initial gun/arm draws precede world geometry and remain visible in published depth without merge. The earlier general missing-depth diagnosis is withdrawn for this arrangement. Same-request native solve-to-draw skeleton ownership is still unresolved; stale cache cookies do not prove a solve failure. Unarmed Sense-driven hands remain unfinished. | Dedicated Opus 5.5 `hands` task; actual skeleton, attachments and first-person draw transform must agree. |
 | Reticle always agrees with visible barrel and actual native aiming | **Incomplete.** Candidate 21 repairs an independent binocular-reference bug; it does not establish visible gun alignment. | Hands/ADS integration; near/far and independent head/hand movement. No fabricated center dot or desired-ray authority. |
 | Independent left wrist rotation | **Carried into installed 24; not physically accepted.** Explicit grip-to-native-hand calibration transports native flags256. Full artifact preservation, AOT generation and signed-app integration passed; 11 native state tests, 2 factory tests and 46 UI-flow checks pass after independent fixes. Uncalibrated play keeps native wrist orientation. | Hands task; proper calibrated frame and native orientation transport. |
 | First-person head looking, body turning and weapon aiming can be separated or chosen | **Partially implemented, choice unfinished.** Sense weapon aiming and headset view have separate source paths. There is no normal Settings choice for the requested first-person head-check/body-turn experiment. Preserve accepted third-person behavior. | Hands/aiming follow-up after actual barrel alignment is accepted. |
