@@ -22,5 +22,9 @@
     </dict>
     <key>NSWorldSensingUsageDescription</key>
     <string>Los Santos uses your headset position and movement to render the immersive game world around you.</string>
+    <key>NSAccessoryTrackingUsageDescription</key>
+    <string>Los Santos can use the position and orientation of your paired spatial controllers for immersive hand and aiming controls.</string>
+    <key>NSHandsTrackingUsageDescription</key>
+    <string>Los Santos can use your hand movements for immersive hand controls.</string>
 </dict>
 </plist>
