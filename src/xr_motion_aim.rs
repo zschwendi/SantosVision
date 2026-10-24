@@ -22,6 +22,13 @@ static GAMEPLAY_REQUESTED:LazyLock<bool>=LazyLock::new(||std::env::var("MUGUET_X
 /// Certificate acceptance and gameplay activation are deliberately independent.
 /// Cache only launch intent; an early status read cannot cache certificatefalse.
 pub fn gameplay_enabled()->bool {diagnostic_enabled()&&*GAMEPLAY_REQUESTED}
+fn supported_motion_scope(first_person:bool,world_active:bool,spatial:bool,in_vehicle:bool,gameplay:bool)->bool {
+    first_person&&world_active&&spatial&&!in_vehicle&&gameplay
+}
+fn current_supported_scope(first_person:bool)->bool {
+    supported_motion_scope(first_person,crate::xr_view::world_camera_enabled(),crate::pad::spatial_controls_selected(),
+        crate::pad::IN_VEHICLE.load(Ordering::Relaxed),crate::pad::verified_guest_gameplay_context())
+}
 
 #[derive(Clone,Copy)]
 enum FireScope { Native, Motion {ready:bool} }
@@ -163,6 +170,7 @@ pub(crate) fn host_hook(caller:&mut wasmtime::Caller<'_,crate::HostState>,name:&
                 *IK_PERMIT.lock().unwrap_or_else(|p|p.into_inner())=None;
                 caller.data_mut().motion_aim.invalidate_inputs();return Ok(());
             }
+            if !current_supported_scope(first_person){caller.data_mut().motion_aim.invalidate_inputs();return Ok(());}
             let current_sp=caller.get_export("__muguet_motion_stack_pointer").and_then(|e|e.into_global())
                 .and_then(|g|g.get(&mut *caller).i64()).map(|v|v as u64);
             // The SP global is intentionally not normally exported. The
@@ -219,8 +227,7 @@ pub(crate) fn host_hook(caller:&mut wasmtime::Caller<'_,crate::HostState>,name:&
             let (phase,task,ped,tls,first_person)=(arg(0)?,arg(1)?,arg(2)?,arg(3)?,arg(4)?!=0);
             anyhow::ensure!(phase<=1,"motion fire gate phase unknown");
             let identity=make_identity(tls);let epoch=crate::xr_view::view_epoch();
-            let scoped=first_person&&crate::xr_view::world_camera_enabled()&&crate::pad::spatial_controls_selected()
-                &&!crate::pad::IN_VEHICLE.load(Ordering::Relaxed)&&crate::pad::verified_guest_gameplay_context();
+            let scoped=current_supported_scope(first_person);
             let candidate=CANDIDATE.lock().unwrap_or_else(|p|p.into_inner()).clone();
             let valid=scoped&&candidate.as_ref().is_some_and(|c|motion_ready(c,Instant::now(),epoch));
             let allowed=if phase==0{
@@ -605,5 +612,13 @@ mod tests {
         inactive_hook("calculation_complete",&vec![Val::I64(-1);7],&mut []).unwrap();
         inactive_hook("allow_fire",&vec![Val::I64(-1);5],&mut result).unwrap();assert_eq!(result[0].i32(),Some(1));
         assert!(inactive_hook("unknown",&[],&mut []).is_err());
+    }
+    #[test]
+    fn native_frame_and_firing_share_only_supported_spatial_onfoot_firstperson_scope(){
+        assert!(supported_motion_scope(true,true,true,false,true));
+        for route in [(false,true,true,false,true),(true,false,true,false,true),
+            (true,true,false,false,true),(true,true,true,true,true),(true,true,true,false,false)]{
+            assert!(!supported_motion_scope(route.0,route.1,route.2,route.3,route.4));
+        }
     }
 }
