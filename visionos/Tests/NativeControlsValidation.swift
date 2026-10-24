@@ -10,6 +10,16 @@ import Foundation
         require(svNativeControlsOwnsInputV1() == 1, "Rust must observe modal ownership")
         NativeControlsOwnership.shared.set(false)
         require(svNativeControlsOwnsInputV1() == 0, "Ownership releases on dismiss")
+        require(svNativeControlsInputPolicyV2() == 0, "V2 starts in normal gameplay")
+        NativeControlsOwnership.shared.set(modal: false, utility: true)
+        require(svNativeControlsOwnsInputV1() == 1 && svNativeControlsInputPolicyV2() == 2,
+                "Utility retains V1 boolean compatibility and distinct V2 navigation policy")
+        NativeControlsOwnership.shared.set(modal: true, utility: true)
+        require(svNativeControlsOwnsInputV1() == 1 && svNativeControlsInputPolicyV2() == 1,
+                "A full modal always takes priority over utility navigation")
+        NativeControlsOwnership.shared.set(modal: false, utility: false)
+        require(svNativeControlsOwnsInputV1() == 0 && svNativeControlsInputPolicyV2() == 0,
+                "Releasing both owners restores normal gameplay policy")
         var router = NativeControlsRouter()
         let heldStart = NativeControlsInput(pause: true)
         require(!router.update(heldStart, selection: 0, now: 0).dismiss, "Opening Start cannot close its own panel")

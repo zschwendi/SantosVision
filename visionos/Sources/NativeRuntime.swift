@@ -418,7 +418,7 @@ final class NativeRuntimeModel: ObservableObject {
 
     private func updateNativeControlsOwnership() {
         let modal = gameControlsVisible || nativeSettingsPresented
-        NativeControlsOwnership.shared.set(modal || senseUtilityInteractionActive)
+        NativeControlsOwnership.shared.set(modal: modal, utility: senseUtilityInteractionActive)
         nativeControlsRouter = NativeControlsRouter()
         nativeControlsSelection = 0
         nativeControlsActivationGate.cancel()
@@ -851,6 +851,7 @@ final class NativeRuntimeModel: ObservableObject {
             "window_surface_ready": windowSurfaceReady,
             "window_scene_policy": "single_instance_main",
             "native_controls_owns_input": NativeControlsOwnership.shared.read(),
+            "native_controls_input_policy_v2": NativeControlsOwnership.shared.readPolicy(),
             "native_controls_selection": nativeControlsSelection,
             "sense_gameplay_utilities_visible": senseGameplayUtilitiesVisible,
             "native_controls_status": nativeControlsStatus,

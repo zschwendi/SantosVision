@@ -192,16 +192,21 @@ fn menu_action_key(actions: &mut MenuActions, now: Instant, paused: Option<bool>
 }
 
 #[cfg(all(target_os = "visionos", not(test)))]
-fn native_controls_own_input() -> bool {
-    extern "C" { fn sv_native_controls_owns_input_v1() -> u32; }
-    unsafe { sv_native_controls_owns_input_v1() != 0 }
+fn native_controls_input_policy() -> u32 {
+    extern "C" { fn sv_native_controls_input_policy_v2() -> u32; }
+    unsafe { sv_native_controls_input_policy_v2() }
 }
 #[cfg(test)]
 static TEST_NATIVE_CONTROLS_OWN_INPUT: AtomicBool = AtomicBool::new(false);
 #[cfg(test)]
-fn native_controls_own_input() -> bool { TEST_NATIVE_CONTROLS_OWN_INPUT.load(Ordering::Relaxed) }
+static TEST_NATIVE_CONTROLS_POLICY: AtomicU64 = AtomicU64::new(0);
+#[cfg(test)]
+fn native_controls_input_policy() -> u32 {
+    if TEST_NATIVE_CONTROLS_OWN_INPUT.load(Ordering::Relaxed) { 1 }
+    else { TEST_NATIVE_CONTROLS_POLICY.load(Ordering::Relaxed) as u32 }
+}
 #[cfg(all(not(target_os = "visionos"), not(test)))]
-fn native_controls_own_input() -> bool { false }
+fn native_controls_input_policy() -> u32 { 0 }
 
 fn physical_sample_for_owner(sample: Option<Sample>, owns: bool, require_neutral: &mut bool) -> Option<Sample> {
     if owns { *require_neutral = true; return None; }
@@ -210,6 +215,21 @@ fn physical_sample_for_owner(sample: Option<Sample>, owns: bool, require_neutral
         return None;
     }
     sample
+}
+
+fn physical_sample_for_policy(sample: Option<Sample>, policy: u32, wheel_navigation: bool,
+    require_neutral: &mut bool) -> Option<Sample> {
+    match policy {
+        0 => physical_sample_for_owner(sample, false, require_neutral),
+        2 => {
+            *require_neutral = true;
+            if !wheel_navigation { return None; }
+            sample.map(|source| Sample { right_stick: source.right_stick,
+                spatial: source.spatial, ..Sample::default() })
+        }
+        // A full modal and any future/invalid policy fail closed.
+        _ => physical_sample_for_owner(sample, true, require_neutral),
+    }
 }
 
 const UTILITY_DPAD_WATCHDOG: Duration = Duration::from_millis(250);
@@ -391,17 +411,26 @@ fn poll_sample(gp: Option<Sample>) -> bool {
     let source = gp.map(|sample| sample.spatial);
     if !connected || source != st.utility_source { clear_utility_dpad(); }
     st.utility_source = source;
-    let gp = physical_sample_for_owner(gp, native_controls_own_input(), &mut st.native_controls_require_neutral);
+    let in_car = IN_VEHICLE.load(Ordering::Relaxed);
+    let guest = guest_context::read();
+    let ui_directions = utility_dpad(Instant::now());
+    let wheel_navigation = ui_directions & 2 != 0 && !in_car
+        && !guest.map_or(st.menu_navigation, |context| context.paused)
+        && !guest.is_some_and(|context| context.phone)
+        && st.down_since.is_some_and(|since| since.elapsed() >= SWITCH_HOLD)
+        // Wait until a PREVIOUS mapper poll emitted the actual wheel key.
+        // The threshold-crossing poll itself must never rotate the view first.
+        && st.held.contains("AltLeft");
+    let gp = physical_sample_for_policy(gp, native_controls_input_policy(), wheel_navigation,
+        &mut st.native_controls_require_neutral);
     let gp = gp.map(|sample| st.spatial_router.apply(sample, Instant::now()));
     if gp.is_none() { st.spatial_router = spatial::Router::default(); }
     let dt = st.last.elapsed().as_secs_f64().min(0.05);
     st.last = Instant::now();
 
-    let in_car = IN_VEHICLE.load(Ordering::Relaxed);
     let mut keys: HashSet<&'static str> = HashSet::new();
     let mut buttons = 0u8;
     let mut looking = false;
-    let guest = guest_context::read();
     let (menu_key, wheel) = {
         let mut actions = MENU_ACTIONS.lock().unwrap();
         let key = menu_action_key(&mut actions, Instant::now(), guest.map(|context| context.paused));
@@ -486,7 +515,7 @@ fn poll_sample(gp: Option<Sample>) -> bool {
     }
     // UI holds bypass physical modal filtering intentionally, but still use
     // the identical direction/character-wheel semantics and normal key diff.
-    let directions = gp.as_ref().map_or(0, |sample| sample.dpad) | utility_dpad(Instant::now());
+    let directions = gp.as_ref().map_or(0, |sample| sample.dpad) | ui_directions;
     if directions & 1 != 0 { keys.insert("ArrowUp"); }
     if directions & 2 != 0 {
         let since = *st.down_since.get_or_insert_with(Instant::now);

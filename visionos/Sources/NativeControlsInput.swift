@@ -4,14 +4,25 @@ import Foundation
 final class NativeControlsOwnership: @unchecked Sendable {
     static let shared = NativeControlsOwnership()
     private let lock = NSLock()
-    private var ownsInput = false
-    func set(_ value: Bool) { lock.lock(); ownsInput = value; lock.unlock() }
-    func read() -> Bool { lock.lock(); defer { lock.unlock() }; return ownsInput }
+    // V1 remains a boolean. V2 distinguishes a blocking app modal from a
+    // utility gesture whose held character wheel needs safe navigation axes.
+    private var policy: UInt32 = 0
+    func set(_ value: Bool) { set(modal: value, utility: false) }
+    func set(modal: Bool, utility: Bool) {
+        lock.lock(); policy = modal ? 1 : utility ? 2 : 0; lock.unlock()
+    }
+    func read() -> Bool { readPolicy() != 0 }
+    func readPolicy() -> UInt32 { lock.lock(); defer { lock.unlock() }; return policy }
 }
 
 @_cdecl("sv_native_controls_owns_input_v1")
 func svNativeControlsOwnsInputV1() -> UInt32 {
     NativeControlsOwnership.shared.read() ? 1 : 0
+}
+
+@_cdecl("sv_native_controls_input_policy_v2")
+func svNativeControlsInputPolicyV2() -> UInt32 {
+    NativeControlsOwnership.shared.readPolicy()
 }
 
 struct NativeControlsInput: Sendable {

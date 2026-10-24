@@ -22,6 +22,11 @@ int32_t sv_runtime_menu_action(uint32_t action);
 uint64_t sv_native_menu_press_count_v1(void);
 /* UI D-pad holds: action8..11, pressed0/1. Refresh <250ms;0success,-1invalid. */
 int32_t sv_native_utility_dpad_v1(uint32_t action, uint32_t pressed);
+/* Swift input ownership: V1 remains0/1. V2:0game,1modal,2utility.
+ * Utility still blocks gameplay actions; Rust admits character-wheel axes
+ * only after its real held-Down mapping has emitted AltLeft. */
+uint32_t sv_native_controls_owns_input_v1(void);
+uint32_t sv_native_controls_input_policy_v2(void);
 /* Pre-start live 2D window surface. Pass a live CAMetalLayer pointer on visionOS.
  * Metal retains the layer; Swift must keep its owning UIView alive and attached
  * for presentation. Returns 0 on success, -1 for null, repeated, unsupported or

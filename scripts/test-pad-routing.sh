@@ -121,6 +121,56 @@ mod pad {
             crate::input::take();
         }
         #[test]
+        fn utility_character_wheel_allows_actual_right_stick_mouse_only_after_open_and_rearms_actions() {
+            suspend();
+            TEST_NATIVE_CONTROLS_OWN_INPUT.store(false, Ordering::Relaxed);
+            TEST_NATIVE_CONTROLS_POLICY.store(0, Ordering::Relaxed);
+            MENU_NAVIGATION.store(false, Ordering::Relaxed);
+            IN_VEHICLE.store(false, Ordering::Relaxed);
+            let neutral = spatial::spatial_sample(3, 0, [0.0; 6], 42).unwrap();
+            let held = spatial::spatial_sample(3, 63, [1.0, 1.0, 0.8, 0.6, 1.0, 1.0], 42).unwrap();
+            poll_sample(Some(neutral)); crate::input::take();
+            TEST_NATIVE_CONTROLS_POLICY.store(2, Ordering::Relaxed);
+            assert_eq!(sv_native_utility_dpad_v1(9, 1), 0);
+            poll_sample(Some(held));
+            let initial = crate::input::take();
+            assert!(initial.contains(&Event::Key("ArrowDown".into(), true)));
+            assert!(!initial.iter().any(|event| matches!(event, Event::Motion(..) | Event::Button(_,true))));
+            assert!(!initial.iter().any(|event| matches!(event, Event::Key(k,true) if ["KeyW","KeyA","KeyS","KeyD","ShiftLeft","Space","KeyF","Tab","KeyQ"].contains(&k.as_str()))));
+            STATE.lock().unwrap().as_mut().unwrap().down_since = Some(Instant::now() - SWITCH_HOLD);
+            assert_eq!(sv_native_utility_dpad_v1(9, 1), 0);
+            poll_sample(Some(held));
+            let opened = crate::input::take();
+            assert!(opened.contains(&Event::Key("AltLeft".into(), true)));
+            assert!(!opened.iter().any(|event| matches!(event, Event::Motion(..))), "Threshold-crossing poll cannot rotate the view before emitting wheel-open");
+            poll_sample(Some(held));
+            let navigation = crate::input::take();
+            assert!(navigation.iter().any(|event| matches!(event, Event::Motion(x,y) if *x > 0.0 && *y < 0.0)), "Held UI Down must allow real character-wheel right-stick mouse selection");
+            assert!(!navigation.iter().any(|event| matches!(event, Event::Button(_,true))));
+            let state = STATE.lock().unwrap();
+            assert_eq!(state.as_ref().unwrap().held, std::collections::HashSet::from(["AltLeft"]));
+            assert_eq!(state.as_ref().unwrap().buttons, 0); drop(state);
+            // Full modal policy overrides even a held character-wheel gesture.
+            TEST_NATIVE_CONTROLS_POLICY.store(1, Ordering::Relaxed);
+            poll_sample(Some(held));
+            assert!(!crate::input::take().iter().any(|event| matches!(event, Event::Motion(..) | Event::Button(_,true))));
+            assert_eq!(sv_native_utility_dpad_v1(9, 0), 0);
+            TEST_NATIVE_CONTROLS_POLICY.store(2, Ordering::Relaxed);
+            poll_sample(Some(held));
+            let released = crate::input::take();
+            assert!(released.contains(&Event::Key("AltLeft".into(), false)));
+            assert!(!released.iter().any(|event| matches!(event, Event::Motion(..))));
+            TEST_NATIVE_CONTROLS_POLICY.store(0, Ordering::Relaxed);
+            poll_sample(Some(held));
+            assert!(crate::input::take().is_empty(), "Held actions cannot leak on utility dismissal");
+            poll_sample(Some(neutral)); crate::input::take();
+            poll_sample(Some(held));
+            let rearmed = crate::input::take();
+            assert!(rearmed.contains(&Event::Button(0,true)) && rearmed.contains(&Event::Button(2,true)));
+            assert!(rearmed.contains(&Event::Key("KeyW".into(), true)), "A real neutral sample must rearm normal controls");
+            suspend(); crate::input::take();
+        }
+        #[test]
         fn ui_direction_watchdog_disconnect_replacement_and_suspend_emit_releases() {
             suspend();
             TEST_NATIVE_CONTROLS_OWN_INPUT.store(false, Ordering::Relaxed);
