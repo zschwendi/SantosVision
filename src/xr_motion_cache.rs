@@ -66,7 +66,7 @@ pub(super) fn current_ray(epoch:u64)->Option<CurrentInputRay>{
     let frame=actual_frame(&mut s,None)?;
     if !close(&frame,&sample.frame)||!primary_agrees(&mut s,&primary)||!s.unchanged()
         ||crate::xr_motion_aim::native_ray_primary()!=Some(primary){return None;}
-    Some(CurrentInputRay{origin:[frame[12],frame[13],frame[14]],direction:[frame[0],frame[1],frame[2]],source_age:sample.at.elapsed(),camera_sequence:sample.view.camera_sequence,native_cached:true})
+    Some(CurrentInputRay{origin:[frame[12],frame[13],frame[14]],direction:[frame[0],frame[1],frame[2]],source_age:sample.at.elapsed(),camera_sequence:sample.view.camera_sequence,native_cached:true,reference:Some(primary)})
 }
 pub(super) fn host_hook(caller:&mut wasmtime::Caller<'_,crate::HostState>,params:&[wasmtime::Val],results:&mut[wasmtime::Val],mem:&wasmtime::SharedMemory)->anyhow::Result<()>{
     use wasmtime::Val;
@@ -83,7 +83,8 @@ pub(super) fn host_hook(caller:&mut wasmtime::Caller<'_,crate::HostState>,params
     let Ok(serial)=NEXT.fetch_update(Ordering::Relaxed,Ordering::Relaxed,|v|v.checked_add(1))else{return Ok(());};
     let state=&mut caller.data_mut().motion_arms;state.cache_touched.retain(|x|x.2.elapsed()<=MAX_AGE);
     if state.cache_touched.len()>=512{return Ok(());}let Some(sequence)=state.sequence.checked_add(1)else{return Ok(());};state.sequence=sequence;state.cache_touched.push((sequence,serial,Instant::now()));
-    *SAMPLE.lock().unwrap_or_else(|p|p.into_inner())=Some(Sample{serial,frame,view:primary,at:Instant::now()});observation.0="accepted";Ok(())
+    *SAMPLE.lock().unwrap_or_else(|p|p.into_inner())=Some(Sample{serial,frame,view:primary,at:Instant::now()});observation.0="accepted";
+    trace::render(&guest,primary.provenance_epoch);Ok(())
 }
 
 #[cfg(test)]mod tests{

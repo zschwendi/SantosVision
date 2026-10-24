@@ -158,6 +158,19 @@ pub struct SVXRAimSnapshot {
 }
 const _: () = assert!(std::mem::size_of::<SVXRAimSnapshot>() == AIM_SIZE as usize);
 
+/// One actual native ray and its independently qualified current reference.
+/// The producer camera sequence remains separate: this is not an assertion
+/// that an older displayed render lease contains this newly sampled barrel.
+#[repr(C)]
+#[derive(Clone,Copy,Debug,Default)]
+pub struct SVXRAimReferenceSnapshotV2 {
+    pub version:u32,pub size:u32,pub aim:SVXRAimSnapshot,
+    pub reference_camera_sequence:u64,pub reference_request_frame:u64,pub reference_head_frame:u64,
+    pub producer_camera_sequence:u64,pub scope_sequence:u64,pub game_from_stage:[f64;16],
+}
+pub const AIM_REFERENCE_SIZE:u32=280;
+const _:()=assert!(std::mem::size_of::<SVXRAimReferenceSnapshotV2>()==AIM_REFERENCE_SIZE as usize);
+
 #[derive(Clone, Copy)]
 pub(crate) struct GameplayAim {
     pub origin: [f32; 3],
@@ -370,6 +383,37 @@ pub unsafe extern "C" fn sv_xr_get_aim_snapshot(output: *mut SVXRAimSnapshot, by
     else { unsafe { output.write_unaligned(SVXRAimSnapshot::default()) }; 1 }
 }
 
+fn reference_snapshot(baseline:Option<SVXRAimSnapshot>,ray:crate::xr_motion_arms::CurrentInputRay,time:f64)->Option<SVXRAimReferenceSnapshotV2>{
+    let reference=ray.reference?;
+    let aim=select_snapshot(baseline,true,Some(ray),time)?;
+    if !reference.headset_applied||reference.provenance_epoch!=aim.view_epoch
+        ||reference.camera_sequence<ray.camera_sequence||reference.request_frame==0||reference.head_pose_frame==0
+        ||!crate::xr_motion_aim::rigid(&reference.game_from_stage){return None;}
+    Some(SVXRAimReferenceSnapshotV2{version:2,size:AIM_REFERENCE_SIZE,aim,
+        reference_camera_sequence:reference.camera_sequence,reference_request_frame:reference.request_frame,
+        reference_head_frame:reference.head_pose_frame,producer_camera_sequence:ray.camera_sequence,
+        scope_sequence:reference.optics.scope_sequence,game_from_stage:reference.game_from_stage.map(f64::from)})
+}
+
+/// Additive ABI; the104-byte getter is unchanged. Both eyes must consume this
+/// ONE immutable tuple. No guest calls, old source-frame guessing or new pose.
+#[no_mangle]
+pub unsafe extern "C" fn sv_xr_get_aim_reference_snapshot_v2(output:*mut SVXRAimReferenceSnapshotV2,byte_size:u32)->i32{
+    if output.is_null(){return -1;}if byte_size!=AIM_REFERENCE_SIZE{return -2;}
+    let epoch=crate::xr_view::view_epoch();
+    let baseline=fresh_snapshot(&STATE.lock().unwrap_or_else(|p|p.into_inner()),Instant::now(),epoch,reticle_ready_for_epoch(epoch));
+    let result=(||{
+        if !tracked_scope(baseline){return None;}
+        let ray=crate::xr_motion_arms::current_actual_input_ray(epoch)?;
+        let reference=ray.reference?;
+        let time=crate::RT.get()?.start.elapsed().as_secs_f64();
+        let snapshot=reference_snapshot(baseline,ray,time)?;
+        (reticle_ready_for_epoch(epoch)&&crate::xr_motion_aim::native_ray_primary()==Some(reference)).then_some(snapshot)
+    })();
+    if let Some(snapshot)=result{unsafe{output.write_unaligned(snapshot)};0}
+    else{unsafe{output.write_unaligned(SVXRAimReferenceSnapshotV2::default())};1}
+}
+
 pub fn status_json() -> serde_json::Value {
     let state = STATE.lock().unwrap_or_else(|p| p.into_inner());
     let epoch = crate::xr_view::view_epoch();
@@ -508,7 +552,7 @@ mod tests {
     fn tracked_reticle_uses_current_native_ray_and_waits_for_pose_agreement() {
         let baseline = make_snapshot(sample(), 7, 10.).unwrap();
         let ray = || crate::xr_motion_arms::CurrentInputRay { origin:[8.,9.,10.], direction:[1.,0.,0.],
-            source_age:Duration::from_millis(25), camera_sequence:123,native_cached:false };
+            source_age:Duration::from_millis(25), camera_sequence:123,native_cached:false,reference:None };
         let tracked = select_snapshot(Some(baseline), true, Some(ray()), 10.).unwrap();
         assert_eq!(tracked.origin, [8.,9.,10.]); assert_eq!(tracked.direction, [1.,0.,0.]);
         assert_eq!(tracked.sequence, 123); assert_eq!(tracked.view_epoch, 7);
@@ -523,6 +567,26 @@ mod tests {
         let ordinary = select_snapshot(Some(baseline), false, Some(ray()), 10.).unwrap();
         assert_eq!(ordinary.origin, baseline.origin); assert_eq!(ordinary.direction, baseline.direction);
         assert_eq!(ordinary.flags, baseline.flags);
+    }
+
+    #[test]
+    fn reference_tuple_preserves_one_actual_ray_with_its_qualified_base_and_separate_producer(){
+        let baseline=make_snapshot(sample(),7,10.).unwrap();
+        let mut reference=crate::xr_view::WorldView{provenance_epoch:7,camera_sequence:124,request_frame:80,head_pose_frame:90,
+            presentation_time_seconds:1.,eye_index:0,view_count:2,game_from_eye:crate::xr_motion_aim::identity(),
+            game_from_stage:crate::xr_motion_aim::identity(),projection_from_eye:crate::xr_motion_aim::identity(),depth_reverse_z:false,headset_applied:true,optics:crate::xr_view::ScopeOptics::default()};
+        reference.game_from_stage[12]=19.;reference.optics.scope_sequence=8;
+        let mut ray=crate::xr_motion_arms::CurrentInputRay{origin:[8.,9.,10.],direction:[1.,0.,0.],source_age:Duration::from_millis(25),camera_sequence:123,native_cached:true,reference:Some(reference)};
+        let tuple=reference_snapshot(Some(baseline),ray,10.).unwrap();
+        assert_eq!((tuple.version,tuple.size,tuple.reference_camera_sequence,tuple.producer_camera_sequence),(2,280,124,123));
+        assert_eq!((tuple.reference_request_frame,tuple.reference_head_frame,tuple.scope_sequence),(80,90,8));
+        assert_eq!(tuple.game_from_stage[12],19.);assert_eq!(tuple.aim.origin,[8.,9.,10.]);assert_eq!(tuple.aim.sequence,123);
+        reference.provenance_epoch=8;ray.reference=Some(reference);assert!(reference_snapshot(Some(baseline),ray,10.).is_none());
+        reference.provenance_epoch=7;reference.camera_sequence=122;ray.reference=Some(reference);assert!(reference_snapshot(Some(baseline),ray,10.).is_none());
+        reference.camera_sequence=124;reference.game_from_stage[0]=2.;ray.reference=Some(reference);assert!(reference_snapshot(Some(baseline),ray,10.).is_none());
+        ray.reference=None;assert!(reference_snapshot(Some(baseline),ray,10.).is_none());
+        assert_eq!(unsafe{sv_xr_get_aim_reference_snapshot_v2(std::ptr::null_mut(),AIM_REFERENCE_SIZE)},-1);
+        let mut output=SVXRAimReferenceSnapshotV2::default();assert_eq!(unsafe{sv_xr_get_aim_reference_snapshot_v2(&mut output,AIM_REFERENCE_SIZE-1)},-2);
     }
     #[test]
     fn replacement_frontend_cannot_be_enabled_without_active_camera_owner() {

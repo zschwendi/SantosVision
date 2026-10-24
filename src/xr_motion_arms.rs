@@ -5,6 +5,8 @@ use std::{collections::VecDeque, sync::{atomic::{AtomicU32, Ordering}, Mutex}, t
 use crate::xr_motion_aim::{identity, multiply, rigid, CameraCandidate};
 #[path="xr_motion_cache.rs"]
 mod cached;
+#[path="xr_motion_arm_trace.rs"]
+mod trace;
 
 pub const IMPORT_MODULE: &str = "muguet_motion_arms_v1";
 const MAX_AGE: Duration = Duration::from_millis(150);
@@ -64,7 +66,7 @@ pub fn status_json()->serde_json::Value{
         "right_tracked_ray_qualified":input.as_ref().is_some_and(|i|i.capability.ray_qualified()&&i.at.elapsed()<=MAX_AGE),
         "left_orientation_policy":"native wrist; tracked grip translation only","unsupported_weapon_native_fallback":native_fallback_active(),"last_unsupported_weapon":unsupported,
         "right_input_state":match STATUS.load(Ordering::Relaxed){0=>"inactive",1=>"waiting for qualified request and exact tracking packet",2=>"native target accepted; waiting for weapon pose agreement",3=>"actual weapon ray ready",5=>"visual target accepted; cached muzzle uses native firing",_=>"live weapon or packet qualification pending"},
-        "pose_agreement_translation_m":0.03,"pose_agreement_rotation_degrees":3,"ray_is_impact":false,"hook_diagnostics":audit,"native_cached_ray":cached::status()})
+        "pose_agreement_translation_m":0.03,"pose_agreement_rotation_degrees":3,"ray_is_impact":false,"hook_diagnostics":audit,"native_cached_ray":cached::status(),"geometry_observations":trace::status()})
 }
 fn input_for_candidate(c:&CameraCandidate)->Option<WeaponInput>{
     if native_fallback_active(){return None;}
@@ -77,12 +79,15 @@ fn ray_capabilities_agree(input:PoseCapability,lease:PoseCapability,live:PoseCap
 }
 /// Actual native weapon geometry: either genuine cached-producer/bone agreement
 /// or uncached target agreement. Neither certifies impact or renderer latency.
-pub(crate) struct CurrentInputRay{pub origin:[f32;3],pub direction:[f32;3],pub source_age:Duration,pub camera_sequence:u64,pub native_cached:bool}
+#[derive(Clone,Copy)]
+pub(crate) struct CurrentInputRay{pub origin:[f32;3],pub direction:[f32;3],pub source_age:Duration,pub camera_sequence:u64,pub native_cached:bool,pub reference:Option<crate::xr_view::WorldView>}
 pub(crate) fn current_actual_input_ray(epoch:u64)->Option<CurrentInputRay>{
     if let Some(ray)=cached::current_ray(epoch){return Some(ray);}
-    let c=current(true)?;if c.view_epoch!=epoch{return None;}let frame=camera_frame_for_candidate(&c)?;
+    let primary=crate::xr_motion_aim::native_ray_primary()?;
+    let c=current(true)?;if c.view_epoch!=epoch||primary.provenance_epoch!=epoch||primary.camera_sequence<c.camera_sequence{return None;}let frame=camera_frame_for_candidate(&c)?;
+    if crate::xr_motion_aim::native_ray_primary()!=Some(primary){return None;}
     Some(CurrentInputRay{origin:[frame[12],frame[13],frame[14]],direction:[-frame[8],-frame[9],-frame[10]],
-        source_age:c.recorded_at.elapsed().checked_add(c.source_age_at_capture)?,camera_sequence:c.camera_sequence,native_cached:false})
+        source_age:c.recorded_at.elapsed().checked_add(c.source_age_at_capture)?,camera_sequence:c.camera_sequence,native_cached:false,reference:Some(primary)})
 }
 fn pose_agrees(actual:&[f32;16],desired:&[f32;16])->bool{
     let distance=(0..3).map(|i|(actual[12+i]-desired[12+i]).powi(2)).sum::<f32>();
@@ -398,6 +403,7 @@ pub(crate) fn host_hook(caller:&mut wasmtime::Caller<'_,crate::HostState>,name:&
             if !read.unchanged()||current_arm(first,arm as u32).is_none_or(|c|c.generation()!=lease.generation){return Ok(());}
             audit.gate="boundary_journal_capacity";if !caller.data_mut().motion_arms.touch(token){return Ok(());}
             anyhow::ensure!(store_target(&guest,target,&lease.hand,lease.capability.full_pose()),"qualified private arm target range changed");
+            trace::target(&guest,ped,skel,goal,request,&lease,original,reference);
             if arm==1{
             // In position-only mode the native38487 hand basis is preserved.
             // Record that applied value, never the identity request placeholder.
