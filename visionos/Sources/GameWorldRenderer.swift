@@ -63,6 +63,7 @@ struct GameWorldLifecycleEvent: Sendable {
     var viewCount: Int? = nil
     var trackedPose: Bool? = nil
     var requestBytesHex: String? = nil
+    var motionTrackingJSON: String? = nil
 
     var reportValue: [String: Any] {
         var value: [String: Any] = ["stage": stage, "uptime_seconds": uptime,
@@ -73,6 +74,11 @@ struct GameWorldLifecycleEvent: Sendable {
         if let viewCount { value["view_count"] = viewCount }
         if let trackedPose { value["tracked_pose"] = trackedPose }
         if let requestBytesHex { value["request_bytes_hex"] = requestBytesHex }
+        value["source_guard_band_scale"] = GameWorldSourceGuardBand.configuredScale
+        if let motionTrackingJSON, let data = motionTrackingJSON.data(using: .utf8),
+           let motion = try? JSONSerialization.jsonObject(with: data) {
+            value["motion_tracking"] = motion
+        }
         return value
     }
 }
@@ -357,7 +363,12 @@ struct GameWorldStatusLimiter {
 final class GameWorldRenderer: @unchecked Sendable {
     private let layer: LayerRenderer
     private let session = ARKitSession()
-    private let tracking = WorldTrackingProvider()
+    // Replaced only during startup if optional motion providers fail. ARKit
+    // stops every supplied provider on run failure; a stopped one cannot retry.
+    private var tracking = WorldTrackingProvider()
+    private let motionTracking = XRMotionTracking(enabled:
+        ProcessInfo.processInfo.arguments.contains("--sv-motion-tracking-preview")
+        || ProcessInfo.processInfo.environment["MUGUET_XR_MOTION_AIM"] == "1")
     private let queue: any MTLCommandQueue
     private let pipeline: any MTLRenderPipelineState
     private let reticle: GameWorldReticle?
@@ -507,10 +518,25 @@ final class GameWorldRenderer: @unchecked Sendable {
         if SimulatorPoseFixture.shared == nil {
             guard WorldTrackingProvider.isSupported else { throw GameWorldError.unsupportedTracking }
             recordLifecycle("tracking_run_requested")
-            do { try await session.run([tracking]) }
+            let providers = await motionTracking.prepare(session: session, world: tracking)
+            do {
+                try await session.run(providers)
+                motionTracking.didStart()
+            }
             catch {
-                recordLifecycle("tracking_run_failed", detail: String(reflecting: error))
-                throw error
+                if providers.count > 1 {
+                    motionTracking.disableForSession(reason: String(reflecting: error))
+                    tracking = WorldTrackingProvider()
+                    recordLifecycle("motion_tracking_fallback", detail: "Optional tracking failed; retrying head tracking with a fresh provider.")
+                    do { try await session.run([tracking]) }
+                    catch {
+                        recordLifecycle("tracking_run_failed", detail: String(reflecting: error))
+                        throw error
+                    }
+                } else {
+                    recordLifecycle("tracking_run_failed", detail: String(reflecting: error))
+                    throw error
+                }
             }
             recordLifecycle("tracking_run_returned")
         }
@@ -533,6 +559,7 @@ final class GameWorldRenderer: @unchecked Sendable {
         stopLock.lock()
         stopped = true
         stopLock.unlock()
+        motionTracking.stop()
         if retainsAnchors { XRHeadTracking.shared.invalidateRetainedAnchors(reason: "renderer stopped") }
         WorldCameraOwnership.shared.release(sessionToken)
         session.stop()
@@ -543,6 +570,7 @@ final class GameWorldRenderer: @unchecked Sendable {
         if self.active != active { gpuTiming?.reset(); probeTiming?.reset() }
         self.active = active
         stopLock.unlock()
+        motionTracking.setActive(active)
     }
 
     private var isStopped: Bool {
@@ -566,6 +594,8 @@ final class GameWorldRenderer: @unchecked Sendable {
     private func recordLifecycle(_ stage: String, detail: String? = nil,
                                  viewCount: Int? = nil, trackedPose: Bool? = nil,
                                  requestBytesHex: String? = nil) {
+        let motionJSON = (try? JSONSerialization.data(withJSONObject: motionTracking.report, options: [.sortedKeys]))
+            .flatMap { String(data: $0, encoding: .utf8) }
         report(.lifecycle(GameWorldLifecycleEvent(stage: stage,
             uptime: ProcessInfo.processInfo.systemUptime,
             layerState: String(describing: layer.state),
@@ -573,7 +603,7 @@ final class GameWorldRenderer: @unchecked Sendable {
             rendererActive: isActive, rendererStopped: isStopped,
             ownsWorldCamera: WorldCameraOwnership.shared.isOwner(sessionToken),
             detail: detail, viewCount: viewCount, trackedPose: trackedPose,
-            requestBytesHex: requestBytesHex)))
+            requestBytesHex: requestBytesHex, motionTrackingJSON: motionJSON)))
     }
 
     private func renderLoop() {
@@ -583,6 +613,7 @@ final class GameWorldRenderer: @unchecked Sendable {
         var previousActive: Bool?
         recordLifecycle("render_loop_started")
         defer {
+            motionTracking.stop()
             session.stop()
             if retainsAnchors { XRHeadTracking.shared.invalidateRetainedAnchors(reason: "render loop ended") }
             WorldCameraOwnership.shared.release(sessionToken)
@@ -594,6 +625,9 @@ final class GameWorldRenderer: @unchecked Sendable {
             let trackingState = tracking.state
             let active = isActive
             if layerState != previousLayerState || trackingState != previousTrackingState || active != previousActive {
+                if layerState != .running || trackingState != .running || !active {
+                    motionTracking.invalidate(reason: "World renderer or tracking inactive")
+                }
                 previousLayerState = layerState
                 previousTrackingState = trackingState
                 previousActive = active
@@ -678,7 +712,13 @@ final class GameWorldRenderer: @unchecked Sendable {
                     headFrame = XRHeadTracking.shared.submit(timestamp: timestamp, stageFromHead: stageFromHead, tracked: true,
                                                               anchor: trackedAnchor, requestFrame: requestFrame, eyes: eyes, retain: true)
                 } else {
-                    XRHeadTracking.shared.submit(timestamp: timestamp, stageFromHead: stageFromHead, tracked: true)
+                    headFrame = XRHeadTracking.shared.submit(timestamp: timestamp, stageFromHead: stageFromHead, tracked: true,
+                                                              anchor: trackedAnchor, requestFrame: requestFrame, eyes: eyes, retain: false)
+                }
+                if let headFrame {
+                    motionTracking.sample(timestamp: timestamp, stageFromHead: stageFromHead, headFrame: headFrame)
+                } else {
+                    motionTracking.invalidate(reason: "No accepted native head generation")
                 }
                 let viewRequestAccepted = submitViews(drawable: drawable, timestamp: timestamp,
                                                        requestFrame: requestFrame, eyes: eyes)
@@ -749,6 +789,7 @@ final class GameWorldRenderer: @unchecked Sendable {
                     }
                 }
             } else if builtIn, stageFromHead == nil {
+                motionTracking.invalidate(reason: "Head tracking unavailable")
                 XRHeadTracking.shared.submit(timestamp: timestamp, stageFromHead: nil, tracked: false)
                 reportStatus("Head pose unavailable; native world drawing is suspended until tracking returns.")
             } else if builtIn {
