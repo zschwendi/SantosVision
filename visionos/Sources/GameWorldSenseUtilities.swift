@@ -33,6 +33,11 @@ struct GameWorldSenseUtilityInteraction<ID: Hashable> {
         return original
     }
     mutating func cancel(_ id: ID) { pressed.removeValue(forKey: id); cancelled.remove(id) }
+    mutating func suspend() {
+        cancelled.formUnion(pressed.keys)
+        pressed.removeAll(keepingCapacity: true)
+    }
+    mutating func rejectUntilEnd(_ id: ID) { pressed.removeValue(forKey: id); cancelled.insert(id) }
     mutating func clear() { pressed.removeAll(keepingCapacity: true); cancelled.removeAll(keepingCapacity: true) }
 }
 

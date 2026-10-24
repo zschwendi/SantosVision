@@ -95,6 +95,7 @@ enum GameWorldEvent: Sendable {
     case presented(GameWorldPresentation)
     case singleSourcePresented(GameWorldSingleSourcePresentation)
     case gpuTiming(GameWorldGpuTimingSummary)
+    case senseUtilityTracking(active: Bool, sequence: UInt64)
     case ended(String)
 }
 
@@ -382,6 +383,9 @@ final class GameWorldRenderer: @unchecked Sendable {
     private let reticle: GameWorldReticle?
     private let hud: GameWorldHUD?
     private let senseUtilities: GameWorldSenseUtilities?
+    private let senseUtilityTrackingLock = NSLock()
+    private var senseUtilityTrackingLive = false
+    private var senseUtilityTrackingSequence: UInt64 = 0
     /// Optional exact corner-depth precompute (MUGUET_COMPOSITOR_CORNER_PRECOMPUTE=1); nil keeps the
     /// single-pass pipeline above. Off by default.
     private let cornerPrecompute: (kernel: any MTLComputePipelineState, pipeline: any MTLRenderPipelineState,
@@ -583,6 +587,7 @@ final class GameWorldRenderer: @unchecked Sendable {
         stopLock.lock()
         stopped = true
         stopLock.unlock()
+        updateSenseUtilityTracking(false)
         motionTracking.stop()
         if retainsAnchors { XRHeadTracking.shared.invalidateRetainedAnchors(reason: "renderer stopped") }
         WorldCameraOwnership.shared.release(sessionToken)
@@ -595,9 +600,20 @@ final class GameWorldRenderer: @unchecked Sendable {
         self.active = active
         stopLock.unlock()
         motionTracking.setActive(active)
+        if !active { updateSenseUtilityTracking(false) }
     }
 
     func setSenseUtilitiesVisible(_ visible: Bool) { senseUtilities?.setVisible(visible) }
+
+    private func updateSenseUtilityTracking(_ active: Bool) {
+        senseUtilityTrackingLock.lock()
+        guard active != senseUtilityTrackingLive else { senseUtilityTrackingLock.unlock(); return }
+        senseUtilityTrackingLive = active
+        senseUtilityTrackingSequence &+= 1
+        let sequence = senseUtilityTrackingSequence
+        senseUtilityTrackingLock.unlock()
+        report(.senseUtilityTracking(active: active, sequence: sequence))
+    }
 
     private var isStopped: Bool {
         stopLock.lock()
@@ -639,6 +655,7 @@ final class GameWorldRenderer: @unchecked Sendable {
         var previousActive: Bool?
         recordLifecycle("render_loop_started")
         defer {
+            updateSenseUtilityTracking(false)
             motionTracking.stop()
             session.stop()
             if retainsAnchors { XRHeadTracking.shared.invalidateRetainedAnchors(reason: "render loop ended") }
@@ -652,6 +669,7 @@ final class GameWorldRenderer: @unchecked Sendable {
             let active = isActive
             if layerState != previousLayerState || trackingState != previousTrackingState || active != previousActive {
                 if layerState != .running || trackingState != .running || !active {
+                    updateSenseUtilityTracking(false)
                     motionTracking.invalidate(reason: "World renderer or tracking inactive")
                 }
                 previousLayerState = layerState
@@ -708,6 +726,7 @@ final class GameWorldRenderer: @unchecked Sendable {
             // Capture drawables must not replace the headset's two-view request
             // with a one-view recording request.
             let builtIn = drawable.target == .builtIn
+            if builtIn { updateSenseUtilityTracking(stageFromHead != nil) }
             let sampleTime = ProcessInfo.processInfo.systemUptime
             if builtIn, sampleTime >= nextLifecycleSample {
                 nextLifecycleSample = sampleTime + 5

@@ -28,6 +28,8 @@ final class GameWorldModel: ObservableObject {
     private var senseUtilityVisibilityObservation: AnyCancellable?
     private var senseUtilityLayer: LayerRenderer?
     private var senseUtilityInteraction = GameWorldSenseUtilityInteraction<SpatialEventCollection.Event.ID>()
+    private var senseUtilityTrackingLive = false
+    private var senseUtilityTrackingSequence: UInt64 = 0
     private let log = Logger(subsystem: "com.zephyrstudios.santosvision", category: "GameWorldStatus")
 
     func startRenderer(_ layer: LayerRenderer, runtime: NativeRuntimeModel) {
@@ -40,6 +42,8 @@ final class GameWorldModel: ObservableObject {
         latestRendererState = [:]
         latestFiniteSkySupport = [:]
         latestHUDCanvas = [:]
+        senseUtilityTrackingLive = false
+        senseUtilityTrackingSequence = 0
         latestViewRequestFailure = [:]
         diagnosticRenderingMethod = nil
         recordedStatusKeys.removeAll(keepingCapacity: true)
@@ -85,6 +89,12 @@ final class GameWorldModel: ObservableObject {
                     case .gpuTiming(let timing):
                         self.runtime?.recordWorldGpuTiming(timing)
                         return
+                    case .senseUtilityTracking(let active, let sequence):
+                        guard sequence > self.senseUtilityTrackingSequence else { return }
+                        self.senseUtilityTrackingSequence = sequence
+                        self.senseUtilityTrackingLive = active
+                        if !active { self.clearSenseUtilityInteraction(preserveGestureCancellation: true) }
+                        return
                     case .ended(let reason):
                         self.senseUtilityVisibilityObservation = nil
                         self.senseUtilityLayer?.onSpatialEvent = { _ in }
@@ -110,7 +120,7 @@ final class GameWorldModel: ObservableObject {
                 Task { @MainActor [weak self] in
                     guard let self, self.generation == token else { return }
                     self.renderer?.setSenseUtilitiesVisible(visible)
-                    if !visible { self.clearSenseUtilityInteraction() }
+                    if !visible { self.clearSenseUtilityInteraction(preserveGestureCancellation: true) }
                 }
             }
             recordState("renderer_constructor_succeeded")
@@ -140,7 +150,10 @@ final class GameWorldModel: ObservableObject {
         let changed = appActive != active
         appActive = active
         renderer?.setActive(active)
-        if !active { clearSenseUtilityInteraction() }
+        if !active {
+            senseUtilityTrackingLive = false
+            clearSenseUtilityInteraction(preserveGestureCancellation: true)
+        }
         if changed { recordState("scene_activity_changed", detail: "active=\(active)") }
         if active, renderer != nil { XRHeadTracking.shared.resume() }
     }
@@ -166,17 +179,26 @@ final class GameWorldModel: ObservableObject {
         recordState("renderer_detached")
     }
 
-    private func clearSenseUtilityInteraction() {
+    private func clearSenseUtilityInteraction(preserveGestureCancellation: Bool = false) {
         for action in senseUtilityInteraction.activeActions {
             _ = runtime?.setSenseUtilityPressed(action, pressed: false)
         }
-        senseUtilityInteraction.clear()
+        if preserveGestureCancellation { senseUtilityInteraction.suspend() }
+        else { senseUtilityInteraction.clear() }
         runtime?.setSenseUtilityInteractionActive(false)
     }
 
     private func handleSenseUtilityEvents(_ events: SpatialEventCollection) {
-        guard let runtime, runtime.senseGameplayUtilitiesVisible, renderer != nil, appActive else {
-            clearSenseUtilityInteraction()
+        guard let runtime, runtime.senseGameplayUtilitiesVisible, renderer != nil, appActive,
+              senseUtilityTrackingLive else {
+            clearSenseUtilityInteraction(preserveGestureCancellation: true)
+            for event in events {
+                switch event.phase {
+                case .active: senseUtilityInteraction.rejectUntilEnd(event.id)
+                case .ended, .cancelled: senseUtilityInteraction.cancel(event.id)
+                @unknown default: break
+                }
+            }
             return
         }
         for event in events {
