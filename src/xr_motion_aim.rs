@@ -80,6 +80,10 @@ fn resolve_arms_requested(runtime:Option<&str>,compiled_default:Option<&str>)->b
 }
 static ARMS_REQUESTED:LazyLock<bool>=LazyLock::new(||resolve_arms_requested(std::env::var("MUGUET_XR_MOTION_ARMS").ok().as_deref(),option_env!("MUGUET_XR_MOTION_ARMS_DEFAULT")));
 pub fn arms_enabled()->bool{diagnostic_enabled()&&*ARMS_REQUESTED}
+// First-person view-model correction is a render change with its own physical
+// acceptance. It requires the certified separate AOT and its own launch intent.
+static VIEWMODEL_REQUESTED:LazyLock<bool>=LazyLock::new(||resolve_arms_requested(std::env::var("MUGUET_XR_FP_VIEWMODEL").ok().as_deref(),option_env!("MUGUET_XR_FP_VIEWMODEL_DEFAULT")));
+pub(crate) fn viewmodel_enabled()->bool{diagnostic_enabled()&&*VIEWMODEL_REQUESTED}
 /// Swift acquisition follows the native certificate-qualified mode, including
 /// an explicitly opted-in build's ordinary Home-screen launch without env vars.
 #[no_mangle]

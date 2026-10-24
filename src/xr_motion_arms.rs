@@ -7,6 +7,8 @@ use crate::xr_motion_aim::{identity, multiply, rigid, CameraCandidate};
 mod cached;
 #[path="xr_motion_arm_trace.rs"]
 mod trace;
+#[path="xr_viewmodel.rs"]
+mod viewmodel;
 
 pub const IMPORT_MODULE: &str = "muguet_motion_arms_v1";
 const MAX_AGE: Duration = Duration::from_millis(150);
@@ -66,7 +68,7 @@ pub fn status_json()->serde_json::Value{
         "right_tracked_ray_qualified":input.as_ref().is_some_and(|i|i.capability.ray_qualified()&&i.at.elapsed()<=MAX_AGE),
         "left_orientation_policy":"native wrist; tracked grip translation only","unsupported_weapon_native_fallback":native_fallback_active(),"last_unsupported_weapon":unsupported,
         "right_input_state":match STATUS.load(Ordering::Relaxed){0=>"inactive",1=>"waiting for qualified request and exact tracking packet",2=>"native target accepted; waiting for weapon pose agreement",3=>"actual weapon ray ready",5=>"visual target accepted; cached muzzle uses native firing",_=>"live weapon or packet qualification pending"},
-        "pose_agreement_translation_m":0.03,"pose_agreement_rotation_degrees":3,"ray_is_impact":false,"hook_diagnostics":audit,"native_cached_ray":cached::status(),"geometry_observations":trace::status()})
+        "pose_agreement_translation_m":0.03,"pose_agreement_rotation_degrees":3,"ray_is_impact":false,"hook_diagnostics":audit,"native_cached_ray":cached::status(),"geometry_observations":trace::status(),"first_person_viewmodel":viewmodel::status()})
 }
 fn input_for_candidate(c:&CameraCandidate)->Option<WeaponInput>{
     if native_fallback_active(){return None;}
@@ -323,6 +325,7 @@ pub(crate) fn host_hook(caller:&mut wasmtime::Caller<'_,crate::HostState>,name:&
     let arg=|i:usize|->anyhow::Result<u64>{match params.get(i){Some(Val::I64(v))=>Ok(*v as u64),Some(Val::I32(v))=>Ok(*v as u32 as u64),_=>anyhow::bail!("native arm argument ABI mismatch")}};
     match name {
         "cache"=>{return cached::host_hook(caller,params,results,mem);},
+        "viewmodel"=>{return viewmodel::host_hook(caller,params,results,mem);},
         "request"=>{
             anyhow::ensure!(params.len()==6&&results.len()==1,"native arm request ABI mismatch");results[0]=Val::I64(0);
             let(manager_pointer,position,tls,first)=(arg(0)?,arg(2)?,arg(3)?,arg(4)?!=0);
@@ -423,7 +426,7 @@ pub(crate) fn host_hook(caller:&mut wasmtime::Caller<'_,crate::HostState>,name:&
 #[cfg(test)]mod tests{
     use super::*;
     use std::{cell::RefCell,collections::BTreeMap};
-    #[derive(Default)]pub(super) struct TestMemory(RefCell<BTreeMap<u64,u32>>);
+    #[derive(Default)]pub(super) struct TestMemory(pub(super) RefCell<BTreeMap<u64,u32>>);
     impl Memory for TestMemory{fn word(&self,a:u64)->Option<u32>{self.0.borrow().get(&a).copied()}fn put(&self,a:u64,v:u32)->bool{self.0.borrow_mut().insert(a,v);true}}
     impl TestMemory{pub(super) fn u64(&self,a:u64,v:u64){self.put(a,v as u32);self.put(a+4,(v>>32)as u32);}pub(super) fn matrix(&self,a:u64,m:&[f32;16]){for(i,v)in m.iter().enumerate(){self.put(a+i as u64*4,v.to_bits());}}}
     pub(super) fn native_fixture()->TestMemory{

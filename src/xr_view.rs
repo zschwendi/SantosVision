@@ -1084,6 +1084,18 @@ fn match_reverse_clone(state: &State, mem: &SharedMemory, pointer: u64) -> Optio
         .find_map(|saved| reverse_clone_view(&camera,&projection,saved).map(|view|(*saved,view)))
 }
 
+/// The headset eye camera this module installed on a primary viewport, matched
+/// bit-exactly on its twelve actual Mat34 coordinates (render-thread copies keep
+/// the bytes; padding confers nothing), and the original game camera it replaced.
+/// Values only; no pointer is retained.
+pub(crate) fn installed_headset_eye(camera: &[f32; 16]) -> Option<(WorldView, [f32; 16])> {
+    let state = lock_world_state();
+    state.history.iter().rev().find(|saved| saved.view.headset_applied
+        && view_epoch_is_active(saved.view.provenance_epoch)
+        && (0..4).all(|c| (0..3).all(|r| camera[c * 4 + r].to_bits() == saved.view.game_from_eye[c * 4 + r].to_bits())))
+        .map(|saved| (saved.view, saved.base_camera))
+}
+
 pub fn viewport_command(_caller: &mut Caller<'_, HostState>, _command: u64) -> Result<()> {
     if !TRACE_ENABLED.load(Ordering::Acquire) { return Ok(()); }
     lock_world_state().viewport_commands += 1;
