@@ -40,7 +40,10 @@ struct ProjectionCalibrationValidation {
                     }
                 }
             }
-            precondition(maximumRayError < 2e-5 && maximumDepthError < 2e-5)
+            precondition(maximumRayError <= GameWorldProjection.maximumNDCError
+                && maximumDepthError <= GameWorldProjection.maximumNDCError)
+            precondition(maximumRayError <= Double(conversion.maximumRayError) + 1e-9
+                && maximumDepthError <= Double(conversion.maximumDepthError) + 1e-9)
             var oblique = raw; oblique[0][2] = 0.01
             precondition(GameWorldProjection.nativePinhole(oblique) == nil)
             var skew = raw; skew[1][0] = 0.01

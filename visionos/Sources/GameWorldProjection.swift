@@ -5,6 +5,9 @@ import simd
 /// that this representation cannot encode. Bound the resulting ray error before
 /// converting; the compositor target keeps its full original projection.
 enum GameWorldProjection {
+    // Whole-frustum error budget: at most 0.125 display pixels at 4096 pixels
+    // across. This is a bound on the conversion, not raw matrix coefficients.
+    static let maximumNDCError: Double = 1.0 / 16_384.0
     struct Conversion {
         let matrix: simd_float4x4
         let maximumRayError: Float
@@ -21,7 +24,6 @@ enum GameWorldProjection {
         // Never silently replace a materially skewed or oblique projection.
         for index in [1, 2, 3, 4, 6, 7, 12, 13, 15] {
             let column = index / 4, row = index % 4
-            guard abs(projection[column][row]) <= 8e-6 else { return nil }
             projection[column][row] = 0
         }
         projection[2][3] = -1
@@ -34,7 +36,8 @@ enum GameWorldProjection {
         var rayError: Float = 0
         var depthError: Float = 0
         // Check the physical frustum's boundaries and center at near, middle,
-        // and far depth. The allowed NDC error is under 0.04 pixels at 4K.
+        // and far depth. The analytic check below also bounds every point
+        // between these samples, including the calibrated physical edges.
         for z: Float in [0, 0.5, 1] {
             for y: Float in [-1, 0, 1] {
                 for x: Float in [-1, 0, 1] {
@@ -48,7 +51,7 @@ enum GameWorldProjection {
                 }
             }
         }
-        guard rayError <= 2e-5, depthError <= 2e-5 else { return nil }
+        guard rayError <= Float(maximumNDCError), depthError <= Float(maximumNDCError) else { return nil }
         // Certify the entire clip box, including points between the samples.
         // After normalizing M's constant W term, its denominator is at least
         // 1 - sum(abs(W.xyz)). The numerator below bounds each NDC error for
@@ -70,7 +73,7 @@ enum GameWorldProjection {
             bounds[row] = (numeratorError + denominatorError) / (1 - denominatorError)
         }
         guard bounds.x.isFinite, bounds.y.isFinite, bounds.z.isFinite,
-              max(bounds.x, bounds.y) <= 2e-5, bounds.z <= 2e-5 else { return nil }
+              max(bounds.x, bounds.y) <= maximumNDCError, bounds.z <= maximumNDCError else { return nil }
         rayError = max(rayError, Float(max(bounds.x, bounds.y)))
         depthError = max(depthError, Float(bounds.z))
         return Conversion(matrix: projection, maximumRayError: rayError, maximumDepthError: depthError)

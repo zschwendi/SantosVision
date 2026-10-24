@@ -695,14 +695,19 @@ final class GameWorldRenderer: @unchecked Sendable {
             var singleSource: GameWorldSourceEye?
             var singleSourceEpoch: UInt64?
             if builtIn, let stageFromHead, (1...2).contains(drawable.views.count) {
-                let eyes = drawable.views.indices.map { index in
+                let eyes = drawable.views.indices.compactMap { index -> XRRetainedEyeView? in
                     let physicalProjection = drawable.computeProjection(convention: .rightUpBack, viewIndex: index)
                     // Retain precisely the projection submitted to the game's
                     // scalar camera bridge. Encoding below still uses the full
                     // compositor projection for display-time reprojection.
-                    let nativeProjection = GameWorldSourceGuardBand.projection(physicalProjection) ?? physicalProjection
+                    guard let nativeProjection = GameWorldSourceGuardBand.projection(physicalProjection) else { return nil }
                     return XRRetainedEyeView(headFromEye: drawable.views[index].transform,
                                       projectionFromEye: nativeProjection)
+                }
+                guard eyes.count == drawable.views.count else {
+                    motionTracking.invalidate(reason: "Physical projection exceeds the native camera conversion budget")
+                    reportStatus("The headset projection exceeds the native camera conversion budget.")
+                    continue
                 }
                 // The request frame names the eye geometry; the head frame names the pose. Both are
                 // retained together so a lease can be checked against the exact pair it claims.
