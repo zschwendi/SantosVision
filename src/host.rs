@@ -14,6 +14,10 @@ use wasmtime::{Caller, SharedMemory, Val};
 #[path = "benchmark.rs"]
 pub(crate) mod benchmark;
 
+#[cfg(all(test, feature = "jit"))]
+#[path = "mailbox_reachability.rs"]
+mod mailbox_reachability;
+
 #[derive(Debug)]
 pub struct Unwind;
 impl std::fmt::Display for Unwind {
@@ -31,6 +35,26 @@ impl std::error::Error for LongJmp {}
 static PENDING_MAILBOX: LazyLock<Mutex<HashSet<u64>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
 static ANY_PENDING: AtomicU64 = AtomicU64::new(0);
 static STUB_SEQ: AtomicU64 = AtomicU64::new(0);
+
+// mailbox_reachability certifies that the exact original has no sender this
+// host can reach: every task enqueue is in do_proxy, whose only entries are the
+// JS-glue _emscripten_run_js_on_main_thread exports. These counters are a
+// tripwire for builds outside that certificate. They never change delivery.
+static MAILBOX_NOTIFICATIONS: AtomicU64 = AtomicU64::new(0);
+static MAILBOX_DELIVERIES: AtomicU64 = AtomicU64::new(0);
+static MAILBOX_PRODUCER_DELIVERIES: AtomicU64 = AtomicU64::new(0);
+static MAILBOX_UNQUALIFIED_DELIVERIES: AtomicU64 = AtomicU64::new(0);
+
+// The only original functions with atomic RMW on producer mutex 8348864. A
+// live frame of one is a superset of "this pthread may hold that mutex".
+const PRODUCER_LOCK_FUNCTIONS: [&str; 3] = [
+    "wasm_gpu::Init()",
+    "wasm_gpu::Emit(unsigned int, unsigned int const*, unsigned int)",
+    "wasm_gpu::EmitData(unsigned int, unsigned int const*, unsigned int, void const*, unsigned long)",
+];
+// Wasmtime 49 default; engine_config does not override it. A full trace cannot
+// exclude a deeper producer frame.
+const BACKTRACE_FRAME_LIMIT: usize = 20;
 
 thread_local! {
     static PENDING_LONGJMP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -76,9 +100,49 @@ pub fn mailbox_await(mem: &SharedMemory, pthread_ptr: u64) {
     write_u32(mem, pthread_ptr + 204, 1);
 }
 
+fn notify_mailbox(target: u64) {
+    if MAILBOX_NOTIFICATIONS.fetch_add(1, Ordering::Relaxed) == 0 {
+        eprintln!("[host] mailbox notification for pthread 0x{target:x}: outside the mailbox reachability certificate");
+    }
+    if PENDING_MAILBOX.lock().unwrap().insert(target) {
+        ANY_PENDING.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+#[derive(Debug, PartialEq)]
+enum ProducerStack { Clear, Producer, Unqualified }
+
+// Diagnostic only: a producer frame proves no ownership by itself, and a
+// truncated or nameless trace proves no absence.
+fn producer_stack(caller: &Caller<'_, HostState>) -> ProducerStack {
+    let trace = wasmtime::WasmBacktrace::force_capture(caller);
+    let frames = trace.frames();
+    if frames.iter().any(|f| f.func_name().is_some_and(|n| PRODUCER_LOCK_FUNCTIONS.contains(&n))) {
+        ProducerStack::Producer
+    } else if frames.is_empty() || frames.len() >= BACKTRACE_FRAME_LIMIT || frames.iter().any(|f| f.func_name().is_none()) {
+        ProducerStack::Unqualified
+    } else {
+        ProducerStack::Clear
+    }
+}
+
+// Root wires this into native runtime status at integration.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn mailbox_status_json() -> serde_json::Value {
+    serde_json::json!({
+        "notifications": MAILBOX_NOTIFICATIONS.load(Ordering::Relaxed),
+        "pending_threads": ANY_PENDING.load(Ordering::Relaxed),
+        "deliveries": MAILBOX_DELIVERIES.load(Ordering::Relaxed),
+        "deliveries_with_producer_frame": MAILBOX_PRODUCER_DELIVERIES.load(Ordering::Relaxed),
+        "deliveries_unqualified_stack": MAILBOX_UNQUALIFIED_DELIVERIES.load(Ordering::Relaxed),
+        "scope": "Certified original has no host-reachable sender; nonzero notifications falsify that for this build. Delivery policy is unchanged.",
+    })
+}
+
 // One place owns pending delivery. Normal callers use the false policy; the
 // experimental true policy has no production activation path because eventual
-// delivery on every real producer thread is not yet certified.
+// delivery on every real producer thread is not certified. In the certified
+// original nothing can become pending (see mailbox_reachability).
 fn deliver_pending_mailbox<const DEFER_EMIT: bool>(caller: &mut Caller<'_, HostState>, name: &str, mem: &SharedMemory) -> Result<()> {
     // The certified Emit hook runs while its producer mutex is held and before
     // publishing head. Guest mailbox work here can reenter Emit or replace the
@@ -89,6 +153,12 @@ fn deliver_pending_mailbox<const DEFER_EMIT: bool>(caller: &mut Caller<'_, HostS
         let has = me != 0 && PENDING_MAILBOX.lock().unwrap().remove(&me);
         if has {
             ANY_PENDING.fetch_sub(1, Ordering::Relaxed);
+            MAILBOX_DELIVERIES.fetch_add(1, Ordering::Relaxed);
+            match producer_stack(caller) {
+                ProducerStack::Producer => { MAILBOX_PRODUCER_DELIVERIES.fetch_add(1, Ordering::Relaxed); }
+                ProducerStack::Unqualified => { MAILBOX_UNQUALIFIED_DELIVERIES.fetch_add(1, Ordering::Relaxed); }
+                ProducerStack::Clear => {}
+            }
             mailbox_await(mem, me);
             export_call_kind(caller, "_emscripten_check_mailbox", &[], crate::guest_call_scope::Kind::Mailbox)?;
         }
@@ -119,6 +189,7 @@ pub fn call(mut caller: Caller<'_, HostState>, idx: usize, params: &[Val], resul
 
     // Preserve normal runtime scheduling until a safe polling/liveness boundary
     // is certified for every producer. The true policy is test-only groundwork.
+    // With the certified original nothing is pending, so this is a load.
     deliver_pending_mailbox::<false>(&mut caller, name, mem)?;
 
     if name.starts_with("invoke_") {
@@ -149,11 +220,7 @@ pub fn call(mut caller: Caller<'_, HostState>, idx: usize, params: &[Val], resul
             set_int(results, r as i64);
         }
         "_emscripten_thread_mailbox_await" => mailbox_await(mem, int(params, 0) as u64),
-        "_emscripten_notify_mailbox_postmessage" => {
-            if PENDING_MAILBOX.lock().unwrap().insert(int(params, 0) as u64) {
-                ANY_PENDING.fetch_add(1, Ordering::Relaxed);
-            }
-        }
+        "_emscripten_notify_mailbox_postmessage" => notify_mailbox(int(params, 0) as u64),
         "_emscripten_thread_cleanup" => {
             export_call(&mut caller, "_emscripten_thread_free_data", &[Val::I64(int(params, 0))])?;
         }
@@ -398,8 +465,11 @@ mod mailbox_publication_tests {
     use std::sync::Arc;
     use std::sync::atomic::AtomicBool;
     use wasmtime::{Config, Engine, Linker, MemoryType, Module, Store};
+    // Pending mailboxes and their counters are process-global.
+    static SERIAL: Mutex<()> = Mutex::new(());
     #[test]
     fn critical_emit_defers_mailbox_then_normal_import_delivers_once() {
+        let _serial = SERIAL.lock().unwrap_or_else(|poison| poison.into_inner());
         use wasm_encoder::{CodeSection, EntityType, ExportKind, ExportSection, Function,
             FunctionSection, ImportSection, Instruction as I, TypeSection};
         let mut wasm=wasm_encoder::Module::new();
@@ -456,5 +526,85 @@ mod mailbox_publication_tests {
         assert_eq!(*observed.lock().unwrap(),vec![false]);
         assert_eq!(ANY_PENDING.load(Ordering::Relaxed),0);assert!(!PENDING_MAILBOX.lock().unwrap().contains(&me));
         assert_eq!(read_u32(&mem,me+204),Some(1));
+    }
+
+    // The tripwire must not alter production delivery: a pending mailbox still
+    // runs at the next eligible import even inside a producer frame. It only
+    // classifies that stack, and a deep stack is never reported as clear.
+    #[test]
+    fn production_delivery_is_unchanged_and_classifies_producer_frames() {
+        let _serial = SERIAL.lock().unwrap_or_else(|poison| poison.into_inner());
+        use wasm_encoder::{BlockType, CodeSection, EntityType, ExportKind, ExportSection, Function,
+            FunctionSection, ImportSection, Instruction as I, NameMap, NameSection, TypeSection};
+        let mut wasm=wasm_encoder::Module::new();
+        let mut types=TypeSection::new(); types.ty().function([],[]); types.ty().function([wasm_encoder::ValType::I32],[]); wasm.section(&types);
+        let mut imports=ImportSection::new();
+        imports.import("test","deliver",EntityType::Function(0)); imports.import("test","mailbox_observed",EntityType::Function(0));
+        wasm.section(&imports);
+        let mut funcs=FunctionSection::new(); for ty in [0,0,1,1,0] {funcs.function(ty);} wasm.section(&funcs);
+        let mut exports=ExportSection::new();
+        for (name,index) in [("emit",2),("ordinary",3),("deep",4),("deep_emit_data",5),("_emscripten_check_mailbox",6)] {
+            exports.export(name,ExportKind::Func,index);
+        }
+        wasm.section(&exports);
+        let mut code=CodeSection::new();
+        for calls in [&[0u32][..],&[0][..]] {
+            let mut f=Function::new([]); for call in calls {f.instruction(&I::Call(*call));} f.instruction(&I::End);code.function(&f);
+        }
+        let mut deep=Function::new([]);
+        deep.instruction(&I::LocalGet(0)).instruction(&I::I32Eqz).instruction(&I::If(BlockType::Empty))
+            .instruction(&I::Call(0)).instruction(&I::Else)
+            .instruction(&I::LocalGet(0)).instruction(&I::I32Const(1)).instruction(&I::I32Sub).instruction(&I::Call(4))
+            .instruction(&I::End).instruction(&I::End);
+        code.function(&deep);
+        let mut deep_emit_data=Function::new([]); deep_emit_data.instruction(&I::LocalGet(0)).instruction(&I::Call(4)).instruction(&I::End); code.function(&deep_emit_data);
+        let mut check=Function::new([]); check.instruction(&I::Call(1)).instruction(&I::End); code.function(&check);
+        wasm.section(&code);
+        let mut names=NameMap::new();
+        for (index,name) in [(2,PRODUCER_LOCK_FUNCTIONS[1]),(3,"CApp::Update()"),(4,"deep(int)"),(5,PRODUCER_LOCK_FUNCTIONS[2]),(6,"_emscripten_check_mailbox")] {
+            names.append(index,name);
+        }
+        let mut name_section=NameSection::new(); name_section.functions(&names); wasm.section(&name_section);
+
+        let mut config=Config::new(); config.wasm_threads(true).shared_memory(true);
+        let engine=Engine::new(&config).unwrap();
+        let mem=SharedMemory::new(&engine,MemoryType::shared(1,1)).unwrap();
+        let observed=Arc::new(AtomicU64::new(0));
+        let mut linker=Linker::<HostState>::new(&engine);
+        let memory=mem.clone();
+        linker.func_wrap("test","deliver",move |mut caller:Caller<'_,HostState>| -> std::result::Result<(),wasmtime::Error> {
+            deliver_pending_mailbox::<false>(&mut caller,"wasm_now_ms",&memory).map_err(wasmtime::Error::from_anyhow)
+        }).unwrap();
+        let count=observed.clone();
+        linker.func_wrap("test","mailbox_observed",move|| {count.fetch_add(1,Ordering::SeqCst);}).unwrap();
+        let me=512u64;
+        let mut store=Store::new(&engine,HostState::new(me));
+        let module=Module::new(&engine,wasm.finish()).unwrap();let inst=linker.instantiate(&mut store,&module).unwrap();
+        let snapshot=|| [&MAILBOX_NOTIFICATIONS,&MAILBOX_DELIVERIES,&MAILBOX_PRODUCER_DELIVERIES,&MAILBOX_UNQUALIFIED_DELIVERIES].map(|c| c.load(Ordering::Relaxed));
+        let before=snapshot();
+        assert_eq!(ANY_PENDING.load(Ordering::Relaxed),0);
+        // Depth 5 stays under the frame limit; depth 30 is truncated, including
+        // when the producer frame is below the retained frames.
+        let cases:[(&str,Option<i32>,[u64;2]);5]=[("emit",None,[1,0]),("ordinary",None,[0,0]),("deep",Some(5),[0,0]),("deep",Some(30),[0,1]),("deep_emit_data",Some(30),[0,1])];
+        for (k,(export,depth,[producer,unqualified])) in cases.into_iter().enumerate() {
+            let counts=snapshot();
+            notify_mailbox(me);
+            assert_eq!(ANY_PENDING.load(Ordering::Relaxed),1);
+            match depth {
+                None=>inst.get_typed_func::<(),()>(&mut store,export).unwrap().call(&mut store,()).unwrap(),
+                Some(n)=>inst.get_typed_func::<i32,()>(&mut store,export).unwrap().call(&mut store,n).unwrap(),
+            }
+            assert_eq!(observed.load(Ordering::SeqCst),k as u64+1,"{export} {depth:?} must still deliver");
+            let after=snapshot();
+            assert_eq!([after[2]-counts[2],after[3]-counts[3]],[producer,unqualified],"{export} {depth:?}");
+            assert_eq!(ANY_PENDING.load(Ordering::Relaxed),0);
+        }
+        let after=snapshot();
+        assert_eq!([after[0]-before[0],after[1]-before[1]],[5,5]);
+        assert!(!PENDING_MAILBOX.lock().unwrap().contains(&me));
+        assert_eq!(read_u32(&mem,me+204),Some(1));
+        let status=mailbox_status_json();
+        assert_eq!(status["deliveries"].as_u64(),Some(after[1]));
+        assert_eq!(status["deliveries_with_producer_frame"].as_u64(),Some(after[2]));
     }
 }
