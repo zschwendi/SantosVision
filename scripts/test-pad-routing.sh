@@ -1,0 +1,124 @@
+#!/bin/sh
+set -eu
+cd "$(dirname "$0")/.."
+out=${1:-target/verification/pad-routing}
+mkdir -p "$out/harness/src"
+python3 - "$out" <<'PY'
+import hashlib, json, pathlib, sys
+root = pathlib.Path.cwd()
+out = pathlib.Path(sys.argv[1]).resolve()
+(out/'harness/Cargo.toml').write_text('''[package]
+name = "santosvision-pad-routing-check"
+version = "0.0.0"
+edition = "2021"
+[workspace]
+[dependencies]
+objc2 = "0.6"
+objc2-game-controller = { version = "0.3", default-features = false, features = ["std", "GCController", "GCExtendedGamepad", "GCPhysicalInputProfile", "GCControllerElement", "GCControllerAxisInput", "GCControllerButtonInput", "GCControllerDirectionPad"] }
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSArray", "NSString", "NSEnumerator"] }
+serde_json = "1.0.151"
+[features]
+jit = []
+''')
+source = r'''#![allow(dead_code, unexpected_cfgs)]
+struct Runtime { mem: () }
+static RT: std::sync::OnceLock<Runtime> = std::sync::OnceLock::new();
+fn mem_base_len(_: &()) -> (*mut u8, usize) { (std::ptr::null_mut(), 0) }
+mod input {
+    #[derive(Clone, Debug, PartialEq)]
+    pub enum Event { Key(String, bool), Button(usize, bool), Motion(f64, f64) }
+    static EVENTS: std::sync::Mutex<Vec<Event>> = std::sync::Mutex::new(Vec::new());
+    pub fn take() -> Vec<Event> { std::mem::take(&mut *EVENTS.lock().unwrap()) }
+    pub fn key(k: &str, down: bool, _: bool, _: Option<&str>, _: bool) { EVENTS.lock().unwrap().push(Event::Key(k.into(), down)); }
+    pub fn button(b: usize, down: bool) { EVENTS.lock().unwrap().push(Event::Button(b, down)); }
+    pub fn mouse_delta_f(x: f64, y: f64) { EVENTS.lock().unwrap().push(Event::Motion(x,y)); }
+    pub fn set_locked(_: bool) {}
+}
+mod mp { pub fn key_pressed(_: &str) {} }
+mod pad {
+    include!(PAD_SOURCE_PATH);
+    #[cfg(test)]
+    mod emitted_lifetime_tests {
+        use super::*;
+        use crate::input::Event;
+        #[test]
+        fn partial_disconnect_and_suspend_emit_actual_releases_and_stop_look() {
+            suspend();
+            MENU_NAVIGATION.store(false, Ordering::Relaxed);
+            IN_VEHICLE.store(false, Ordering::Relaxed);
+            let neutral = spatial::spatial_sample(3, 0, [0.0; 6], 42).unwrap();
+            poll_sample(Some(neutral));
+            crate::input::take();
+            let held = spatial::spatial_sample(3, 1, [0.0, 1.0, 0.7, 0.0, 1.0, 1.0], 42).unwrap();
+            poll_sample(Some(held));
+            let events = crate::input::take();
+            assert!(events.contains(&Event::Key("KeyW".into(), true)));
+            assert!(events.contains(&Event::Button(2, true)));
+            assert!(events.contains(&Event::Button(0, true)));
+            assert!(events.iter().any(|event| matches!(event, Event::Motion(x, _) if *x > 0.0)));
+            // Left disconnects while aim/movement are held; right continues firing.
+            let right = spatial::spatial_sample(2, 1, [1.0; 6], 0).unwrap();
+            poll_sample(Some(right));
+            let events = crate::input::take();
+            assert!(events.contains(&Event::Key("KeyW".into(), false)));
+            assert!(events.contains(&Event::Button(2, false)));
+            assert!(!events.contains(&Event::Button(0, false)));
+            // Right then disconnects: fire and sprint release; no further look.
+            poll_sample(None);
+            let events = crate::input::take();
+            assert!(events.contains(&Event::Button(0, false)));
+            assert!(events.contains(&Event::Key("ShiftLeft".into(), false)));
+            assert!(!events.iter().any(|event| matches!(event, Event::Motion(..))));
+            assert!(STATE.lock().unwrap().as_ref().unwrap().held.is_empty());
+            // Focus/runtime suspension uses the same actual release path.
+            poll_sample(Some(held));
+            crate::input::take();
+            suspend();
+            let events = crate::input::take();
+            assert!(events.contains(&Event::Key("KeyW".into(), false)));
+            assert!(events.contains(&Event::Button(0, false)));
+            assert!(events.contains(&Event::Button(2, false)));
+            assert!(STATE.lock().unwrap().is_none());
+            // A pending L3 tap is discarded on suspension and cannot reappear.
+            poll_sample(Some(neutral));
+            let click = spatial::spatial_sample(3, 1 << 6, [0.0; 6], 42).unwrap();
+            poll_sample(Some(click));
+            suspend();
+            crate::input::take();
+            poll_sample(Some(neutral));
+            assert!(!crate::input::take().contains(&Event::Key("ControlLeft".into(), true)));
+            suspend();
+        }
+        #[test]
+        fn virtual_dpad_uses_actual_mapper_without_movement_or_delayed_l3() {
+            suspend();
+            MENU_NAVIGATION.store(false, Ordering::Relaxed);
+            IN_VEHICLE.store(false, Ordering::Relaxed);
+            let neutral = spatial::spatial_sample(3, 0, [0.0; 6], 42).unwrap();
+            poll_sample(Some(neutral));
+            crate::input::take();
+            let chord = spatial::spatial_sample(3, 1 << 6, [0.8, 0.9, 0.0, 0.0, 0.0, 0.0], 42).unwrap();
+            poll_sample(Some(chord));
+            let events = crate::input::take();
+            assert!(events.contains(&Event::Key("ArrowUp".into(), true)));
+            assert!(events.contains(&Event::Key("ArrowRight".into(), true)));
+            assert!(!events.contains(&Event::Key("KeyW".into(), true)));
+            assert!(!events.contains(&Event::Key("KeyD".into(), true)));
+            poll_sample(Some(neutral));
+            let events = crate::input::take();
+            assert!(events.contains(&Event::Key("ArrowUp".into(), false)));
+            assert!(events.contains(&Event::Key("ArrowRight".into(), false)));
+            assert!(!events.contains(&Event::Key("ControlLeft".into(), true)));
+            suspend();
+        }
+    }
+}
+'''.replace('PAD_SOURCE_PATH', json.dumps(str(root/'src/pad.rs')))
+(out/'harness/src/lib.rs').write_text(source)
+files = ['src/pad.rs', 'src/pad_spatial.rs', 'src/pad_guest_context.rs', 'scripts/test-pad-routing.sh']
+(out/'source-hashes.json').write_text(json.dumps({f: hashlib.sha256((root/f).read_bytes()).hexdigest() for f in files}, indent=2)+'\n')
+PY
+export CARGO_HOME=${CARGO_HOME:-$PWD/.tools/cargo}
+export RUSTUP_HOME=${RUSTUP_HOME:-$PWD/.tools/rustup}
+export PATH="$CARGO_HOME/bin:$PATH"
+cargo +1.98.1 test --offline --manifest-path "$out/harness/Cargo.toml" -j2 -- --test-threads=1

@@ -11,6 +11,9 @@ use std::time::{Duration, Instant};
 
 #[path = "pad_guest_context.rs"]
 mod guest_context;
+#[path = "pad_spatial.rs"]
+mod spatial;
+use spatial::Sample;
 
 pub static ACTIVE: AtomicBool = AtomicBool::new(false);
 static POLL_SAMPLES: AtomicU64 = AtomicU64::new(0);
@@ -20,6 +23,10 @@ static KEY_EVENTS: AtomicU64 = AtomicU64::new(0);
 static BUTTON_EVENTS: AtomicU64 = AtomicU64::new(0);
 static LOOK_EVENTS: AtomicU64 = AtomicU64::new(0);
 static MENU_PRESS_COUNT: AtomicU64 = AtomicU64::new(0);
+// 0 absent, 1 established extended gamepad, 2 spatial controls. Hand bits are
+// available validated controls, not Bluetooth pairing or tracked pose claims.
+static INPUT_PROFILE: AtomicU64 = AtomicU64::new(0);
+static SPATIAL_HANDS: AtomicU64 = AtomicU64::new(0);
 static LOOK_SENSITIVITY: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
 // Exact supported builds follow the guest pause state; Escape parity is only a
 // compatibility fallback for other executables.
@@ -48,6 +55,10 @@ pub(crate) fn status_json() -> serde_json::Value {
         "mapped_button_events": BUTTON_EVENTS.load(Ordering::Relaxed),
         "mapped_look_events": LOOK_EVENTS.load(Ordering::Relaxed),
         "menu_press_count": MENU_PRESS_COUNT.load(Ordering::Relaxed),
+        "input_profile": match INPUT_PROFILE.load(Ordering::Relaxed) { 1 => "extended_gamepad", 2 => "spatial_gamepad_buttons_v1", _ => "none" },
+        "spatial_left_controls_available": SPATIAL_HANDS.load(Ordering::Relaxed) & 1 != 0,
+        "spatial_right_controls_available": SPATIAL_HANDS.load(Ordering::Relaxed) & 2 != 0,
+        "motion_aim_enabled": false,
         "menu_navigation_inferred": MENU_NAVIGATION.load(Ordering::Relaxed),
         "menu_navigation": MENU_NAVIGATION.load(Ordering::Relaxed),
         "menu_context_source": if GUEST_CONTEXT_AVAILABLE.load(Ordering::Relaxed) { "verified_guest_pause_state" } else { "escape_fallback" },
@@ -85,6 +96,7 @@ struct State {
     menu_navigation: bool,
     menu_button_down: bool,
     blocked_context_buttons: u8,
+    spatial_router: spatial::Router,
 }
 static STATE: Mutex<Option<State>> = Mutex::new(None);
 
@@ -188,6 +200,54 @@ fn touchpad_pressed(gamepad: &GCExtendedGamepad) -> bool {
     button.is_some_and(|button| down(&button))
 }
 
+fn controller_sample() -> Option<Sample> {
+    #[cfg(target_os = "visionos")]
+    {
+        extern "C" {
+            fn sv_spatial_gamepad_read_v1(values: *mut f32, count: u32, buttons: *mut u32, left_device: *mut u64) -> u32;
+        }
+        let mut values = [0.0; 6];
+        let mut buttons = 0;
+        let mut left_device = 0;
+        let hands = unsafe { sv_spatial_gamepad_read_v1(values.as_mut_ptr(), 6, &mut buttons, &mut left_device) };
+        SPATIAL_HANDS.store((hands & 3) as u64, Ordering::Relaxed);
+        if let Some(sample) = spatial::spatial_sample(hands, buttons, values, left_device) {
+            INPUT_PROFILE.store(2, Ordering::Relaxed);
+            return Some(sample);
+        }
+    }
+    let Some(gp) = gamepad() else {
+        INPUT_PROFILE.store(0, Ordering::Relaxed);
+        return None;
+    };
+    INPUT_PROFILE.store(1, Ordering::Relaxed);
+    // Preserve the established single extended-gamepad selection and all of
+    // its existing button meanings on iOS, desktop and visionOS.
+    unsafe {
+        let mut face_and_shoulders = 0;
+        for (bit, button) in [(CROSS, gp.buttonA()), (CIRCLE, gp.buttonB()), (SQUARE, gp.buttonX()),
+            (TRIANGLE, gp.buttonY()), (LEFT_SHOULDER, gp.leftShoulder()), (RIGHT_SHOULDER, gp.rightShoulder())] {
+            if down(&button) { face_and_shoulders |= bit; }
+        }
+        let left = gp.leftThumbstick();
+        let right = gp.rightThumbstick();
+        let dpad = gp.dpad();
+        Some(Sample {
+            left_stick: [left.xAxis().value(), left.yAxis().value()],
+            right_stick: [right.xAxis().value(), right.yAxis().value()],
+            left_trigger: gp.leftTrigger().value(), right_trigger: gp.rightTrigger().value(),
+            face_and_shoulders,
+            left_click: gp.leftThumbstickButton().is_some_and(|b| down(&b)),
+            right_click: gp.rightThumbstickButton().is_some_and(|b| down(&b)),
+            menu: down(&gp.buttonMenu()),
+            camera: gp.buttonOptions().is_some_and(|b| down(&b)) || touchpad_pressed(&gp),
+            dpad: u8::from(down(&dpad.up())) | (u8::from(down(&dpad.down())) << 1)
+                | (u8::from(down(&dpad.left())) << 2) | (u8::from(down(&dpad.right())) << 3),
+            spatial: None,
+        })
+    }
+}
+
 fn face_keys(keys: &mut HashSet<&'static str>, menu: bool, in_car: bool,
              cross: bool, circle: bool, square: bool) {
     if menu {
@@ -222,7 +282,11 @@ fn navigation_context(previous: bool, escape_released: bool,
 
 pub fn poll() -> bool {
     POLL_SAMPLES.fetch_add(1, Ordering::Relaxed);
-    let gp = gamepad();
+    let gp = controller_sample();
+    poll_sample(gp)
+}
+
+fn poll_sample(gp: Option<Sample>) -> bool {
     let connected = gp.is_some();
     if ACTIVE.swap(connected, Ordering::Relaxed) != connected {
         eprintln!("[pad] controller {}", if connected { "connected" } else { "disconnected" });
@@ -230,7 +294,10 @@ pub fn poll() -> bool {
     if connected { CONNECTED_SAMPLES.fetch_add(1, Ordering::Relaxed); }
     let mut guard = STATE.lock().unwrap();
     let st = guard.get_or_insert_with(|| State { held: HashSet::new(), buttons: 0, last: Instant::now(), down_since: None,
-        menu_navigation: MENU_NAVIGATION.load(Ordering::Relaxed), menu_button_down: false, blocked_context_buttons: 0 });
+        menu_navigation: MENU_NAVIGATION.load(Ordering::Relaxed), menu_button_down: false, blocked_context_buttons: 0,
+        spatial_router: spatial::Router::default() });
+    let gp = gp.map(|sample| st.spatial_router.apply(sample, Instant::now()));
+    if gp.is_none() { st.spatial_router = spatial::Router::default(); }
     let dt = st.last.elapsed().as_secs_f64().min(0.05);
     st.last = Instant::now();
 
@@ -239,7 +306,7 @@ pub fn poll() -> bool {
     let mut buttons = 0u8;
     let mut looking = false;
     let menu_key = menu_action_key(&mut MENU_ACTIONS.lock().unwrap(), Instant::now());
-    let menu_down = gp.as_ref().is_some_and(|gp| unsafe { down(&gp.buttonMenu()) });
+    let menu_down = gp.as_ref().is_some_and(|gp| gp.menu);
     if menu_down && !st.menu_button_down {
         MENU_PRESS_COUNT.fetch_add(1, Ordering::Relaxed);
     }
@@ -253,19 +320,14 @@ pub fn poll() -> bool {
     GUEST_CONTEXT_AVAILABLE.store(guest.is_some(), Ordering::Relaxed);
     PHONE_INSTANTIATED.store(phone_instantiated, Ordering::Relaxed);
     if menu_down { keys.insert("Escape"); }
-    if let Some(gp) = gp.as_ref() { unsafe {
+    if let Some(gp) = gp.as_ref() {
         let menu = st.menu_navigation;
-        let mut pressed = 0;
-        for (bit, button) in [(CROSS, gp.buttonA()), (CIRCLE, gp.buttonB()), (SQUARE, gp.buttonX()),
-            (TRIANGLE, gp.buttonY()), (LEFT_SHOULDER, gp.leftShoulder()), (RIGHT_SHOULDER, gp.rightShoulder())] {
-            if down(&button) { pressed |= bit; }
-        }
+        let pressed = gp.face_and_shoulders;
         // Closing a menu with Circle must release Backspace, not turn the same
         // still-held press into Reload. Require a fresh press after a transition.
         let allowed = context_buttons(&mut st.blocked_context_buttons, context_changed, pressed);
         let pressed = |bit| allowed & bit != 0;
-        let ls = gp.leftThumbstick();
-        let (lx, ly) = (ls.xAxis().value(), ls.yAxis().value());
+        let [lx, ly] = gp.left_stick;
         if lx < -STICK_DEADZONE { keys.insert(if menu { "ArrowLeft" } else { "KeyA" }); }
         if lx > STICK_DEADZONE { keys.insert(if menu { "ArrowRight" } else { "KeyD" }); }
         if menu {
@@ -275,17 +337,17 @@ pub fn poll() -> bool {
         } else if in_car {
             if ly > STICK_DEADZONE { keys.insert("Numpad8"); }
             if ly < -STICK_DEADZONE { keys.insert("Numpad2"); }
-            if gp.rightTrigger().value() > 0.2 { keys.insert("KeyW"); }
-            if gp.leftTrigger().value() > 0.2 { keys.insert("KeyS"); }
+            if gp.right_trigger > 0.2 { keys.insert("KeyW"); }
+            if gp.left_trigger > 0.2 { keys.insert("KeyS"); }
             if pressed(RIGHT_SHOULDER) { keys.insert("Space"); }
-            HORN_PAD.store(gp.leftThumbstickButton().is_some_and(|b| down(&b)), Ordering::Relaxed);
+            HORN_PAD.store(gp.left_click, Ordering::Relaxed);
         } else {
             if ly > STICK_DEADZONE { keys.insert("KeyW"); }
             if ly < -STICK_DEADZONE { keys.insert("KeyS"); }
-            if gp.rightTrigger().value() > 0.2 { buttons |= 1; }
-            if gp.leftTrigger().value() > 0.2 { buttons |= 2; }
+            if gp.right_trigger > 0.2 { buttons |= 1; }
+            if gp.left_trigger > 0.2 { buttons |= 2; }
             if pressed(RIGHT_SHOULDER) { keys.insert("KeyQ"); }
-            if gp.leftThumbstickButton().is_some_and(|b| down(&b)) { keys.insert("ControlLeft"); }
+            if gp.left_click { keys.insert("ControlLeft"); }
         }
         face_keys(&mut keys, menu, in_car, pressed(CROSS), pressed(CIRCLE), pressed(SQUARE));
         if menu {
@@ -295,36 +357,33 @@ pub fn poll() -> bool {
         } else {
             if pressed(TRIANGLE) { keys.insert("KeyF"); }
             if pressed(LEFT_SHOULDER) { keys.insert("Tab"); }
-            if gp.rightThumbstickButton().is_some_and(|b| down(&b)) { keys.insert("KeyC"); }
+            if gp.right_click { keys.insert("KeyC"); }
         }
-        let dp = gp.dpad();
-        if down(&dp.up()) { keys.insert("ArrowUp"); }
-        if down(&dp.down()) {
+        if gp.dpad & 1 != 0 { keys.insert("ArrowUp"); }
+        if gp.dpad & 2 != 0 {
             let since = *st.down_since.get_or_insert_with(Instant::now);
             if !menu && since.elapsed() >= SWITCH_HOLD { keys.insert("AltLeft"); } else { keys.insert("ArrowDown"); }
         } else {
             st.down_since = None;
         }
-        if down(&dp.left()) { keys.insert("ArrowLeft"); }
-        if down(&dp.right()) { keys.insert("ArrowRight"); }
+        if gp.dpad & 4 != 0 { keys.insert("ArrowLeft"); }
+        if gp.dpad & 8 != 0 { keys.insert("ArrowRight"); }
         if !menu {
-            if gp.buttonOptions().is_some_and(|b| down(&b)) { keys.insert("KeyV"); }
-            if touchpad_pressed(&gp) { keys.insert("KeyV"); }
+            if gp.camera { keys.insert("KeyV"); }
         }
 
-        let rs = gp.rightThumbstick();
         let curve = |v: f32| -> f64 {
             let a = v.abs();
             if a < LOOK_DEADZONE { 0.0 } else { (((a - LOOK_DEADZONE) / (1.0 - LOOK_DEADZONE)) as f64).powf(1.8).copysign(v as f64) }
         };
-        let (dx, dy) = (curve(rs.xAxis().value()), -curve(rs.yAxis().value()));
+        let (dx, dy) = (curve(gp.right_stick[0]), -curve(gp.right_stick[1]));
         if !menu && (dx != 0.0 || dy != 0.0) {
             looking = true;
             LOOK_EVENTS.fetch_add(1, Ordering::Relaxed);
             let speed = LOOK_SPEED * look_sensitivity_percent() / 100.0;
             input::mouse_delta_f(dx * speed * dt, dy * speed * dt);
         }
-    } } else {
+    } else {
         st.menu_button_down = false;
         st.blocked_context_buttons = 0;
         st.down_since = None;
@@ -367,6 +426,8 @@ pub fn suspend() {
     actions.active = None;
     actions.gap_until = None;
     ACTIVE.store(false, Ordering::Relaxed);
+    INPUT_PROFILE.store(0, Ordering::Relaxed);
+    SPATIAL_HANDS.store(0, Ordering::Relaxed);
     HORN_PAD.store(false, Ordering::Relaxed);
 }
 

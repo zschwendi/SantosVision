@@ -186,6 +186,7 @@ final class NativeRuntimeModel: ObservableObject {
             playSettingsStatus = "Sound and controls need attention: \(error.localizedDescription)"
         }
         if let device = MTLCreateSystemDefaultDevice() { recordMetalCapabilities(device) }
+        SpatialGamepadInput.shared.start()
         if !isLinked { status = "This build contains the native immersive tracking test. Build game mode to link the GTA engine." }
     }
 
@@ -633,7 +634,13 @@ final class NativeRuntimeModel: ObservableObject {
             .flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }
         let controllers = GCController.controllers().filter { $0.extendedGamepad != nil }
         let controllerNames = controllers.map { $0.vendorName ?? "Game controller" }
-        controllerSummary = controllerNames.first.map { "\($0) connected" } ?? "Controller not connected"
+        let spatialControllers = SpatialGamepadInput.shared.report
+        let leftSpatial = spatialControllers["left_controls_available"] as? Bool == true
+        let rightSpatial = spatialControllers["right_controls_available"] as? Bool == true
+        controllerSummary = leftSpatial && rightSpatial ? "Spatial controls ready (left + right)"
+            : leftSpatial ? "Left spatial controls ready; connect right"
+            : rightSpatial ? "Right spatial controls ready; connect left"
+            : controllerNames.first.map { "\($0) connected" } ?? "Controller not connected"
         // A historical completion is evidence, but the native publisher also
         // verifies a fresh ready frame and current lifecycle epoch.
         let currentWorldConnected = isActive && compositorOwnsHeadTracking && worldPresentation != nil
@@ -652,6 +659,7 @@ final class NativeRuntimeModel: ObservableObject {
             "compositor_owns_head_tracking": compositorOwnsHeadTracking,
             "connected_window_scene_count": UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.count,
             "controllers": ["connected": !controllers.isEmpty, "names": controllerNames],
+            "spatial_controllers": spatialControllers,
             "save_root": saveRoot.path, "has_game_data": hasGameData,
             "save_sync_status": cloudSaves.status,
             "graphics_requested": graphicsSettings.reportValue,
