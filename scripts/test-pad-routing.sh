@@ -26,12 +26,13 @@ static RT: std::sync::OnceLock<Runtime> = std::sync::OnceLock::new();
 fn mem_base_len(_: &()) -> (*mut u8, usize) { (std::ptr::null_mut(), 0) }
 mod input {
     #[derive(Clone, Debug, PartialEq)]
-    pub enum Event { Key(String, bool), Button(usize, bool), Motion(f64, f64) }
+    pub enum Event { Key(String, bool), Button(usize, bool), Motion(f64, f64), Wheel(i32) }
     static EVENTS: std::sync::Mutex<Vec<Event>> = std::sync::Mutex::new(Vec::new());
     pub fn take() -> Vec<Event> { std::mem::take(&mut *EVENTS.lock().unwrap()) }
     pub fn key(k: &str, down: bool, _: bool, _: Option<&str>, _: bool) { EVENTS.lock().unwrap().push(Event::Key(k.into(), down)); }
     pub fn button(b: usize, down: bool) { EVENTS.lock().unwrap().push(Event::Button(b, down)); }
     pub fn mouse_delta_f(x: f64, y: f64) { EVENTS.lock().unwrap().push(Event::Motion(x,y)); }
+    pub fn wheel(notches: i32) { EVENTS.lock().unwrap().push(Event::Wheel(notches)); }
     pub fn set_locked(_: bool) {}
 }
 mod mp { pub fn key_pressed(_: &str) {} }
@@ -112,6 +113,15 @@ mod pad {
             assert!(events.contains(&Event::Button(0, false)));
             assert!(events.contains(&Event::Button(2, false)));
             assert!(events.contains(&Event::Key("Space".into(), true)), "Apply still reaches GTA while the native UI owns physical input");
+            // Expire the Apply pulse using the queue's real clock, then prove
+            // the same production poller emits actual mouse-wheel map zoom.
+            { let mut actions = MENU_ACTIONS.lock().unwrap(); actions.active = None; actions.gap_until = None; }
+            assert!(queue_menu_action(15));
+            poll_sample(Some(held));
+            assert!(crate::input::take().contains(&Event::Wheel(1)));
+            assert!(queue_menu_action(16));
+            poll_sample(Some(held));
+            assert!(crate::input::take().contains(&Event::Wheel(-1)));
             TEST_NATIVE_CONTROLS_OWN_INPUT.store(false, Ordering::Relaxed);
             poll_sample(Some(held));
             let events = crate::input::take();

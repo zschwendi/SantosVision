@@ -28,6 +28,7 @@ enum SantosControlAction: Int, CaseIterable, Identifiable {
     case phone, up, down, quit
     case left, right, select, back
     case apply, yes, no, tab
+    case zoomIn, zoomOut
     var id: Int { rawValue }
     var title: String {
         switch self {
@@ -47,6 +48,8 @@ enum SantosControlAction: Int, CaseIterable, Identifiable {
         case .yes: "Yes"
         case .no: "No"
         case .tab: "Tab"
+        case .zoomIn: "Map zoom +"
+        case .zoomOut: "Map zoom −"
         }
     }
     var symbol: String {
@@ -67,6 +70,8 @@ enum SantosControlAction: Int, CaseIterable, Identifiable {
         case .yes: "y.circle"
         case .no: "n.circle"
         case .tab: "arrow.right.to.line"
+        case .zoomIn: "plus.magnifyingglass"
+        case .zoomOut: "minus.magnifyingglass"
         }
     }
     var menuAction: UInt32? {
@@ -84,6 +89,8 @@ enum SantosControlAction: Int, CaseIterable, Identifiable {
         case .yes: 4
         case .no: 5
         case .tab: 14
+        case .zoomIn: 15
+        case .zoomOut: 16
         default: nil
         }
     }

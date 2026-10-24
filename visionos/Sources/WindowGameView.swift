@@ -354,7 +354,7 @@ struct SantosSettingsView: View {
                         set: { runtime.setDrawSetupOverhead($0) }))
                         .disabled(!runtime.canChangeRenderingOptimizations)
                     if runtime.hasStarted {
-                        Text("Quit and reopen to change graphics, sound, or look sensitivity.").font(.caption).foregroundStyle(.secondary)
+                        Text("Graphics, sound and look sensitivity apply at the next launch. Quit the game, reopen Los Santos, change them before Play, then launch again. Apply in the pause controls sends GTA’s own Apply command; it does not apply launcher settings.").font(.caption).foregroundStyle(.secondary)
                     }
                     if !runtime.playSettingsStatus.isEmpty {
                         Text(runtime.playSettingsStatus).font(.caption).foregroundStyle(.secondary)
@@ -415,6 +415,8 @@ struct SantosPauseControls: View {
                 }
             }
             Text("Left stick / D-pad · Move highlight    Cross · Use highlighted button    Circle / Start · Resume")
+                .font(.caption2).foregroundStyle(.secondary)
+            Text("Map zoom + / − sends the game’s mouse wheel. GTA Apply saves GTA menu changes.")
                 .font(.caption2).foregroundStyle(.secondary)
             Text("Sense: both stick clicks · Camera    Hold left stick click + stick · D-pad")
                 .font(.caption2).foregroundStyle(.secondary)

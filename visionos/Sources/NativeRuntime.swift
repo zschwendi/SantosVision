@@ -452,8 +452,8 @@ final class NativeRuntimeModel: ObservableObject {
     }
 
     private func updateActivity(deferReport: Bool = false) {
-        let active = nativeControlsSceneIsActive || (compositorOwnsHeadTracking && immersiveSceneIsActive)
-            || (appSceneIsActive && (!windowGameMode || (windowIsAttached && windowSceneIsActive)))
+        let active = !isQuitting && (nativeControlsSceneIsActive || (compositorOwnsHeadTracking && immersiveSceneIsActive)
+            || (appSceneIsActive && (!windowGameMode || (windowIsAttached && windowSceneIsActive))))
         let changed = active != isActive
         if active != isActive {
             worldGpuTimingNotBeforeUptime = ProcessInfo.processInfo.systemUptime

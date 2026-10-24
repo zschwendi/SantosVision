@@ -27,7 +27,8 @@ import Foundation
         require(SantosControlAction.camera.menuAction == 6, "Camera routes to gameplay-aware native key path")
         require(SantosControlAction.phone.menuAction == 7, "Phone routes to gameplay-aware native key path")
         require(SantosControlAction.resume.menuAction == 13, "Resume is state aware, never a blind Escape toggle")
-        require(Set(SantosControlAction.allCases.map(\.rawValue)).count == 16, "Every visible cell has unique selection")
+        require(Set(SantosControlAction.allCases.map(\.rawValue)).count == 18, "Every visible cell has unique selection")
+        require(SantosControlAction.zoomIn.menuAction == 15 && SantosControlAction.zoomOut.menuAction == 16, "Map zoom reaches the real wheel queue")
         print("Native controls policy: \(checks) checks passed")
     }
 }

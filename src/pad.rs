@@ -21,6 +21,7 @@ static CONNECTED_SAMPLES: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_INPUT_SAMPLES: AtomicU64 = AtomicU64::new(0);
 static KEY_EVENTS: AtomicU64 = AtomicU64::new(0);
 static BUTTON_EVENTS: AtomicU64 = AtomicU64::new(0);
+static WHEEL_EVENTS: AtomicU64 = AtomicU64::new(0);
 static LOOK_EVENTS: AtomicU64 = AtomicU64::new(0);
 static MENU_PRESS_COUNT: AtomicU64 = AtomicU64::new(0);
 // 0 absent, 1 established extended gamepad, 2 spatial controls. Hand bits are
@@ -55,6 +56,7 @@ pub(crate) fn status_json() -> serde_json::Value {
         "mapped_key_events": KEY_EVENTS.load(Ordering::Relaxed),
         "mapped_button_events": BUTTON_EVENTS.load(Ordering::Relaxed),
         "mapped_look_events": LOOK_EVENTS.load(Ordering::Relaxed),
+        "mapped_wheel_events": WHEEL_EVENTS.load(Ordering::Relaxed),
         "menu_press_count": MENU_PRESS_COUNT.load(Ordering::Relaxed),
         "input_profile": match INPUT_PROFILE.load(Ordering::Relaxed) { 1 => "extended_gamepad", 2 => "spatial_gamepad_buttons_v1", _ => "none" },
         "spatial_left_controls_available": SPATIAL_HANDS.load(Ordering::Relaxed) & 1 != 0,
@@ -104,15 +106,16 @@ struct State {
 static STATE: Mutex<Option<State>> = Mutex::new(None);
 
 #[derive(Clone, Copy, Debug, PartialEq)]
-enum AppAction { Key(&'static str), Gameplay(&'static str), Resume }
+enum AppAction { Key(&'static str), Gameplay(&'static str), Resume, Wheel(i32) }
 struct MenuActions {
     queued: VecDeque<AppAction>,
     active: Option<(&'static str, Instant)>,
     gap_until: Option<Instant>,
     waiting_for_gameplay: Option<(&'static str, Instant)>,
+    wheel_pending: i32,
 }
 static MENU_ACTIONS: Mutex<MenuActions> = Mutex::new(MenuActions {
-    queued: VecDeque::new(), active: None, gap_until: None, waiting_for_gameplay: None,
+    queued: VecDeque::new(), active: None, gap_until: None, waiting_for_gameplay: None, wheel_pending: 0,
 });
 const MENU_ACTION_HOLD: Duration = Duration::from_millis(120);
 const MENU_ACTION_GAP: Duration = Duration::from_millis(32);
@@ -131,6 +134,7 @@ pub fn queue_menu_action(action: u32) -> bool {
         10 => AppAction::Key("ArrowLeft"), 11 => AppAction::Key("ArrowRight"),
         12 => AppAction::Key("Backspace"), 13 => AppAction::Resume,
         14 => AppAction::Key("Tab"),
+        15 => AppAction::Wheel(1), 16 => AppAction::Wheel(-1),
         _ => return false,
     };
     let mut actions = MENU_ACTIONS.lock().unwrap();
@@ -164,6 +168,7 @@ fn menu_action_key(actions: &mut MenuActions, now: Instant, paused: Option<bool>
         let key = match action {
             AppAction::Key(key) => Some(key),
             AppAction::Resume => (paused == Some(true)).then_some("Escape"),
+            AppAction::Wheel(notches) => { actions.wheel_pending += notches; None },
             AppAction::Gameplay(key) => match paused {
                 Some(false) => Some(key),
                 Some(true) => {
@@ -363,7 +368,15 @@ fn poll_sample(gp: Option<Sample>) -> bool {
     let mut buttons = 0u8;
     let mut looking = false;
     let guest = guest_context::read();
-    let menu_key = menu_action_key(&mut MENU_ACTIONS.lock().unwrap(), Instant::now(), guest.map(|context| context.paused));
+    let (menu_key, wheel) = {
+        let mut actions = MENU_ACTIONS.lock().unwrap();
+        let key = menu_action_key(&mut actions, Instant::now(), guest.map(|context| context.paused));
+        (key, std::mem::take(&mut actions.wheel_pending))
+    };
+    if wheel != 0 {
+        WHEEL_EVENTS.fetch_add(1, Ordering::Relaxed);
+        input::wheel(wheel);
+    }
     let menu_down = gp.as_ref().is_some_and(|gp| gp.menu);
     if menu_down && !st.menu_button_down {
         MENU_PRESS_COUNT.fetch_add(1, Ordering::Relaxed);
@@ -484,6 +497,7 @@ pub fn suspend() {
     actions.active = None;
     actions.gap_until = None;
     actions.waiting_for_gameplay = None;
+    actions.wheel_pending = 0;
     ACTIVE.store(false, Ordering::Relaxed);
     INPUT_PROFILE.store(0, Ordering::Relaxed);
     SPATIAL_HANDS.store(0, Ordering::Relaxed);
@@ -568,7 +582,7 @@ mod tests {
     fn menu_actions_hold_then_release_before_repeating() {
         let now = Instant::now();
         let mut actions = MenuActions {
-            queued: VecDeque::from([AppAction::Key("Escape"), AppAction::Key("Escape")]), active: None, gap_until: None, waiting_for_gameplay: None,
+            queued: VecDeque::from([AppAction::Key("Escape"), AppAction::Key("Escape")]), active: None, gap_until: None, waiting_for_gameplay: None, wheel_pending: 0,
         };
         assert_eq!(menu_action_key(&mut actions, now, None), Some("Escape"));
         assert_eq!(menu_action_key(&mut actions, now + MENU_ACTION_HOLD - Duration::from_millis(1), None), Some("Escape"));
@@ -581,7 +595,7 @@ mod tests {
     fn gameplay_shortcuts_wait_for_real_unpause_and_fail_closed_when_unknown() {
         let now = Instant::now();
         let make = || MenuActions { queued: VecDeque::from([AppAction::Gameplay("KeyV")]),
-            active: None, gap_until: None, waiting_for_gameplay: None };
+            active: None, gap_until: None, waiting_for_gameplay: None, wheel_pending: 0 };
         let mut actions = make();
         assert_eq!(menu_action_key(&mut actions, now, Some(true)), Some("Escape"));
         let after = now + MENU_ACTION_HOLD + MENU_ACTION_GAP;
@@ -596,7 +610,7 @@ mod tests {
         assert_eq!(menu_action_key(&mut timeout, now + GAMEPLAY_ACTION_TIMEOUT, Some(false)), None);
         assert!(timeout.waiting_for_gameplay.is_none());
         let mut resume = MenuActions { queued: VecDeque::from([AppAction::Resume]),
-            active: None, gap_until: None, waiting_for_gameplay: None };
+            active: None, gap_until: None, waiting_for_gameplay: None, wheel_pending: 0 };
         assert_eq!(menu_action_key(&mut resume, now, Some(false)), None,
             "Resume must not pause gameplay when only the native UI is open");
     }
@@ -618,7 +632,7 @@ mod tests {
     #[test]
     fn menu_action_api_rejects_unknown_and_excess_actions() {
         assert!(!queue_menu_action(0));
-        assert!(!queue_menu_action(15));
+        assert!(!queue_menu_action(17));
         for action in [1, 2, 3, 4, 5, 1, 2, 3] { assert!(queue_menu_action(action)); }
         assert!(!queue_menu_action(4));
         MENU_ACTIONS.lock().unwrap().queued.clear();
