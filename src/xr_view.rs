@@ -424,28 +424,31 @@ pub(crate) fn rigid(m: &[f32; 16]) -> bool {
     (0.97..=1.03).contains(&det)
 }
 
-fn validate_request(request: &SVXRViewRequest) -> Result<(), i32> {
+fn canonical_request(mut request: SVXRViewRequest) -> Result<SVXRViewRequest, i32> {
     if request.version != 1 || request.size != 288 || request.reserved != 0
         || !(1..=2).contains(&request.view_count) { return Err(-2); }
     if !request.presentation_time_seconds.is_finite() || request.presentation_time_seconds < 0. { return Err(-3); }
-    for view in request.views.iter().take(request.view_count as usize) {
-        let p = &view.projection_from_eye;
+    for view in request.views.iter_mut().take(request.view_count as usize) {
         if !rigid(&view.head_from_eye) || view.head_from_eye[12..15].iter().any(|x| x.abs() > 0.25)
-            || p.iter().any(|x| !x.is_finite()) || p[0] <= 0. || p[5] <= 0.
-            || p[3].abs() > 1e-5 || p[7].abs() > 1e-5 || p[15].abs() > 1e-5
-            || (p[11] + 1.).abs() > 1e-4 || p[10] < 0. || p[14] <= 0.
-            || projection_scalars(p).is_none()
         { return Err(-3); }
+        view.projection_from_eye = canonical_eye_projection(&view.projection_from_eye)
+            .ok_or(-3)?.0;
     }
-    Ok(())
+    Ok(request)
+}
+
+fn validate_request(request: &SVXRViewRequest) -> Result<(), i32> {
+    canonical_request(*request).map(|_| ())
 }
 
 /// Copies compositor eye geometry. The native game thread consumes this later.
 #[no_mangle]
 pub unsafe extern "C" fn sv_xr_submit_views(request: *const SVXRViewRequest) -> i32 {
     if request.is_null() { return -1; }
-    let request = unsafe { request.read_unaligned() };
-    if let Err(error) = validate_request(&request) { return error; }
+    let request = match canonical_request(unsafe { request.read_unaligned() }) {
+        Ok(request) => request,
+        Err(error) => return error,
+    };
     let mut state = lock_world_state();
     if state.request.is_some_and(|(previous, _)| request.frame <= previous.frame) { return -4; }
     state.request = Some((request, Instant::now()));
@@ -551,6 +554,61 @@ fn projection_scalars(p: &[f32; 16]) -> Option<[f32; 11]> {
     let aspect = p[5] / p[0];
     let fields = [near, far, 1., 1., p[8], p[9], 2. * tan_y.atan().to_degrees(), tan_y, tan_x, aspect, aspect];
     fields.iter().all(|v| v.is_finite()).then_some(fields)
+}
+
+// The game's eleven scalars encode an asymmetric finite pinhole, whereas the
+// physical compositor includes calibration residuals. Admit a conversion only
+// after bounding its error over the ENTIRE physical clip box. 1/16384 NDC is
+// at most 0.125 pixel on a 4096-wide target; reverse depth has the same absolute
+// clip-space budget. The compositor keeps its original physical projection.
+const PROJECTION_CLIP_ERROR_BUDGET: f64 = 1.0 / 16384.0;
+
+fn canonical_eye_projection(original: &[f32; 16]) -> Option<([f32; 16], [f64; 3])> {
+    if original.iter().any(|v| !v.is_finite()) || original[0] <= 0. || original[5] <= 0.
+        || (original[11] + 1.).abs() > 1e-4 || original[10] <= 0. || original[14] <= 0.
+    { return None; }
+    let scale = 1.0f32 / -original[11];
+    let mut canonical = original.map(|v| v * scale);
+    for index in [1, 2, 3, 4, 6, 7, 12, 13, 15] { canonical[index] = 0.; }
+    canonical[11] = -1.;
+    projection_scalars(&canonical)?;
+
+    // Gauss-Jordan in f64 avoids f32 inversion noise consuming the admission
+    // budget. This inverse is used only for the certificate, never rendering.
+    let mut inverse = [[0.0f64; 8]; 4];
+    for row in 0..4 { for column in 0..4 {
+        inverse[row][column] = original[column * 4 + row] as f64;
+        inverse[row][column + 4] = f64::from(row == column);
+    }}
+    for column in 0..4 {
+        let pivot = (column..4).max_by(|&a, &b|
+            inverse[a][column].abs().total_cmp(&inverse[b][column].abs()))?;
+        inverse.swap(column, pivot);
+        let divisor = inverse[column][column];
+        if !divisor.is_finite() || divisor == 0. { return None; }
+        for value in &mut inverse[column] { *value /= divisor; }
+        for row in 0..4 {
+            if row == column { continue; }
+            let factor = inverse[row][column];
+            for entry in 0..8 { inverse[row][entry] -= factor * inverse[column][entry]; }
+        }
+    }
+    let mut mapping: [f64; 16] = std::array::from_fn(|index| {
+        let (column, row) = (index / 4, index % 4);
+        (0..4).map(|k| canonical[k * 4 + row] as f64 * inverse[k][column + 4]).sum()
+    });
+    if mapping.iter().any(|v| !v.is_finite()) || mapping[15] <= 0. { return None; }
+    let constant_w = mapping[15];
+    for value in &mut mapping { *value /= constant_w; }
+    let denominator_error: f64 = [3, 7, 11].into_iter().map(|i| mapping[i].abs()).sum();
+    if !denominator_error.is_finite() || denominator_error >= 1. { return None; }
+    let bounds: [f64; 3] = std::array::from_fn(|row| {
+        let numerator_error: f64 = (0..4).map(|column|
+            (mapping[column * 4 + row] - f64::from(column == row)).abs()).sum();
+        (numerator_error + denominator_error) / (1. - denominator_error)
+    });
+    bounds.iter().all(|v| v.is_finite() && *v <= PROJECTION_CLIP_ERROR_BUDGET)
+        .then_some((canonical, bounds))
 }
 
 fn read_projection_scalars(mem: &SharedMemory, viewport: u64) -> Option<[f32; 11]> {
@@ -1574,6 +1632,55 @@ mod tests {
         request.view_count=3; assert_eq!(validate_request(&request),Err(-2)); request.view_count=2;
         request.views[0].head_from_eye[0]=-1.; assert_eq!(validate_request(&request),Err(-3));
         request.views[0]=eye; request.views[0].projection_from_eye[14]=-0.1; assert_eq!(validate_request(&request),Err(-3));
+    }
+    #[test]
+    fn physical_projection_request_calibration_is_bounded_and_canonical_at_storage() {
+        // Exact 288-byte request rejected with -3 by physical build10. These
+        // are compositor calibration terms, not an invented malformed matrix.
+        let hex = "01000000200100002102000000000000d8bcaa3358a9c3400200000000000000f2ff7f3fdf39953a0c073e3a0000000045fb94babdff7f3f1a3128bb0000008049c93ebac323283bc4ff7f3f00000080f19106bd5e9ed0bc6b343bbd0000803fad89383fe4d28ab40000000089b261b6df4a3bb76b07663f000000002c89f4b7ff168abe0edab2bd8e8ace38bcff7fbf0000000000000000e7afc93d00000000ecff7f3fe36fc1bac8a52b3a0000000024b4c13a9eff7f3ff6d64bbb00000080396e2abacde64b3bacff7f3f000000804cc3053dfa6fd0bc49cd3bbd0000803f0063383f63b8b534000000003918693668cc37b790d7653f0000000098de0038a8eb893ed77eb3bd435fce380e0080bf0000000000000000a185c93d00000000";
+        let bytes: Vec<u8> = hex.as_bytes().chunks_exact(2).map(|pair|
+            u8::from_str_radix(std::str::from_utf8(pair).unwrap(),16).unwrap()).collect();
+        assert_eq!(bytes.len(),std::mem::size_of::<SVXRViewRequest>());
+        let request=unsafe { bytes.as_ptr().cast::<SVXRViewRequest>().read_unaligned() };
+        assert!(request.views.iter().all(|eye|eye.projection_from_eye[7].abs()>1e-5));
+        assert_eq!(validate_request(&request),Ok(()));
+        let accepted=canonical_request(request).unwrap();
+        // Bit patterns exported by the independent Swift conversion of this
+        // exact physical request; both sides must retain identical eye geometry.
+        let swift_bits: [[u32;16];2]=[
+            [0x3f3889de,0,0,0,0,0x3f6607a8,0,0,0xbe8a1724,0xbdb2da3e,0x38ce8ac5,0xbf800000,0,0,0x3dc9b01d,0],
+            [0x3f3862ec,0,0,0,0,0x3f65d777,0,0,0x3e89eb99,0xbdb37ec3,0x38ce5f2c,0xbf800000,0,0,0x3dc9858b,0],
+        ];
+        assert_eq!((accepted.frame,accepted.presentation_time_seconds),(request.frame,request.presentation_time_seconds));
+        for index in 0..2 {
+            assert_eq!(accepted.views[index].head_from_eye.map(f32::to_bits),request.views[index].head_from_eye.map(f32::to_bits));
+            let original=request.views[index].projection_from_eye;
+            let (canonical,bounds)=canonical_eye_projection(&original).unwrap();
+            assert!(bounds[0]>5e-5 && bounds.iter().all(|v|*v<=PROJECTION_CLIP_ERROR_BUDGET));
+            assert_eq!(canonical[11],-1.);
+            for field in [1,2,3,4,6,7,12,13,15] { assert_eq!(canonical[field],0.); }
+            assert_eq!(accepted.views[index].projection_from_eye.map(f32::to_bits),canonical.map(f32::to_bits));
+            assert_eq!(canonical.map(f32::to_bits),swift_bits[index]);
+            assert_eq!(canonical_eye_projection(&canonical).unwrap().0.map(f32::to_bits),canonical.map(f32::to_bits));
+            assert!(projection_scalars(&canonical).is_some());
+            // Focal lengths, asymmetric offsets and finite depth are preserved
+            // under the same homogeneous normalization as the Swift bridge.
+            let scale=1.0f32 / -original[11];
+            for field in [0,5,8,9,10,14] { assert_eq!(canonical[field].to_bits(),(original[field]*scale).to_bits()); }
+        }
+        assert!(accepted.views[0].projection_from_eye[8]<0. && accepted.views[1].projection_from_eye[8]>0.);
+    }
+    #[test]
+    fn physical_projection_request_rejects_material_skew_obliqueness_and_depth_changes() {
+        let original=projection();
+        for field in [1,2,3,4,6,7,12,13,15] {
+            let mut malformed=original;malformed[field]=0.01;
+            assert!(canonical_eye_projection(&malformed).is_none(),"material projection field {field}");
+        }
+        for (field,value) in [(0,f32::NAN),(5,0.),(10,0.),(11,0.),(14,-0.1)] {
+            let mut malformed=original;malformed[field]=value;
+            assert!(canonical_eye_projection(&malformed).is_none(),"invalid projection field {field}");
+        }
     }
     fn view(eye_index: u32, camera_sequence: u64) -> WorldView {
         WorldView { provenance_epoch:1, camera_sequence, request_frame:1, head_pose_frame:1,presentation_time_seconds:1.,eye_index,view_count:2,
