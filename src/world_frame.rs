@@ -59,7 +59,8 @@ impl FrozenPreUiDepth {
 }
 #[derive(Clone)]
 struct Ready { slot: Arc<Slot>, frame: WorldFrame, generation: u64, provenance_epoch: u64,
-    pair_epoch: u64, ready_at: Instant, snapshot_submit_to_gpu_completion_seconds: Option<f64> }
+    pair_epoch: u64, ready_at: Instant, snapshot_submit_to_gpu_completion_seconds: Option<f64>,
+    hud: Option<Arc<crate::xr_hud::HudImages>> }
 impl Ready {
     #[cfg(test)]
     fn depth_texture(&self) -> &Texture { &self.slot.depth }
@@ -377,7 +378,7 @@ pub(crate) fn publish_pair(device: &Device, queue: &Queue, sources: [PairSource<
                 let ready_at = Instant::now();
                 let eyes = std::array::from_fn(|index| Ready { slot: slots[index].clone(),
                     frame: published[index], generation, provenance_epoch, pair_epoch: scene_epoch,
-                    ready_at, snapshot_submit_to_gpu_completion_seconds });
+                    ready_at, snapshot_submit_to_gpu_completion_seconds, hud:None });
                 frames.latest = [Some(eyes[0].clone()), Some(eyes[1].clone())];
                 frames.latest_pair = Some(ReadyPair { eyes, scene_epoch, ready_at });
                 frames.published += 2;
@@ -400,9 +401,24 @@ pub(crate) fn publish(device: &Device, queue: &Queue, color: &Texture, depth: &T
 /// A frozen depth may replace only the second, bridge-owned depth copy. The
 /// producer's pre-UI copy and this color snapshot remain ordered on one queue.
 pub(crate) fn publish_with_frozen_depth(device: &Device, queue: &Queue, color: &Texture,
-    depth: &Texture, frozen_depth: Option<FrozenPreUiDepth>, mut frame: WorldFrame,
+    depth: &Texture, frozen_depth: Option<FrozenPreUiDepth>, frame: WorldFrame,
     provenance_epoch: u64) {
+    publish_with_hud(device, queue, color, depth, frozen_depth, frame, provenance_epoch, None);
+}
+
+/// The optional contribution image was produced from the identical raster/depth/
+/// stencil samples as the original final-target HUD writes. Its private texture
+/// is never rebound by the game and is retained by this exact completed lease.
+pub(crate) fn publish_with_hud(device:&Device, queue:&Queue, color:&Texture,
+    depth:&Texture, frozen_depth:Option<FrozenPreUiDepth>, mut frame:WorldFrame,
+    provenance_epoch:u64, hud:Option<Arc<crate::xr_hud::HudImages>>) {
     let result = (|| -> anyhow::Result<()> {
+        if let Some(images)=&hud { let hud=&images.contribution; anyhow::ensure!(hud.format()==TextureFormat::Rgba16Float
+            && hud.width()==color.width() && hud.height()==color.height()
+            && hud.sample_count()==1 && hud.depth_or_array_layers()==1
+            && hud.usage().contains(TextureUsages::TEXTURE_BINDING)
+            && metal_pointer(hud).is_some() && metal_device_pointer(hud)==metal_device_pointer(color),
+            "HUD image layout/device differs from its world"); }
         anyhow::ensure!(frame.view_index < frame.view_count && (1..=2).contains(&frame.view_count), "invalid world view count");
         anyhow::ensure!(frame.presentation_time.is_finite() && frame.projection_from_eye.iter()
             .chain(&frame.game_from_eye).chain(&frame.game_from_stage).all(|n| n.is_finite()), "non-finite world metadata");
@@ -467,8 +483,9 @@ pub(crate) fn publish_with_frozen_depth(device: &Device, queue: &Queue, color: &
             if let Ok(mut frames) = FRAMES.lock() {
                 if generation != frames.generation || !crate::xr_view::view_epoch_is_active(provenance_epoch) { return; }
                 let index = frame.view_index as usize;
+                if hud.is_some(){crate::xr_hud::record_result(true,None);}
                 frames.latest[index] = Some(Ready { slot, frame, generation, provenance_epoch,
-                    pair_epoch: 0, ready_at: Instant::now(), snapshot_submit_to_gpu_completion_seconds });
+                    pair_epoch: 0, ready_at: Instant::now(), snapshot_submit_to_gpu_completion_seconds, hud });
                 frames.published += 1;
                 if used_frozen_depth { frames.frozen_depth_handoffs += 1; }
                 else { frames.copied_depth_snapshots += 1; }
@@ -504,6 +521,28 @@ fn metal_device_pointer(texture: &Texture) -> Option<usize> {
     }
     #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "visionos")))]
     { let _ = texture; None }
+}
+
+
+/// Additive HUD accessor. No new world lease is minted: this borrowed Metal
+/// texture remains alive exactly as long as `world_lease` is retained.
+#[no_mangle]
+pub extern "C" fn sv_world_frame_hud_v1(world_lease:u64, output:*mut crate::xr_hud::HudFrame)->i32 {
+    if output.is_null() || (output as usize)%std::mem::align_of::<crate::xr_hud::HudFrame>()!=0{return -1;}
+    let out=unsafe{&mut *output};
+    if out.abi_version!=1 || out.byte_size!=104{return -1;}
+    let Ok(frames)=FRAMES.lock()else{return -1;};
+    let Some(ready)=frames.leases.get(&world_lease)else{return -1;};
+    if !crate::xr_view::view_epoch_is_active(ready.provenance_epoch){return 1;}
+    let Some(images)=&ready.hud else{return 1;};
+    let hud=&images.contribution;
+    let Some(texture)=metal_pointer(hud)else{return -1;};
+    *out=crate::xr_hud::HudFrame{abi_version:1,byte_size:104,lease:world_lease,
+        provenance_epoch:ready.provenance_epoch,game_frame:ready.frame.game_frame,
+        request_frame:ready.frame.request_frame,head_frame:ready.frame.head_frame,
+        color_texture:texture,world_color_texture:match metal_pointer(&images.world){Some(pointer)=>pointer,None=>return -1},presentation_time:ready.frame.presentation_time,
+        width:hud.width(),height:hud.height(),source_eye:ready.frame.view_index,flags:1,
+        angular_width_degrees:60.,distance_metres:2.,reserved:[0;2]};0
 }
 
 #[no_mangle]

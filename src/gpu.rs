@@ -41,6 +41,10 @@ mod upload_dedup_tests;
 #[path = "texture_view_cache_tests.rs"]
 mod texture_view_cache_tests;
 
+#[cfg(all(test,target_os="macos"))]
+#[path="xr_hud_gpu_tests.rs"]
+mod xr_hud_gpu_tests;
+
 /// A frozen pre-UI depth copy belongs to its qualified camera/present, not to
 /// subsequent contents of the live source texture. Ordinary source clears do
 /// not modify the copy. Other mutations and unqualified geometry still revoke
@@ -765,6 +769,7 @@ struct ShaderObj {
     program: Option<Option<Rc<Program>>>,
 }
 struct Program {
+    hud_kind: Option<crate::xr_hud::ShaderKind>,
     module: ShaderModule,
     info: Info,
     consts: Option<Buffer>,
@@ -993,7 +998,13 @@ enum MapKind {
     Occlusion { list: Vec<(u64, u32, Arc<QueryLife>, bool, usize)> },
 }
 
-pub struct Gpu {
+pub struct HudCapture {
+    final_id:u32, final_texture:Texture, view:crate::xr_view::WorldView,
+    images:Option<Arc<crate::xr_hud::HudImages>>, draws:u64,
+    scratch:HashMap<u32,Texture>, rejected:Option<String>,
+}
+
+struct Gpu {
     mem: SharedMemory,
     base: *mut u8,
     ring: u64,
@@ -1019,6 +1030,7 @@ pub struct Gpu {
     world_depth_trace: HashMap<(u32, u64, bool, u32, bool), (u64, [f32; 6])>,
     world_depth_anomalies: Vec<serde_json::Value>,
     color_phase_trace: crate::world_ui::ColorPhaseTrace,
+    hud_capture:Option<HudCapture>, hud_draw:Option<crate::xr_hud::HudBlend>, hud_pool:Vec<Arc<crate::xr_hud::HudImages>>,
     command_trace: crate::world_command_trace::CommandTrace,
     pdirty: bool,
     last_pl: Option<Rc<Pl>>,
@@ -1206,7 +1218,7 @@ impl Gpu {
             base, mem, ring, device, queue, adapter, surface, surface_format, surface_size: (0, 0),
             objs: Vec::new(), enc: None, enc_epoch: 1, pass: None, pass_key: None, pass_info: None, pass_st: PassSt::default(),
             s: State::new(), world_view: None, world_depths: HashMap::new(), world_depth_before_ui: HashMap::new(), world_depth_snapshot_overflow: false, world_depth_snapshots_this_present: 0, world_depth_trace: HashMap::new(), world_depth_anomalies: Vec::new(),
-            color_phase_trace: crate::world_ui::ColorPhaseTrace::from_env(), command_trace: crate::world_command_trace::CommandTrace::from_env(), pdirty: true, last_pl: None, last_program_uids: None,
+            color_phase_trace: crate::world_ui::ColorPhaseTrace::from_env(), hud_capture:None, hud_draw:None, hud_pool:Vec::new(), command_trace: crate::world_command_trace::CommandTrace::from_env(), pdirty: true, last_pl: None, last_program_uids: None,
             float_programs: HashMap::new(), shader_index, shader_dir, next_uid: 1,
             bgl_cache: HashMap::new(), empty_bgl: None, pipelines: HashMap::new(), compute: HashMap::new(), bind_groups: HashMap::new(),
             numeric_bgl_cache: HashMap::new(), render_prepare, uniform_pack, uniform_snapshot, bind_group_prepare,
@@ -1289,6 +1301,149 @@ impl Gpu {
         self.world_depth_before_ui.insert(id, (view,
             crate::world_frame::FrozenPreUiDepth::new_snapshot(snapshot), draws));
         log_once("world-depth-before-ui", "qualified real scene depth copied before GTA's clip-space UI clear; final color must retain the same camera rays");
+    }
+
+    fn hud_reject(&mut self,reason:&str) {
+        if let Some(h)=&mut self.hud_capture { h.rejected.get_or_insert_with(||reason.to_owned()); }
+    }
+
+    /// Execute before every mutation opcode, irrespective of tracing flags.
+    /// IDs are resolved against retained native texture handles at draws/present;
+    /// replacing a guest ID cannot preserve a candidate by numerical coincidence.
+    fn hud_non_draw_command(&mut self,op:u32,p:u64,_n:u64) {
+        if self.hud_capture.is_none(){return;}
+        let u=|i|self.u(p+i);
+        let mut writes=Vec::new();let mut reads=Vec::new();
+        match op {
+            3|4|5|6|13=>writes.push(u(0)),
+            34=>{writes.push(u(0));reads.push(u(5));},
+            35=>{writes.push(u(0));reads.push(u(1));},
+            36=>{writes.push(u(0));reads.push(u(2));},
+            42=>reads.push(u(0)),
+            40|41=>{let view=u(0);if let Some(v)=self.view_obj(view){writes.push(v.res);reads.push(v.res);}},
+            39=>{for &id in &self.s.uav[2] {if let Some(v)=self.view_obj(id){writes.push(v.res);reads.push(v.res);}}
+                for &id in &self.s.srv[2]{if let Some(v)=self.view_obj(id){reads.push(v.res);}}},
+            0..=47=>{},
+            _=>self.hud_reject("unknown GPU opcode after final postFX"),
+        }
+        if let Some(h)=&mut self.hud_capture {
+            for id in writes { h.scratch.remove(&id);if id==h.final_id {h.rejected.get_or_insert_with(||format!("opcode{op} mutates final HUD target"));} }
+            if h.images.is_some() && reads.contains(&h.final_id){h.rejected.get_or_insert_with(||format!("opcode{op} reads HUD-bearing final target"));}
+        }
+    }
+
+    fn reserve_hud_images(&mut self,source:&Texture)->Option<Arc<crate::xr_hud::HudImages>> {
+        self.hud_pool.retain(|images|Arc::strong_count(images)>1 || (images.world.width()==source.width()
+            && images.world.height()==source.height() && images.world.format()==source.format()));
+        if let Some(images)=self.hud_pool.iter().find(|images|Arc::strong_count(images)==1) {return Some(images.clone());}
+        if self.hud_pool.len()>=6{return None;}
+        // Bound both the live pool and pixel allocation before allocating.
+        if source.width() as u64*source.height() as u64>16_777_216{return None;}
+        let make=|format,label|self.device.create_texture(&TextureDescriptor{label:Some(label),size:Extent3d{width:source.width(),height:source.height(),depth_or_array_layers:1},mip_level_count:1,sample_count:1,dimension:TextureDimension::D2,format,usage:TextureUsages::COPY_SRC|TextureUsages::COPY_DST|TextureUsages::TEXTURE_BINDING|TextureUsages::RENDER_ATTACHMENT,view_formats:&[]});
+        let images=Arc::new(crate::xr_hud::HudImages{world:make(source.format(),"HUD-free final world color"),contribution:make(TextureFormat::Rgba16Float,"Actual HUD premultiplied contribution and coverage")});
+        self.hud_pool.push(images.clone());Some(images)
+    }
+
+    fn prepare_hud_draw(&mut self,vs:&Program,ps:Option<&Program>)->Option<crate::xr_hud::HudBlend> {
+        use crate::xr_hud::ShaderKind as K;
+        let Some(capture)=self.hud_capture.as_ref()else{return None;};
+        if capture.rejected.is_some(){return None;}
+        if !crate::xr_hud::enabled(){self.hud_reject("HUD frontend inactive");return None;}
+        if self.s.rt.iter().skip(1).any(|r|r.tex==capture.final_id
+            || self.tex(r.tex).is_some_and(|t|t.tex==capture.final_texture)) {
+            self.hud_reject("final target bound outside sole attachment zero");return None;
+        }
+        let secondary_targets:Vec<u32>=self.s.rt.iter().skip(1).filter(|r|r.tex!=0).map(|r|r.tex).collect();
+        if let Some(c)=&mut self.hud_capture{for id in secondary_targets{c.scratch.remove(&id);}}
+        let capture=self.hud_capture.as_ref().unwrap();
+        let graphics_uav_resources:Vec<u32>=self.s.uav[..2].iter().flatten().filter_map(|id|self.view_obj(*id).map(|v|v.res)).collect();
+        if graphics_uav_resources.iter().any(|id|*id==capture.final_id
+            || self.tex(*id).is_some_and(|t|t.tex==capture.final_texture)) {
+            self.hud_reject("graphics UAV aliases final target");return None;
+        }
+        if !graphics_uav_resources.is_empty(){if let Some(c)=&mut self.hud_capture{for id in &graphics_uav_resources{c.scratch.remove(id);}}}
+        let capture=self.hud_capture.as_ref().unwrap();
+        if capture.images.is_some() {
+            let reads_final=[(0,Some(vs)),(1,ps)].into_iter().any(|(stage,program)|program.is_some_and(|program|
+                program.info.bindings.iter().any(|b|matches!(b.kind,Kind::Texture|Kind::StorageTexture|Kind::Storage|Kind::ReadOnlyStorage)
+                  && b.binding>=32 && self.s.srv[stage].get((b.binding-32)as usize).and_then(|id|self.view_obj(*id))
+                    .is_some_and(|v|v.res==capture.final_id))));
+            if reads_final{self.hud_reject("draw reads HUD-bearing final target");return None;}
+        }
+        let id=self.s.rt[0].tex;
+        let final_target=id==capture.final_id;
+        let valid_final=final_target && self.tex(id).is_some_and(|t|t.tex==capture.final_texture);
+        let pair=(vs.hud_kind,ps.and_then(|p|p.hud_kind));
+        let one_target=self.s.rt.iter().skip(1).all(|r|r.tex==0)
+            && self.s.rt[0].mip==0 && self.s.rt[0].slice==0;
+        let (blend,mask)=blend_for(self.state(self.s.blend.0).as_deref(),0);
+        let writes_depth=self.s.ds.flags&1==0 && self.state(self.s.dss.0).is_some_and(|d|d.words.first()==Some(&1)&&d.words.get(1)==Some(&1));
+        if !final_target {
+            // The minimap scratch has an original full clear and a closed set of
+            // source-pinned UI/map writers. Its final blit alpha is used exactly
+            // as that original fragment emits it; raw scratch alpha is not a
+            // claimed coverage mask (notably PS_BlitDepthToAlpha).
+            let clear=pair==(Some(K::ClearVertex),Some(K::ClearPixel)) && one_target
+                && blend.is_none() && mask==ColorWrites::ALL && self.tex(id).is_some_and(|t|{
+                    let vp=self.s.viewports.first().copied().unwrap_or([0.,0.,t.desc.w as f32,t.desc.h as f32,0.,1.]);
+                    let sc=self.s.scissors.first().copied().unwrap_or([0,0,t.desc.w,t.desc.h]);
+                    vp[..4]==[0.,0.,t.desc.w as f32,t.desc.h as f32] && sc==[0,0,t.desc.w,t.desc.h]
+                });
+            let blit_sources_certified=ps.is_some_and(|program|program.info.bindings.iter().filter(|b|b.kind==Kind::Texture).all(|b|
+                self.s.srv[1].get(b.binding.wrapping_sub(32)as usize).and_then(|id|self.view_obj(*id))
+                    .is_some_and(|v|self.tex(v.res).is_some_and(|t|capture.scratch.get(&v.res)==Some(&t.tex)))));
+            let rgb_empty=(mask&(ColorWrites::RED|ColorWrites::GREEN|ColorWrites::BLUE)).is_empty();
+            let known=matches!(pair,(Some(K::ScaleformVertex),Some(K::ScaleformPixel))|(Some(K::MapVertex),Some(K::MapPixel))|(Some(K::ClearVertex),Some(K::ClearPixel)))
+                || matches!(pair,(Some(K::BlitVertex),Some(K::BlitPixel|K::DepthToAlpha)))&&(rgb_empty||blit_sources_certified);
+            let texture=self.tex(id).map(|t|t.tex.clone());
+            if let Some(c)=&mut self.hud_capture {
+                if clear {if let Some(texture)=texture {if c.scratch.len()<8 || c.scratch.contains_key(&id){c.scratch.insert(id,texture);}}}
+                else if !known || !one_target || texture.as_ref()!=c.scratch.get(&id) {c.scratch.remove(&id);}
+            }
+            return None;
+        }
+        if !valid_final || !one_target || writes_depth || ps.is_none_or(|p|p.info.writes_fragment_depth||p.info.outputs!=[0]) {
+            self.hud_reject("unqualified final-target layout/depth/fragment output");return None;
+        }
+        let scaleform=matches!(pair,(Some(K::ScaleformVertex),Some(K::ScaleformPixel)));
+        let blit=pair==(Some(K::BlitVertex),Some(K::BlitPixel)) && ps.is_some_and(|p|{
+            let mut textures=p.info.bindings.iter().filter(|b|b.kind==Kind::Texture);
+            let Some(binding)=textures.next()else{return false;};if textures.next().is_some(){return false;}
+            let Some(&view_id)=self.s.srv[1].get(binding.binding.wrapping_sub(32) as usize)else{return false;};
+            let Some(view)=self.view_obj(view_id).filter(|v|!v.is_buf)else{return false;};
+            self.tex(view.res).is_some_and(|t|capture.scratch.get(&view.res)==Some(&t.tex))
+        });
+        if !scaleform && !blit {self.hud_reject("final target write is not a pinned Scaleform writer or qualified minimap composite");return None;}
+        let Some(mode)=crate::xr_hud::qualify_blend(blend,mask)else{self.hud_reject("unsupported HUD partial RGB mask or destination-dependent blend");return None;};
+        if !ps.is_some_and(|p|crate::xr_hud::fragment_abi_supported(&p.text)){self.hud_reject("HUD fragment return ABI differs");return None;}
+        if capture.images.is_none() {
+            let source=capture.final_texture.clone();
+            self.end_pass();self.materialize_clears(id);
+            let Some(images)=self.reserve_hud_images(&source)else{self.hud_reject("bounded HUD snapshot pool full");return None;};
+            self.encoder().copy_texture_to_texture(TexelCopyTextureInfo{texture:&source,mip_level:0,origin:Origin3d::ZERO,aspect:TextureAspect::All},TexelCopyTextureInfo{texture:&images.world,mip_level:0,origin:Origin3d::ZERO,aspect:TextureAspect::All},Extent3d{width:source.width(),height:source.height(),depth_or_array_layers:1});
+            let view=images.contribution.create_view(&TextureViewDescriptor::default());
+            {let _clear=self.encoder().begin_render_pass(&RenderPassDescriptor{label:Some("Clear real HUD contribution"),color_attachments:&[Some(RenderPassColorAttachment{view:&view,depth_slice:None,resolve_target:None,ops:Operations{load:LoadOp::Clear(Color::TRANSPARENT),store:StoreOp::Store}})],depth_stencil_attachment:None,timestamp_writes:None,occlusion_query_set:None,multiview_mask:None});}
+            self.hud_capture.as_mut().unwrap().images=Some(images);
+        }
+        Some(mode)
+    }
+
+    fn finish_hud_draw(&mut self,vs:&Program,ps:Option<&Program>) {
+        use crate::xr_hud::ShaderKind as K;
+        if self.hud_draw.is_some(){if let Some(c)=&mut self.hud_capture{c.draws+=1;}return;}
+        if !crate::xr_hud::enabled() || self.hud_capture.is_some()
+            || (vs.hud_kind,ps.and_then(|p|p.hud_kind))!=(Some(K::LensVertex),Some(K::LensPixel)) {return;}
+        let Some(view)=self.world_view.filter(|v|v.headset_applied&&crate::xr_view::view_epoch_is_active(v.provenance_epoch))else{return;};
+        let r=&self.s.rt[0];
+        let Some(t)=self.tex(r.tex)else{return;};
+        let (blend,mask)=blend_for(self.state(self.s.blend.0).as_deref(),0);
+        let expected=[0.,0.,t.desc.w as f32,t.desc.h as f32,0.,1.];
+        if r.mip!=0 || r.slice!=0 || self.s.rt.iter().skip(1).any(|r|r.tex!=0)
+            || t.desc.samples!=1 || t.desc.d!=1 || !matches!(t.format,TextureFormat::Bgra8Unorm|TextureFormat::Rgba8Unorm)
+            || blend.is_some() || mask!=ColorWrites::ALL
+            || self.s.viewports.first().copied().unwrap_or(expected)!=expected
+            || self.s.scissors.first().copied().unwrap_or([0,0,t.desc.w,t.desc.h])!=[0,0,t.desc.w,t.desc.h] {return;}
+        self.hud_capture=Some(HudCapture{final_id:r.tex,final_texture:t.tex.clone(),view,images:None,draws:0,scratch:HashMap::new(),rejected:None});
     }
 
     fn color_phase_target(&self, id: u32) -> serde_json::Value {
@@ -1596,6 +1751,7 @@ impl Gpu {
     fn exec(&mut self, op: u32, p: u64, n: u64) {
         let mb = self.base;
         let u = move |w: u64| unsafe { std::ptr::read_volatile(mb.add(((p + w) * 4) as usize) as *const u32) };
+        self.hud_non_draw_command(op,p,n);
         match op {
             0 | 2 => {}
             3 => self.create_texture(u(0), u(1), u(2), u(3), u(4), u(5), u(6), u(7), u(8), u(9)),
@@ -2222,7 +2378,7 @@ impl Gpu {
         let out_locs = if stage == 0 { locations_in(&text, true) } else { vec![] };
         let in_locs = if stage == 1 { locations_in(&text, false) } else { vec![] };
         let clip = text.contains("@builtin(clip_distances)");
-        Some(Rc::new(Program { module, info, consts, pack, text, flat, group_bindings, variants: RefCell::new(HashMap::new()), label, uid, vid, iid, out_locs, in_locs, clip }))
+        Some(Rc::new(Program { hud_kind:crate::xr_hud::certify_shader(hash,&source), module, info, consts, pack, text, flat, group_bindings, variants: RefCell::new(HashMap::new()), label, uid, vid, iid, out_locs, in_locs, clip }))
     }
 
     fn variant(&self, prog: &Program, key: &str, make: impl FnOnce(&str) -> String) -> Option<ShaderModule> {
@@ -2293,7 +2449,7 @@ impl Gpu {
             for bindings in groups.values_mut() { bindings.sort_by_key(|binding| binding.binding); }
             log_once(&format!("float32variant{}{:?}", prog.uid, key.1), &format!("{}: {} float32 sample call(s) use textureLoad; bindings {:?}", prog.label, rewritten.rewritten_calls, selected));
             Some(Rc::new(Program {
-                module, info, consts: prog.consts.clone(), pack: prog.pack.clone(), text: rewritten.text,
+                hud_kind:prog.hud_kind, module, info, consts: prog.consts.clone(), pack: prog.pack.clone(), text: rewritten.text,
                 flat: prog.flat.clone(), group_bindings: groups, variants: RefCell::new(HashMap::new()),
                 label, uid: self.uid(), vid: prog.vid, iid: prog.iid,
                 out_locs: prog.out_locs.clone(), in_locs: prog.in_locs.clone(), clip: prog.clip,
@@ -2336,16 +2492,17 @@ impl Gpu {
         })
     }
 
-    fn pixel_module(&self, ps: &Program, a2c: bool, remap: Option<&(HashMap<u32, u32>, String, bool)>) -> Option<ShaderModule> {
+    fn pixel_module(&self, ps: &Program, a2c: bool, remap: Option<&(HashMap<u32, u32>, String, bool)>, hud:Option<crate::xr_hud::HudBlend>) -> Option<ShaderModule> {
         let remap = remap.filter(|r| r.2);
-        if remap.is_none() && !a2c { return Some(ps.module.clone()); }
-        let key = format!("{}{}", remap.map(|r| format!("remap|{}", r.1)).unwrap_or_default(), if a2c { "|a2c" } else { "" });
+        if remap.is_none() && !a2c && hud.is_none() { return Some(ps.module.clone()); }
+        let key = format!("{}{}", remap.map(|r| format!("remap|{}", r.1)).unwrap_or_default(), if a2c { "|a2c" } else { "" })+&format!("|hud{hud:?}");
         let m = self.variant(ps, &key, |text| {
             let mut t = text.to_string();
             if a2c { t = RE_MAIN_INNER.replace(&t, "$1\n  if (o0.w < 0.5f) { discard; }").into_owned(); }
+            if let Some(mode)=hud { t=crate::xr_hud::augment_fragment(&t,mode).unwrap_or_else(||"invalid hud shader certificate".to_owned()); }
             match remap { Some(r) => remap_locations(&t, false, &r.0), None => t }
         });
-        if m.is_none() && remap.is_none() { Some(ps.module.clone()) } else { m }
+        if m.is_none() && remap.is_none() && hud.is_none() { Some(ps.module.clone()) } else { m }
     }
 
     fn layout_entry(b: &Binding, stage: u32) -> BindGroupLayoutEntry {
@@ -2454,6 +2611,10 @@ impl Gpu {
             }
         }
         while matches!(colors.last(), Some(None)) { colors.pop(); }
+        if self.hud_draw.is_some() {
+            let Some(texture)=self.hud_capture.as_ref().and_then(|h|h.images.as_ref()).map(|images|&images.contribution) else{return false;};
+            colors.push(Some((texture.create_view(&TextureViewDescriptor::default()),TextureFormat::Rgba16Float)));
+        }
         let ds = self.s.ds.clone();
         let mut ds_att = None;
         let mut ds_format = None;
@@ -3011,6 +3172,7 @@ impl Gpu {
         for &(slot, _) in &layout.slots { key.push(strides[slot as usize] as i64); }
         key.extend([self.s.topo as i64, match strip_fmt { Some(IndexFormat::Uint16) => 1, Some(_) => 2, None => 0 }, self.s.blend.0 as i64, self.s.dss.0 as i64, self.s.rs as i64]);
         for f in &pi.rt_formats { key.push(f.map(|f| format_id(f)).unwrap_or(-1)); }
+        key.push(-100 - self.hud_draw.map(|mode|mode as i64+1).unwrap_or(0));
         key.extend([-7, pi.ds_format.map(format_id).unwrap_or(-1), pi.samples as i64, pi.ro_depth as i64, pi.ro_stencil as i64]);
         let _ = (vs_id, ps_id);
         match self.pipelines.get(&key) {
@@ -3100,6 +3262,7 @@ impl Gpu {
             Some(p) => {
                 for (i, f) in pi.rt_formats.iter().enumerate() {
                     let Some(format) = f else { targets.push(None); continue };
+                    if i==1 { if let Some(mode)=self.hud_draw { targets.push(Some(crate::xr_hud::target(mode))); continue; } }
                     if !p.info.outputs.contains(&(i as u32)) { targets.push(Some(ColorTargetState { format: *format, blend: None, write_mask: ColorWrites::empty() })); continue; }
                     let (bl, write) = blend_for(blend.as_deref(), i);
 
@@ -3108,7 +3271,7 @@ impl Gpu {
                 }
                 let missing: Vec<_> = p.info.outputs.iter().filter(|&&l| pi.rt_formats.get(l as usize).copied().flatten().is_none()).collect();
                 if !missing.is_empty() { log_once(&format!("psout{}", p.label), &format!("{} writes colour output(s) {:?} with no render target bound", p.label, missing)); }
-                Some(self.pixel_module(p, a2c, remap.as_ref())?)
+                Some(self.pixel_module(p, a2c, remap.as_ref(),self.hud_draw)?)
             }
             None => None,
         };
@@ -3130,6 +3293,7 @@ impl Gpu {
     }
 
     fn skip(&mut self) {
+        if let Some(hud)=&mut self.hud_capture { hud.rejected.get_or_insert_with(||"draw skipped after final postFX".into()); }
         self.skipped += 1;
     }
 
@@ -3484,6 +3648,8 @@ impl Gpu {
                     actual.is_finite() && (actual - expected).abs() <= 0.00002)
             });
         if ui_depth_clear { self.save_world_depth_before_ui(self.s.ds.tex); }
+        let hud_draw=self.prepare_hud_draw(&vs,ps.as_deref());
+        if self.hud_draw!=hud_draw { self.end_pass(); self.hud_draw=hud_draw; self.pdirty=true; }
         let program_uids = (vs.uid, ps.as_ref().map(|program| program.uid).unwrap_or(0));
         if self.last_program_uids != Some(program_uids) {
             self.pdirty = true;
@@ -3492,8 +3658,11 @@ impl Gpu {
         let layout = match self.obj(self.s.layout) { Some(Obj::Layout(l)) => l.clone(), _ => { self.skip(); return } };
         self.prepare_depth_proxies(&vs, 0);
         if let Some(p) = &ps { self.prepare_depth_proxies(p, 1); }
-        if !self.ensure_pass() { self.skip(); return; }
-        let pl = if !self.pdirty && self.last_pl.is_some() {
+        if !self.ensure_pass() {
+            if self.hud_draw.is_some(){self.hud_reject("auxiliary HUD render pass unavailable");self.end_pass();self.hud_draw=None;self.pdirty=true;}
+            if !self.ensure_pass(){self.skip();return;}
+        }
+        let mut pl = if !self.pdirty && self.last_pl.is_some() {
             self.last_pl.clone()
         } else {
             let pl = self.get_pipeline(vs_id, ps_id, &vs, ps.as_ref(), &layout);
@@ -3501,6 +3670,15 @@ impl Gpu {
             self.pdirty = false;
             pl
         };
+        if pl.is_none() && self.hud_draw.is_some(){
+            // Optional pipeline compilation (including an asynchronous pending
+            // result) must never suppress an original flat-screen game draw.
+            self.hud_reject("auxiliary HUD pipeline unavailable; original draw retained");
+            self.end_pass();self.hud_draw=None;self.pdirty=true;
+            if !self.ensure_pass(){self.skip();return;}
+            pl=self.get_pipeline(vs_id,ps_id,&vs,ps.as_ref(),&layout);
+            self.last_pl=pl.clone();self.pdirty=false;
+        }
         let Some(pl) = pl else { self.skip(); return };
 
         let g0 = if vs.group_bindings.contains_key(&0) {
@@ -3638,6 +3816,7 @@ impl Gpu {
             }
         }
         self.draws += 1;
+        self.finish_hud_draw(&vs,ps.as_deref());
         // Camera context arrives with this exact GPU command, not from a newer
         // game-thread camera. Only record the qualified world's real depth.
         let ds_tex = self.s.ds.tex;
@@ -3771,7 +3950,7 @@ impl Gpu {
                         for b in &info.bindings { gb.entry(b.group).or_default().push(b.clone()); }
                         for v in gb.values_mut() { v.sort_by_key(|b| b.binding); }
                         let uid = self.uid();
-                        Rc::new(Program { module, info, consts: prog.consts.clone(), pack: prog.pack.as_ref().map(|p| Pack { members: p.members.iter().map(|m| PackMember { binding: m.binding, size: m.size, offset: m.offset }).collect(), size: p.size }), text, flat: vec![], group_bindings: gb, variants: RefCell::new(HashMap::new()), label: prog.label.clone(), uid, vid: false, iid: false, out_locs: vec![], in_locs: vec![], clip: false })
+                        Rc::new(Program { hud_kind:prog.hud_kind, module, info, consts: prog.consts.clone(), pack: prog.pack.as_ref().map(|p| Pack { members: p.members.iter().map(|m| PackMember { binding: m.binding, size: m.size, offset: m.offset }).collect(), size: p.size }), text, flat: vec![], group_bindings: gb, variants: RefCell::new(HashMap::new()), label: prog.label.clone(), uid, vid: false, iid: false, out_locs: vec![], in_locs: vec![], clip: false })
                     }
                     None => { self.compute.insert(key.clone(), None); self.skipped += 1; return; }
                 }
@@ -4424,6 +4603,9 @@ impl Gpu {
     fn publish_world_frame(&mut self, color_id: u32) {
         // Consume every presentation, including loading, to preserve queue order.
         let present_view = crate::xr_view::take_present_view();
+        self.end_pass();
+        self.hud_draw=None;
+        let hud_capture=self.hud_capture.take();
         if self.command_trace.wants_command(7) {
             self.command_trace.present(self.presents+1, present_view.as_ref(),
                 crate::xr_view::world_camera_enabled() && present_view.as_ref().is_some_and(|view|
@@ -4440,7 +4622,18 @@ impl Gpu {
         let trace = std::mem::take(&mut self.world_depth_trace);
         let anomalies = std::mem::take(&mut self.world_depth_anomalies);
         let Some(view) = present_view.filter(|view| view.headset_applied) else { return; };
-        let Some(color) = self.tex(color_id).map(|t| t.tex.clone()) else { return; };
+        let Some(original_color) = self.tex(color_id).map(|t| t.tex.clone()) else { return; };
+        let hud=match hud_capture {
+            Some(capture) if capture.final_id==color_id && capture.final_texture==original_color
+                && capture.rejected.is_none() && capture.draws>0
+                && crate::world_frame::shares_screen_rays(&view,&capture.view)
+                && capture.images.is_some()=>{
+                    capture.images
+                },
+            Some(capture)=>{crate::xr_hud::record_result(false,capture.rejected.as_deref().or(Some("final HUD provenance/draw qualification failed")));None},
+            None=>None,
+        };
+        let color=original_color;
         // Main-world camera provenance plus full-size, single-sample depth must
         // select exactly one target. Ambiguous weapon/reflection targets fail closed.
         let mut sources: BTreeMap<u32, (crate::xr_view::WorldView, u64, Option<crate::world_frame::FrozenPreUiDepth>)> = saved.into_iter()
@@ -4484,8 +4677,8 @@ impl Gpu {
             game_from_stage: view.game_from_stage, depth_near: near, depth_far: far,
             ..Default::default()
         };
-        crate::world_frame::publish_with_frozen_depth(&self.device, &self.queue, &color,
-            &depth, frozen_depth, frame, view.provenance_epoch);
+        crate::world_frame::publish_with_hud(&self.device, &self.queue, &color,
+            &depth, frozen_depth, frame, view.provenance_epoch,hud);
     }
 
     fn log_fps(&mut self) {

@@ -81,7 +81,7 @@ mod tests {
                 mapped.copy_from_slice(&bytes); }
             buffer.unmap(); buffer
         });
-        Program { module, info, consts, pack: None, text: source.into(), flat: vec![], group_bindings: groups,
+        Program { hud_kind:None, module, info, consts, pack: None, text: source.into(), flat: vec![], group_bindings: groups,
             variants: RefCell::new(HashMap::new()), label: "same label".into(), uid: g.uid(), vid: false, iid: false,
             out_locs: vec![], in_locs: vec![], clip: false }
     }

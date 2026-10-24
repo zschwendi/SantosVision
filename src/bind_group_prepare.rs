@@ -308,7 +308,7 @@ mod tests {
         for binding in &info.bindings {
             group_bindings.entry(binding.group).or_default().push(binding.clone());
         }
-        let program = Program { module, info, consts: None,
+        let program = Program { hud_kind:None, module, info, consts: None,
             pack: Some(Pack { members: vec![PackMember { binding: 0, size: 16, offset: 0 }], size: 16 }),
             text: source.into(), flat: vec![], group_bindings, variants: RefCell::new(HashMap::new()),
             label: "bind group key fixture".into(), uid: gpu.uid(), vid: false, iid: false,
@@ -391,7 +391,7 @@ mod tests {
         for binding in &counter_info.bindings {
             counter_groups.entry(binding.group).or_default().push(binding.clone());
         }
-        let counter_program = Program { module: counter_module, info: counter_info, consts: None,
+        let counter_program = Program { hud_kind:None, module: counter_module, info: counter_info, consts: None,
             pack: None, text: counter_source.into(), flat: vec![], group_bindings: counter_groups,
             variants: RefCell::new(HashMap::new()), label: "bind group counter fixture".into(),
             uid: gpu.uid(), vid: false, iid: false, out_locs: vec![], in_locs: vec![], clip: false };

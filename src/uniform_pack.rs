@@ -265,7 +265,7 @@ fn main() {
         let info = parse_wgsl(&text); let mut group_bindings: BTreeMap<u32, Vec<Binding>> = BTreeMap::new();
         for binding in &info.bindings { group_bindings.entry(binding.group).or_default().push(binding.clone()); }
         for bindings in group_bindings.values_mut() { bindings.sort_by_key(|binding| binding.binding); }
-        let p = Program { module, info, consts: None, pack: Some(pack), text, flat: vec![], group_bindings,
+        let p = Program { hud_kind:None, module, info, consts: None, pack: Some(pack), text, flat: vec![], group_bindings,
             variants: RefCell::new(HashMap::new()), label: "uniform stage pack fixture".into(), uid: g.uid(),
             vid: false, iid: false, out_locs: vec![], in_locs: vec![], clip: false };
         let bgl = g.bgl_for(&p, 2, 0);

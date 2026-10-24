@@ -23,7 +23,7 @@ fn program(g: &mut Gpu) -> Program {
     let module=g.device.create_shader_module(ShaderModuleDescriptor {label:Some("texture cache fixture"),source:ShaderSource::Wgsl(text.as_str().into())});
     let info=parse_wgsl(&text);assert_eq!(info.bindings.len(),2);
     let group_bindings=BTreeMap::from([(0,info.bindings.clone())]);
-    Program {module,info,consts:None,pack:None,text,flat:vec![],group_bindings,variants:RefCell::new(HashMap::new()),label:"texture cache fixture".into(),uid:g.uid(),vid:false,iid:false,out_locs:vec![],in_locs:vec![],clip:false}
+    Program { hud_kind:None,module,info,consts:None,pack:None,text,flat:vec![],group_bindings,variants:RefCell::new(HashMap::new()),label:"texture cache fixture".into(),uid:g.uid(),vid:false,iid:false,out_locs:vec![],in_locs:vec![],clip:false}
 }
 fn copy(g: &mut Gpu,p: &Program,bgl: &(BindGroupLayout,u64),pipeline: &ComputePipeline) -> u64 {
     let bound=g.stage_bind_group(2,p,0,bgl).expect("production bind group");
