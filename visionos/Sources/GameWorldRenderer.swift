@@ -605,6 +605,7 @@ final class GameWorldRenderer: @unchecked Sendable {
     }
 
     func setSenseUtilitiesVisible(_ visible: Bool) { senseUtilities?.setVisible(visible) }
+    func setSenseUtilitiesPhoneOpen(_ open: Bool) { senseUtilities?.setPhoneOpen(open) }
 
     private func updateSenseUtilityTracking(_ active: Bool) {
         senseUtilityTrackingLock.lock()

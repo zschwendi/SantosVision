@@ -28,7 +28,7 @@ fragment GameWorldSenseUtilityOutput gameWorldSenseUtilityFragment(GameWorldSens
     const float edge = length(max(q, 0.0)) + min(max(q.x,q.y),0.0) - .10;
     if (edge > 0) { discard_fragment(); }
     constexpr sampler s(filter::linear, address::clamp_to_edge);
-    const float2 uv = float2((float(u.atlasIndex) + in.uv.x) / 6.0, in.uv.y);
+    const float2 uv = float2((float(u.atlasIndex) + in.uv.x) / 7.0, in.uv.y);
     const float4 glyph = atlas.sample(s, uv);
     const float border = step(-.012, edge);
     const float3 background = mix(float3(.025,.035,.038),float3(.11,.15,.16),border);

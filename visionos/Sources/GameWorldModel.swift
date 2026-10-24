@@ -26,10 +26,13 @@ final class GameWorldModel: ObservableObject {
     private var recordedStatusKeys = Set<String>()
     private weak var runtime: NativeRuntimeModel?
     private var senseUtilityVisibilityObservation: AnyCancellable?
+    private var senseUtilityPhoneObservation: AnyCancellable?
     private var senseUtilityLayer: LayerRenderer?
     private var senseUtilityInteraction = GameWorldSenseUtilityInteraction<SpatialEventCollection.Event.ID>()
     private var senseUtilityTrackingLive = false
     private var senseUtilityTrackingSequence: UInt64 = 0
+    private var senseUtilityEventCounts: [String: UInt64] = [:]
+    private var senseUtilityLastInput: [String: Any] = [:]
     private let log = Logger(subsystem: "com.zephyrstudios.santosvision", category: "GameWorldStatus")
 
     func startRenderer(_ layer: LayerRenderer, runtime: NativeRuntimeModel) {
@@ -44,6 +47,8 @@ final class GameWorldModel: ObservableObject {
         latestHUDCanvas = [:]
         senseUtilityTrackingLive = false
         senseUtilityTrackingSequence = 0
+        senseUtilityEventCounts = [:]
+        senseUtilityLastInput = [:]
         latestViewRequestFailure = [:]
         diagnosticRenderingMethod = nil
         recordedStatusKeys.removeAll(keepingCapacity: true)
@@ -97,6 +102,7 @@ final class GameWorldModel: ObservableObject {
                         return
                     case .ended(let reason):
                         self.senseUtilityVisibilityObservation = nil
+                        self.senseUtilityPhoneObservation = nil
                         self.senseUtilityLayer?.onSpatialEvent = { _ in }
                         self.senseUtilityLayer = nil
                         self.clearSenseUtilityInteraction()
@@ -116,11 +122,19 @@ final class GameWorldModel: ObservableObject {
                 self.handleSenseUtilityEvents(events)
             }
             renderer.setSenseUtilitiesVisible(runtime.senseGameplayUtilitiesVisible)
+            renderer.setSenseUtilitiesPhoneOpen(runtime.sensePhoneNavigationVisible)
             senseUtilityVisibilityObservation = runtime.$senseGameplayUtilitiesVisible.removeDuplicates().sink { [weak self] visible in
                 Task { @MainActor [weak self] in
                     guard let self, self.generation == token else { return }
                     self.renderer?.setSenseUtilitiesVisible(visible)
                     if !visible { self.clearSenseUtilityInteraction(preserveGestureCancellation: true) }
+                }
+            }
+            senseUtilityPhoneObservation = runtime.$sensePhoneNavigationVisible.removeDuplicates().sink { [weak self] open in
+                Task { @MainActor [weak self] in
+                    guard let self, self.generation == token else { return }
+                    self.renderer?.setSenseUtilitiesPhoneOpen(open)
+                    self.clearSenseUtilityInteraction(preserveGestureCancellation: true)
                 }
             }
             recordState("renderer_constructor_succeeded")
@@ -168,6 +182,7 @@ final class GameWorldModel: ObservableObject {
         recordState("renderer_stop_requested", detail: reason)
         generation = UUID()
         senseUtilityVisibilityObservation = nil
+        senseUtilityPhoneObservation = nil
         senseUtilityLayer?.onSpatialEvent = { _ in }
         senseUtilityLayer = nil
         clearSenseUtilityInteraction()
@@ -180,9 +195,6 @@ final class GameWorldModel: ObservableObject {
     }
 
     private func clearSenseUtilityInteraction(preserveGestureCancellation: Bool = false) {
-        for action in senseUtilityInteraction.activeActions {
-            _ = runtime?.setSenseUtilityPressed(action, pressed: false)
-        }
         if preserveGestureCancellation { senseUtilityInteraction.suspend() }
         else { senseUtilityInteraction.clear() }
         runtime?.setSenseUtilityInteractionActive(false)
@@ -191,42 +203,43 @@ final class GameWorldModel: ObservableObject {
     private func handleSenseUtilityEvents(_ events: SpatialEventCollection) {
         guard let runtime, runtime.senseGameplayUtilitiesVisible, renderer != nil, appActive,
               senseUtilityTrackingLive else {
+            senseUtilityEventCounts["unavailable", default: 0] &+= UInt64(events.count)
             clearSenseUtilityInteraction(preserveGestureCancellation: true)
             for event in events {
                 switch event.phase {
                 case .active: senseUtilityInteraction.rejectUntilEnd(event.id)
-                case .ended, .cancelled: senseUtilityInteraction.cancel(event.id)
+                case .ended, .cancelled: senseUtilityInteraction.cancel(event.id, timestamp: event.timestamp)
                 @unknown default: break
                 }
             }
             return
         }
         for event in events {
-            let previousActions = senseUtilityInteraction.activeActions
-            let action = GameWorldSenseUtilityLayout.action(identifier: event.trackingAreaIdentifier.rawValue)
+            let candidate = GameWorldSenseUtilityLayout.action(identifier: event.trackingAreaIdentifier.rawValue)
+            let action = candidate.flatMap { $0.isDirection && !runtime.sensePhoneNavigationVisible ? nil : $0 }
+            senseUtilityEventCounts[String(describing: event.phase), default: 0] &+= 1
+            senseUtilityEventCounts[action == nil ? "unknown_hit" : "known_hit", default: 0] &+= 1
+            senseUtilityLastInput = ["phase": String(describing: event.phase), "kind": String(describing: event.kind),
+                "known_action": action?.rawValue ?? 0]
             switch event.phase {
             case .active:
                 senseUtilityInteraction.update(event.id, action: action)
                 runtime.setSenseUtilityInteractionActive(senseUtilityInteraction.isActive)
             case .ended:
-                if let pressed = senseUtilityInteraction.end(event.id, action: action) {
+                if let pressed = senseUtilityInteraction.end(event.id, action: action, timestamp: event.timestamp) {
                     // The explicit native action bypasses physical ownership;
                     // release ownership only after queuing the intended action.
-                    _ = runtime.performSenseUtility(pressed)
+                    runtime.setSenseUtilityInteractionActive(true)
+                    let accepted = runtime.performSenseUtility(pressed)
+                    senseUtilityEventCounts[accepted ? "action_queued" : "action_rejected", default: 0] &+= 1
                 }
                 runtime.setSenseUtilityInteractionActive(senseUtilityInteraction.isActive)
             case .cancelled:
-                senseUtilityInteraction.cancel(event.id)
+                senseUtilityInteraction.cancel(event.id, timestamp: event.timestamp)
                 runtime.setSenseUtilityInteractionActive(senseUtilityInteraction.isActive)
             @unknown default: break
             }
-            let currentActions = senseUtilityInteraction.activeActions
-            for action in previousActions.subtracting(currentActions) {
-                _ = runtime.setSenseUtilityPressed(action, pressed: false)
-            }
-            for action in currentActions.subtracting(previousActions) {
-                _ = runtime.setSenseUtilityPressed(action, pressed: true)
-            }
+            if event.phase != .active { recordState("sense_utility_input", appendEvent: false) }
         }
     }
 
@@ -260,6 +273,8 @@ final class GameWorldModel: ObservableObject {
             "renderer": latestRendererState, "events": lifecycle,
             "finite_sky_support": latestFiniteSkySupport,
             "hud_canvas": latestHUDCanvas,
+            "sense_utility_input": ["events": senseUtilityEventCounts, "last_event": senseUtilityLastInput,
+                "tracking_live": senseUtilityTrackingLive, "input_scope": "system hit identifiers only; no gaze coordinates"],
             "latest_rejected_view_request": latestViewRequestFailure]
         if let lastFailure { value["last_failure"] = lastFailure }
         if let diagnosticRenderingMethod { value["rendering_method"] = diagnosticRenderingMethod }
