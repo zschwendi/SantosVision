@@ -220,10 +220,20 @@ pub struct NativeGraphics {
     pub width: u32,
     pub height: u32,
     pub fps_limit: u32,
+    pub preset: NativeGraphicsPreset,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NativeGraphicsPreset { Existing, Performance, Clarity }
+impl NativeGraphicsPreset {
+    fn parse(value: &str) -> Option<Self> { match value {
+        "existing" | "low" => Some(Self::Existing), // Legacy low never reapplied quality to existing XML.
+        "performance" => Some(Self::Performance), "clarity" => Some(Self::Clarity), _ => None,
+    }}
+    fn as_str(self) -> &'static str { match self { Self::Existing => "existing", Self::Performance => "performance", Self::Clarity => "clarity" } }
 }
 
 impl Default for NativeGraphics {
-    fn default() -> Self { Self { width: 960, height: 540, fps_limit: 60 } }
+    fn default() -> Self { Self { width: 960, height: 540, fps_limit: 60, preset: NativeGraphicsPreset::Existing } }
 }
 
 impl NativeGraphics {
@@ -237,12 +247,13 @@ impl NativeGraphics {
             let number = object[key].as_u64().ok_or_else(|| anyhow::anyhow!("{key} must be an unsigned integer"))?;
             u32::try_from(number).with_context(|| format!("{key} is out of range"))
         };
-        let config = Self { width: integer("width")?, height: integer("height")?, fps_limit: integer("fps_limit")? };
+        let preset = object["graphics_preset"].as_str().and_then(NativeGraphicsPreset::parse)
+            .context("native graphics_preset must be existing, performance or clarity")?;
+        let config = Self { width: integer("width")?, height: integer("height")?, fps_limit: integer("fps_limit")?, preset };
         ensure!(matches!((config.width, config.height),
             (640, 360) | (960, 540) | (1280, 720) | (1920, 1080) | (2560, 1440) | (3840, 2160)),
             "native resolution must be 640x360, 960x540, 1280x720, 1920x1080, 2560x1440 or 3840x2160");
         ensure!(matches!(config.fps_limit, 30 | 60), "native fps_limit must be 30 or 60");
-        ensure!(object["graphics_preset"].as_str() == Some("low"), "native graphics_preset must be low");
         Ok(config)
     }
 }
@@ -257,16 +268,19 @@ pub struct NativeGraphicsLaunch {
     backup_path: Option<PathBuf>,
     marker_path: PathBuf,
     marker_action: &'static str,
+    quality_action: &'static str,
+    actual_graphics_values: std::collections::BTreeMap<String, String>,
 }
 
 impl NativeGraphicsLaunch {
     pub fn status_json(&self) -> serde_json::Value {
         serde_json::json!({"width":self.config.width, "height":self.config.height,
-            "fps_limit":self.config.fps_limit,"graphics_preset":"low", "config_source":self.config_source,
+            "fps_limit":self.config.fps_limit,"graphics_preset":self.config.preset.as_str(), "config_source":self.config_source,
             "config_path":self.config_path,"settings_path":self.settings_path,
             "settings_action":self.settings_action,"changed_tags":self.changed_tags,"backup_path":self.backup_path,
             "marker_path":self.marker_path,"marker_action":self.marker_action,
-            "settings_scope":"Low defaults on missing XML; existing GTA choices preserved except MSAA, which is disabled for the current immersive depth path; launcher resolution and FPS changes apply separately"})
+            "quality_action":self.quality_action,"actual_graphics_values":self.actual_graphics_values,
+            "settings_scope":"Preset is a requested one-time change, not a claim about current GTA quality. Existing choices are preserved on unchanged launch; Clarity changes textures/filtering/blur only; MSAA remains disabled for immersive depth. Resolution and frame cap apply separately."})
     }
 }
 
@@ -305,6 +319,12 @@ const LOW_GRAPHICS: &[(&str, &str)] = &[
     ("Shadow_LongShadows", "false"), ("Shadow_SoftShadows", "0"), ("Reflection_MipBlur", "false"),
     ("LodScale", "0.000000"), ("MaxLodScale", "0.000000"), ("PedLodBias", "0.000000"),
     ("VehicleLodBias", "0.000000"), ("CityDensity", "0.000000"),
+];
+// Exact original65672 forwards graphics+40 unchanged to MaxAnisotropy;
+// the host sampler accepts/clamps the raw multiplier to16, not an enum index.
+const CLARITY_GRAPHICS: &[(&str, &str)] = &[
+    ("TextureQuality", "2"), ("AnisotropicFiltering", "16"),
+    ("DoF", "false"), ("MotionBlurStrength", "0.000000"),
 ];
 
 // Same root/version/system/audio/video shape as the actual game-generated file.
@@ -368,6 +388,10 @@ fn video_settings_xml(xml: &str, config: &NativeGraphics) -> anyhow::Result<(Str
 
 fn settings_xml_with_values(xml: &str, wanted: std::collections::BTreeMap<(&str, &str), String>)
     -> anyhow::Result<(String, Vec<String>)> {
+    settings_xml_with_observed_values(xml, wanted, &mut std::collections::BTreeMap::new())
+}
+fn settings_xml_with_observed_values(xml: &str, wanted: std::collections::BTreeMap<(&str, &str), String>,
+    observed: &mut std::collections::BTreeMap<String, String>) -> anyhow::Result<(String, Vec<String>)> {
     use anyhow::{ensure, Context};
     use std::collections::{BTreeMap, BTreeSet};
     let value_attribute = regex::Regex::new(r#"\bvalue\s*=\s*(?:"([^"]*)"|'([^']*)')"#)?;
@@ -416,6 +440,11 @@ fn settings_xml_with_values(xml: &str, wanted: std::collections::BTreeMap<(&str,
                 roots += 1;
             }
             if stack.len() == 2 && stack[0] == "Settings" {
+                if stack[1] == "graphics" && ["TextureQuality", "ShaderQuality", "AnisotropicFiltering", "ShadowQuality", "ReflectionQuality", "SSAO", "Tessellation", "FXAA_Enabled", "MSAA", "DoF", "MotionBlurStrength"].contains(&name) {
+                    if let Some(captures) = value_attribute.captures(&xml[start..end + 1]) {
+                        observed.insert(name.into(), captures.get(1).or_else(|| captures.get(2)).unwrap().as_str().into());
+                    }
+                }
                 if let Some(value) = wanted.get(&(stack[1], name)) {
                     ensure!(self_closing && seen.insert((stack[1], name)), "duplicate or non-value graphics tag {name}");
                     let captures = value_attribute.captures(&xml[start..end + 1])
@@ -460,7 +489,7 @@ fn prepare_native_graphics(save_root: &Path) -> anyhow::Result<NativeGraphicsLau
     let (config, config_source) = match std::fs::read_to_string(&config_path) {
         Ok(text) => { ensure!(text.len() <= 4096, "native graphics config exceeds 4096 bytes"); (NativeGraphics::parse(&text)?, "file") }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            eprintln!("[config] {} missing; using native low 960x540 at 60 fps", config_path.display());
+            eprintln!("[config] {} missing; preserving GTA quality with native 960x540 at 60 fps", config_path.display());
             (NativeGraphics::default(), "built_in_default")
         }
         Err(error) => return Err(error).with_context(|| format!("read {}", config_path.display())),
@@ -480,16 +509,38 @@ fn prepare_native_graphics(save_root: &Path) -> anyhow::Result<NativeGraphicsLau
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => (NATIVE_DEFAULT_SETTINGS.into(), false),
         Err(error) => return Err(error).with_context(|| format!("read {}", settings_path.display())),
     };
-    let (xml, mut changed_tags) = if !existed {
+    let preset_changed = applied_config.as_ref().map(|previous| previous.preset != config.preset)
+        .unwrap_or(config.preset != NativeGraphicsPreset::Existing);
+    let video_changed = applied_config.as_ref().map(|previous|
+        (previous.width, previous.height, previous.fps_limit) != (config.width, config.height, config.fps_limit))
+        .unwrap_or(config.preset != NativeGraphicsPreset::Existing);
+    let (mut xml, mut changed_tags) = if !existed {
         low_settings_xml(&original, &config).context("create native low graphics defaults")?
-    } else if applied_config.as_ref().is_some_and(|previous| previous != &config) {
-        video_settings_xml(&original, &config).context("apply changed native resolution and frame cap")?
     } else {
         // A missing marker means this may be an upgrade with GTA-owned XML.
         // Validate its structure, then adopt it without rewriting user values.
         settings_xml_with_values(&original, std::collections::BTreeMap::new())
             .context("validate existing GTA settings")?
     };
+    let quality_action = match config.preset {
+        NativeGraphicsPreset::Clarity if !existed || preset_changed => {
+            let wanted = CLARITY_GRAPHICS.iter().map(|(tag, value)| (("graphics", *tag), (*value).into())).collect();
+            let (updated, tags) = settings_xml_with_values(&xml, wanted).context("apply explicit Clarity graphics")?;
+            xml = updated; changed_tags.extend(tags); "applied_clarity"
+        }
+        NativeGraphicsPreset::Performance if existed && preset_changed => {
+            let wanted = LOW_GRAPHICS.iter().map(|(tag, value)| (("graphics", *tag), (*value).into())).collect();
+            let (updated, tags) = settings_xml_with_values(&xml, wanted).context("apply explicit Performance graphics")?;
+            xml = updated; changed_tags.extend(tags); "applied_performance"
+        }
+        _ if !existed => "created_performance_baseline",
+        NativeGraphicsPreset::Existing => "kept_existing",
+        _ => "preserved_game_choices",
+    };
+    if existed && video_changed {
+        let (updated, tags) = video_settings_xml(&xml, &config).context("apply changed native resolution and frame cap")?;
+        xml = updated; changed_tags.extend(tags);
+    }
     // The current world-frame handoff requires actual single-sample depth.
     // Do not accept MSAA targets as if they were qualified scene depth. Keep
     // all other game choices, including FXAA, and use the existing exact backup.
@@ -522,14 +573,16 @@ fn prepare_native_graphics(save_root: &Path) -> anyhow::Result<NativeGraphicsLau
         })();
         if result.is_err() { let _ = std::fs::remove_file(&temporary); }
         result?;
-        if existed { "updated_with_backup" } else { "created_low_defaults" }
+        if existed { "updated_with_backup" } else if config.preset == NativeGraphicsPreset::Clarity { "created_clarity_defaults" } else { "created_low_defaults" }
     };
     let marker_action = if applied_config.as_ref() == Some(&config) && existed { "unchanged" } else {
         write_native_graphics_marker(&marker_path, &config)?;
         if applied_config.is_some() { "updated" } else if existed { "adopted_existing" } else { "created" }
     };
+    let mut actual_graphics_values = std::collections::BTreeMap::new();
+    settings_xml_with_observed_values(&xml, std::collections::BTreeMap::new(), &mut actual_graphics_values)?;
     let launch = NativeGraphicsLaunch { config, config_path, config_source, settings_path, settings_action,
-        changed_tags, backup_path, marker_path, marker_action };
+        changed_tags, backup_path, marker_path, marker_action, quality_action, actual_graphics_values };
     eprintln!("[config] native graphics {}", launch.status_json());
     Ok(launch)
 }
@@ -538,7 +591,7 @@ fn write_native_graphics_marker(path: &Path, config: &NativeGraphics) -> anyhow:
     use anyhow::Context;
     use std::io::Write;
     let data = serde_json::to_vec(&serde_json::json!({"width": config.width, "height": config.height,
-        "fps_limit": config.fps_limit, "graphics_preset": "low"}))?;
+        "fps_limit": config.fps_limit, "graphics_preset": config.preset.as_str()}))?;
     let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_nanos();
     let temporary = path.with_file_name(format!(".native-graphics-applied.{stamp}.{}.tmp", std::process::id()));
     let result = (|| -> anyhow::Result<()> {
@@ -565,7 +618,10 @@ mod native_graphics_tests {
             Self(root)
         }
         fn config(&self, width: u32, height: u32, fps: u32) {
-            std::fs::write(self.0.join("native-graphics.json"), format!(r#"{{"width":{width},"height":{height},"fps_limit":{fps},"graphics_preset":"low"}}"#)).unwrap();
+            self.preset(width, height, fps, "low");
+        }
+        fn preset(&self, width: u32, height: u32, fps: u32, preset: &str) {
+            std::fs::write(self.0.join("native-graphics.json"), format!(r#"{{"width":{width},"height":{height},"fps_limit":{fps},"graphics_preset":"{preset}"}}"#)).unwrap();
         }
         fn settings(&self) -> PathBuf { self.0.join("userdata/Documents/Rockstar Games/GTA V/settings.xml") }
         fn marker(&self) -> PathBuf { self.0.join("native-graphics-applied.json") }
@@ -596,10 +652,10 @@ mod native_graphics_tests {
         for (width, height) in [(640, 360), (960, 540), (1280, 720), (1920, 1080), (2560, 1440), (3840, 2160)] {
             for fps in [30, 60] {
                 let value = format!(r#"{{"width":{width},"height":{height},"fps_limit":{fps},"graphics_preset":"low"}}"#);
-                assert_eq!(NativeGraphics::parse(&value).unwrap(), NativeGraphics { width, height, fps_limit: fps });
+                assert_eq!(NativeGraphics::parse(&value).unwrap(), NativeGraphics { width, height, fps_limit: fps, ..NativeGraphics::default() });
             }
         }
-        assert_eq!(NativeGraphics::default(), NativeGraphics { width: 960, height: 540, fps_limit: 60 });
+        assert_eq!(NativeGraphics::default(), NativeGraphics { width: 960, height: 540, fps_limit: 60, preset: NativeGraphicsPreset::Existing });
     }
 
     #[test]
@@ -617,6 +673,107 @@ mod native_graphics_tests {
         }
     }
 
+    fn current_quality_xml() -> String {
+        let graphics = r#"<TextureQuality value="1"/><AnisotropicFiltering value="2"/><ShaderQuality value="1"/><ShadowQuality value="2"/><ReflectionQuality value="1"/><SSAO value="1"/><Tessellation value="1"/><FXAA_Enabled value="true"/><DoF value="true"/><MotionBlurStrength value="1.000000"/>"#;
+        NATIVE_DEFAULT_SETTINGS.replace("<graphics>", &format!("<graphics>{graphics}"))
+            .replace("<video>", "<video><ScreenWidth value=\"1920\"/><ScreenHeight value=\"1080\"/><RefreshRate value=\"60\"/>")
+    }
+
+    #[test]
+    fn clarity_is_surgical_once_then_preserves_game_edits_and_atomic_backup() {
+        let fixture = Fixture::new();
+        fixture.preset(1920, 1080, 60, "clarity");
+        let original = current_quality_xml();
+        let path = fixture.settings();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, &original).unwrap();
+        write_native_graphics_marker(&fixture.marker(), &NativeGraphics { width:1920, height:1080, ..NativeGraphics::default() }).unwrap();
+        let launch = prepare_native_graphics(&fixture.0).unwrap();
+        assert_eq!(launch.quality_action, "applied_clarity");
+        assert_eq!(launch.changed_tags, ["AnisotropicFiltering", "DoF", "MotionBlurStrength", "TextureQuality"]);
+        assert_eq!(std::fs::read_to_string(launch.backup_path.as_ref().unwrap()).unwrap(), original);
+        let expected = original.replace("<TextureQuality value=\"1\"/>", "<TextureQuality value=\"2\"/>")
+            .replace("<AnisotropicFiltering value=\"2\"/>", "<AnisotropicFiltering value=\"16\"/>")
+            .replace("<DoF value=\"true\"/>", "<DoF value=\"false\"/>")
+            .replace("<MotionBlurStrength value=\"1.000000\"/>", "<MotionBlurStrength value=\"0.000000\"/>");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), expected);
+        let status = launch.status_json();
+        assert_eq!(status["graphics_preset"], "clarity");
+        assert_eq!(status["actual_graphics_values"]["ShadowQuality"], "2");
+        assert_eq!(status["actual_graphics_values"]["ShaderQuality"], "1");
+        assert_eq!(status["actual_graphics_values"]["FXAA_Enabled"], "true");
+        assert_eq!(NativeGraphics::parse(&std::fs::read_to_string(fixture.marker()).unwrap()).unwrap().preset, NativeGraphicsPreset::Clarity);
+        for directory in [&fixture.0, path.parent().unwrap()] {
+            assert!(std::fs::read_dir(directory).unwrap().all(|entry| !entry.unwrap().file_name().to_string_lossy().ends_with(".tmp")));
+        }
+        let user_edit = expected.replace("<TextureQuality value=\"2\"/>", "<TextureQuality value=\"1\"/>")
+            .replace("<AnisotropicFiltering value=\"16\"/>", "<AnisotropicFiltering value=\"4\"/>");
+        std::fs::write(&path, &user_edit).unwrap();
+        let next = prepare_native_graphics(&fixture.0).unwrap();
+        assert_eq!(next.settings_action, "unchanged");
+        assert_eq!(next.quality_action, "preserved_game_choices");
+        assert!(next.backup_path.is_none());
+        assert_eq!(next.actual_graphics_values["AnisotropicFiltering"], "4");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), user_edit);
+        fixture.preset(1920, 1080, 60, "existing");
+        assert_eq!(prepare_native_graphics(&fixture.0).unwrap().settings_action, "unchanged");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), user_edit);
+    }
+
+    #[test]
+    fn explicit_quality_without_marker_applies_requested_video_and_keeps_other_choices() {
+        let fixture = Fixture::new();
+        fixture.preset(2560, 1440, 60, "clarity");
+        let original = current_quality_xml();
+        let path = fixture.settings();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, &original).unwrap();
+        let launch = prepare_native_graphics(&fixture.0).unwrap();
+        assert_eq!(std::fs::read_to_string(launch.backup_path.unwrap()).unwrap(), original);
+        let xml = std::fs::read_to_string(&path).unwrap();
+        for exact in ["<ScreenWidth value=\"2560\"/>", "<ScreenHeight value=\"1440\"/>", "<ShadowQuality value=\"2\"/>"] { assert!(xml.contains(exact)); }
+        assert_eq!(prepare_native_graphics(&fixture.0).unwrap().settings_action, "unchanged");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), xml);
+    }
+
+    #[test]
+    fn performance_requires_explicit_transition_and_does_not_change_video() {
+        let fixture = Fixture::new();
+        fixture.preset(2560, 1440, 60, "performance");
+        let original = current_quality_xml();
+        let path = fixture.settings();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, &original).unwrap();
+        write_native_graphics_marker(&fixture.marker(), &NativeGraphics { width:2560, height:1440, preset:NativeGraphicsPreset::Clarity, ..NativeGraphics::default() }).unwrap();
+        let launch = prepare_native_graphics(&fixture.0).unwrap();
+        assert_eq!(launch.quality_action, "applied_performance");
+        assert_eq!(std::fs::read_to_string(launch.backup_path.unwrap()).unwrap(), original);
+        let xml = std::fs::read_to_string(&path).unwrap();
+        for exact in ["<TextureQuality value=\"0\"/>", "<ShadowQuality value=\"0\"/>", "<ScreenWidth value=\"1920\"/>", "<ScreenHeight value=\"1080\"/>"] { assert!(xml.contains(exact)); }
+        assert!(!launch.changed_tags.iter().any(|tag| tag == "ScreenWidth" || tag == "ScreenHeight"));
+    }
+
+    #[test]
+    fn missing_xml_clarity_has_complete_defaults_and_invalid_profile_never_writes() {
+        let fixture = Fixture::new();
+        fixture.preset(2560, 1440, 60, "clarity");
+        let launch = prepare_native_graphics(&fixture.0).unwrap();
+        assert_eq!(launch.settings_action, "created_clarity_defaults");
+        let xml = std::fs::read_to_string(fixture.settings()).unwrap();
+        for exact in ["<TextureQuality value=\"2\" />", "<AnisotropicFiltering value=\"16\" />", "<ShaderQuality value=\"1\" />", "<MSAA value=\"0\" />", "<ScreenWidth value=\"2560\" />"] { assert!(xml.contains(exact)); }
+        let marker = std::fs::read(fixture.marker()).unwrap();
+        fixture.preset(2560, 1440, 60, "ultra");
+        assert!(prepare_native_graphics(&fixture.0).is_err());
+        assert_eq!(std::fs::read_to_string(fixture.settings()).unwrap(), xml);
+        assert_eq!(std::fs::read(fixture.marker()).unwrap(), marker);
+        fixture.preset(2560, 1440, 60, "performance");
+        let malformed = "<Settings><graphics><TextureQuality value=\"1\"/>";
+        std::fs::write(fixture.settings(), malformed).unwrap();
+        assert!(prepare_native_graphics(&fixture.0).is_err());
+        assert_eq!(std::fs::read_to_string(fixture.settings()).unwrap(), malformed);
+        assert_eq!(std::fs::read(fixture.marker()).unwrap(), marker);
+    }
+
     #[test]
     fn native_low_xml_preserves_unrelated_sections_attributes_and_comments() {
         let xml = r#"<?xml version="1.0"?><Settings><version value="27"/><configSource>SMC_AUTO</configSource>
@@ -625,7 +782,7 @@ mod native_graphics_tests {
 <system><maxFileStoreSize value="65536" /></system><audio><Audio3d value="true" /></audio>
 <video><ScreenWidth value="1280"/><ScreenHeight value="720"/><RefreshRate value="60"/><VSync value="2"/>
 <AdapterIndex value="9" /></video><VideoCardDescription>KEEP</VideoCardDescription></Settings>"#;
-        let config = NativeGraphics { width: 640, height: 360, fps_limit: 30 };
+        let config = NativeGraphics { width: 640, height: 360, fps_limit: 30, ..NativeGraphics::default() };
         let (new, tags) = low_settings_xml(xml, &config).unwrap();
         for exact in ["<!-- <TextureQuality value=\"2\" /> -->", "<CustomQuality value=\"7\" />",
             "<custom><TextureQuality value=\"2\" /></custom>", "<system><maxFileStoreSize value=\"65536\" /></system>",
@@ -693,7 +850,7 @@ mod native_graphics_tests {
         let save = fixture.0.join("SGTA50000");
         std::fs::write(&save, [9, 0, 255, 32]).unwrap();
         let launch = prepare_native_graphics(&fixture.0).unwrap();
-        assert_eq!(launch.config, NativeGraphics { width: 3840, height: 2160, fps_limit: 60 });
+        assert_eq!(launch.config, NativeGraphics { width: 3840, height: 2160, fps_limit: 60, ..NativeGraphics::default() });
         let xml = std::fs::read_to_string(&path).unwrap();
         assert!(xml.contains("<ScreenWidth value=\"3840\" />"));
         assert!(xml.contains("<ScreenHeight value=\"2160\" />"));
@@ -701,7 +858,7 @@ mod native_graphics_tests {
         assert_eq!(std::fs::read(save).unwrap(), [9, 0, 255, 32]);
         assert_eq!(std::fs::read_to_string(launch.backup_path.unwrap()).unwrap(), NATIVE_DEFAULT_SETTINGS);
         assert_eq!(prepare_native_graphics(&fixture.0).unwrap().settings_action, "unchanged");
-        assert_eq!(NativeGraphics::default(), NativeGraphics { width: 960, height: 540, fps_limit: 60 });
+        assert_eq!(NativeGraphics::default(), NativeGraphics { width: 960, height: 540, fps_limit: 60, preset: NativeGraphicsPreset::Existing });
     }
 
     #[test]

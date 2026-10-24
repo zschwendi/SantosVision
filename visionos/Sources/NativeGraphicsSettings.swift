@@ -1,6 +1,16 @@
 import Foundation
 
 struct NativeGraphicsSettings: Codable, Equatable, Sendable {
+    enum Preset: String, CaseIterable, Identifiable, Hashable, Sendable {
+        case existing, performance, clarity
+        var id: String { rawValue }
+        var label: String { switch self { case .existing: "Existing GTA"; case .performance: "Performance"; case .clarity: "Clarity" } }
+        var detail: String { switch self {
+        case .existing: "Keep your current GTA quality settings."
+        case .performance: "Apply lower graphics quality once, keeping resolution and frame cap."
+        case .clarity: "Sharper textures and 16× filtering, with depth of field and motion blur off. Other GTA choices are kept."
+        } }
+    }
     enum Resolution: String, CaseIterable, Identifiable, Hashable, Sendable {
         case small = "640x360"
         case standard = "960x540"
@@ -33,7 +43,7 @@ struct NativeGraphicsSettings: Codable, Equatable, Sendable {
     var width = 960
     var height = 540
     var fpsLimit = 60
-    var graphicsPreset = "low"
+    var graphicsPreset = "existing"
 
     private enum CodingKeys: String, CodingKey {
         case width, height
@@ -44,7 +54,8 @@ struct NativeGraphicsSettings: Codable, Equatable, Sendable {
     var resolution: Resolution {
         Resolution.allCases.first { $0.dimensions.width == width && $0.dimensions.height == height } ?? .standard
     }
-    var summary: String { "\(width)×\(height) · \(fpsLimit) FPS cap" }
+    var preset: Preset { Preset(rawValue: graphicsPreset) ?? .existing }
+    var summary: String { "\(width)×\(height) · \(fpsLimit) FPS cap · \(preset.label) selected" }
     var reportValue: [String: Any] {
         ["width": width, "height": height, "fps_limit": fpsLimit, "graphics_preset": graphicsPreset]
     }
@@ -56,8 +67,8 @@ struct NativeGraphicsSettings: Codable, Equatable, Sendable {
         guard fpsLimit == 30 || fpsLimit == 60 else {
             throw SettingsError.invalid("Choose a 30 or 60 FPS frame cap.")
         }
-        guard graphicsPreset == "low" else {
-            throw SettingsError.invalid("The supported graphics preset is Low.")
+        guard Preset(rawValue: graphicsPreset) != nil else {
+            throw SettingsError.invalid("Choose Existing GTA, Performance or Clarity quality.")
         }
     }
 
@@ -67,7 +78,8 @@ struct NativeGraphicsSettings: Codable, Equatable, Sendable {
         guard size <= 65_536 else { throw SettingsError.invalid("The graphics settings file is too large.") }
         let data = try Data(contentsOf: url)
         guard data.count <= 65_536 else { throw SettingsError.invalid("The graphics settings file is too large.") }
-        let settings = try JSONDecoder().decode(Self.self, from: data)
+        var settings = try JSONDecoder().decode(Self.self, from: data)
+        if settings.graphicsPreset == "low" { settings.graphicsPreset = "existing" }
         try settings.validate()
         return settings
     }
@@ -93,7 +105,7 @@ struct NativeGraphicsSettings: Codable, Equatable, Sendable {
             }
             fpsLimit = cap
         }
-        if let value = try value("--sv-graphics-preset") { graphicsPreset = value }
+        if let value = try value("--sv-graphics-preset") { graphicsPreset = value == "low" ? "existing" : value }
         try validate()
     }
 

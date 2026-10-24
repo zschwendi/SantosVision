@@ -424,10 +424,9 @@ final class NativeRuntimeModel: ObservableObject {
         graphicsSettings.fpsLimit = cap
         saveGraphicsSelection()
     }
-
-    func restoreLowGraphics() {
+    func setGraphicsPreset(_ preset: NativeGraphicsSettings.Preset) {
         guard canChangeGraphics else { return }
-        graphicsSettings = NativeGraphicsSettings()
+        graphicsSettings.graphicsPreset = preset.rawValue
         saveGraphicsSelection()
     }
 

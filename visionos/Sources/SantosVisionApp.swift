@@ -242,7 +242,16 @@ private struct LauncherView: View {
     private var nativeGraphicsControls: some View {
         VStack(alignment: .leading, spacing: 10) {
             Text("Graphics").font(.headline)
-            Text("Low preset").font(.callout)
+            Picker("Quality", selection: Binding(
+                get: { runtime.graphicsSettings.preset },
+                set: { runtime.setGraphicsPreset($0) })) {
+                ForEach(NativeGraphicsSettings.Preset.allCases) { preset in
+                    Text(preset.label).tag(preset)
+                }
+            }
+            .disabled(!runtime.canChangeGraphics)
+            Text(runtime.graphicsSettings.preset.detail)
+                .font(.caption).foregroundStyle(.secondary)
             HStack {
                 Picker("Resolution", selection: Binding(
                     get: { runtime.graphicsSettings.resolution },
@@ -263,9 +272,6 @@ private struct LauncherView: View {
             if runtime.hasStarted {
                 Text("Quit and reopen Los Santos to change graphics.")
                     .font(.caption).foregroundStyle(.secondary)
-            } else {
-                Button("Restore low defaults") { runtime.restoreLowGraphics() }
-                    .disabled(!runtime.canChangeGraphics)
             }
         }
     }

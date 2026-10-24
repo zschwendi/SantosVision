@@ -339,6 +339,15 @@ struct SantosSettingsView: View {
         NavigationStack {
             Form {
                 Section("Graphics") {
+                    Picker("Quality", selection: Binding(
+                        get: { runtime.graphicsSettings.preset },
+                        set: { runtime.setGraphicsPreset($0) })) {
+                        ForEach(NativeGraphicsSettings.Preset.allCases) { preset in
+                            Text(preset.label).tag(preset)
+                        }
+                    }
+                    Text(runtime.graphicsSettings.preset.detail)
+                        .font(.caption).foregroundStyle(.secondary)
                     Picker("Resolution", selection: Binding(
                         get: { runtime.graphicsSettings.resolution },
                         set: { runtime.setGraphicsResolution($0) })) {
@@ -352,7 +361,7 @@ struct SantosSettingsView: View {
                         Text("30 FPS").tag(30)
                         Text("60 FPS").tag(60)
                     }
-                    Text("MSAA is turned off at launch for immersive view. FXAA and your other GTA graphics choices are preserved.")
+                    Text("Quality applies when the selected preset changes. Later GTA edits are kept. MSAA stays off for immersive view; resolution and frame cap are separate.")
                         .font(.caption).foregroundStyle(.secondary)
                 }
                 .disabled(!runtime.canChangeGraphics)
