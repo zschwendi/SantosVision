@@ -945,8 +945,18 @@ fn apply_native_head_pose(c: &mut Cmd<'_, '_>) {
 /// Uses the original gameplay ray; head movement remains render-only free look.
 /// This function runs only in script_tick's selected guest TLS/scratch scope.
 fn capture_native_controller_aim(c: &mut Cmd<'_, '_>, ped: i32) {
+    let certified = crate::pad::exact_guest_abi_verified();
+    // This is a fresh, explicit native death predicate. An unavailable player
+    // or getter remains unknown; unarmed/missing aim samples do not mean dead.
+    let alive = if certified && ped != 0 && c.exists(ped) {
+        match call(c.caller, "mp:IsPedDeadOrDying", &[i(ped), b(true)]) {
+            Some(Val::I32(value)) if matches!(value, 0 | 1) => Some(value == 0),
+            _ => None,
+        }
+    } else { None };
+    crate::xr_aim::record_gameplay_ui_eligibility(alive, crate::xr_view::view_epoch());
     if !crate::pad::verified_guest_gameplay_context() || !crate::pad::exact_guest_abi_verified()
-        || ped == 0 || !c.exists(ped) || c.i("IsPedDeadOrDying", &[i(ped), b(true)]) != 0
+        || alive != Some(true)
         || c.i("IsGameplayCamRendering", &[]) == 0 {
         crate::xr_aim::clear("original gameplay camera unavailable or guest menu/cinematic active");
         return;
@@ -954,6 +964,12 @@ fn capture_native_controller_aim(c: &mut Cmd<'_, '_>, ped: i32) {
     let epoch = crate::xr_view::view_epoch();
     if !crate::xr_aim::reticle_ready_for_epoch(epoch) {
         crate::xr_aim::clear("replacement reticle frontend not ready for this immersive epoch");
+        return;
+    }
+    if crate::xr_aim::observe_native_scoped_optic(c.caller, epoch, certified) {
+        // Original51716 displays the sniper scope as HUD component14. Do not
+        // invoke the ordinary component14 hider or draw a generic replacement.
+        crate::xr_aim::clear("verified original native scoped optic retained");
         return;
     }
     let result = (|| -> anyhow::Result<()> {
