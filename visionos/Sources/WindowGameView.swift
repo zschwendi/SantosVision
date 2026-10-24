@@ -213,8 +213,6 @@ struct WindowGameView: View {
     private var launcher: some View {
         VStack(spacing: 24) {
             HStack(spacing: 12) {
-                Image(systemName: "sparkles").foregroundStyle(SantosTheme.glow)
-                Text("Los Santos").font(.title3.bold())
                 Spacer()
                 Button { runtime.nativeSettingsPresented = true } label: {
                     Image(systemName: "gearshape").padding(4)
@@ -225,9 +223,6 @@ struct WindowGameView: View {
                 }
             }
             VStack(spacing: 18) {
-                Image(systemName: "building.2.crop.circle")
-                    .font(.system(size: 58, weight: .light))
-                    .foregroundStyle(SantosTheme.glow)
                 Text("Los Santos").font(.largeTitle.weight(.semibold))
                 Text("GTA V").font(.headline).foregroundStyle(.secondary)
                 if runtime.isBusy {
@@ -237,12 +232,10 @@ struct WindowGameView: View {
                         .buttonStyle(.borderedProminent)
                         .disabled(!runtime.probePassed || !runtime.hasGameData || !runtime.windowSurfaceReady)
                 }
-                Text(shortStatus).font(.subheadline).foregroundStyle(.secondary)
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .background(SantosTheme.surface.opacity(0.45), in: RoundedRectangle(cornerRadius: 22))
             HStack {
-                Circle().fill(runtime.hasStarted ? Color.green : SantosTheme.glow).frame(width: 6, height: 6)
                 Text(shortStatus).font(.caption).foregroundStyle(.secondary)
                 Spacer()
                 Label(runtime.controllerSummary, systemImage: "gamecontroller").font(.caption).foregroundStyle(.secondary)

@@ -5,6 +5,22 @@ aiming. The headset controls the view, the dominant hand controls the weapon,
 and both eyes project the same gameplay aim. Third-person and flat-window
 controls retain their existing behavior.
 
+## October 24 integration status
+
+Installed candidate 22 is the separate nine-body AOT with native arm requests,
+cached-muzzle observation and completed-model correction for first-person
+skinned families 44415/44355. Its signed native host defaults that matched
+artifact on. This supersedes the candidate-10 opt-in-only instructions below;
+those paragraphs describe the earlier diagnostic milestone. Candidate 22 is
+not yet visibly accepted for gun/arm tracking or barrel/reticle agreement.
+
+The left hand in candidate 22 still follows grip translation with GTA's wrist
+orientation. Full left-wrist calibration is a separate source work item, not
+part of that installed binary. Combined first-person foreground depth,
+unarmed/bare-hand integration and unsupported weapon producers remain open.
+Current acceptance and deployment status live in
+[the request audit](USER-REQUEST-AUDIT-20261024.md).
+
 ## References inspected
 
 - [VRAge](https://www.gta5-mods.com/scripts/vrage-jaspergaming) is the closest
@@ -41,7 +57,7 @@ opt-in `MUGUET_XR_MOTION_AIM=1`. A normal launch keeps ordinary aiming. A tracki
 preview alone does not enable motion shooting. Bare wrist poses are not treated
 as calibrated gun barrels.
 
-## Remaining native integration
+## Remaining native integration at the candidate-10 milestone
 
 The current gun-direction hook reduces its target to torso yaw/pitch. Independent
 weapon translation and roll require the native arm-goal matrix solver and its

@@ -5,6 +5,13 @@ headset feedback supersedes earlier passing source tests and target counters.
 The coordinator owns integration and the complete player experience. Parent:
 `w-14dea40fb6e248138ad507f85cf4384b`, topic `santosvision-immersive`.
 
+Build **22** is installed in place and its installed bundle version was verified.
+The frozen source is `db5f612`, tag
+`los-santos-first-person-candidate22-20261024`. The subsequent background-only
+launch request timed out; opening it and gameplay acceptance remain unconfirmed.
+No uninstall or save-data replacement occurred. Deployment receipt:
+`target/verification/device-session-20261024/first-person22-device/deployment-receipt.json`.
+
 ## Current blockers and unfinished requests
 
 | Request | Current status | Owner / next acceptance |
@@ -15,7 +22,7 @@ The coordinator owns integration and the complete player experience. Parent:
 | Sense can navigate GTA Settings and controls in every view | **Source repair integrated; hardware check pending.** GTA keeps the controller while its menu is open; L1/R1/Triangle send its actual Q/E/Tab bindings. Combined menu/ADS routing passes 39 tests. | Dedicated Opus 5.5 `menus` task; actual directions, tabs, confirm/cancel and Apply/save. |
 | Actual tracked gun, hands and arms | **Partial source repair; not visibly accepted.** Native poses/IK move, but first-person model drawing cancels the head/eyes. The two skinned families now have a certified corrected draw transform and separate nine-body AOT. Combined foreground depth, full left wrist and unarmed tracking are still unfinished. | Dedicated Opus 5.5 `hands` task; actual skeleton, attachments and first-person draw transform must agree. |
 | Reticle always agrees with visible barrel and actual native aiming | **Incomplete.** Candidate 21 repairs an independent binocular-reference bug; it does not establish visible gun alignment. | Hands/ADS integration; near/far and independent head/hand movement. No fabricated center dot or desired-ray authority. |
-| Independent left wrist rotation | **Unimplemented at candidate 21.** Left hand currently has translated grip with native wrist orientation. | Hands task; proper calibrated frame and native orientation transport. |
+| Independent left wrist rotation | **Not in installed candidate 22.** A separate Opus source implementation measures an explicit grip-to-native-hand calibration and transports native flags256; review, complete artifact preservation, AOT integration and physical acceptance remain. Installed left hand uses translated grip with native wrist orientation. | Hands task; proper calibrated frame and native orientation transport. |
 | First-person immersive sniper is single and correctly zoomed | **Partial source repair; hardware pending.** Qualified scoped world now shares the graticule axis and uses a 1/m virtual baseline. Baked HUD fallback can still double when real HUD isolation is rejected; new counters identify it. | Dedicated Opus 5.5 `sniper` task. |
 | Crisp immersive graphics closer to the flat presentation | **Unaccepted.** New default-off display-resolution choice and experimental gap fill; Mac Metal parity passes for the fill. Source vertical density and alternating-eye limits remain. | Dedicated Opus 5.5 `quality` task; source/display evidence and explicit controls, no unsupported performance claims. |
 | Cannot outrun the immersive viewport into black edges | **Unresolved.** Wider adaptive source coverage exists; user-visible residuals remain. | Quality/renderer work after core aiming and stability. |
@@ -23,7 +30,7 @@ The coordinator owns integration and the complete player experience. Parent:
 | Weapon wheel and Wasted are not duplicated; HUD stays visible | **Not fully accepted.** Prior reticle improvement does not prove all HUD elements. | Explicit UI/stereo checks; minimap lower without moving farther left, right HUD lower and inward. |
 | Phone/view utilities are minimal and out of the way | **Source trimmed; player check pending.** Removed the View ornament in both presentations. Physical camera shortcuts, Phone/Close-phone and phone-only directions remain. | Coordinator: trim redundant camera ornament; settle minimal phone access without reintroducing the old window phone trap. Preserve the physical camera button. |
 | Phone arrow pad only appears with phone, as an upright directional ornament; phone button closes phone | **Partial.** User previously accepted window behavior; immersive phone/open-transition failures remain. | Controls/lifecycle regression; preserve the working window path. |
-| Front of app feels concise and deliberate | **Needs revision.** User asks to trim front-end clutter again. | Coordinator after startup/menu crash repair; no replacement wall of diagnostic controls. |
+| Front of app feels concise and deliberate | **Source trimmed after build 22; not yet installed.** Removed duplicate title/status and generic launcher decoration. Play, Settings, Quit and controller status remain; View ornament was already removed in build 22. | Coordinator; no replacement wall of diagnostic controls. |
 | Original police-siren/Rockstar startup presentation instead of the current legal-only experience | **Missing asset confirmed.** The engine references platform:/movies/rockstar_logos, but none of the fourteen supplied archives contains the movie. Requires the original intro from the user's own copy; no new Rockstar asset bundled. | Coordinator; use the user's installed game assets, without embedding new proprietary assets in the app. |
 | Reliable iCloud save sync with redundant recovery | **Configured in signed build 22; story save/restore remains unverified.** CloudDocuments container/entitlements are present. Last received play configuration is Sandbox/developer mode ON; it does not establish a story-save round trip. | Inspect existing CloudSaveModel/recovery evidence and test actual save, restore and overwrite recovery. |
 | Vision Pro on the app icon instead of sunglasses | **Implemented and visually checked.** Asset catalog selects santos-five-visor.png, introduced by 5baebf1 in build 12 and retained in signed build 22. The prior audit entry was stale. | Keep the selected visor asset; APP-ICON.md provenance corrected. |
