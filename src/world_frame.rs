@@ -732,10 +732,17 @@ pub extern "C" fn sv_world_complete_frame(leases: *const u64, count: u32, metal_
     0
 }
 
+/// GPU fixtures touching publication counters share the existing frame-test
+/// lock, so an unfiltered parallel test run cannot race their observations.
+#[cfg(test)]
+pub(crate) fn lock_test_publication() -> std::sync::MutexGuard<'static, ()> {
+    tests::TEST_LOCK.lock().unwrap()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    static TEST_LOCK: Mutex<()> = Mutex::new(());
+    pub(super) static TEST_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn world_callback_accounting_drives_production_poll_and_idle_policy_until_every_guard_retires() {

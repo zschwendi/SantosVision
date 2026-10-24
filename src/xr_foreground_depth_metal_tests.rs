@@ -164,6 +164,7 @@ fn metal_foreground_clear_refreshes_proxy_after_snapshot_closes_overlay() {
 
 #[test]
 fn metal_foreground_colour_without_depth_refuses_publication_without_an_overlay() {
+    let _serial = crate::world_frame::lock_test_publication();
     let mut g = gpu();
     const REASON: &str = "foreground_opaque_colour_without_depth_write";
     for scenario in 0..3 {
