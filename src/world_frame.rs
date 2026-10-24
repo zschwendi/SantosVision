@@ -89,8 +89,15 @@ struct Slot { color: Texture, depth: Texture }
 pub(crate) struct FrozenPreUiDepth(Texture);
 impl FrozenPreUiDepth {
     pub(crate) fn new_snapshot(texture: Texture) -> Self { Self(texture) }
+    /// Gpu::merge_foreground_depth output only: the frozen pre-UI world with the
+    /// actual attributed first-person depth writes of the same raster, in a new
+    /// texture the game never binds. Same R32Float convention and extent.
+    pub(crate) fn new_merged_foreground(texture: Texture) -> Self { Self(texture) }
     pub(crate) fn texture(&self) -> &Texture { &self.0 }
 }
+
+/// Native handle for diagnostics manifests only; never dereferenced by callers.
+pub(crate) fn native_texture_handle(texture: &Texture) -> Option<u64> { metal_pointer(texture) }
 #[derive(Clone)]
 struct Ready { slot: Arc<Slot>, frame: WorldFrame, generation: u64, provenance_epoch: u64,
     pair_epoch: u64, ready_at: Instant, snapshot_submit_to_gpu_completion_seconds: Option<f64>,

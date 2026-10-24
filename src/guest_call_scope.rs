@@ -52,6 +52,9 @@ fn observing() -> bool {
 pub(crate) fn call<S, T, E>(store: &mut S, kind: Kind,
     invoke: impl FnOnce(&mut S) -> Result<T, E>) -> Result<T, E>
 where S: AsContextMut<Data = HostState> {
+    // First-person attribution opened inside this call never outlives it, and
+    // mailbox work never inherits it. Inert unless foreground depth is requested.
+    let _foreground = crate::xr_view::foreground_depth::Boundary::enter(kind == Kind::Mailbox);
     if !observing() {
         if !crate::xr_motion_aim::gameplay_enabled() { return invoke(store); }
         let prefix=store.as_context().data().motion_aim.boundary_prefix();

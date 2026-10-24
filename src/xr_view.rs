@@ -21,6 +21,9 @@ pub(crate) mod packet_trace;
 #[path = "xr_projection_restore.rs"]
 mod projection_restore;
 
+#[path = "xr_foreground_depth.rs"]
+pub(crate) mod foreground_depth;
+
 const ACTIVE_CVIEWPORT: u64 = 19_237_856;
 const CAMERA_OFFSET: u64 = 192;
 const PROJECTION_OFFSET: u64 = 320;
@@ -403,6 +406,10 @@ struct State {
     history: VecDeque<SavedViewport>,
     markers: BTreeMap<u64, Option<WorldView>>,
     last_emitted: Option<WorldView>,
+    // Producer-certified first-person attribution, positional like `markers`.
+    foreground_markers: BTreeMap<u64, Option<foreground_depth::ForegroundMark>>,
+    last_foreground: Option<foreground_depth::ForegroundMark>,
+    foreground_marker_changes: u64,
     frame_world: Option<WorldView>,
     frame_conflict: bool,
     presents: VecDeque<Option<WorldView>>,
@@ -448,6 +455,10 @@ static STATE: LazyLock<Mutex<State>> = LazyLock::new(|| Mutex::new(State::defaul
 static ENABLED: AtomicBool = AtomicBool::new(false);
 static EPOCH: AtomicU64 = AtomicU64::new(1);
 static MARKER_COUNT: AtomicU64 = AtomicU64::new(0);
+static FOREGROUND_MARKER_COUNT: AtomicU64 = AtomicU64::new(0);
+// Whether the last recorded foreground marker attributes; the Emit fast path
+// may skip only when nothing would change.
+static FOREGROUND_LAST_SET: AtomicBool = AtomicBool::new(false);
 static TRACE_ENABLED: AtomicBool = AtomicBool::new(cfg!(target_os = "visionos"));
 // Tokens describe a binding, not the view's matrix/value. A second binding of
 // the same view deliberately takes a different token. Zero means no shortcut.
@@ -537,6 +548,9 @@ fn invalidate_state(state: &mut State) {
     // Preserve queue positions for commands already published; convert their
     // payloads to nonworld rather than shifting the presentation correspondence.
     for view in state.markers.values_mut() { *view = None; }
+    for mark in state.foreground_markers.values_mut() { *mark = None; }
+    state.last_foreground = None;
+    FOREGROUND_LAST_SET.store(false, Ordering::Release);
     for view in state.presents.iter_mut() { *view = None; }
 }
 
@@ -1133,6 +1147,9 @@ pub fn viewport_command(_caller: &mut Caller<'_, HostState>, _command: u64) -> R
 }
 
 pub fn current_view(caller: &mut Caller<'_, HostState>, viewport: u64, _set_window: u64) -> Result<()> {
+    // The original SetCurrent(parent) continuation (or any other SetCurrent)
+    // ends a first-person attribution before anything else can be emitted.
+    foreground_depth::end_at_set_current(viewport);
     if !TRACE_ENABLED.load(Ordering::Acquire) { return Ok(()); }
     let mem = &RT.get().context("missing runtime")?.mem;
     let mut state = lock_world_state(); state.current_calls += 1;
@@ -1176,16 +1193,19 @@ pub fn current_view(caller: &mut Caller<'_, HostState>, viewport: u64, _set_wind
         if emission_fast_enabled() {
             thread.emission_token = if view.is_some() { next_emission_token() } else { 0 };
         }
+        foreground_depth::note_current(epoch, viewport, view);
     });
     Ok(())
 }
 
 /// Called at the exact wasm_gpu::Emit midpoint while its producer mutex is held.
 /// Command bytes are complete; the GPU consumer cannot yet see the published head.
-pub fn gpu_command(_caller: &mut Caller<'_, HostState>, command: u64) -> Result<()> {
+pub fn gpu_command(caller: &mut Caller<'_, HostState>, command: u64) -> Result<()> {
     if !TRACE_ENABLED.load(Ordering::Acquire) { return Ok(()); }
     let mem = &RT.get().context("missing runtime")?.mem;
     let Some(opcode) = read_u32(mem, command) else { return Ok(()); };
+    // Host reads only; None unless a certified first-person binding is live.
+    let foreground = foreground_depth::emission(caller, mem);
     if !emission_fast_enabled() {
         // Preserve the flag-off path's original lock/TLS/record publication
         // ordering exactly, including its epoch and current-view filtering.
@@ -1198,6 +1218,7 @@ pub fn gpu_command(_caller: &mut Caller<'_, HostState>, command: u64) -> Result<
             record_emission(&mut state, command, opcode, current);
             MARKER_COUNT.store(state.markers.len() as u64, Ordering::Release);
         });
+        record_foreground(&mut state, command, foreground, EPOCH.load(Ordering::Acquire));
         return Ok(());
     }
     // wasm_gpu::Emit serializes producers while this callback runs. The token
@@ -1212,6 +1233,7 @@ pub fn gpu_command(_caller: &mut Caller<'_, HostState>, command: u64) -> Result<
         (current, token, thread.epoch)
     });
     if !EMISSION_TOKEN_EXHAUSTED.load(Ordering::Acquire)
+        && foreground.is_none() && !FOREGROUND_LAST_SET.load(Ordering::Acquire)
         && thread_epoch == EPOCH.load(Ordering::Acquire)
         && can_skip_emission(opcode, token, LAST_EMITTED_TOKEN.load(Ordering::Acquire))
         && current.is_some_and(|view| !view.headset_applied || view_epoch_is_active(view.provenance_epoch)) {
@@ -1230,9 +1252,39 @@ pub fn gpu_command(_caller: &mut Caller<'_, HostState>, command: u64) -> Result<
     let current = current.filter(|view| !view.headset_applied || view_epoch_is_active(view.provenance_epoch));
     let token = if current.is_some() { token } else { 0 };
     record_emission(&mut state, command, opcode, current);
+    record_foreground(&mut state, command, foreground, EPOCH.load(Ordering::Acquire));
     LAST_EMITTED_TOKEN.store(token_after_slow_emission(&state, current, token), Ordering::Release);
     MARKER_COUNT.store(state.markers.len() as u64, Ordering::Release);
     Ok(())
+}
+
+/// Positional, immutable first-person attribution for this exact ring command.
+/// A marker is written only on change; GPU consumption order is ring order.
+fn record_foreground(state: &mut State, command: u64, mark: Option<foreground_depth::ForegroundMark>, epoch: u64) {
+    let mark = mark.filter(|mark| mark.view.provenance_epoch == epoch);
+    if mark != state.last_foreground {
+        if state.foreground_markers.len() >= MAX_MARKERS || state.foreground_markers.contains_key(&command) {
+            // A lost transition would mislabel later commands: refuse images.
+            state.correlation_failed = true;
+            state.last_error = Some("first-person foreground marker overrun; refusing uncorrelated images".into());
+        } else {
+            state.foreground_markers.insert(command, mark);
+            state.last_foreground = mark;
+            state.foreground_marker_changes += 1;
+        }
+    }
+    FOREGROUND_LAST_SET.store(state.last_foreground.is_some(), Ordering::Release);
+    FOREGROUND_MARKER_COUNT.store(state.foreground_markers.len() as u64, Ordering::Release);
+}
+
+/// GPU worker, before executing each ring command, after take_command_view.
+/// None: no change. Some(None): attribution ended at this command.
+pub(crate) fn take_command_foreground(command_address: u64) -> Option<Option<foreground_depth::ForegroundMark>> {
+    if FOREGROUND_MARKER_COUNT.load(Ordering::Acquire) == 0 { return None; }
+    let mut state = lock_world_state();
+    let result = state.foreground_markers.remove(&command_address);
+    FOREGROUND_MARKER_COUNT.store(state.foreground_markers.len() as u64, Ordering::Release);
+    result
 }
 
 fn record_emission(state: &mut State, command: u64, opcode: u32, current: Option<WorldView>) {
@@ -1329,6 +1381,8 @@ pub fn status_json() -> serde_json::Value {
         "unmatched_near_world":unmatched,
         "rendering_method":"one eye per natural game frame; two views use alternate-eye rendering, not simultaneous stereo"});
     status["projection_clones_already_current"] = serde_json::json!(state.projection_clones_already_current);
+    status["first_person_foreground_markers"] = serde_json::json!({"changes":state.foreground_marker_changes,
+        "pending":state.foreground_markers.len(),"last_generation":state.last_foreground.map(|mark|mark.generation)});
     status["primary_crop_restoration"] = serde_json::json!({"pending":state.primary_crop_owner.is_some(),
         "restored":state.primary_crop_restores,"dropped":state.primary_crop_dropped,
         "unqualified":state.primary_crop_unqualified,"failures":state.primary_crop_failures});
@@ -2059,6 +2113,36 @@ mod tests {
         assert_eq!(state.markers.remove(&120),Some(Some(left)));
         assert_eq!(state.markers.remove(&140),Some(None));
         assert!(!state.correlation_failed);
+    }
+    #[test]
+    fn first_person_foreground_markers_are_positional_epoch_filtered_and_fail_closed() {
+        let mark = foreground_depth::ForegroundMark { generation: 7, family: 44415, view: view(0, 3) };
+        let next = foreground_depth::ForegroundMark { generation: 8, family: 44355, ..mark };
+        let mut state = State::default();
+        record_emission(&mut state, 100, 32, Some(view(0, 3)));
+        record_foreground(&mut state, 100, None, 1); // nothing changed
+        record_foreground(&mut state, 120, Some(mark), 1); // seam-certified invocation begins
+        record_foreground(&mut state, 140, Some(mark), 1);
+        record_foreground(&mut state, 160, Some(next), 1); // next invocation, new generation
+        record_foreground(&mut state, 180, None, 1); // original SetCurrent(parent)
+        let stale = foreground_depth::ForegroundMark { view: WorldView { provenance_epoch: 2, ..view(0, 3) }, ..mark };
+        record_foreground(&mut state, 200, Some(stale), 1); // foreign epoch never attributes
+        assert_eq!(state.foreground_markers, BTreeMap::from([(120, Some(mark)), (160, Some(next)), (180, None)]));
+        assert_eq!(state.markers, BTreeMap::from([(100, Some(view(0, 3)))]), "attribution never edits view markers");
+        // Reset keeps every queue position and ends attribution at each one.
+        record_foreground(&mut state, 220, Some(mark), 1);
+        invalidate_state(&mut state);
+        assert_eq!(state.foreground_markers.len(), 4);
+        assert!(state.foreground_markers.values().all(Option::is_none) && state.last_foreground.is_none());
+        // A lost transition would mislabel later commands: images are refused.
+        let mut state = State::default();
+        state.foreground_markers = (0..MAX_MARKERS as u64).map(|address| (address, None)).collect();
+        record_foreground(&mut state, MAX_MARKERS as u64 + 4, Some(mark), 1);
+        assert!(state.correlation_failed && state.last_foreground.is_none());
+        let mut state = State::default();
+        record_foreground(&mut state, 50, Some(mark), 1);
+        record_foreground(&mut state, 50, None, 1);
+        assert!(state.correlation_failed);
     }
     #[test]
     fn mixed_camera_draws_and_ring_overrun_refuse_correlated_world_frame() {

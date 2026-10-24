@@ -12,6 +12,7 @@ use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 use wasmtime::SharedMemory;
 use wgpu::*;
+use crate::xr_view::foreground_depth as fg;
 
 #[path = "render_prepare.rs"]
 mod render_prepare;
@@ -1041,6 +1042,13 @@ struct Gpu {
     world_depth_anomalies: Vec<serde_json::Value>,
     color_phase_trace: crate::world_ui::ColorPhaseTrace,
     hud_capture:Option<HudCapture>, hud_draw:Option<crate::xr_hud::HudBlend>, hud_pool:Vec<Arc<crate::xr_hud::HudImages>>,
+    // Producer-attributed first-person foreground (default off; see fg).
+    foreground: Option<fg::ForegroundMark>,
+    fp_sessions: fg::logic::Sessions,
+    fp_images: HashMap<u32, ForegroundImages>,
+    fp_pool: Vec<Texture>,
+    fp_merge: Option<(RenderPipeline, BindGroupLayout)>,
+    foreground_capture: Option<ForegroundCapture>,
     command_trace: crate::world_command_trace::CommandTrace,
     pdirty: bool,
     last_pl: Option<Rc<Pl>>,
@@ -1228,7 +1236,10 @@ impl Gpu {
             base, mem, ring, device, queue, adapter, surface, surface_format, surface_size: (0, 0),
             objs: Vec::new(), enc: None, enc_epoch: 1, pass: None, pass_key: None, pass_info: None, pass_st: PassSt::default(),
             s: State::new(), world_view: None, world_depths: HashMap::new(), world_depth_before_ui: HashMap::new(), world_depth_snapshot_overflow: false, world_depth_snapshots_this_present: 0, world_depth_trace: HashMap::new(), world_depth_anomalies: Vec::new(),
-            color_phase_trace: crate::world_ui::ColorPhaseTrace::from_env(), hud_capture:None, hud_draw:None, hud_pool:Vec::new(), command_trace: crate::world_command_trace::CommandTrace::from_env(), pdirty: true, last_pl: None, last_program_uids: None,
+            color_phase_trace: crate::world_ui::ColorPhaseTrace::from_env(), hud_capture:None, hud_draw:None, hud_pool:Vec::new(),
+            foreground: None, fp_sessions: Default::default(), fp_images: HashMap::new(), fp_pool: Vec::new(), fp_merge: None,
+            foreground_capture: ForegroundCapture::from_env(),
+            command_trace: crate::world_command_trace::CommandTrace::from_env(), pdirty: true, last_pl: None, last_program_uids: None,
             float_programs: HashMap::new(), shader_index, shader_dir, next_uid: 1,
             bgl_cache: HashMap::new(), empty_bgl: None, pipelines: HashMap::new(), compute: HashMap::new(), bind_groups: HashMap::new(),
             numeric_bgl_cache: HashMap::new(), render_prepare, uniform_pack, uniform_snapshot, bind_group_prepare,
@@ -1275,6 +1286,12 @@ impl Gpu {
     }
 
     fn invalidate_world_depth_inner(&mut self, id: u32, reason: serde_json::Value, change: WorldDepthChange) {
+        // Every caller runs before its mutation is encoded: an open foreground
+        // overlay snapshots its actual post-write depth first.
+        self.foreground_foreign_write(id, "depth_target_mutation");
+        if self.foreground_capture_live() && (self.fp_sessions.overlay(id).is_some() || self.tex(id).is_some_and(|t| is_depth(t.format))) {
+            self.foreground_capture_event(serde_json::json!({"event":"depth_mutation","target":id,"reason":reason.clone(),"draw":self.draws}));
+        }
         let previous = invalidate_world_depth_records(&mut self.world_depths,
             &mut self.world_depth_before_ui, id, change);
         if let Some((view, draws)) = previous {
@@ -1310,6 +1327,8 @@ impl Gpu {
         self.world_depth_snapshots_this_present += 1;
         self.world_depth_before_ui.insert(id, (view,
             crate::world_frame::FrozenPreUiDepth::new_snapshot(snapshot), draws));
+        self.foreground_capture_event(serde_json::json!({"event":"world_depth_frozen_before_ui_clear","target":id,
+            "camera_sequence":view.camera_sequence,"world_draws":draws,"draw":self.draws}));
         log_once("world-depth-before-ui", "qualified real scene depth copied before GTA's clip-space UI clear; final color must retain the same camera rays");
     }
 
@@ -1730,6 +1749,7 @@ impl Gpu {
             let op = self.u(base);
             let n = self.u(base + 1) as u64;
             if let Some(view) = crate::xr_view::take_command_view(base * 4) { self.world_view = view; }
+            if let Some(mark) = crate::xr_view::take_command_foreground(base * 4) { self.foreground_set(mark); }
             if self.command_trace.wants_command(op) { self.trace_ring_command(op, base, n); }
             if op == 1 {
                 tail = RING_DATA as i32;
@@ -3645,6 +3665,9 @@ impl Gpu {
         let ps_id = self.s.shader[1];
         let Some(vs) = self.shader_program(vs_id).and_then(|program| self.float_sampling_program(program, 0)) else { self.skip(); return };
         let ps = if ps_id != 0 { match self.shader_program(ps_id).and_then(|program| self.float_sampling_program(program, 1)) { Some(p) => Some(p), None => { self.skip(); return } } } else { None };
+        // Before encoding: an attributed first-person depth write is accounted
+        // for here; anything else closes an open overlay on its target first.
+        let foreground_accepted = self.foreground_pre_draw(&vs, ps.as_deref());
         let ui_depth_clear = self.world_view.is_none()
             && vs.label == "billboard_nobump::VS_Blit"
             && ps.as_ref().is_some_and(|program| program.label == "im::PS_Clear"
@@ -3893,7 +3916,7 @@ impl Gpu {
                 self.state(self.s.dss.0).map(|state| state.words.clone()),
                 self.state(self.s.rs).map(|state| state.words.clone())));
         }
-        if writes_depth && ds.mip == 0 && ds.slice == 0 {
+        if writes_depth && ds.mip == 0 && ds.slice == 0 && !foreground_accepted {
             if let Some(view) = self.world_view.filter(|view| view.headset_applied && full_world_viewport && self.tex(ds.tex).is_some_and(|t|
                 is_depth(t.format) && t.desc.samples == 1 && t.desc.d == 1)) {
                 self.world_depth_before_ui.remove(&ds.tex); // A newer qualified scene supersedes the saved image.
@@ -4203,6 +4226,7 @@ impl Gpu {
         self.use_tex(dst);
     }
     fn resolve(&mut self, dst: u32, dst_sub: u32, src: u32, src_sub: u32) {
+        self.foreground_foreign_write(dst, "resolve_destination");
         self.materialize_clears(src);
         self.materialize_clears(dst);
         let (Some(s), Some(d)) = (self.tex(src), self.tex(dst)) else { return };
@@ -4586,6 +4610,7 @@ impl Gpu {
         }
         let started = Instant::now();
         self.publish_world_frame(id);
+        self.foreground_capture_present(id);
         self.thread_wall[THREAD_WORLD_PUBLICATION].record(started.elapsed());
         let started = Instant::now();
         self.collect_pipelines();
@@ -4627,11 +4652,22 @@ impl Gpu {
             self.color_phase_trace.present(self.presents+1, present_view.as_ref(), target);
         }
         let depths = std::mem::take(&mut self.world_depths);
-        let saved = std::mem::take(&mut self.world_depth_before_ui);
+        let mut saved = std::mem::take(&mut self.world_depth_before_ui);
         let snapshot_overflow = std::mem::replace(&mut self.world_depth_snapshot_overflow, false);
         let snapshots_this_present = std::mem::replace(&mut self.world_depth_snapshots_this_present, 0);
         let trace = std::mem::take(&mut self.world_depth_trace);
         let anomalies = std::mem::take(&mut self.world_depth_anomalies);
+        // Foreground bookkeeping is per present, like the world records. An
+        // accepted overlay bypassed the generic unqualified-writer invalidation;
+        // unless it merges below, withdraw its frozen world exactly as that
+        // rule would have, so FP colour never pairs world-only depth there.
+        let fp_sessions = std::mem::take(&mut self.fp_sessions);
+        let mut fp_images = std::mem::take(&mut self.fp_images);
+        for overlay in fp_sessions.overlays.iter().filter(|overlay| overlay.draws > 0) {
+            if let Err(reason) = fp_sessions.publishable(overlay.target) {
+                if saved.remove(&overlay.target).is_some() { fg::note_withdrawal(reason); }
+            }
+        }
         let Some(view) = present_view.filter(|view| view.headset_applied) else { return; };
         let Some(original_color) = self.tex(color_id).map(|t| t.tex.clone()) else { return; };
         let hud=match hud_capture {
@@ -4666,6 +4702,27 @@ impl Gpu {
             return;
         }
         let (depth_id, (view, _, frozen_depth)) = candidates.into_iter().next().unwrap();
+        // The selected frozen world carries accepted attributed foreground
+        // writes: publish the actual merge or nothing.
+        let mut merged_overlay = None;
+        let frozen_depth = match frozen_depth {
+            Some(world) if fp_sessions.overlay(depth_id).is_some_and(|overlay| overlay.draws > 0) => {
+                match self.merge_foreground_depth(&fp_sessions, &mut fp_images, depth_id, world.texture()) {
+                    Ok((texture, overlay)) => {
+                        merged_overlay = Some(overlay);
+                        Some(crate::world_frame::FrozenPreUiDepth::new_merged_foreground(texture))
+                    }
+                    Err(reason) => {
+                        fg::note_withdrawal(reason);
+                        self.foreground_recycle(fp_images);
+                        crate::world_frame::reject(format!("attributed first-person depth on the selected frozen world could not be merged: {reason}"));
+                        return;
+                    }
+                }
+            }
+            other => other,
+        };
+        self.foreground_recycle(fp_images);
         // Preserve the opaque pass's actual depth convention. The final
         // lighting pass can have identical screen rays with a different Z row.
         let depth = match &frozen_depth {
@@ -4675,6 +4732,14 @@ impl Gpu {
                 None => { crate::world_frame::reject("qualified world depth conversion failed".into()); return; }
             },
         };
+        if let Some(overlay) = &merged_overlay { fg::note_merge(self.presents + 1, overlay); }
+        if let Some(capture) = self.foreground_capture.as_mut().filter(|capture| capture.state == ForegroundCaptureState::Triggered) {
+            capture.published = Some(serde_json::json!({"target":depth_id,"frozen":frozen_depth.is_some(),
+                "merged_overlay":merged_overlay.map(|o| serde_json::json!({"draws":o.draws,"families":o.families,
+                    "first_generation":o.first_generation,"last_generation":o.last_generation})),
+                "view":crate::world_ui::marker(&view)}));
+            capture.published_depth = Some(depth.clone());
+        }
         self.flush();
         let p = view.projection_from_eye;
         let (near_denominator, far_denominator) = if view.depth_reverse_z { (p[10] + 1., p[10]) }
@@ -4758,6 +4823,437 @@ impl Gpu {
     }
     fn log_stats(&self) {
         log(&format!("stats: draws {} (skipped {}), presents {}, objects {}, pipelines {}", self.draws, self.skipped, self.presents, self.objs.iter().filter(|o| o.is_some()).count(), self.pipelines.len()));
+    }
+}
+
+/// Actual depth of one overlay target immediately before its first and after
+/// its last producer-attributed first-person write (R32Float proxy copies).
+struct ForegroundImages { target: Texture, before: Texture, after: Option<Texture> }
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ForegroundCaptureState { Armed, Triggered, Done }
+
+/// One-shot capture at the first attributed first-person draw of a present.
+/// Registered raw images plus every depth writer/mutation of that present.
+struct ForegroundCapture {
+    state: ForegroundCaptureState,
+    events: Vec<serde_json::Value>,
+    events_omitted: u64,
+    budget: fg::logic::CaptureBudget,
+    images: Vec<fg::CaptureImage>,
+    images_omitted: Vec<serde_json::Value>,
+    trigger: Option<serde_json::Value>,
+    depth_target: Option<(u32, Texture)>,
+    color_target: Option<(u32, u32, u32, Texture)>,
+    post: (Option<usize>, Option<usize>),
+    segments: u64,
+    published: Option<serde_json::Value>,
+    published_depth: Option<Texture>,
+}
+
+impl ForegroundCapture {
+    fn from_env() -> Option<Self> {
+        if !fg::attribution_requested() { return None; }
+        fg::capture_dir()?;
+        fg::capture_state("armed");
+        Some(Self { state: ForegroundCaptureState::Armed, events: Vec::new(), events_omitted: 0, budget: Default::default(),
+            images: Vec::new(), images_omitted: Vec::new(), trigger: None, depth_target: None, color_target: None,
+            post: (None, None), segments: 0, published: None, published_depth: None })
+    }
+}
+
+impl Gpu {
+    fn foreground_set(&mut self, mark: Option<fg::ForegroundMark>) {
+        let mark = mark.filter(|mark| mark.view.headset_applied && crate::xr_view::view_epoch_is_active(mark.view.provenance_epoch));
+        let previous = std::mem::replace(&mut self.foreground, mark);
+        if previous.is_some_and(|previous| mark.map(|mark| mark.generation) != Some(previous.generation)) {
+            self.foreground_capture_segment_end();
+        }
+        if self.foreground_capture_live() {
+            let event = serde_json::json!({"event":"foreground_marker","draw":self.draws,"generation":mark.map(|m| m.generation),
+                "family":mark.map(|m| m.family),"camera_sequence":mark.map(|m| m.view.camera_sequence),"eye":mark.map(|m| m.view.eye_index)});
+            self.foreground_capture_event(event);
+        }
+    }
+
+    fn foreground_capture_live(&self) -> bool {
+        self.foreground_capture.as_ref().is_some_and(|capture| capture.state != ForegroundCaptureState::Done)
+    }
+
+    fn foreground_capture_event(&mut self, event: serde_json::Value) {
+        let Some(capture) = self.foreground_capture.as_mut().filter(|capture| capture.state != ForegroundCaptureState::Done) else { return; };
+        if capture.events.len() < fg::logic::MAX_CAPTURE_EVENTS { capture.events.push(event); } else { capture.events_omitted += 1; }
+    }
+
+    /// Before the draw is encoded. True only when an attributed first-person
+    /// depth write is accounted for here and bypasses the generic rule.
+    fn foreground_pre_draw(&mut self, vs: &Program, ps: Option<&Program>) -> bool {
+        if self.foreground.is_none() && self.fp_sessions.is_empty() && !self.foreground_capture_live() { return false; }
+        let ds = self.s.ds.clone();
+        let may_write = ds.tex != 0 && ds.flags & 1 == 0 && self.state(self.s.dss.0).is_some_and(|state|
+            state.words.first().copied().unwrap_or(0) != 0 && state.words.get(1) == Some(&1));
+        let mark = self.foreground;
+        if self.foreground_capture_live() && (may_write || mark.is_some()) { self.foreground_capture_draw(vs, ps, mark, may_write); }
+        let Some(mark) = mark else {
+            if may_write { self.foreground_foreign_write(ds.tex, "unattributed_depth_draw"); }
+            return false;
+        };
+        // Attribution alone (capture) keeps every existing rule unchanged.
+        if !fg::merge_requested() { return false; }
+        fg::gpu_status().foreground_draws += 1;
+        if !may_write { return false; }
+        fg::gpu_status().foreground_depth_draws += 1;
+        if let Err(reason) = self.foreground_draw_qualifies(&mark, ps) { return self.foreground_generic(ds.tex, reason); }
+        // A clear issued before this draw belongs to the image before it.
+        self.materialize_clears(ds.tex);
+        let identity = match (self.fp_images.get(&ds.tex), self.tex(ds.tex)) {
+            (Some(images), Some(texture)) if images.target != texture.tex => 2,
+            _ => 1,
+        };
+        let relation = self.foreground_relation(ds.tex, &mark.view);
+        match self.fp_sessions.foreground_depth_draw(ds.tex, identity, relation, mark.generation, mark.family) {
+            fg::logic::Decision::Combined => { fg::gpu_status().combined_live_writes += 1; true }
+            fg::logic::Decision::ContinueOverlay => { fg::gpu_status().overlay_writes += 1; true }
+            fg::logic::Decision::OpenOverlay => {
+                if !self.foreground_snapshot(ds.tex, true) { return self.foreground_generic(ds.tex, "pre_foreground_snapshot_failed"); }
+                self.fp_sessions.opened(ds.tex);
+                let mut status = fg::gpu_status();
+                status.overlays_opened += 1;
+                status.overlay_writes += 1;
+                true
+            }
+            fg::logic::Decision::Generic(reason) => { fg::note_generic(reason); false }
+        }
+    }
+
+    fn foreground_generic(&mut self, target: u32, reason: &'static str) -> bool {
+        self.fp_sessions.reject(target, reason);
+        fg::note_generic(reason);
+        false
+    }
+
+    /// Opaque, unbiased, projection-exact actual depth on a full single-sample
+    /// target, in the attributed view's own depth convention.
+    fn foreground_draw_qualifies(&self, mark: &fg::ForegroundMark, ps: Option<&Program>) -> Result<(), &'static str> {
+        if !mark.view.headset_applied || !crate::xr_view::view_epoch_is_active(mark.view.provenance_epoch) { return Err("foreground_view_epoch_inactive"); }
+        let ds = &self.s.ds;
+        if ds.mip != 0 || ds.slice != 0 { return Err("foreground_depth_subresource"); }
+        let Some(texture) = self.tex(ds.tex) else { return Err("foreground_depth_target_missing"); };
+        if !is_depth(texture.format) || texture.desc.samples != 1 || texture.desc.d != 1 { return Err("foreground_depth_target_layout"); }
+        let expected = [0., 0., texture.desc.w as f32, texture.desc.h as f32, 0., 1.];
+        let viewport = self.s.viewports.first().copied().unwrap_or(expected);
+        if !viewport.iter().zip(expected).all(|(&actual, expected)| actual.is_finite() && (actual - expected).abs() <= 0.00002) {
+            return Err("foreground_viewport_or_depth_range_not_full");
+        }
+        if ps.is_some_and(|program| program.info.writes_fragment_depth) { return Err("foreground_fragment_depth"); }
+        let compare = self.state(self.s.dss.0).and_then(|state| state.words.get(2).copied()).unwrap_or(0);
+        let nearer = if mark.view.depth_reverse_z { matches!(compare, 5 | 7 | 8) } else { matches!(compare, 2 | 4 | 8) };
+        if !nearer { return Err("foreground_depth_compare_convention"); }
+        let exact = self.state(self.s.rs).is_none_or(|state|
+            state.words.get(3).copied().unwrap_or(0) == 0
+            && wf(state.words.get(4).copied().unwrap_or(0)) == 0.
+            && wf(state.words.get(5).copied().unwrap_or(0)) == 0.
+            && (state.words.get(6).copied() != Some(0) || !self.device.features().contains(Features::DEPTH_CLIP_CONTROL)));
+        if !exact { return Err("foreground_depth_bias_or_clamp"); }
+        let blend = self.state(self.s.blend.0);
+        if self.s.rt.iter().enumerate().any(|(slot, rt)| rt.tex != 0
+            && ps.is_some_and(|program| program.info.outputs.contains(&(slot as u32)))
+            && blend_for(blend.as_deref(), slot).0.is_some()) { return Err("foreground_blended_depth_writer"); }
+        Ok(())
+    }
+
+    fn foreground_relation(&self, target: u32, view: &crate::xr_view::WorldView) -> fg::logic::Relation {
+        use fg::logic::Relation;
+        if let Some((live, draws)) = self.world_depths.get(&target) {
+            return if *draws > 0 && fg::same_raster(live, view) { Relation::LiveSame } else { Relation::LiveDifferent };
+        }
+        if let Some((frozen, _, draws)) = self.world_depth_before_ui.get(&target) {
+            return if *draws > 0 && fg::same_raster(frozen, view) { Relation::FrozenSame } else { Relation::FrozenDifferent };
+        }
+        Relation::Absent
+    }
+
+    fn foreground_pooled(&mut self, width: u32, height: u32) -> Texture {
+        if let Some(index) = self.fp_pool.iter().position(|texture| texture.width() == width && texture.height() == height) {
+            return self.fp_pool.swap_remove(index);
+        }
+        self.device.create_texture(&TextureDescriptor { label: Some("Actual depth bracketing attributed first-person writes"),
+            size: Extent3d { width, height, depth_or_array_layers: 1 }, mip_level_count: 1, sample_count: 1,
+            dimension: TextureDimension::D2, format: TextureFormat::R32Float,
+            usage: TextureUsages::COPY_DST | TextureUsages::COPY_SRC | TextureUsages::TEXTURE_BINDING, view_formats: &[] })
+    }
+
+    /// Queue order makes reuse safe: later copies into a pooled image are
+    /// encoded after the merge pass that reads it.
+    fn foreground_recycle(&mut self, images: HashMap<u32, ForegroundImages>) {
+        for images in images.into_values() {
+            for texture in std::iter::once(images.before).chain(images.after) {
+                if self.fp_pool.len() < 4 { self.fp_pool.push(texture); }
+            }
+        }
+    }
+
+    /// Exact copy of the target's actual depth at this point of the stream.
+    /// `before` opens the overlay images; otherwise records its post image.
+    fn foreground_snapshot(&mut self, target: u32, before: bool) -> bool {
+        self.end_pass();
+        let Some(current) = self.tex(target).map(|texture| texture.tex.clone()) else { return false; };
+        if !before && !self.fp_images.get(&target).is_some_and(|images| images.target == current && images.after.is_none()) { return false; }
+        let Some((proxy, _)) = self.depth_proxy(target, false) else { return false; };
+        let (width, height) = (proxy.width(), proxy.height());
+        let copy = self.foreground_pooled(width, height);
+        self.end_pass();
+        self.encoder().copy_texture_to_texture(
+            TexelCopyTextureInfo { texture: &proxy, mip_level: 0, origin: Origin3d::ZERO, aspect: TextureAspect::All },
+            TexelCopyTextureInfo { texture: &copy, mip_level: 0, origin: Origin3d::ZERO, aspect: TextureAspect::All },
+            Extent3d { width, height, depth_or_array_layers: 1 });
+        if before { self.fp_images.insert(target, ForegroundImages { target: current, before: copy, after: None }); }
+        else if let Some(images) = self.fp_images.get_mut(&target) { images.after = Some(copy); }
+        true
+    }
+
+    /// Any non-attributed writer of an open overlay target: record the actual
+    /// post-foreground depth before that write is encoded.
+    fn foreground_foreign_write(&mut self, target: u32, reason: &'static str) {
+        if self.fp_sessions.is_empty() || !self.fp_sessions.foreign_write(target) { return; }
+        if !self.foreground_snapshot(target, false) { self.fp_sessions.reject(target, "post_foreground_snapshot_failed"); }
+        self.foreground_capture_event(serde_json::json!({"event":"overlay_closed","target":target,"reason":reason,"draw":self.draws}));
+    }
+
+    fn foreground_merge_pipeline(&mut self) -> (RenderPipeline, BindGroupLayout) {
+        if let Some(pipeline) = &self.fp_merge { return pipeline.clone(); }
+        let entry = |binding| BindGroupLayoutEntry { binding, visibility: ShaderStages::FRAGMENT, count: None,
+            ty: BindingType::Texture { sample_type: TextureSampleType::Float { filterable: false }, view_dimension: TextureViewDimension::D2, multisampled: false } };
+        let layout = self.device.create_bind_group_layout(&BindGroupLayoutDescriptor { label: Some("first-person depth merge"), entries: &[entry(0), entry(1), entry(2)] });
+        let pipeline_layout = self.device.create_pipeline_layout(&PipelineLayoutDescriptor { label: Some("first-person depth merge"), bind_group_layouts: &[Some(&layout)], immediate_size: 0 });
+        let module = self.device.create_shader_module(ShaderModuleDescriptor { label: Some("first-person depth merge"), source: ShaderSource::Wgsl(fg::logic::MERGE_WGSL.into()) });
+        let targets = [Some(ColorTargetState { format: TextureFormat::R32Float, blend: None, write_mask: ColorWrites::ALL })];
+        let pipeline = self.device.create_render_pipeline(&RenderPipelineDescriptor {
+            label: Some("first-person depth merge"), layout: Some(&pipeline_layout),
+            vertex: VertexState { module: &module, entry_point: Some("vs"), compilation_options: Default::default(), buffers: &[] },
+            primitive: PrimitiveState::default(), depth_stencil: None, multisample: MultisampleState::default(),
+            fragment: Some(FragmentState { module: &module, entry_point: Some("fs"), compilation_options: Default::default(), targets: &targets }),
+            multiview_mask: None, cache: None });
+        self.fp_merge = Some((pipeline.clone(), layout.clone()));
+        (pipeline, layout)
+    }
+
+    /// New R32Float = frozen world except where the attributed foreground
+    /// actually wrote (exact before/after bit difference), which takes its
+    /// actual depth. Same extent and convention as the frozen world.
+    fn merge_foreground_depth(&mut self, sessions: &fg::logic::Sessions, images: &mut HashMap<u32, ForegroundImages>,
+        target: u32, world: &Texture) -> Result<(Texture, fg::logic::Overlay), &'static str> {
+        let overlay = sessions.publishable(target)?;
+        let entry = images.get_mut(&target).ok_or("missing_pre_foreground_snapshot")?;
+        if entry.after.is_none() {
+            // Still open at presentation: the live target holds the last write.
+            if !self.tex(target).is_some_and(|texture| texture.tex == entry.target) { return Err("depth_target_replaced_before_present"); }
+            self.end_pass();
+            let Some((proxy, _)) = self.depth_proxy(target, false) else { return Err("post_foreground_snapshot_failed"); };
+            let copy = self.foreground_pooled(proxy.width(), proxy.height());
+            self.end_pass();
+            self.encoder().copy_texture_to_texture(
+                TexelCopyTextureInfo { texture: &proxy, mip_level: 0, origin: Origin3d::ZERO, aspect: TextureAspect::All },
+                TexelCopyTextureInfo { texture: &copy, mip_level: 0, origin: Origin3d::ZERO, aspect: TextureAspect::All },
+                Extent3d { width: proxy.width(), height: proxy.height(), depth_or_array_layers: 1 });
+            entry.after = Some(copy);
+        }
+        let Some(after) = entry.after.as_ref() else { return Err("post_foreground_snapshot_failed"); };
+        let before = &entry.before;
+        if world.format() != TextureFormat::R32Float
+            || [before, after].iter().any(|texture| texture.width() != world.width() || texture.height() != world.height()) {
+            return Err("foreground_world_extent_or_format_differs");
+        }
+        let (pipeline, layout) = self.foreground_merge_pipeline();
+        let output = self.device.create_texture(&TextureDescriptor { label: Some("Frozen world with actual first-person depth writes"),
+            size: Extent3d { width: world.width(), height: world.height(), depth_or_array_layers: 1 }, mip_level_count: 1, sample_count: 1,
+            dimension: TextureDimension::D2, format: TextureFormat::R32Float,
+            usage: TextureUsages::COPY_SRC | TextureUsages::COPY_DST | TextureUsages::TEXTURE_BINDING | TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[] });
+        let views = [world, before, after].map(|texture| texture.create_view(&TextureViewDescriptor::default()));
+        let bind_group = self.device.create_bind_group(&BindGroupDescriptor { label: Some("first-person depth merge"), layout: &layout,
+            entries: &[BindGroupEntry { binding: 0, resource: BindingResource::TextureView(&views[0]) },
+                BindGroupEntry { binding: 1, resource: BindingResource::TextureView(&views[1]) },
+                BindGroupEntry { binding: 2, resource: BindingResource::TextureView(&views[2]) }] });
+        let output_view = output.create_view(&TextureViewDescriptor::default());
+        self.end_pass();
+        {
+            let mut pass = self.encoder().begin_render_pass(&RenderPassDescriptor { label: Some("Merge actual first-person depth over frozen world"),
+                color_attachments: &[Some(RenderPassColorAttachment { view: &output_view, depth_slice: None, resolve_target: None,
+                    ops: Operations { load: LoadOp::Clear(Color::BLACK), store: StoreOp::Store } })],
+                depth_stencil_attachment: None, timestamp_writes: None, occlusion_query_set: None, multiview_mask: None });
+            pass.set_pipeline(&pipeline);
+            pass.set_bind_group(0, &bind_group, &[]);
+            pass.draw(0..3, 0..1);
+        }
+        Ok((output, overlay))
+    }
+
+    /// Registered raw copy of one subresource into a bounded MAP_READ buffer.
+    fn foreground_capture_copy(&mut self, name: &'static str, texture: &Texture, mip: u32, layer: u32, source: serde_json::Value) -> Option<usize> {
+        let bytes_per_texel = texel_bytes(texture.format());
+        let (width, height) = ((texture.width() >> mip).max(1), (texture.height() >> mip).max(1));
+        let eligible = bytes_per_texel != 0 && texture.sample_count() == 1 && texture.dimension() == TextureDimension::D2
+            && texture.usage().contains(TextureUsages::COPY_SRC) && mip < texture.mip_level_count() && layer < texture.depth_or_array_layers();
+        let padded = fg::logic::padded_row_bytes(width, bytes_per_texel).filter(|_| eligible);
+        let size = padded.map(|padded| padded as u64 * height as u64);
+        let capture = self.foreground_capture.as_mut()?;
+        if !size.is_some_and(|size| capture.budget.admit(size)) {
+            capture.images_omitted.push(serde_json::json!({"name":name,"format":format!("{:?}",texture.format()),
+                "width":width,"height":height,"eligible":eligible,"source":source}));
+            return None;
+        }
+        let (padded, size) = (padded?, size?);
+        let buffer = self.device.create_buffer(&BufferDescriptor { label: Some("First-person foreground capture"), size,
+            usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ, mapped_at_creation: false });
+        self.end_pass();
+        self.encoder().copy_texture_to_buffer(
+            TexelCopyTextureInfo { texture, mip_level: mip, origin: Origin3d { x: 0, y: 0, z: layer }, aspect: TextureAspect::All },
+            TexelCopyBufferInfo { buffer: &buffer, layout: TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(padded), rows_per_image: Some(height) } },
+            Extent3d { width, height, depth_or_array_layers: 1 });
+        let capture = self.foreground_capture.as_mut()?;
+        capture.images.push(fg::CaptureImage { name, buffer, width, height, row_bytes: width * bytes_per_texel, padded_row_bytes: padded,
+            format: format!("{:?}", texture.format()), source });
+        Some(capture.images.len() - 1)
+    }
+
+    /// Overwrite an already registered image in stream order (last wins).
+    fn foreground_capture_recopy(&mut self, index: usize, texture: &Texture, mip: u32, layer: u32) -> bool {
+        let Some(image) = self.foreground_capture.as_ref().and_then(|capture| capture.images.get(index)) else { return false; };
+        let (width, height) = ((texture.width() >> mip).max(1), (texture.height() >> mip).max(1));
+        if image.width != width || image.height != height || image.format != format!("{:?}", texture.format()) { return false; }
+        let (buffer, padded) = (image.buffer.clone(), image.padded_row_bytes);
+        self.end_pass();
+        self.encoder().copy_texture_to_buffer(
+            TexelCopyTextureInfo { texture, mip_level: mip, origin: Origin3d { x: 0, y: 0, z: layer }, aspect: TextureAspect::All },
+            TexelCopyBufferInfo { buffer: &buffer, layout: TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(padded), rows_per_image: Some(height) } },
+            Extent3d { width, height, depth_or_array_layers: 1 });
+        true
+    }
+
+    fn foreground_native(texture: Option<&Texture>) -> Option<String> {
+        texture.and_then(crate::world_frame::native_texture_handle).map(|handle| format!("{handle:#x}"))
+    }
+
+    /// Logs every depth-writing or attributed draw while armed; the first
+    /// attributed draw triggers the before-images of its actual targets.
+    fn foreground_capture_draw(&mut self, vs: &Program, ps: Option<&Program>, mark: Option<fg::ForegroundMark>, may_write: bool) {
+        let ds = self.s.ds.clone();
+        let rt0 = self.s.rt[0].clone();
+        let event = serde_json::json!({"event":"draw","draw":self.draws,"depth":ds.tex,"depth_subresource":[ds.mip,ds.slice,ds.flags],
+            "color0":[rt0.tex,rt0.mip,rt0.slice],"writes_depth":may_write,
+            "depth_state":self.state(self.s.dss.0).map(|state| state.words.iter().take(3).copied().collect::<Vec<_>>()),
+            "vertex":vs.label.chars().take(96).collect::<String>(),"pixel":ps.map(|program| program.label.chars().take(96).collect::<String>()),
+            "viewport":self.s.viewports.first().copied(),
+            "world":self.world_view.map(|view| serde_json::json!([view.camera_sequence,view.eye_index,view.depth_reverse_z])),
+            "foreground":mark.map(|mark| serde_json::json!([mark.generation,mark.family,mark.view.camera_sequence,mark.view.eye_index])),
+            "live_world_depth":self.world_depths.get(&ds.tex).map(|(view,draws)| serde_json::json!([view.camera_sequence,draws])),
+            "frozen_world_depth":self.world_depth_before_ui.get(&ds.tex).map(|(view,_,draws)| serde_json::json!([view.camera_sequence,draws]))});
+        self.foreground_capture_event(event);
+        let Some(mark) = mark else { return; };
+        if self.foreground_capture.as_ref().is_none_or(|capture| capture.state != ForegroundCaptureState::Armed) { return; }
+        if let Some(capture) = self.foreground_capture.as_mut() { capture.state = ForegroundCaptureState::Triggered; }
+        fg::capture_state("triggered");
+        let depth = self.tex(ds.tex).filter(|texture| is_depth(texture.format) && texture.desc.samples == 1).map(|texture| texture.tex.clone());
+        if depth.is_some() {
+            self.end_pass();
+            if let Some((proxy, _)) = self.depth_proxy(ds.tex, false) {
+                let index = self.foreground_capture_copy("depth_before_first_foreground", &proxy, 0, 0,
+                    serde_json::json!({"target":ds.tex,"native":Self::foreground_native(depth.as_ref()),"conversion":"exact R32Float depth proxy"}));
+                if index.is_none() { self.foreground_capture_event(serde_json::json!({"event":"capture_image_omitted","name":"depth_before_first_foreground"})); }
+            }
+        }
+        let color = self.tex(rt0.tex).map(|texture| texture.tex.clone());
+        if let Some(texture) = &color {
+            self.foreground_capture_copy("color0_before_first_foreground", texture, rt0.mip, rt0.slice,
+                serde_json::json!({"target":rt0.tex,"mip":rt0.mip,"slice":rt0.slice,"native":Self::foreground_native(Some(texture))}));
+        }
+        let frozen = self.world_depth_before_ui.get(&ds.tex).map(|(view, frozen, draws)| (*view, frozen.texture().clone(), *draws));
+        if let Some((view, texture, draws)) = &frozen {
+            self.foreground_capture_copy("frozen_world_depth_at_trigger", texture, 0, 0, serde_json::json!({"target":ds.tex,
+                "camera_sequence":view.camera_sequence,"world_draws":draws,"native":Self::foreground_native(Some(texture))}));
+        }
+        let trigger = serde_json::json!({"present":self.presents + 1,"draw":self.draws,"depth_target":ds.tex,
+            "depth_texture":self.color_phase_target(ds.tex),"color0_texture":self.color_phase_target(rt0.tex),
+            "native":{"depth":Self::foreground_native(depth.as_ref()),"color0":Self::foreground_native(color.as_ref()),
+                "frozen_world":Self::foreground_native(frozen.as_ref().map(|(_, texture, _)| texture))},
+            "mark":{"generation":mark.generation,"family":mark.family,"view":crate::world_ui::marker(&mark.view)},
+            "merge_requested":fg::merge_requested()});
+        if let Some(capture) = self.foreground_capture.as_mut() {
+            capture.trigger = Some(trigger);
+            capture.depth_target = depth.map(|texture| (ds.tex, texture));
+            capture.color_target = color.map(|texture| (rt0.tex, rt0.mip, rt0.slice, texture));
+        }
+    }
+
+    /// End of an attributed segment: the actual targets after it (last wins).
+    fn foreground_capture_segment_end(&mut self) {
+        let Some(capture) = self.foreground_capture.as_mut().filter(|capture| capture.state == ForegroundCaptureState::Triggered) else { return; };
+        capture.segments += 1;
+        let (depth, color, (depth_slot, color_slot)) = (capture.depth_target.clone(), capture.color_target.clone(), capture.post);
+        let mut post = (depth_slot, color_slot);
+        if let Some((id, texture)) = depth {
+            if self.tex(id).is_some_and(|current| current.tex == texture) {
+                self.end_pass();
+                if let Some((proxy, _)) = self.depth_proxy(id, false) {
+                    post.0 = match depth_slot {
+                        Some(index) => self.foreground_capture_recopy(index, &proxy, 0, 0).then_some(index),
+                        None => self.foreground_capture_copy("depth_after_last_foreground", &proxy, 0, 0,
+                            serde_json::json!({"target":id,"native":Self::foreground_native(Some(&texture)),"conversion":"exact R32Float depth proxy"})),
+                    };
+                }
+            } else { self.foreground_capture_event(serde_json::json!({"event":"capture_depth_target_replaced","target":id,"draw":self.draws})); }
+        }
+        if let Some((id, mip, slice, texture)) = color {
+            if self.tex(id).is_some_and(|current| current.tex == texture) {
+                self.materialize_clears(id);
+                post.1 = match color_slot {
+                    Some(index) => self.foreground_capture_recopy(index, &texture, mip, slice).then_some(index),
+                    None => self.foreground_capture_copy("color0_after_last_foreground", &texture, mip, slice,
+                        serde_json::json!({"target":id,"mip":mip,"slice":slice,"native":Self::foreground_native(Some(&texture))})),
+                };
+            } else { self.foreground_capture_event(serde_json::json!({"event":"capture_color_target_replaced","target":id,"draw":self.draws})); }
+        }
+        if let Some(capture) = self.foreground_capture.as_mut() { capture.post = post; }
+        self.foreground_capture_event(serde_json::json!({"event":"foreground_segment_end","draw":self.draws}));
+    }
+
+    /// Present of the triggered capture: final colour and published depth, then
+    /// one submission and create-new background persistence. Untriggered
+    /// presents only reset the bounded log.
+    fn foreground_capture_present(&mut self, color_id: u32) {
+        let Some(state) = self.foreground_capture.as_ref().map(|capture| capture.state) else { return; };
+        match state {
+            ForegroundCaptureState::Done => return,
+            ForegroundCaptureState::Armed => {
+                if let Some(capture) = self.foreground_capture.as_mut() { capture.events.clear(); capture.events_omitted = 0; }
+                return;
+            }
+            ForegroundCaptureState::Triggered => {}
+        }
+        self.materialize_clears(color_id);
+        if let Some(texture) = self.tex(color_id).map(|texture| texture.tex.clone()) {
+            self.foreground_capture_copy("present_final_color", &texture, 0, 0,
+                serde_json::json!({"target":color_id,"native":Self::foreground_native(Some(&texture))}));
+        }
+        if let Some(depth) = self.foreground_capture.as_mut().and_then(|capture| capture.published_depth.take()) {
+            self.foreground_capture_copy("published_depth", &depth, 0, 0, serde_json::json!({"native":Self::foreground_native(Some(&depth))}));
+        }
+        self.flush();
+        let submission = self.last_submit.clone();
+        let presents = self.presents + 1;
+        let Some(capture) = self.foreground_capture.as_mut() else { return; };
+        capture.state = ForegroundCaptureState::Done;
+        fg::note_capture_events(capture.events.len());
+        let manifest = serde_json::json!({"schema":"muguet.first-person-foreground-depth-capture.v1","present":presents,
+            "trigger":capture.trigger.take(),"published":capture.published.take(),"segments":capture.segments,
+            "events":std::mem::take(&mut capture.events),"events_omitted":capture.events_omitted,
+            "images_omitted":std::mem::take(&mut capture.images_omitted),
+            "merge_requested":fg::merge_requested(),
+            "interpretation":"Raw images are GPU copies in command-stream order. depth_before_first_foreground and depth_after_last_foreground bracket every producer-attributed first-person draw of this present on the trigger depth target; events list every depth-writing draw, attribution marker, freeze and depth-target mutation observed in it, in order.",
+            "replay_complete":false,"command_snapshot_complete":false,"physical_visibility_certified":false});
+        let images = std::mem::take(&mut capture.images);
+        fg::persist_capture(self.device.clone(), submission, images, manifest);
     }
 }
 

@@ -145,7 +145,11 @@ pub(super) fn host_hook(caller:&mut wasmtime::Caller<'_,crate::HostState>,params
         else if !crate::xr_view::world_camera_enabled(){"immersive_world_camera_inactive"}
         else if *tls==0||active_stack(caller)!=Some(*stack as u64){"frame_or_tls_identity"}
         else{match qualify_and_correct(&Guest(mem),family,*draw as u64,*stack as u64,*parent as u64,*qualified!=0,crate::xr_view::installed_headset_eye){
-            Ok(applied)=>{APPLIED[family.slot()].fetch_add(1,Ordering::Relaxed);*LAST_APPLIED.lock().unwrap_or_else(|p|p.into_inner())=Some((Instant::now(),applied));"applied"}
+            Ok(applied)=>{APPLIED[family.slot()].fetch_add(1,Ordering::Relaxed);*LAST_APPLIED.lock().unwrap_or_else(|p|p.into_inner())=Some((Instant::now(),applied));
+                // Only a corrected completed model may attribute this invocation's
+                // emissions to its displaced parent eye (default off; host reads only).
+                let _=crate::xr_view::foreground_depth::bind_after_correction(caller.data(),mem,family.index() as u32,*stack as u64,*parent as u64,&applied.view);
+                "applied"}
             Err(gate)=>gate}};
     LAST_GATE.lock().unwrap_or_else(|p|p.into_inner())[family.slot()]=Some((Instant::now(),gate));Ok(())
 }
@@ -157,7 +161,8 @@ pub(super) fn status()->serde_json::Value{
         "last_applied":last.map(|(at,a)|serde_json::json!({"age_ms":at.elapsed().as_millis(),"family":a.family.index(),"view_epoch":a.view.provenance_epoch,
             "camera_sequence":a.view.camera_sequence,"eye_index":a.view.eye_index,"head_translation_m":a.head_translation_m,"head_rotation_degrees":a.head_rotation_deg,
             "model_translation_shift_m":a.model_shift_m,"camera_relative_vs_draw_world":a.draw_world.map(|(t,r)|serde_json::json!({"translation_m":t,"rotation_degrees":r}))})),
-        "authority":"completed stack model matrix only; no displayed-pixel, depth, coverage or barrel-alignment certificate"})
+        "authority":"completed stack model matrix only; no displayed-pixel, depth, coverage or barrel-alignment certificate",
+        "foreground_depth":crate::xr_view::foreground_depth::status_json()})
 }
 
 #[cfg(test)]mod tests{
