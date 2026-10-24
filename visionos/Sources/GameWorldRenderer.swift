@@ -20,6 +20,7 @@ struct GameWorldConfiguration: CompositorLayerConfiguration {
             configuration.depthFormat = .depth32Float
         }
         configuration.isFoveationEnabled = false
+        if GameWorldDisplayQuality.requested { configuration.maxRenderQuality = .init(rawValue: 1) }
         let interactionFormats = capabilities.supportedTrackingAreasFormats
         if interactionFormats.contains(.r16Uint) { configuration.trackingAreasFormat = .r16Uint }
         else if interactionFormats.contains(.r8Uint) { configuration.trackingAreasFormat = .r8Uint }
@@ -73,6 +74,8 @@ struct GameWorldLifecycleEvent: Sendable {
     var motionTrackingJSON: String? = nil
     var sourceGuardBandScale: Float? = nil
     var sourceCoverageSaturated: Bool? = nil
+    var displayRenderQuality: Float? = nil
+    var maximumDisplayRenderQuality: Float? = nil
 
     var reportValue: [String: Any] {
         var value: [String: Any] = ["stage": stage, "uptime_seconds": uptime,
@@ -85,6 +88,8 @@ struct GameWorldLifecycleEvent: Sendable {
         if let requestBytesHex { value["request_bytes_hex"] = requestBytesHex }
         value["source_guard_band_scale"] = sourceGuardBandScale ?? GameWorldSourceGuardBand.configuredScale
         if let sourceCoverageSaturated { value["source_coverage_saturated"] = sourceCoverageSaturated }
+        if let displayRenderQuality { value["display_render_quality"] = displayRenderQuality }
+        if let maximumDisplayRenderQuality { value["maximum_display_render_quality"] = maximumDisplayRenderQuality }
         if let motionTrackingJSON, let data = motionTrackingJSON.data(using: .utf8),
            let motion = try? JSONSerialization.jsonObject(with: data) {
             value["motion_tracking"] = motion
@@ -495,6 +500,7 @@ final class GameWorldRenderer: @unchecked Sendable {
     init(layer: LayerRenderer, utilityAtlas: (any MTLTexture)? = nil,
          report: @escaping @Sendable (GameWorldEvent) -> Void) throws {
         self.layer = layer
+        if GameWorldDisplayQuality.requested { layer.renderQuality = .init(rawValue: 1) }
         self.report = report
         guard let queue = layer.device.makeCommandQueue(), let library = layer.device.makeDefaultLibrary(),
               let vertex = library.makeFunction(name: "gameWorldVertex"),
@@ -709,7 +715,8 @@ final class GameWorldRenderer: @unchecked Sendable {
             ownsWorldCamera: WorldCameraOwnership.shared.isOwner(sessionToken),
             detail: detail, viewCount: viewCount, trackedPose: trackedPose,
             requestBytesHex: requestBytesHex, motionTrackingJSON: motionJSON,
-            sourceGuardBandScale: sourceGuardBandScale, sourceCoverageSaturated: sourceCoverageSaturated)))
+            sourceGuardBandScale: sourceGuardBandScale, sourceCoverageSaturated: sourceCoverageSaturated,
+            displayRenderQuality: layer.renderQuality.rawValue, maximumDisplayRenderQuality: layer.configuration.maxRenderQuality.rawValue)))
     }
 
     private func renderLoop() {

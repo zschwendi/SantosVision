@@ -1,4 +1,18 @@
 import Foundation
+
+/// Display resolution is independent of GTA's source resolution. Preserve the
+/// system allocation until the player explicitly asks for the higher setting.
+enum GameWorldDisplayQuality {
+    static let storedKey = "SantosVisionHigherImmersiveResolution"
+    static var stored: Bool { UserDefaults.standard.bool(forKey: storedKey) }
+    static var requested: Bool {
+        switch ProcessInfo.processInfo.environment["MUGUET_COMPOSITOR_HIGH_RESOLUTION"] {
+        case "1": return true
+        case "0": return false
+        default: return stored
+        }
+    }
+}
 import simd
 
 /// Mirrors `GameWorldDepthEdgeFillUniforms` in GameWorld.metal (240 bytes).

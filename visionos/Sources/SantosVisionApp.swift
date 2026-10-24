@@ -78,6 +78,9 @@ struct SantosVisionApp: App {
             GameImmersiveScene(runtime: runtime, world: world, gameScenes: gameScenes)
             .onDisappear {
                 if world.isImmersiveActive || world.isOpening { world.stopRenderer(reason: "immersive_scene_disappeared") }
+                // Also releases diagnostic-launcher ownership if no layer
+                // renderer ever started. endWorldTracking is idempotent.
+                runtime.endWorldTracking()
                 world.isImmersiveActive = false
                 // Queue restoration at App scope; never create a new scene
                 // from the disappearing compositor's environment actions.
@@ -116,7 +119,7 @@ struct SantosVisionApp: App {
     /// and compositor may disappear while an openWindow request is in flight.
     private func restoreGameWindowIfRequested() {
         guard windowReturnTask == nil,
-              let ticket = gameScenes.begin(active: scenePhase == .active, quitting: runtime.isQuitting) else { return }
+              let ticket = gameScenes.begin(active: runtime.appActiveForSceneTransitions, quitting: runtime.isQuitting) else { return }
         world.recordSceneTransition("main_window_requested", serial: ticket.serial)
         openWindow(id: "main")
         windowReturnTask = Task { @MainActor in
@@ -125,12 +128,16 @@ struct SantosVisionApp: App {
                 let gameWindowConnected = runtime.windowReadyForReturn
                     && windowSurface.view.window?.windowScene?.activationState == .foregroundActive
                 switch gameScenes.poll(ticket, windowReady: gameWindowConnected,
-                                       active: scenePhase == .active, quitting: runtime.isQuitting) {
+                                       active: runtime.appActiveForSceneTransitions, quitting: runtime.isQuitting) {
                 case .waiting:
                     do { try await Task.sleep(for: .milliseconds(50)) } catch { return }
                 case .closeSpace:
                     // A late request must never stop a new immersive renderer.
-                    if world.isImmersiveActive, world.sceneGeneration != ticket.rendererGeneration {
+                    // openImmersiveSpace returns before the layer starts its
+                    // renderer, so a GTA-menu return can predate that
+                    // generation; GTA's still-open menu keeps it valid.
+                    if world.isImmersiveActive, world.sceneGeneration != ticket.rendererGeneration,
+                       !runtime.gtaPauseMenuOpen {
                         gameScenes.finish(ticket)
                         world.recordSceneTransition("stale_window_return_ignored", serial: ticket.serial)
                         return

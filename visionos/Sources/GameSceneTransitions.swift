@@ -31,7 +31,9 @@ struct GameWindowReturnPolicy {
     mutating func sceneDisappeared(generation: UUID) {
         // dismissImmersiveSpace can return BEFORE onDisappear. That late
         // callback belongs to the completed return, not a second openWindow.
-        guard !returnRequestedForThisSpace else { return }
+        // A timed-out return kept immersion open, so its later dismissal
+        // still needs the game window.
+        guard !returnRequestedForThisSpace || stage == .failed else { return }
         request(generation: generation, reason: "immersive_scene_disappeared")
     }
     mutating func begin(active: Bool, quitting: Bool, now: Double) -> Ticket? {
@@ -46,7 +48,11 @@ struct GameWindowReturnPolicy {
                        quitting: Bool, now: Double) -> Decision {
         guard ticket == expected, stage == .openingWindow else { return .stale }
         if quitting { cancel(); return .cancelled }
-        if active, windowReady { stage = .closingSpace; return .closeSpace }
+        // Removing the headset must not spend the attachment deadline. The
+        // return task reads the live runtime activity, not its captured App value.
+        if !active { deadline = nil; return .waiting }
+        if windowReady { stage = .closingSpace; return .closeSpace }
+        if deadline == nil, now.isFinite { deadline = now + 5 }
         if let deadline, now.isFinite, now >= deadline {
             stage = .failed
             return .timedOut

@@ -45,7 +45,7 @@ The scene-only test uses its own simulator and bundle; no other project's
 simulator or device app was changed. It proves scene sequencing, not actual
 game output, performance, headset tracking or startup reliability.
 
-The transition policy has 20 passing checks, including delayed disappearance,
+The initial transition policy had 20 passing checks, including delayed disappearance,
 background/quit gates, real attachment, timeout, duplicate requests and stale
 tickets. All app sources typecheck against the physical visionOS SDK. Existing
 native controls checks pass; the changed utility layout passes actual Metal
@@ -63,6 +63,19 @@ Intermittent black **cold startup remains unresolved** until a new failing
 startup has actual pixel/surface evidence. This repair addresses a reproduced
 scene failure and makes launch-scene selection explicit; it is not proof that
 every reported black image shares that cause.
+
+## Integrated review corrections
+
+The independent Opus menus review found four remaining return regressions:
+modal input retained after Window, Start between space-open and renderer-start,
+Crown exit after an attachment timeout, and a late first frame closing the
+window during restoration. Their corrections are integrated. Root also uses
+live runtime activity instead of the task's captured App phase, pauses the
+attachment deadline while inactive, makes tracking release idempotent, and
+clears `hasPresentedFrames` on renderer stop/end. A previous successful session
+therefore cannot hide main before the next renderer has produced a frame.
+The policy now has 27 checks. These changes still need the complete physical
+game test; they do not close the separate cold-start pixel investigation.
 
 ## Original startup intro
 

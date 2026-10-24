@@ -56,6 +56,35 @@ import Foundation
         policy.request(generation: new, reason: "late disappear during quit")
         require(policy.begin(active: true, quitting: true, now: 40) == nil && !policy.pending,
                 "Late teardown request never starts a scene operation")
+        var kept = GameWindowReturnPolicy()
+        kept.sceneAppeared()
+        kept.request(generation: new, reason: "gta_pause_menu_in_window")
+        let keptTicket = kept.begin(active: true, quitting: false, now: 50)!
+        require(kept.poll(keptTicket, windowReady: false, active: true, quitting: false, now: 55) == .timedOut,
+                "Attachment failure keeps immersion open")
+        kept.sceneDisappeared(generation: new)
+        require(kept.pending && kept.serial > keptTicket.serial,
+                "A later system dismissal of that kept immersion still restores the game window")
+        var completed = GameWindowReturnPolicy()
+        completed.sceneAppeared()
+        completed.request(generation: new, reason: "Start")
+        let done = completed.begin(active: true, quitting: false, now: 60)!
+        _ = completed.poll(done, windowReady: true, active: true, quitting: false, now: 60)
+        completed.finish(done)
+        completed.sceneDisappeared(generation: new)
+        require(!completed.pending && completed.serial == done.serial,
+                "The failure exception does not reopen after a completed return")
+        var suspended = GameWindowReturnPolicy()
+        suspended.request(generation: new, reason: "Window")
+        let suspendedTicket = suspended.begin(active: true, quitting: false, now: 70)!
+        require(suspended.poll(suspendedTicket, windowReady: false, active: false, quitting: false, now: 71) == .waiting,
+                "Taking off the headset pauses the window attachment deadline")
+        require(suspended.poll(suspendedTicket, windowReady: false, active: true, quitting: false, now: 700) == .waiting,
+                "Reactivation gives the actual window a fresh bounded attachment opportunity")
+        require(suspended.poll(suspendedTicket, windowReady: false, active: true, quitting: false, now: 704.99) == .waiting,
+                "Background time is never mistaken for failed window restoration")
+        require(suspended.poll(suspendedTicket, windowReady: true, active: true, quitting: false, now: 705) == .closeSpace,
+                "The live reactivated window can complete the return")
         print("Game scene transitions: \(checks) checks passed")
     }
 }

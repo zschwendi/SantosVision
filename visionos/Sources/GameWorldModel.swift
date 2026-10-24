@@ -156,6 +156,7 @@ final class GameWorldModel: ObservableObject {
                         if !active { self.clearSenseUtilityInteraction(preserveGestureCancellation: true) }
                         return
                     case .ended(let reason):
+                        self.hasPresentedFrames = false
                         self.senseUtilityVisibilityObservation = nil
                         self.senseUtilityPhoneObservation = nil
                         self.senseUtilityLayer?.onSpatialEvent = { _ in }
@@ -270,6 +271,9 @@ final class GameWorldModel: ObservableObject {
 
     func stopRenderer(reason: String = "requested") {
         recordState("renderer_stop_requested", detail: reason)
+        // A previous session's successful frame must never hide the window
+        // during the next space's open-before-layer-start interval.
+        hasPresentedFrames = false
         generation = UUID()
         frameWatchdog.stop()
         senseUtilityVisibilityObservation = nil

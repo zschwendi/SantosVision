@@ -56,6 +56,9 @@ struct ImmersiveGameControls: View {
             SantosPauseControls(runtime: runtime,
                 windowAction: {
                     gameScenes.requestReturn(generation: world.sceneGeneration, reason: "player_requested_window")
+                    // Window resumes play in the window; an app-only modal
+                    // panel must not keep the controller after the return.
+                    if !runtime.pauseControlsFollowGame { runtime.gameControlsVisible = false }
                 }, immersive: true)
             if !world.hasPresentedFrames {
                 Text(world.status).font(.caption).foregroundStyle(.secondary)

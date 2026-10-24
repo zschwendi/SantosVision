@@ -204,7 +204,8 @@ struct WindowGameView: View {
             }
         }
         .onChange(of: world.hasPresentedFrames) { _, presented in
-            if presented, world.isImmersiveActive { dismissWindow(id: "main") }
+            // A coordinated return is bringing this window back; never close it.
+            if presented, world.isImmersiveActive, !gameScenes.pending { dismissWindow(id: "main") }
         }
         #endif
     }
@@ -264,7 +265,7 @@ struct WindowGameView: View {
         switch await openImmersiveSpace(id: GameWorldModel.spaceID) {
         case .opened:
             world.isImmersiveActive = true
-            if world.hasPresentedFrames { dismissWindow(id: "main") }
+            if world.hasPresentedFrames, !gameScenes.pending { dismissWindow(id: "main") }
         case .userCancelled:
             world.stopRenderer()
             world.status = "Immersive view cancelled."
@@ -366,6 +367,21 @@ struct SantosSettingsView: View {
                         .font(.caption).foregroundStyle(.secondary)
                 }
                 .disabled(!runtime.canChangeGraphics)
+                Section("Immersive display") {
+                    Toggle("Higher display resolution", isOn: Binding(
+                        get: { runtime.higherImmersiveResolutionEnabled },
+                        set: { runtime.setHigherImmersiveResolution($0) }))
+                    Text("Uses visionOS's highest display resolution. Costs more GPU time; GTA's resolution above controls source detail. Applies the next time you enter immersive view.")
+                        .font(.caption).foregroundStyle(.secondary)
+                    DisclosureGroup("Experimental") {
+                        Toggle("Fill gaps beside near objects", isOn: Binding(
+                            get: { runtime.depthEdgeFillEnabled },
+                            set: { runtime.setDepthEdgeFill($0) }))
+                        Text("Estimates background in small gaps from the same game image. Starts off; applies on the next immersive entry.")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                }
+                .disabled(!runtime.canChangeImmersiveDisplay)
                 CloudSaveSettingsView(runtime: runtime, saves: runtime.cloudSaves)
                 Section("Sound") {
                     LabeledContent("Master volume", value: "\(Int((runtime.playSettings.masterVolume * 100).rounded()))%")
@@ -381,7 +397,7 @@ struct SantosSettingsView: View {
                         .disabled(!runtime.canChangePlaySettings)
                     Text("Adjusts the right stick's look speed. GTA's own mouse sensitivity also applies.")
                         .font(.caption).foregroundStyle(.secondary)
-                    Text("DualSense: click the touchpad to change camera. Sense: click both sticks together to change camera. Left stick always moves; its click is normal L3. Use the Phone button and its arrow pad for the phone. Look at a native button and press either Sense trigger to select it. Start opens GTA's own pause menu in the game window, with Los Santos settings and Quit beside it. In GTA Settings: stick moves, Cross selects, Circle goes back, L1/R1 change tabs, Square applies and Triangle is GTA's Tab. GTA keys: Enter ✕, Backspace ○, Space □, Tab △, Q/E L1/R1.")
+                    Text("DualSense: click the touchpad to change camera. Sense: click both sticks together to change camera; in first person, hold L2 and click R3 to toggle sights. Left stick always moves; its click is normal L3. Use the Phone button and its arrow pad for the phone. Look at a native button and press either Sense trigger to select it. Start opens GTA's own pause menu in the game window, with Los Santos settings and Quit beside it. In GTA Settings: stick moves, Cross selects, Circle goes back, L1/R1 change tabs, Square applies and Triangle is GTA's Tab. GTA keys: Enter ✕, Backspace ○, Space □, Tab △, Q/E L1/R1.")
                         .font(.caption).foregroundStyle(.secondary)
                 }
                 Section {

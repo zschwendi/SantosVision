@@ -168,6 +168,7 @@ final class NativeRuntimeModel: ObservableObject {
     @Published private(set) var frozenDepthHandoffEnabled = RenderingOptimizations.storedFrozenDepth
     @Published private(set) var drawSetupOverheadEnabled = RenderingOptimizations.storedDrawSetup
     @Published private(set) var depthEdgeFillEnabled = GameWorldDepthEdgeFillPolicy.stored
+    @Published private(set) var higherImmersiveResolutionEnabled = GameWorldDisplayQuality.stored
     @Published private(set) var windowSurfaceReady = false
     @Published private(set) var controllerSummary = "Controller not connected"
     @Published private(set) var menuPressCount: UInt64 = 0
@@ -457,9 +458,18 @@ final class NativeRuntimeModel: ObservableObject {
     }
 
     func setDepthEdgeFill(_ enabled: Bool) {
-        guard canChangeRenderingOptimizations else { return }
+        guard canChangeImmersiveDisplay else { return }
         depthEdgeFillEnabled = enabled
         UserDefaults.standard.set(enabled, forKey: GameWorldDepthEdgeFillPolicy.storedKey)
+        recordReport()
+    }
+
+    var canChangeImmersiveDisplay: Bool { !compositorOwnsHeadTracking && !isQuitting }
+
+    func setHigherImmersiveResolution(_ enabled: Bool) {
+        guard canChangeImmersiveDisplay else { return }
+        higherImmersiveResolutionEnabled = enabled
+        UserDefaults.standard.set(enabled, forKey: GameWorldDisplayQuality.storedKey)
         recordReport()
     }
 
@@ -494,6 +504,7 @@ final class NativeRuntimeModel: ObservableObject {
     /// setWindowAttached comes from the real retained GameMetalView and the
     /// scene phase comes from its containing window, not an openWindow request.
     var windowReadyForReturn: Bool { windowIsAttached && windowSceneIsActive }
+    var appActiveForSceneTransitions: Bool { appSceneIsActive }
     var immersiveWindowReturnNeedsDismissal: Bool { compositorOwnsHeadTracking || immersiveSceneIsActive }
 
     func setImmersiveSceneActive(_ active: Bool) {
@@ -869,6 +880,7 @@ final class NativeRuntimeModel: ObservableObject {
     }
 
     func endWorldTracking() {
+        guard compositorOwnsHeadTracking else { return }
         compositorOwnsHeadTracking = false
         worldPresentation = nil
         worldGpuTiming = nil
@@ -1154,8 +1166,10 @@ final class NativeRuntimeModel: ObservableObject {
                 "metal_skip_empty_transit": RenderingOptimizations.metalSkipEmptyTransitEnabled,
                 "metal_skip_empty_prepass": RenderingOptimizations.metalSkipEmptyPrepassEnabled
             ],
-            "rendering_quality_requested": ["depth_edge_fill": depthEdgeFillEnabled],
-            "rendering_quality_effective": ["depth_edge_fill": GameWorldDepthEdgeFillPolicy.requested(
+            "rendering_quality_requested": ["depth_edge_fill": depthEdgeFillEnabled,
+                                            "higher_display_resolution": higherImmersiveResolutionEnabled],
+            "rendering_quality_effective": ["higher_display_resolution": GameWorldDisplayQuality.requested,
+                "depth_edge_fill": GameWorldDepthEdgeFillPolicy.requested(
                 environment: ProcessInfo.processInfo.environment, arguments: ProcessInfo.processInfo.arguments,
                 stored: GameWorldDepthEdgeFillPolicy.stored)],
             "probe": payload(lastProbe), "start": payload(lastStart), "status": payload(lastStatus),

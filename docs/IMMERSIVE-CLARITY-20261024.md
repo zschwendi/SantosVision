@@ -82,3 +82,27 @@ It also records warmed Mac timings with and without the fill. It was compiled, n
 ## Remaining physical acceptance
 
 Run the Metal parity step, then build. With the toggle on, compare third-person and first-person immersive scenes while translating the head. Black silhouettes and specks should become background-coloured, with no smears, flicker or regression of covered pixels, HUD, reticle or third-person camera. Record the `image_quality` counters and the compositor GPU timing. Flip the default only after that A/B. Vertical source density, alternating-eye updates and first-person foreground depth remain separate constraints.
+
+## Root integration and explicit display resolution
+
+The production Metal parity run passed on the registered capture: 5,556
+interior gaps filled, zero GPU/CPU texel mismatches, the 1,557 audited body
+pixels filled, covered pixels bit-identical and the 314,537-pixel outside
+border unchanged. Maximum depth difference was 1.12e-8. These are actual Mac
+Metal results, not Vision Pro visual or performance acceptance. Timing varied
+considerably; no speed improvement is claimed. Receipt:
+`target/verification/device-session-20261024/first-person22-integration/depth-edge-metal/metal-result.json`.
+
+Normal Settings now exposes the default-off fill under Immersive display →
+Experimental. It can be changed while windowed, applying at the next immersive
+entry without restarting the engine.
+
+A separate default-off Higher display resolution choice requests the visionOS
+26+ `LayerRenderer.Configuration.maxRenderQuality = 1` and
+`LayerRenderer.renderQuality = 1`. Normal launches preserve the system choice.
+This raises the compositor allocation/render resolution when the system default
+is lower; it cannot create game detail missing from the selected source
+resolution. Its actual selected quality and maximum appear in lifecycle events,
+and actual viewport sizes/density remain in image_quality. It is not a promise
+of a fixed pixel size or 4K/60. The SDK documents additional GPU and allocation
+costs; physical performance and subjective improvement are unverified.
