@@ -17,18 +17,36 @@ static INPUT:Mutex<Option<WeaponInput>>=Mutex::new(None);
 static LEFT_INPUT:Mutex<Option<(u32,(u64,u64,u64),Instant)>>=Mutex::new(None);
 static STATUS:AtomicU32=AtomicU32::new(0);
 static SUPPORT:Mutex<Option<(bool,u64,Instant)>>=Mutex::new(None);
+#[derive(Default)]
+struct ArmAudit{request_hooks:u64,local_request_hooks:u64,requested:u64,committed:u64,target_hooks:u64,local_target_hooks:u64,applied:u64,last_request:Option<(Instant,&'static str,bool)>,last_target:Option<(Instant,&'static str,bool)>,last_qualified_request:Option<(Instant,&'static str,bool)>,last_qualified_target:Option<(Instant,&'static str,bool)>,last_immersive_request:Option<(Instant,&'static str,bool)>,last_immersive_target:Option<(Instant,&'static str,bool)>}
+static AUDIT:std::sync::LazyLock<Mutex<[ArmAudit;2]>>=std::sync::LazyLock::new(||Mutex::new([ArmAudit::default(),ArmAudit::default()]));
+// Capture only values and stage names. Never retain a guest address or use an
+// observation to alter request eligibility, native fallback, or packet age.
+struct HookObservation{arm:usize,request:bool,local:bool,first:bool,qualified:bool,immersive:bool,gate:&'static str}
+impl HookObservation{fn new(arm:u32,request:bool,local:bool,first:bool)->Self{Self{arm:arm as usize,request,local,first,qualified:false,immersive:crate::xr_view::world_camera_enabled(),gate:"entered"}}}
+impl Drop for HookObservation{fn drop(&mut self){let mut audits=AUDIT.lock().unwrap_or_else(|p|p.into_inner());let a=&mut audits[self.arm];
+    if self.request{a.request_hooks=a.request_hooks.saturating_add(1);if self.local{a.local_request_hooks=a.local_request_hooks.saturating_add(1);a.last_request=Some((Instant::now(),self.gate,self.first));if self.qualified{a.last_qualified_request=a.last_request;}if self.immersive{a.last_immersive_request=a.last_request;}}if self.gate=="requested"{a.requested=a.requested.saturating_add(1);}}
+    else{a.target_hooks=a.target_hooks.saturating_add(1);if self.local{a.local_target_hooks=a.local_target_hooks.saturating_add(1);a.last_target=Some((Instant::now(),self.gate,self.first));if self.qualified{a.last_qualified_target=a.last_target;}if self.immersive{a.last_immersive_target=a.last_target;}}if self.gate=="applied"{a.applied=a.applied.saturating_add(1);}}
+}}
+fn describe_hook_observation((at,gate,first):(Instant,&'static str,bool))->serde_json::Value{serde_json::json!({"age_ms":at.elapsed().as_millis(),"gate":gate,"native_first_person_argument":first})}
+fn audit_json(a:&ArmAudit)->serde_json::Value{serde_json::json!({"request_hooks":a.request_hooks,"local_request_hooks":a.local_request_hooks,"requested":a.requested,"committed":a.committed,"target_hooks":a.target_hooks,"local_target_hooks":a.local_target_hooks,"applied":a.applied,
+    "last_local_request":a.last_request.map(describe_hook_observation),"last_local_target":a.last_target.map(describe_hook_observation),
+    "last_qualified_local_request":a.last_qualified_request.map(describe_hook_observation),"last_qualified_local_target":a.last_qualified_target.map(describe_hook_observation),
+    "last_immersive_local_request":a.last_immersive_request.map(describe_hook_observation),"last_immersive_local_target":a.last_immersive_target.map(describe_hook_observation)})}
 pub(crate) fn native_fallback_active()->bool{
     crate::xr_motion_aim::arms_enabled()&&SUPPORT.lock().unwrap_or_else(|p|p.into_inner()).is_some_and(|(supported,e,at)|!supported&&e==crate::xr_view::view_epoch()&&at.elapsed()<=MAX_AGE)
 }
 #[derive(Clone)]struct WeaponInput{token:u32,generation:(u64,u64,u64),tracking:u64,weapon:[f32;16],at:Instant}
 pub(crate) fn invalidate_inputs(){LEASES.lock().unwrap_or_else(|p|p.into_inner()).clear();*INPUT.lock().unwrap_or_else(|p|p.into_inner())=None;*LEFT_INPUT.lock().unwrap_or_else(|p|p.into_inner())=None;*SUPPORT.lock().unwrap_or_else(|p|p.into_inner())=None;STATUS.store(0,Ordering::Relaxed);}
 pub fn status_json()->serde_json::Value{
+    let audit={let a=AUDIT.lock().unwrap_or_else(|p|p.into_inner());serde_json::json!({"left":audit_json(&a[0]),"right":audit_json(&a[1])})};
     let input=INPUT.lock().unwrap_or_else(|p|p.into_inner()).clone();let left=*LEFT_INPUT.lock().unwrap_or_else(|p|p.into_inner());
     serde_json::json!({"enabled":crate::xr_motion_aim::arms_enabled(),"right_target_active":input.as_ref().is_some_and(|i|i.at.elapsed()<=MAX_AGE),
         "left_position_active":left.is_some_and(|(_,g,at)|at.elapsed()<=MAX_AGE&&g.0==crate::xr_view::view_epoch()),
+        "right_input_generation":input.as_ref().map(|i|serde_json::json!({"view_epoch":i.generation.0,"camera_sequence":i.generation.1,"hand_sequence":i.generation.2,"tracking_epoch":i.tracking,"age_ms":i.at.elapsed().as_millis()})),
         "left_orientation_policy":"native wrist; tracked grip translation only","unsupported_weapon_native_fallback":native_fallback_active(),
         "right_input_state":match STATUS.load(Ordering::Relaxed){0=>"inactive",1=>"waiting for qualified request and exact tracking packet",2=>"native target accepted; waiting for weapon pose agreement",3=>"actual weapon ray ready",_=>"live weapon or packet qualification pending"},
-        "pose_agreement_translation_m":0.03,"pose_agreement_rotation_degrees":3,"ray_is_impact":false})
+        "pose_agreement_translation_m":0.03,"pose_agreement_rotation_degrees":3,"ray_is_impact":false,"hook_diagnostics":audit})
 }
 fn input_for_candidate(c:&CameraCandidate)->Option<WeaponInput>{
     if native_fallback_active(){return None;}
@@ -213,6 +231,7 @@ fn manager<M:Memory>(s:&mut Snapshot<'_,M>,m:u64)->Option<(u64,u64)>{
 }
 fn current(first:bool)->Option<CameraCandidate>{if !crate::xr_motion_aim::arms_enabled(){return None;}crate::xr_motion_aim::native_arm_candidate(first)}
 fn active_stack(caller:&mut wasmtime::Caller<'_,crate::HostState>)->Option<u64>{caller.get_export("__muguet_motion_stack_pointer")?.into_global()?.get(caller).i64().map(|v|v as u64)}
+fn observed_local_ped<M:Memory>(guest:&M)->Option<u64>{let mut s=Snapshot::new(guest);let factory=s.u64(20_159_720)?;if factory==0{return None;}s.u64(factory.checked_add(8)?).filter(|ped|*ped!=0)}
 
 pub(crate) fn host_hook(caller:&mut wasmtime::Caller<'_,crate::HostState>,name:&str,params:&[wasmtime::Val],results:&mut[wasmtime::Val],mem:&wasmtime::SharedMemory)->anyhow::Result<()>{
     use wasmtime::Val;
@@ -223,62 +242,81 @@ pub(crate) fn host_hook(caller:&mut wasmtime::Caller<'_,crate::HostState>,name:&
             anyhow::ensure!(params.len()==6&&results.len()==1,"native arm request ABI mismatch");results[0]=Val::I64(0);
             let(manager_pointer,position,tls,first)=(arg(0)?,arg(2)?,arg(3)?,arg(4)?!=0);
             let arm=arg(5)? as u32;if arm>1{return Ok(());}
+            let guest=Guest(mem);let local=observed_local_ped(&guest).and_then(|p|p.checked_add(3888))==Some(manager_pointer);
+            let mut audit=HookObservation::new(arm,true,local,first);audit.gate="request_stack_dt_or_tls";
             let dt=params[1].f32().unwrap_or(f32::NAN);if !dt.is_finite()||dt<=0.||tls==0||active_stack(caller)!=Some(position){return Ok(());}
-            let Some(candidate)=current(first)else{return Ok(())};let guest=Guest(mem);let mut read=Snapshot::new(&guest);
+            audit.gate="camera_scope_or_exact_tracking";let Some(candidate)=current(first)else{return Ok(())};audit.qualified=true;let mut read=Snapshot::new(&guest);
             STATUS.store(1,Ordering::Relaxed);
+            audit.gate="local_manager_skeleton_or_native_branch";
             let Some((ped,skel))=manager(&mut read,manager_pointer)else{return Ok(())};
+            audit.gate="converted_hand_or_attachment_bone";
             let Some((hand,bone))=read.u32(position+16).zip(read.u32(position+20)).filter(|(h,b)|*h<65535&&*b<65535)else{return Ok(())};
+            audit.gate="live_attachment_or_bone_chain";
             let Some(attachment)=arm_attachment(&mut read,ped,skel,arm,hand as u16,bone as u16)else{
-                if arm==1&&unsupported_weapon(&mut read,ped,bone as u16)==Some(true)&&read.unchanged(){*SUPPORT.lock().unwrap_or_else(|p|p.into_inner())=Some((false,candidate.view_epoch,Instant::now()));}return Ok(());
+                if arm==1&&unsupported_weapon(&mut read,ped,bone as u16)==Some(true)&&read.unchanged(){audit.gate="unsupported_native_weapon";*SUPPORT.lock().unwrap_or_else(|p|p.into_inner())=Some((false,candidate.view_epoch,Instant::now()));}return Ok(());
             };
             if arm==1{*SUPPORT.lock().unwrap_or_else(|p|p.into_inner())=Some((true,candidate.view_epoch,Instant::now()));}
+            audit.gate="desired_hand_or_left_grip";
             let hand=if arm==1{let b=multiply(&attachment.k,&attachment.a);let Some(h)=desired_hand(&candidate,&b)else{return Ok(())};h}
                 else{let Some(grip)=crate::xr_motion_aim::left_grip_for_candidate(&candidate)else{return Ok(())};let mut h=identity();let g=multiply(&candidate.game_from_stage,&grip);h[12..15].copy_from_slice(&g[12..15]);h};
-            if !read.unchanged()||current(first).is_none_or(|c|generation(&c)!=generation(&candidate)){return Ok(());}
+            audit.gate="request_snapshot_or_generation_changed";if !read.unchanged()||current(first).is_none_or(|c|generation(&c)!=generation(&candidate)){return Ok(());}
+            audit.gate="token_or_pending_capacity";
             let Ok(token)=NEXT_TOKEN.fetch_update(Ordering::Relaxed,Ordering::Relaxed,|t|(t<0x7f_ffff).then_some(t+1))else{return Ok(())};
             if caller.data().motion_arms.pending.len()>=16{return Ok(());}
+            audit.gate="private_request_scratch_write";
             for i in 0..3{if !guest.put(position+i as u64*4,hand[12+i].to_bits()){return Ok(());}}
             if !guest.put(position+12,cookie(token)){return Ok(());}
             let mut leases=LEASES.lock().unwrap_or_else(|p|p.into_inner());leases.retain(|l|l.at.elapsed()<=MAX_AGE);
             if leases.len()>=64{leases.pop_front();}
             leases.push_back(Lease{token,arm,generation:generation(&candidate),tracking:candidate.tracking_epoch,hand,
                 attachment:attachment.a,chain:attachment.k,bones:(attachment.hand,attachment.bone),at:Instant::now(),committed:false});
-            if !caller.data_mut().motion_arms.touch(token){leases.retain(|l|l.token!=token);return Ok(());}
+            audit.gate="boundary_journal_capacity";if !caller.data_mut().motion_arms.touch(token){leases.retain(|l|l.token!=token);return Ok(());}
             caller.data_mut().motion_arms.pending.push((token,tls));caller.data_mut().motion_arms.requests+=1;results[0]=Val::I64(token as i64);
+            audit.gate="requested";
         },
         "request_complete"=>{
             anyhow::ensure!(params.len()==2&&results.is_empty(),"native arm completion ABI mismatch");let(token,tls)=(arg(0)? as u32,arg(1)?);
             let owned=caller.data_mut().motion_arms.pending.pop()==Some((token,tls));
             let mut leases=LEASES.lock().unwrap_or_else(|p|p.into_inner());
-            if owned{if let Some(lease)=leases.iter_mut().find(|l|l.token==token){lease.committed=true;}}else{leases.retain(|l|l.token!=token);}
+            if owned{if let Some(lease)=leases.iter_mut().find(|l|l.token==token){lease.committed=true;let mut audits=AUDIT.lock().unwrap_or_else(|p|p.into_inner());let a=&mut audits[lease.arm as usize];a.committed=a.committed.saturating_add(1);}}else{leases.retain(|l|l.token!=token);}
         },
         "target"=>{
             anyhow::ensure!(params.len()==9&&results.is_empty(),"native arm target ABI mismatch");
             let(solver,passed,resolved,arm,goal,request,target,tls,first)=(arg(0)?,arg(1)?,arg(2)?,arg(3)?,arg(4)?,arg(5)?,arg(6)?,arg(7)?,arg(8)?!=0);
+            if arm>1{return Ok(());}let guest=Guest(mem);let mut observation=Snapshot::new(&guest);
+            let local=observed_local_ped(&guest).is_some_and(|p|observation.u64(solver.saturating_add(480))==Some(p));
+            let mut audit=HookObservation::new(arm as u32,false,local,first);audit.gate="camera_scope_or_exact_tracking";
             let Some(candidate)=current(first)else{return Ok(())};
+            audit.qualified=true;
+            audit.gate="target_stack_or_tls";
             if arm>1||tls==0||active_stack(caller).and_then(|sp|sp.checked_add(96))!=Some(target){return Ok(());}
-            let guest=Guest(mem);let mut read=Snapshot::new(&guest);
+            let mut read=Snapshot::new(&guest);audit.gate="local_manager_skeleton_or_native_branch";
             let Some(ped)=read.u64(solver+480)else{return Ok(())};let Some((owner,skel))=manager(&mut read,ped.saturating_add(3888))else{return Ok(())};
-            if ped!=owner||passed!=skel||resolved!=skel||read.u64(solver)!=Some(SOLVER_VTABLE)||read.u64(ped+3888+272)!=Some(solver)
+            audit.gate="native_solver_request_identity";if ped!=owner||passed!=skel||resolved!=skel||read.u64(solver)!=Some(SOLVER_VTABLE)||read.u64(ped+3888+272)!=Some(solver)
                 ||goal!=solver+32+96*arm||request!=solver+224+128*arm||read.u64(request+80)!=Some(0)||read.u32(request+112)!=Some(if arm==1{256}else{0}){return Ok(());}
-            let Some(token)=read.u32(request+12).and_then(decode_cookie)else{return Ok(())};
+            audit.gate="request_cookie_absent";let Some(token)=read.u32(request+12).and_then(decode_cookie)else{return Ok(())};
+            audit.gate="target_cookie_mismatch";
             if read.u32(target+60)!=Some(cookie(token)){return Ok(());}
             let lease=LEASES.lock().unwrap_or_else(|p|p.into_inner()).iter().find(|l|l.token==token).cloned();
-            let Some(lease)=lease.filter(|l|l.arm==arm as u32&&l.committed&&l.generation==generation(&candidate)&&l.tracking==candidate.tracking_epoch&&l.at.elapsed()<=MAX_AGE)else{return Ok(())};
+            audit.gate="request_lease_uncommitted_stale_or_different_generation";let Some(lease)=lease.filter(|l|l.arm==arm as u32&&l.committed&&l.generation==generation(&candidate)&&l.tracking==candidate.tracking_epoch&&l.at.elapsed()<=MAX_AGE)else{return Ok(())};
+            audit.gate="left_grip_no_longer_live";
             if arm==0&&crate::xr_motion_aim::left_grip_for_candidate(&candidate).is_none(){return Ok(());}
-            let Some((hand,bone))=read.u16(goal+72).zip(read.u16(goal+78))else{return Ok(())};
+            audit.gate="native_goal_bone_interval";let Some((hand,bone))=read.u16(goal+72).zip(read.u16(goal+78))else{return Ok(())};
             let Some((upper,end))=read.u16(goal+76).zip(read.u16(goal+88))else{return Ok(())};
             if (hand,bone)!=lease.bones||bone<=upper||bone>=end||read.u32(skel+32).is_none_or(|n|u32::from(end)>n){return Ok(());}
-            let Some(a)=arm_attachment(&mut read,ped,skel,arm as u32,hand,bone)else{return Ok(())};
+            audit.gate="live_attachment_or_bone_chain";let Some(a)=arm_attachment(&mut read,ped,skel,arm as u32,hand,bone)else{return Ok(())};
+            audit.gate="attachment_or_chain_changed_since_request";
             if a.a!=lease.attachment||!close(&a.k,&lease.chain){return Ok(());}
-            for i in 0..3{if read.u32(request+i as u64*4)!=Some(lease.hand[12+i].to_bits()){return Ok(());}}
+            audit.gate="native_request_position_changed";for i in 0..3{if read.u32(request+i as u64*4)!=Some(lease.hand[12+i].to_bits()){return Ok(());}}
+            audit.gate="native_reference_transform_mismatch";
             let Some(reference)=read.u64(skel+8).and_then(|p|read.matrix(p))else{return Ok(())};
             if read.matrix(target+128)!=Some(reference){return Ok(());}
             // Record all original target words, including padding. Only XYZ is
             // replaced, then the literal native inverse/blend code continues.
-            let Some(original)=read.matrix(target)else{return Ok(())};let _=original;
+            audit.gate="native_target_matrix_invalid";let Some(original)=read.matrix(target)else{return Ok(())};let _=original;
+            audit.gate="target_snapshot_or_generation_changed";
             if !read.unchanged()||current(first).is_none_or(|c|generation(&c)!=lease.generation){return Ok(());}
-            if !caller.data_mut().motion_arms.touch(token){return Ok(());}
+            audit.gate="boundary_journal_capacity";if !caller.data_mut().motion_arms.touch(token){return Ok(());}
             anyhow::ensure!(store_target(&guest,target,&lease.hand,arm==1),"qualified private arm target range changed");
             if arm==1{
             let weapon=multiply(&lease.hand,&multiply(&lease.chain,&lease.attachment));
@@ -287,6 +325,7 @@ pub(crate) fn host_hook(caller:&mut wasmtime::Caller<'_,crate::HostState>,name:&
             STATUS.store(2,Ordering::Relaxed);
             }else{*LEFT_INPUT.lock().unwrap_or_else(|p|p.into_inner())=Some((token,lease.generation,Instant::now()));}
             caller.data_mut().motion_arms.applied+=1;
+            audit.gate="applied";
         },
         _=>anyhow::bail!("unknown native arm import {name}"),
     }Ok(())

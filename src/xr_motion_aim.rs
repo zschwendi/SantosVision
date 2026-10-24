@@ -17,6 +17,40 @@ static LAST_ACK: Mutex<Option<ShotAcknowledgement>> = Mutex::new(None);
 static NATIVE_MODE:Mutex<Option<(bool,Instant,u64,u64)>>=Mutex::new(None);
 static IK_PERMIT:Mutex<Option<(u64,u64,Instant)>>=Mutex::new(None);
 static FIRE_GATE:Mutex<FireGate>=Mutex::new(FireGate {release_required:true,was_motion:false});
+// Value-only, process-lifetime evidence survives leaving immersion. These
+// observations never grant a pose, refresh its age, or change a native gate.
+#[derive(Default)]
+struct CaptureAudit {attempts:u64,accepted:u64,invalidations:u64,last:Option<CaptureObservation>,last_headset:Option<CaptureObservation>}
+type CaptureObservation=(Instant,&'static str,u64,u64,u64,Option<(u32,[u64;4],Option<f64>,Option<f64>)>);
+static CAPTURE_AUDIT:Mutex<CaptureAudit>=Mutex::new(CaptureAudit{attempts:0,accepted:0,invalidations:0,last:None,last_headset:None});
+static ARM_CANDIDATE_GATE:AtomicU64=AtomicU64::new(0);
+impl CaptureAudit{fn record(&mut self,view:crate::xr_view::WorldView,reason:&'static str,observed:Option<(u32,[u64;4],Option<f64>,Option<f64>)>){
+    self.attempts=self.attempts.saturating_add(1);if reason=="accepted"{self.accepted=self.accepted.saturating_add(1);}
+    self.last=Some((Instant::now(),reason,view.provenance_epoch,view.camera_sequence,view.head_pose_frame,observed));
+    if view.headset_applied{self.last_headset=self.last;}
+}}
+fn capture_observed(view:crate::xr_view::WorldView,reason:&'static str,packet:Option<(u32,[f64;3],[u64;4])>){
+    let observed=packet.map(|(flags,times,ids)|(flags,ids,
+        ((times[0]-times[2])*1000.).is_finite().then_some((times[0]-times[2])*1000.),
+        ((times[0]-view.presentation_time_seconds)*1000.).is_finite().then_some((times[0]-view.presentation_time_seconds)*1000.)));
+    CAPTURE_AUDIT.lock().unwrap_or_else(|p|p.into_inner()).record(view,reason,observed);
+}
+fn describe_capture_observation(observation:&CaptureObservation)->serde_json::Value{
+    let(at,reason,epoch,camera,head,packet)=observation;
+    serde_json::json!({"age_ms":at.elapsed().as_millis(),"decision":reason,"view_epoch":epoch,"camera_sequence":camera,"accepted_head_frame":head,
+        "packet_flags":packet.map(|p|p.0),"packet_ids":packet.map(|p|p.1),"right_original_source_age_ms":packet.and_then(|p|p.2),"packet_presentation_delta_ms":packet.and_then(|p|p.3)})
+}
+fn packet_rejection(head:u64,presentation:f64,flags:u32,times:[f64;3],ids:[u64;4])->Option<&'static str>{
+    if flags==0&&ids==[0;4]{return Some("no_exact_head_motion_packet");}
+    if flags&2==0{return Some("no_fresh_right_accessory");}
+    if flags&(1<<9)!=0{return Some("bare_right_wrist_is_not_accessory_aim");}
+    if ids[0]!=1{return Some("motion_packet_schema");}if ids[1]==0{return Some("motion_tracking_epoch_missing");}
+    if ids[2]!=head{return Some("exact_head_frame_mismatch");}if ids[3]==0{return Some("motion_packet_sequence_missing");}
+    if !times.iter().all(|v|v.is_finite()){return Some("nonfinite_packet_time");}
+    if (times[0]-presentation).abs()>1e-6{return Some("accepted_head_presentation_time_mismatch");}
+    if times[2]>times[0]+0.01{return Some("right_source_in_future");}
+    if times[0]-times[2]>0.15{return Some("right_source_stale_at_capture");}None
+}
 pub fn diagnostic_enabled() -> bool { DIAGNOSTIC_ENABLED.load(Ordering::Acquire) }
 static GAMEPLAY_REQUESTED:LazyLock<bool>=LazyLock::new(||std::env::var("MUGUET_XR_MOTION_AIM").as_deref()==Ok("1"));
 static ARMS_REQUESTED:LazyLock<bool>=LazyLock::new(||std::env::var("MUGUET_XR_MOTION_ARMS").as_deref()==Ok("1"));
@@ -34,10 +68,12 @@ fn current_supported_scope(first_person:bool)->bool {
 /// Same accepted camera packet for native arm requests and targets. A later
 /// callback cannot borrow a replacement tracking generation or extend its age.
 pub(crate) fn native_arm_candidate(first_person:bool)->Option<CameraCandidate>{
-    if !gameplay_enabled()||!current_supported_scope(first_person){return None;}
-    if !NATIVE_MODE.lock().unwrap_or_else(|p|p.into_inner()).is_some_and(|(first,at,_,e)|first&&e==crate::xr_view::view_epoch()&&at.elapsed()<=MAX_AGE){return None;}
-    let candidate=CANDIDATE.lock().unwrap_or_else(|p|p.into_inner()).clone()?;
-    (candidate.valid(Instant::now(),crate::xr_view::view_epoch())&&tracking_still_live(&candidate)).then_some(candidate)
+    let fail=|gate|{ARM_CANDIDATE_GATE.store(gate,Ordering::Relaxed);None};
+    if !gameplay_enabled(){return fail(1);}if !current_supported_scope(first_person){return fail(2);}
+    if !NATIVE_MODE.lock().unwrap_or_else(|p|p.into_inner()).is_some_and(|(first,at,_,e)|first&&e==crate::xr_view::view_epoch()&&at.elapsed()<=MAX_AGE){return fail(3);}
+    let Some(candidate)=CANDIDATE.lock().unwrap_or_else(|p|p.into_inner()).clone()else{return fail(4);};
+    if !candidate.valid(Instant::now(),crate::xr_view::view_epoch()){return fail(5);}
+    if !tracking_still_live(&candidate){return fail(6);}ARM_CANDIDATE_GATE.store(7,Ordering::Relaxed);Some(candidate)
 }
 pub(crate) fn accept_native_arm_input(c:&CameraCandidate){
     if arms_enabled()&&c.valid(Instant::now(),crate::xr_view::view_epoch())&&tracking_still_live(c){
@@ -108,6 +144,7 @@ pub(crate) fn qualify_embedded_aot(code: &[u8]) -> anyhow::Result<()> {
 }
 
 pub(crate) fn invalidate_camera() {
+    let mut audit=CAPTURE_AUDIT.lock().unwrap_or_else(|p|p.into_inner());audit.invalidations=audit.invalidations.saturating_add(1);drop(audit);
     crate::xr_motion_arms::invalidate_inputs();
     LATEST_CAMERA_SEQUENCE.store(0,Ordering::Release);
     *CANDIDATE.lock().unwrap_or_else(|p|p.into_inner())=None;
@@ -122,13 +159,14 @@ pub(crate) fn invalidate_camera() {
 /// hand snapshot is borrowed later by native IK/shot reads.
 pub(crate) fn capture_camera(view: crate::xr_view::WorldView, base_camera:[f32;16]) {
     if !gameplay_enabled() { return; }
-    if LATEST_CAMERA_SEQUENCE.fetch_max(view.camera_sequence,Ordering::AcqRel)>view.camera_sequence{return;}
+    if LATEST_CAMERA_SEQUENCE.fetch_max(view.camera_sequence,Ordering::AcqRel)>view.camera_sequence{capture_observed(view,"older_camera_callback",None);return;}
     {
         let mut candidate=CANDIDATE.lock().unwrap_or_else(|p|p.into_inner());
-        if LATEST_CAMERA_SEQUENCE.load(Ordering::Acquire)!=view.camera_sequence{return;}
+        if LATEST_CAMERA_SEQUENCE.load(Ordering::Acquire)!=view.camera_sequence{capture_observed(view,"camera_replaced_before_capture",None);return;}
         *candidate=None;
     }
-    if !view.headset_applied || !crate::xr_view::view_epoch_is_active(view.provenance_epoch) { return; }
+    if !view.headset_applied{capture_observed(view,"headset_not_applied_to_native_camera",None);return;}
+    if !crate::xr_view::view_epoch_is_active(view.provenance_epoch){capture_observed(view,"inactive_view_epoch",None);return;}
     #[cfg(target_os="visionos")]
     {
         extern "C" { fn sv_xr_motion_read_v1(expected_head_frame:u64,
@@ -137,10 +175,7 @@ pub(crate) fn capture_camera(view: crate::xr_view::WorldView, base_camera:[f32;1
         let flags=unsafe{sv_xr_motion_read_v1(view.head_pose_frame,floats.as_mut_ptr(),80,times.as_mut_ptr(),3,ids.as_mut_ptr(),4)};
         // Right-handed first slice. Bare wrist poses do not constitute a
         // calibrated weapon/barrel ray. One missing left hand is harmless.
-        if flags&2==0||flags&(1<<9)!=0||ids[0]!=1||ids[1]==0||ids[2]!=view.head_pose_frame||ids[3]==0
-            || !times.iter().all(|v|v.is_finite())
-            || (times[0]-view.presentation_time_seconds).abs()>1e-6
-            || times[2]>times[0]+0.01||times[0]-times[2]>0.15 { return; }
+        if let Some(reason)=packet_rejection(view.head_pose_frame,view.presentation_time_seconds,flags,times,ids){capture_observed(view,reason,Some((flags,times,ids)));return;}
         let aim:[f32;16]=floats[64..80].try_into().unwrap();
         let candidate=CameraCandidate {view_epoch:view.provenance_epoch,camera_sequence:view.camera_sequence,
             head_frame:view.head_pose_frame,tracking_epoch:ids[1],hand_sequence:ids[3],
@@ -153,19 +188,28 @@ pub(crate) fn capture_camera(view: crate::xr_view::WorldView, base_camera:[f32;1
         if candidate.valid(Instant::now(),view.provenance_epoch) {
             let mut published=CANDIDATE.lock().unwrap_or_else(|p|p.into_inner());
             if LATEST_CAMERA_SEQUENCE.load(Ordering::Acquire)==view.camera_sequence
-                &&crate::xr_view::view_epoch_is_active(view.provenance_epoch){*published=Some(candidate);}
-        }
+                &&crate::xr_view::view_epoch_is_active(view.provenance_epoch){*published=Some(candidate);capture_observed(view,"accepted",Some((flags,times,ids)));}
+            else{capture_observed(view,"camera_or_epoch_replaced_before_publication",Some((flags,times,ids)));}
+        }else{capture_observed(view,"nonrigid_or_expired_candidate",Some((flags,times,ids)));}
     }
-    #[cfg(not(target_os="visionos"))] let _=base_camera;
+    #[cfg(not(target_os="visionos"))] {let _=base_camera;capture_observed(view,"not_visionos_host",None);}
 }
 
 pub fn status_json()->serde_json::Value {
+    let capture={let audit=CAPTURE_AUDIT.lock().unwrap_or_else(|p|p.into_inner());serde_json::json!({"attempts":audit.attempts,"accepted":audit.accepted,"camera_invalidations":audit.invalidations,
+        "last":audit.last.as_ref().map(describe_capture_observation),"last_headset_applied":audit.last_headset.as_ref().map(describe_capture_observation)})};
+    let epoch=crate::xr_view::view_epoch();let mode=*NATIVE_MODE.lock().unwrap_or_else(|p|p.into_inner());let permit=*IK_PERMIT.lock().unwrap_or_else(|p|p.into_inner());
+    let scope=serde_json::json!({"world_camera_active":crate::xr_view::world_camera_enabled(),"spatial_controls_selected":crate::pad::spatial_controls_selected(),"in_vehicle":crate::pad::IN_VEHICLE.load(Ordering::Relaxed),"verified_gameplay":crate::pad::verified_guest_gameplay_context(),
+        "native_mode":mode.map(|(first,at,_,e)|serde_json::json!({"first_person":first,"age_ms":at.elapsed().as_millis(),"current_epoch":e==epoch,"fresh":e==epoch&&at.elapsed()<=MAX_AGE})),
+        "ik_permit":permit.map(|(e,tracking,at)|serde_json::json!({"age_ms":at.elapsed().as_millis(),"tracking_epoch":tracking,"current_epoch":e==epoch,"fresh":e==epoch&&at.elapsed()<=MAX_AGE})),
+        "last_arm_candidate_gate":match ARM_CANDIDATE_GATE.load(Ordering::Relaxed){0=>"not_observed",1=>"gameplay_motion_disabled",2=>"outside_supported_first_person_scope",3=>"native_first_person_mode_missing_or_stale",4=>"no_camera_candidate",5=>"camera_candidate_invalid_or_stale",6=>"exact_tracking_packet_no_longer_live",_=>"ready"}});
     let candidate=CANDIDATE.lock().unwrap_or_else(|p|p.into_inner());
     let ack=LAST_ACK.lock().unwrap_or_else(|p|p.into_inner());
     serde_json::json!({"diagnostic_aot_certified":diagnostic_enabled(),"gameplay_motion_active":gameplay_enabled(),"native_arms":crate::xr_motion_arms::status_json(),
+        "capture_diagnostics":capture,"scope_diagnostics":scope,
         "candidate":candidate.as_ref().map(|c|serde_json::json!({"view_epoch":c.view_epoch,
             "camera_sequence":c.camera_sequence,"head_frame":c.head_frame,"hand_sequence":c.hand_sequence,
-            "tracking_epoch":c.tracking_epoch,"age_ms":c.recorded_at.elapsed().as_millis()})),
+            "tracking_epoch":c.tracking_epoch,"age_ms":c.recorded_at.elapsed().as_millis(),"original_source_age_ms":c.source_age_at_capture.as_millis(),"valid_now":c.valid(Instant::now(),epoch)})),
         "historical_last_successful_native_calculation":ack.as_ref().map(|a|serde_json::json!({"token":a.token,"ped":a.ped,
             "task":a.task,"origin":a.origin,"target":a.target,"motion_input_generation":a.motion_generation,
             "age_ms":a.recorded_at.elapsed().as_millis(),"current_aim_or_impact":false})),
@@ -580,6 +624,27 @@ pub fn rigid(m: &[f32; 16]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]fn capture_diagnostics_distinguish_missing_exact_packet_from_stale_source(){
+        let ids=[1,4,12,13];let times=[100.,99.99,99.98];
+        assert_eq!(packet_rejection(12,100.,3,times,ids),None);
+        assert_eq!(packet_rejection(12,100.,0,[0.;3],[0;4]),Some("no_exact_head_motion_packet"));
+        assert_eq!(packet_rejection(12,100.,1,times,ids),Some("no_fresh_right_accessory"));
+        assert_eq!(packet_rejection(12,100.,514,times,ids),Some("bare_right_wrist_is_not_accessory_aim"));
+        assert_eq!(packet_rejection(13,100.,3,times,ids),Some("exact_head_frame_mismatch"));
+        assert_eq!(packet_rejection(12,100.01,3,times,ids),Some("accepted_head_presentation_time_mismatch"));
+        assert_eq!(packet_rejection(12,100.,3,[100.,99.99,99.8],ids),Some("right_source_stale_at_capture"));
+        assert_eq!(packet_rejection(12,100.,3,[100.,99.99,100.02],ids),Some("right_source_in_future"));
+    }
+    #[test]fn capture_diagnostics_retain_immersive_failure_after_return_to_window(){
+        let mut audit=CaptureAudit::default();let mut view=crate::xr_view::WorldView{provenance_epoch:7,camera_sequence:11,request_frame:1,head_pose_frame:12,presentation_time_seconds:100.,eye_index:0,view_count:2,
+            game_from_eye:identity(),game_from_stage:identity(),projection_from_eye:identity(),depth_reverse_z:false,headset_applied:true};
+        audit.record(view,"accepted",Some((3,[1,4,12,13],Some(20.),Some(0.))));
+        audit.record(view,"no_fresh_right_accessory",Some((0,[0;4],Some(0.),Some(-100000.))));
+        view.headset_applied=false;view.head_pose_frame=0;
+        audit.record(view,"headset_not_applied_to_native_camera",None);
+        assert_eq!((audit.attempts,audit.accepted),(3,1));assert_eq!(audit.last.unwrap().1,"headset_not_applied_to_native_camera");
+        let last=audit.last_headset.unwrap();assert_eq!((last.1,last.4),("no_fresh_right_accessory",12));assert_eq!(last.5.unwrap().0,0);
+    }
     fn id() -> Identity { Identity {store:1,pthread:2,tls:3} }
     fn candidate(now: Instant) -> CameraCandidate {
         let mut aim=identity();aim[12]=2.;aim[13]=3.;aim[14]=4.;
