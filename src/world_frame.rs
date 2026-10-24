@@ -2,6 +2,7 @@
 //! Only a qualified GPU-ring world view with matching real depth may publish.
 use serde_json::json;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 use wgpu::*;
@@ -89,6 +90,24 @@ struct Frames {
     compositor_completed_at: Option<Instant>,
 }
 static FRAMES: LazyLock<Mutex<Frames>> = LazyLock::new(|| Mutex::new(Frames::default()));
+static PENDING_SNAPSHOT_CALLBACKS: AtomicUsize = AtomicUsize::new(0);
+
+// Metal completion updates wgpu's fence, but publication still requires a
+// submit/device poll to dispatch this callback. Keep the producer polling even
+// when no query events, readbacks or upload callbacks are outstanding.
+struct PendingSnapshotCallback;
+impl PendingSnapshotCallback {
+    fn new() -> Self {
+        PENDING_SNAPSHOT_CALLBACKS.fetch_add(1, Ordering::AcqRel);
+        Self
+    }
+}
+impl Drop for PendingSnapshotCallback {
+    fn drop(&mut self) { PENDING_SNAPSHOT_CALLBACKS.fetch_sub(1, Ordering::AcqRel); }
+}
+pub(crate) fn has_pending_callbacks() -> bool {
+    PENDING_SNAPSHOT_CALLBACKS.load(Ordering::Acquire) != 0
+}
 
 pub(crate) fn reset() {
     if let Ok(mut frames) = FRAMES.lock() {
@@ -99,6 +118,7 @@ pub(crate) fn reset() {
         frames.compositor_pair_epoch = None;
         frames.compositor_completed_at = None;
         // Outstanding compositor leases retain their immutable textures until release.
+        // Pending callbacks retain their guards across reset and retire on exit.
     }
 }
 
@@ -154,6 +174,7 @@ pub(crate) fn status_json() -> serde_json::Value {
         "copied_depth_snapshots": frames.copied_depth_snapshots,
         "latest_pair_scene_epoch": frames.latest_pair.as_ref().map(|pair| pair.scene_epoch),
         "outstanding_leases": frames.leases.len(), "slots": frames.pool.len(), "error": frames.error,
+        "pending_snapshot_callbacks": PENDING_SNAPSHOT_CALLBACKS.load(Ordering::Acquire),
         "compositor_completed_frames": frames.compositor_frames, "compositor_completed_views": frames.compositor_views,
         "compositor_completed_pair_epoch": frames.compositor_pair_epoch,
         "compositor_completion_age_seconds": frames.compositor_completed_at.map(|time| time.elapsed().as_secs_f64()),
@@ -370,7 +391,9 @@ pub(crate) fn publish_pair(device: &Device, queue: &Queue, sources: [PairSource<
         }
         queue.submit([encoder.finish()]);
         let snapshot_submitted_at = Instant::now();
+        let pending = PendingSnapshotCallback::new();
         queue.on_submitted_work_done(move || {
+            let _pending = pending;
             let snapshot_submit_to_gpu_completion_seconds = snapshot_completion_seconds(snapshot_submitted_at, Instant::now());
             if let Ok(mut frames) = FRAMES.lock() {
                 if generation != frames.generation || !crate::xr_view::view_epoch_is_active(provenance_epoch)
@@ -478,7 +501,9 @@ pub(crate) fn publish_with_hud(device:&Device, queue:&Queue, color:&Texture,
         queue.submit([commands.finish()]);
         let snapshot_submitted_at = Instant::now();
         // Separate compositor queues may read only after the producer's copy finishes.
+        let pending = PendingSnapshotCallback::new();
         queue.on_submitted_work_done(move || {
+            let _pending = pending;
             let snapshot_submit_to_gpu_completion_seconds = snapshot_completion_seconds(snapshot_submitted_at, Instant::now());
             if let Ok(mut frames) = FRAMES.lock() {
                 if generation != frames.generation || !crate::xr_view::view_epoch_is_active(provenance_epoch) { return; }
@@ -645,6 +670,109 @@ pub extern "C" fn sv_world_complete_frame(leases: *const u64, count: u32, metal_
 mod tests {
     use super::*;
     static TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn world_callback_accounting_drives_production_poll_and_idle_policy_until_every_guard_retires() {
+        let _serial = TEST_LOCK.lock().unwrap();
+        assert!(!has_pending_callbacks());
+        assert!(!crate::gpu::completion_poll_needed(false));
+        assert_eq!(crate::gpu::producer_idle_timeout_millis(false, false, false), 100);
+        for (maps, events, uploads) in [(true, false, false), (false, true, false), (false, false, true)] {
+            assert_eq!(crate::gpu::producer_idle_timeout_millis(maps, events, uploads), 1);
+        }
+        assert!(crate::gpu::completion_poll_needed(true));
+
+        let pending = PendingSnapshotCallback::new();
+        let normal_callback = move || {
+            let _pending = pending;
+            assert!(has_pending_callbacks());
+        };
+        let pending = PendingSnapshotCallback::new();
+        let discarded_callback = move || { let _pending = pending; };
+        let generation = FRAMES.lock().unwrap().generation;
+        let pending = PendingSnapshotCallback::new();
+        let stale_callback = move || {
+            let _pending = pending;
+            if generation != FRAMES.lock().unwrap().generation { return; }
+            panic!("reset must make this callback stale");
+        };
+        assert_eq!(PENDING_SNAPSHOT_CALLBACKS.load(Ordering::Acquire), 3);
+        assert!(crate::gpu::completion_poll_needed(false));
+        assert_eq!(crate::gpu::producer_idle_timeout_millis(false, false, false), 1);
+        reset();
+        assert_eq!(PENDING_SNAPSHOT_CALLBACKS.load(Ordering::Acquire), 3);
+        normal_callback();
+        assert_eq!(PENDING_SNAPSHOT_CALLBACKS.load(Ordering::Acquire), 2);
+        stale_callback();
+        assert_eq!(PENDING_SNAPSHOT_CALLBACKS.load(Ordering::Acquire), 1);
+        assert_eq!(crate::gpu::producer_idle_timeout_millis(false, false, false), 1);
+        drop(discarded_callback);
+        assert!(!has_pending_callbacks());
+        assert!(!crate::gpu::completion_poll_needed(false));
+        assert_eq!(crate::gpu::producer_idle_timeout_millis(false, false, false), 100);
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    #[ignore = "explicit actual Metal callback liveness fixture"]
+    fn metal_world_callback_requires_core_poll_after_native_gpu_completion() {
+        use std::sync::atomic::AtomicBool;
+        let _serial = TEST_LOCK.lock().unwrap();
+        assert!(!has_pending_callbacks());
+        let mut descriptor = InstanceDescriptor::new_without_display_handle();
+        descriptor.backends = Backends::METAL;
+        let instance = Instance::new(descriptor);
+        let adapter = pollster::block_on(instance.request_adapter(&RequestAdapterOptions::default())).unwrap();
+        assert_eq!(adapter.get_info().backend, Backend::Metal);
+        let (device, queue) = pollster::block_on(adapter.request_device(&DeviceDescriptor::default())).unwrap();
+        let buffer = device.create_buffer(&BufferDescriptor { label: Some("World callback liveness GPU work"),
+            size: 4 << 20, usage: BufferUsages::COPY_DST, mapped_at_creation: false });
+        let submit_callback = || {
+            let mut encoder = device.create_command_encoder(&CommandEncoderDescriptor::default());
+            encoder.clear_buffer(&buffer, 0, None);
+            queue.submit([encoder.finish()]);
+            let observed = Arc::new(AtomicBool::new(false));
+            let completed = observed.clone();
+            let pending = PendingSnapshotCallback::new();
+            queue.on_submitted_work_done(move || {
+                let _pending = pending;
+                completed.store(true, Ordering::Release);
+            });
+            // SAFETY: this isolated fixture owns its device/queue and submits no
+            // concurrent work. Native wait only drains Metal; it deliberately
+            // does not invoke wgpu-core maintenance or dispatch user callbacks.
+            let raw = unsafe { queue.as_hal::<wgpu::hal::api::Metal>() }.unwrap();
+            unsafe { wgpu::hal::Queue::wait_for_idle(&*raw) }.unwrap();
+            observed
+        };
+
+        let observed = submit_callback();
+        assert!(!observed.load(Ordering::Acquire), "native GPU completion must not dispatch the core callback");
+        let unpolled_at = Instant::now();
+        std::thread::sleep(Duration::from_millis(100));
+        let unpolled_ms = unpolled_at.elapsed().as_secs_f64() * 1_000.;
+        assert!(!observed.load(Ordering::Acquire), "without maintenance the callback stays pending even after 100 ms");
+        assert!(has_pending_callbacks());
+        assert!(crate::gpu::completion_poll_needed(false));
+        let timeout = crate::gpu::producer_idle_timeout_millis(false, false, false);
+        assert_eq!(timeout, 1);
+        let serviced_at = Instant::now();
+        std::thread::sleep(Duration::from_millis(timeout));
+        device.poll(PollType::Poll).unwrap();
+        assert!(observed.load(Ordering::Acquire));
+        assert!(!has_pending_callbacks());
+        let serviced_ms = serviced_at.elapsed().as_secs_f64() * 1_000.;
+
+        // Native completion before reset must also retire its pending guard.
+        let observed = submit_callback();
+        reset();
+        assert!(has_pending_callbacks());
+        device.poll(PollType::Poll).unwrap();
+        assert!(observed.load(Ordering::Acquire));
+        assert!(!has_pending_callbacks());
+        assert_eq!(crate::gpu::producer_idle_timeout_millis(false, false, false), 100);
+        eprintln!("actual Metal world callback: GPU-complete callback remained pending without poll for {unpolled_ms:.3} ms; production 1 ms idle policy plus Poll serviced it in {serviced_ms:.3} ms; adapter={:?}", adapter.get_info());
+    }
 
     fn telemetry_primary_pose() -> crate::xr_view::WorldView {
         let identity = [1.,0.,0.,0., 0.,1.,0.,0., 0.,0.,1.,0., 0.,0.,0.,1.];

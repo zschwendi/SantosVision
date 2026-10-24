@@ -86,6 +86,16 @@ const BIND_UAV: u32 = 0x80;
 const RING_CHUNK: u64 = 8 << 20;
 const UBO_WINDOW: u64 = 65536;
 const FRAME_SLOTS: usize = 3;
+
+pub(crate) fn completion_poll_needed(query_events_pending: bool) -> bool {
+    query_events_pending || crate::world_frame::has_pending_callbacks()
+}
+
+pub(crate) fn producer_idle_timeout_millis(pending_maps: bool, query_events_pending: bool,
+    pending_upload_callbacks: bool) -> u64 {
+    if pending_maps || completion_poll_needed(query_events_pending) || pending_upload_callbacks { 1 } else { 100 }
+}
+
 const ZERO_VB_SIZE: u64 = 4096;
 const OCCLUSION_CAPACITY: u32 = 2048;
 const OCCLUSION_VISIBLE_COUNT: u64 = 65536;
@@ -1680,7 +1690,7 @@ impl Gpu {
             }
             self.process_maps(false);
             self.uploads.poll(&self.device);
-            if self.inflight.load(Ordering::SeqCst) > 0 {
+            if completion_poll_needed(self.inflight.load(Ordering::SeqCst) > 0) {
                 let started = Instant::now();
                 let _ = self.device.poll(PollType::Poll);
                 self.thread_wall[THREAD_QUERY_POLL].record(started.elapsed());
@@ -1695,7 +1705,8 @@ impl Gpu {
                     self.hdr(5).store(0, Ordering::SeqCst);
                     continue;
                 }
-                let timeout = if self.pending_maps.is_empty() && self.inflight.load(Ordering::SeqCst) == 0 && !self.uploads.has_pending_callbacks() { 100 } else { 1 };
+                let timeout = producer_idle_timeout_millis(!self.pending_maps.is_empty(),
+                    self.inflight.load(Ordering::SeqCst) > 0, self.uploads.has_pending_callbacks());
                 let started = Instant::now();
                 let _ = self.mem.atomic_wait32(self.ring, tail as u32, Some(Duration::from_millis(timeout)));
                 self.thread_wall[THREAD_PRODUCER_IDLE].record(started.elapsed());
@@ -1737,7 +1748,7 @@ impl Gpu {
                 let _ = self.mem.atomic_notify(self.ring + 4, u32::MAX);
                 self.process_maps(false);
                 self.uploads.poll(&self.device);
-                if self.inflight.load(Ordering::SeqCst) > 0 {
+                if completion_poll_needed(self.inflight.load(Ordering::SeqCst) > 0) {
                     let started = Instant::now();
                     let _ = self.device.poll(PollType::Poll);
                     self.thread_wall[THREAD_QUERY_POLL].record(started.elapsed());

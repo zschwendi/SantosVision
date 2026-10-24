@@ -1,0 +1,60 @@
+{
+  "schema": 1,
+  "scope": "Repair producer polling/idle scheduling while immutable world snapshot completion callbacks remain pending",
+  "parent_work_id": "w-14dea40fb6e248138ad507f85cf4384b",
+  "base_commit": "5baebf1960140210e98e583ea40d3b6026ac8e83",
+  "created_at_utc": "2026-10-24T01:50:30.331230+00:00",
+  "source_sha256": {
+    "src/world_frame.rs": "16f6b70a9db147923d945c30f9396c54dd892eedcf26f07b80ac0e468f71c1e5",
+    "src/gpu.rs": "c347afd95543037f330258d55a98e0fad534a641ad2c25705d75a9308082ed95"
+  },
+  "change": [
+    "Separate AtomicUsize counts single-eye and paired-eye world snapshot callbacks; RAII guard retires on callback exit or closure drop, including stale generation/epoch return.",
+    "Reset preserves outstanding callback counts. Both GPU polling sites include world callbacks. Idle wait selects existing 1 ms callback interval while pending; returns to 100 ms when all work is absent.",
+    "Additive world_frames.pending_snapshot_callbacks reports accounting. Existing query_event_poll wall-time bucket now also includes polls requested by world snapshots. No existing API field renamed."
+  ],
+  "verification": {
+    "command_prefix": "CARGO_HOME=/Users/zach/gaming/SantosVision/.tools/cargo RUSTUP_HOME=/Users/zach/gaming/SantosVision/.tools/rustup PATH=/Users/zach/gaming/SantosVision/.tools/cargo/bin:$PATH .tools/cargo/bin/cargo +1.98.1 test --lib --locked --offline",
+    "focused_filter": "world_callback -- --include-ignored --test-threads=1 --nocapture",
+    "focused_result": "2 passed; 0 failed",
+    "world_frame_filter": "world_frame::tests -- --include-ignored --test-threads=1 --nocapture",
+    "world_frame_result": "11 passed; 0 failed; includes four actual Mac Metal fixtures and existing single/pair/depth/lease/reset checks",
+    "actual_metal_adapter": "Apple M4; Backend::Metal",
+    "actual_metal_liveness": {
+      "method": "Isolated wgpu Metal queue submits a real buffer clear; HAL Queue::wait_for_idle proves GPU completion without core maintenance. Callback remains unobserved through 100 ms with no core poll; actual production helpers select polling and 1 ms idle wait, then Poll dispatches callback. No concurrent raw queue operations.",
+      "gpu_complete_but_unpolled_ms": 100.521,
+      "one_ms_policy_plus_poll_observed_ms": 1.403,
+      "timing_assertions": "No upper latency guarantee asserted. Assertions verify native completion alone does not dispatch core callback, pending-only work selects Poll plus 1 ms, Poll dispatches, and pending counter retires."
+    },
+    "guard_policy_regression": "Normal completion, stale callback early return, discarded callback closure, multiple pending callbacks, reset with pending callbacks, and map/event/upload scheduling compatibility.",
+    "independent_review": "Child snapshot_scheduler_review found no blocking issue; checked both registrations, both pollsites, idle predicate, reset behavior and HAL wait safety.",
+    "diff_check": "git diff --check passed",
+    "host_configuration_failure": "Initial --no-default-features host check failed existing lib.rs macOS jit-or-embedded-AOT gate; exact failure captured in host-feature-config-failure.log. Correct default-jit host test configuration passed; no product workaround."
+  },
+  "evidence": {
+    "focused-tests.log": {
+      "path": "target/verification/device-session-20261024/snapshot-callback/focused-tests.log",
+      "sha256": "f08836b6ccc9ea314c91827cee5596f7b4d14199570600813687f9a56ba726b4"
+    },
+    "world-frame-tests.log": {
+      "path": "target/verification/device-session-20261024/snapshot-callback/world-frame-tests.log",
+      "sha256": "d0d6ee9c8c88089173989d0efb3ee5ee54f76333b7830dd6c32e812a6e667232"
+    },
+    "host-feature-config-failure.log": {
+      "path": "target/verification/device-session-20261024/snapshot-callback/host-feature-config-failure.log",
+      "sha256": "54c4a38b49c42ba1da1822fd42f34a3e9f12c0205b4f81d17621960f53d27538"
+    }
+  },
+  "local_source_evidence": [
+    "vendor/wgpu-core/src/device/queue.rs:1904-1915 stores work-done closures; :1662-1686 submits collect/fire callbacks.",
+    "vendor/wgpu-core/src/device/resource.rs:784-789 poll fires collected callbacks; :896-922 obtains native fence and triages submissions.",
+    ".tools/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/wgpu-hal-30.0.1/src/metal/mod.rs:737-756 native Metal completion updates fence+condvar; :832-839 HAL idle wait waits native queue only."
+  ],
+  "limitations": [
+    "This repairs a proven callback-liveness scheduling gap; it does not establish the cause or amount of the user-reported fast-head-turn image lag.",
+    "No Vision Pro or simulator work, camera/prediction/inFlight/default changes, app rebuild/sign/install, or game execution by this worker. Root owns candidate12r2 integration and physical acceptance.",
+    "Recent saved device-session-20261023/20261024 reports contain no numeric snapshot_submit_to_gpu_completion_seconds samples; before-report is window mode and cannot measure active motion latency.",
+    "Global callback accounting may cause extra polling if another device has a retained callback; no publication or provenance rules change."
+  ],
+  "board": "One bounded join timed out after 3 seconds behind shared lock; no retry, registration or finish confirmed. Parent should reference this receipt in its handoff."
+}
