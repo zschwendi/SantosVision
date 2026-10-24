@@ -284,6 +284,88 @@ mod pad {
             crate::input::take();
         }
         #[test]
+        fn gta_pause_and_settings_menus_receive_frontend_keys_from_both_controller_profiles() {
+            for spatial in [false, true] {
+                suspend();
+                TEST_NATIVE_CONTROLS_OWN_INPUT.store(false, Ordering::Relaxed);
+                TEST_NATIVE_CONTROLS_POLICY.store(0, Ordering::Relaxed);
+                IN_VEHICLE.store(false, Ordering::Relaxed);
+                // Spatial ABI v1 bits: right A/B, left A/B, left/right grip, right Menu 9.
+                let make = |faces: u8, left: [f32; 2], trigger: f32, menu: bool| -> Sample {
+                    if !spatial {
+                        return Sample { face_and_shoulders: faces, left_stick: left, right_trigger: trigger,
+                            left_trigger: trigger, menu, ..Sample::default() };
+                    }
+                    let mut buttons = 0u32;
+                    for (bit, face) in [CROSS, CIRCLE, SQUARE, TRIANGLE, LEFT_SHOULDER, RIGHT_SHOULDER].iter().enumerate() {
+                        if faces & face != 0 { buttons |= 1 << bit; }
+                    }
+                    if menu { buttons |= 1 << 9; }
+                    spatial::spatial_sample(3, buttons, [left[0], left[1], 0.0, 0.0, trigger, trigger], 42).unwrap()
+                };
+                let neutral = make(0, [0.0; 2], 0.0, false);
+                let paused = || Some(guest_context::Context { paused: true, phone: false });
+                let gameplay = || Some(guest_context::Context { paused: false, phone: false });
+                poll_sample_in_context(Some(neutral), paused);
+                assert_eq!(sv_native_menu_context_v1(), 2, "Verified GTA menu state reaches the native panel");
+                crate::input::take();
+                let gameplay_only = ["ShiftLeft", "KeyR", "KeyF", "KeyW", "KeyA", "KeyS", "KeyD", "KeyY", "KeyN", "KeyC", "KeyV"];
+                for (faces, left, expected) in [
+                    (CROSS, [0.0, 0.0], "Enter"), (CIRCLE, [0.0, 0.0], "Backspace"), (SQUARE, [0.0, 0.0], "Space"),
+                    (TRIANGLE, [0.0, 0.0], "Tab"), (LEFT_SHOULDER, [0.0, 0.0], "KeyQ"), (RIGHT_SHOULDER, [0.0, 0.0], "KeyE"),
+                    (0, [0.0, 1.0], "ArrowUp"), (0, [0.0, -1.0], "ArrowDown"),
+                    (0, [-1.0, 0.0], "ArrowLeft"), (0, [1.0, 0.0], "ArrowRight"),
+                ] {
+                    poll_sample_in_context(Some(make(faces, left, 0.0, false)), paused);
+                    let events = crate::input::take();
+                    assert!(events.contains(&Event::Key(expected.into(), true)), "spatial={spatial} {expected}");
+                    assert!(!events.iter().any(|event| matches!(event, Event::Key(k, true) if gameplay_only.contains(&k.as_str()))),
+                        "spatial={spatial} {expected} leaked a gameplay key: {events:?}");
+                    assert!(!events.iter().any(|event| matches!(event, Event::Button(_, true) | Event::Motion(..))));
+                    poll_sample_in_context(Some(neutral), paused);
+                    assert!(crate::input::take().contains(&Event::Key(expected.into(), false)));
+                }
+                // L1 must not also send FRONTEND_Y; R1 must not send cover.
+                poll_sample_in_context(Some(make(LEFT_SHOULDER | RIGHT_SHOULDER, [0.0; 2], 0.0, false)), paused);
+                let events = crate::input::take();
+                assert!(!events.contains(&Event::Key("Tab".into(), true)));
+                poll_sample_in_context(Some(neutral), paused); crate::input::take();
+                // Triggers stay free for the Sense system select on native buttons.
+                poll_sample_in_context(Some(make(0, [0.0; 2], 1.0, false)), paused);
+                assert!(crate::input::take().is_empty(), "Menu triggers emit no GTA input");
+                poll_sample_in_context(Some(neutral), paused); crate::input::take();
+                // Start is GTA's own pause/back and is still counted once.
+                let before = sv_native_menu_press_count_v1();
+                poll_sample_in_context(Some(make(0, [0.0; 2], 0.0, true)), paused);
+                assert!(crate::input::take().contains(&Event::Key("Escape".into(), true)));
+                assert_eq!(sv_native_menu_press_count_v1(), before + 1);
+                poll_sample_in_context(Some(neutral), paused); crate::input::take();
+                // A modal native panel is what previously swallowed all of this.
+                TEST_NATIVE_CONTROLS_POLICY.store(1, Ordering::Relaxed);
+                poll_sample_in_context(Some(make(CROSS, [0.0, 1.0], 0.0, false)), paused);
+                assert!(crate::input::take().is_empty(), "Modal ownership still blocks every physical input");
+                TEST_NATIVE_CONTROLS_POLICY.store(0, Ordering::Relaxed);
+                poll_sample_in_context(Some(neutral), paused); crate::input::take();
+                // Gameplay bindings are unchanged after GTA's menu closes.
+                poll_sample_in_context(Some(neutral), gameplay);
+                assert_eq!(sv_native_menu_context_v1(), 1);
+                crate::input::take();
+                for (faces, expected) in [(LEFT_SHOULDER, "Tab"), (RIGHT_SHOULDER, "KeyQ"), (TRIANGLE, "KeyF")] {
+                    poll_sample_in_context(Some(make(faces, [0.0; 2], 0.0, false)), gameplay);
+                    let events = crate::input::take();
+                    assert!(events.contains(&Event::Key(expected.into(), true)), "spatial={spatial} gameplay {expected}");
+                    assert!(!events.contains(&Event::Key("KeyE".into(), true)));
+                    poll_sample_in_context(Some(neutral), gameplay); crate::input::take();
+                }
+                // No verified guest getter: the native panel must stay modal.
+                poll_sample(Some(neutral));
+                assert_eq!(sv_native_menu_context_v1(), 0);
+                suspend();
+                MENU_NAVIGATION.store(false, Ordering::Relaxed);
+                crate::input::take();
+            }
+        }
+        #[test]
         fn native_modal_releases_actual_inputs_keeps_app_actions_and_requires_rearm() {
             suspend();
             MENU_NAVIGATION.store(false, Ordering::Relaxed);

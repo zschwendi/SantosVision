@@ -77,6 +77,70 @@ import Foundation
         require(presses.consume(3)?.toggle == false && presses.count == 3,
                 "Two presses arriving between UI samples preserve parity")
         require(presses.consume(4)?.toggle == true, "Next fresh physical press is handled once")
+        typealias Pause = NativePauseCompanionPolicy
+        let grace = Pause.pauseOpenGrace
+        var legacy = Pause()
+        _ = legacy.observe(.unknown, visible: false)
+        var shown = legacy.startPressed(visible: false, now: 0)
+        require(shown && legacy.panelOwnsController(visible: shown, now: 0),
+                "Unverified game state keeps the established modal Start panel")
+        require(!legacy.startPressed(visible: true, now: 1), "Unverified Start still toggles the panel closed")
+        var pause = Pause()
+        _ = pause.observe(.gameplay, visible: false)
+        shown = pause.startPressed(visible: false, now: 10)
+        require(shown && !pause.panelOwnsController(visible: shown, now: 10.05),
+                "Start opens the panel without cutting GTA's own pause Escape short")
+        shown = pause.observe(.paused, visible: shown)
+        require(shown && !pause.panelOwnsController(visible: shown, now: 10 + grace + 5),
+                "With GTA's pause/Settings menu open the controller belongs to GTA, indefinitely")
+        require(pause.startPressed(visible: shown, now: 20),
+                "Start inside GTA's menu is GTA's Escape; the panel follows GTA's actual state")
+        shown = pause.observe(.paused, visible: shown)
+        require(shown, "Backing out of a GTA submenu keeps the companion")
+        shown = pause.observe(.gameplay, visible: shown)
+        require(!shown, "The panel closes when GTA's own menu closes, by Start or Circle")
+        require(!pause.panelOwnsController(visible: shown, now: 21), "Closed panel never owns input")
+        var noPause = Pause()
+        _ = noPause.observe(.gameplay, visible: false)
+        shown = noPause.startPressed(visible: false, now: 30)
+        shown = noPause.observe(.gameplay, visible: shown)
+        require(shown && !noPause.panelOwnsController(visible: shown, now: 30 + grace - 0.01), "Pause grace stays non-modal")
+        require(noPause.panelOwnsController(visible: shown, now: 30 + grace),
+                "If GTA never opens a menu, the app-only panel takes the controller as before")
+        shown = noPause.observe(.paused, visible: shown)
+        require(shown && !noPause.panelOwnsController(visible: shown, now: 40),
+                "A late GTA pause still returns the controller to GTA's menu")
+        var doubleTap = Pause()
+        _ = doubleTap.observe(.gameplay, visible: false)
+        shown = doubleTap.startPressed(visible: false, now: 50)
+        require(!doubleTap.startPressed(visible: shown, now: 50.2),
+                "A second Start before GTA pauses closes the panel")
+        var external = Pause()
+        _ = external.observe(.paused, visible: false)
+        require(!external.startPressed(visible: false, now: 59),
+                "Start inside a GTA menu opened without the panel is GTA's Escape, not a panel toggle")
+        require(!external.panelOwnsController(visible: true, now: 60),
+                "A panel shown after a failed quit beside GTA's menu still leaves GTA the controller")
+        _ = external.observe(.gameplay, visible: false)
+        require(external.panelOwnsController(visible: true, now: 61),
+                "An app-opened panel over gameplay remains modal")
+        require(Pause.GuestMenu(rawValue: 2) == .paused && Pause.GuestMenu(rawValue: 1) == .gameplay
+                && Pause.GuestMenu(rawValue: 0) == .unknown && Pause.GuestMenu(rawValue: 9) == nil,
+                "Swift reads sv_native_menu_context_v1 values exactly")
+        require(SantosControlAction.companionActions(immersive: true) == [.window, .settings, .quit]
+                && SantosControlAction.companionActions(immersive: false) == [.settings, .quit],
+                "Beside GTA's menu no Resume duplicates GTA's Back, and flat view has no Window no-op")
+        require(SantosControlAction.settings.title != "Settings", "App settings are not labelled like GTA's own Settings tab")
+        var cross = Pause()
+        require(cross.acceptsCompanionActivation(now: 0), "Look-and-trigger or pinch activates companion buttons")
+        cross.observeConfirm(true, now: 1)
+        require(!cross.acceptsCompanionActivation(now: 1.5), "A held Cross belongs to GTA's menu")
+        cross.observeConfirm(false, now: 1.6)
+        require(!cross.acceptsCompanionActivation(now: 1 + Pause.confirmGuard - 0.01),
+                "A system Button event coinciding with Cross is GTA's selection")
+        require(cross.acceptsCompanionActivation(now: 1 + Pause.confirmGuard), "Guard expires after a short bound")
+        cross.observeConfirm(false, now: 3)
+        require(cross.acceptsCompanionActivation(now: 3), "Released state does not refresh the guard")
         print("Native controls policy: \(checks) checks passed")
     }
 }

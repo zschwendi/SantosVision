@@ -42,9 +42,14 @@ enum SantosControlAction: Int, CaseIterable, Identifiable {
         switch self {
         case .resume: "Resume"
         case .window: "Window"
-        case .settings: "Settings"
+        case .settings: "Los Santos settings"
         case .quit: "Quit game"
         }
+    }
+    /// Beside GTA's own pause menu, GTA's Back already resumes and a flat
+    /// window has nothing to return to. Only app-only actions remain.
+    static func companionActions(immersive: Bool) -> [SantosControlAction] {
+        immersive ? [.window, .settings, .quit] : [.settings, .quit]
     }
     var symbol: String {
         switch self {
@@ -112,6 +117,75 @@ struct NativeControlsActivationGate {
         return value.action
     }
     mutating func cancel() { pending = nil }
+}
+
+/// GTA's verified pause state decides who receives the controller while the
+/// Start panel is visible. With GTA's own pause/Settings menu open, physical
+/// input belongs to GTA and the panel is a look-and-select companion that
+/// closes with GTA's menu. Unverified game state keeps the established modal
+/// panel, as does a Start press that never opens GTA's menu.
+struct NativePauseCompanionPolicy {
+    /// Values of `sv_native_menu_context_v1`.
+    enum GuestMenu: UInt32, Sendable { case unknown = 0, gameplay = 1, paused = 2 }
+    /// GTA's pause menu streams in after the Escape sent by Start. The panel
+    /// stays non-modal meanwhile, so it cannot cut that Escape short.
+    static let pauseOpenGrace = 2.0
+    /// A system Button event this close to a physical Cross is GTA's select.
+    static let confirmGuard = 0.25
+    private(set) var guest = GuestMenu.unknown
+    private var awaitingPauseSince: Double?
+    private var followingPause = false
+    private var confirmHeld = false
+    private var lastConfirm = -Double.infinity
+
+    func panelOwnsController(visible: Bool, now: Double) -> Bool {
+        guard visible else { return false }
+        switch guest {
+        case .unknown: return true
+        case .paused: return false
+        case .gameplay:
+            guard let since = awaitingPauseSince else { return true }
+            return now - since >= Self.pauseOpenGrace
+        }
+    }
+
+    /// Physical Start edge seen by the native poller. Returns next visibility.
+    mutating func startPressed(visible: Bool, now: Double) -> Bool {
+        if guest == .unknown { reset(); return !visible }
+        // Inside GTA's own menu Start is GTA's Escape; follow GTA's state.
+        if guest == .paused { return visible }
+        reset()
+        if visible { return false }
+        awaitingPauseSince = now
+        return true
+    }
+
+    /// Latest verified guest state. Returns next visibility.
+    mutating func observe(_ next: GuestMenu, visible: Bool) -> Bool {
+        guest = next
+        guard visible else { reset(); return false }
+        switch next {
+        case .unknown: return true
+        case .paused:
+            followingPause = true
+            awaitingPauseSince = nil
+            return true
+        case .gameplay:
+            if followingPause { reset(); return false }
+            return true
+        }
+    }
+
+    mutating func closed() { reset() }
+    private mutating func reset() { awaitingPauseSince = nil; followingPause = false }
+
+    mutating func observeConfirm(_ pressed: Bool, now: Double) {
+        if pressed, !confirmHeld { lastConfirm = now }
+        confirmHeld = pressed
+    }
+    func acceptsCompanionActivation(now: Double) -> Bool {
+        !confirmHeld && now - lastConfirm >= Self.confirmGuard
+    }
 }
 
 /// Fast atomic polling and slower full status snapshots share this observer.

@@ -380,7 +380,7 @@ struct SantosSettingsView: View {
                         .disabled(!runtime.canChangePlaySettings)
                     Text("Adjusts the right stick's look speed. GTA's own mouse sensitivity also applies.")
                         .font(.caption).foregroundStyle(.secondary)
-                    Text("DualSense: click the touchpad to change camera. Sense: click both sticks together to change camera. Left stick always moves; its click is normal L3. Use the phone arrow buttons for D-pad navigation. The Phone and View buttons sit below the game. Look at a native button and press either Sense trigger to select it. Start opens Resume, Window, Settings and Quit. In GTA menus: Cross selects, Circle goes back, Square applies, Triangle means Yes, and R1 means No.")
+                    Text("DualSense: click the touchpad to change camera. Sense: click both sticks together to change camera. Left stick always moves; its click is normal L3. Use the phone arrow buttons for D-pad navigation. The Phone and View buttons sit below the game. Look at a native button and press either Sense trigger to select it. Start opens GTA's pause menu, with Los Santos settings and Quit beside it (plus Window when immersive). In GTA menus and Settings: stick moves, Cross selects, Circle goes back, L1/R1 change tabs, Square applies and Triangle is GTA's Tab. GTA shows keyboard keys: Enter ✕, Backspace ○, Space □, Tab △, Q/E L1/R1.")
                         .font(.caption).foregroundStyle(.secondary)
                 }
                 Section {
@@ -431,9 +431,14 @@ struct SantosPauseControls: View {
     @State private var registration = UUID()
 
     var body: some View {
+        // Beside GTA's own menu the controller drives GTA, so nothing here is
+        // highlighted and GTA's own Back/Settings are not duplicated.
+        let companion = runtime.pauseControlsFollowGame
+        let actions = companion ? SantosControlAction.companionActions(immersive: immersive) : SantosControlAction.allCases
         VStack(spacing: 12) {
             LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 10) {
-                ForEach(SantosControlAction.allCases) { action in
+                ForEach(actions) { action in
+                    let selected = !companion && action.rawValue == runtime.nativeControlsSelection
                     Button {
                         runtime.activatePauseButton(action)
                     } label: {
@@ -441,13 +446,14 @@ struct SantosPauseControls: View {
                             .frame(maxWidth: .infinity, minHeight: 48)
                     }
                     .buttonStyle(.bordered)
-                    .tint(action.rawValue == runtime.nativeControlsSelection ? SantosTheme.glow : SantosTheme.accent)
-                    .overlay(RoundedRectangle(cornerRadius: 16).stroke(
-                        action.rawValue == runtime.nativeControlsSelection ? SantosTheme.glow : .clear, lineWidth: 2))
-                    .accessibilityAddTraits(action.rawValue == runtime.nativeControlsSelection ? .isSelected : [])
+                    .tint(selected ? SantosTheme.glow : SantosTheme.accent)
+                    .overlay(RoundedRectangle(cornerRadius: 16).stroke(selected ? SantosTheme.glow : .clear, lineWidth: 2))
+                    .accessibilityAddTraits(selected ? .isSelected : [])
                 }
             }
-            Text("Look and click · or stick + Cross\nCircle / Start · Resume")
+            Text(companion
+                 ? "Controller drives GTA's menu · look here and press a trigger or pinch\nGTA keys: Enter ✕ · Backspace ○ · Space □ · Tab △ · Q/E L1/R1"
+                 : "Look and click · or stick + Cross\nCircle / Start · Resume")
                 .font(.caption2).foregroundStyle(.secondary).multilineTextAlignment(.center)
             if !runtime.nativeControlsStatus.isEmpty { Text(runtime.nativeControlsStatus).font(.caption) }
         }

@@ -41,6 +41,16 @@ static LOOK_SENSITIVITY: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
 static MENU_NAVIGATION: AtomicBool = AtomicBool::new(false);
 static GUEST_CONTEXT_AVAILABLE: AtomicBool = AtomicBool::new(false);
 static PHONE_INSTANTIATED: AtomicBool = AtomicBool::new(false);
+// One word, so the native UI never pairs a stale availability with a fresh state.
+static MENU_CONTEXT: AtomicU64 = AtomicU64::new(0);
+
+/// Lightweight verified GTA front-end state for the native Start panel, so it
+/// can leave the controller to GTA's own pause and Settings menus. 0 unknown
+/// (no verified guest getter; the panel stays modal), 1 gameplay, 2 GTA menu.
+#[no_mangle]
+pub extern "C" fn sv_native_menu_context_v1() -> u32 {
+    MENU_CONTEXT.load(Ordering::Relaxed) as u32
+}
 
 /// Share the exact original-game certificate with scoped guest-native helpers.
 pub(crate) fn exact_guest_abi_verified() -> bool {
@@ -382,6 +392,15 @@ fn face_keys(keys: &mut HashSet<&'static str>, menu: bool, in_car: bool,
     }
 }
 
+/// GTA's fixed PC front-end bindings in the shipped x64/data/control/fixed.meta:
+/// FRONTEND_LB/RB are Q/E (header tabs) and FRONTEND_Y is Tab. Y and N have no
+/// front-end binding. Positions follow GTA's own pad layout (L1/R1, Triangle).
+fn frontend_keys(keys: &mut HashSet<&'static str>, triangle: bool, left_shoulder: bool, right_shoulder: bool) {
+    if triangle { keys.insert("Tab"); }
+    if left_shoulder { keys.insert("KeyQ"); }
+    if right_shoulder { keys.insert("KeyE"); }
+}
+
 fn navigation_context(previous: bool, escape_released: bool,
                       guest: Option<guest_context::Context>) -> (bool, bool) {
     if let Some(context) = guest {
@@ -458,6 +477,7 @@ fn poll_sample_in_context(gp: Option<Sample>, context: impl FnOnce() -> Option<g
     MENU_NAVIGATION.store(menu, Ordering::Relaxed);
     GUEST_CONTEXT_AVAILABLE.store(guest.is_some(), Ordering::Relaxed);
     PHONE_INSTANTIATED.store(phone_instantiated, Ordering::Relaxed);
+    MENU_CONTEXT.store(guest.map_or(0, |context| if context.paused { 2 } else { 1 }), Ordering::Relaxed);
     if menu_down { keys.insert("Escape"); }
     if let Some(gp) = gp.as_ref() {
         let menu = st.menu_navigation;
@@ -493,9 +513,7 @@ fn poll_sample_in_context(gp: Option<Sample>, context: impl FnOnce() -> Option<g
         // Leaving it must require a fresh face press before gameplay resumes.
         face_keys(&mut keys, menu || phone_instantiated, in_car, pressed(CROSS), pressed(CIRCLE), pressed(SQUARE));
         if menu {
-            if pressed(TRIANGLE) { keys.insert("KeyY"); }
-            if pressed(RIGHT_SHOULDER) { keys.insert("KeyN"); }
-            if pressed(LEFT_SHOULDER) { keys.insert("Tab"); }
+            frontend_keys(&mut keys, pressed(TRIANGLE), pressed(LEFT_SHOULDER), pressed(RIGHT_SHOULDER));
         } else {
             if pressed(TRIANGLE) { keys.insert("KeyF"); }
             if pressed(LEFT_SHOULDER) { keys.insert("Tab"); }
@@ -642,6 +660,16 @@ mod tests {
         assert_eq!(keys, HashSet::from(["Enter", "Backspace", "Space"]));
         assert!(!keys.contains("ShiftLeft"));
         assert!(!keys.contains("KeyR"));
+    }
+
+    #[test]
+    fn gta_front_end_tabs_and_y_use_fixed_pc_bindings() {
+        let mut keys = HashSet::new();
+        frontend_keys(&mut keys, true, true, true);
+        assert_eq!(keys, HashSet::from(["Tab", "KeyQ", "KeyE"]));
+        let mut left = HashSet::new();
+        frontend_keys(&mut left, false, true, false);
+        assert_eq!(left, HashSet::from(["KeyQ"]), "L1 is GTA's previous tab, not FRONTEND_Y");
     }
 
     #[test]

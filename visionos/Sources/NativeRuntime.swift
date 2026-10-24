@@ -173,6 +173,9 @@ final class NativeRuntimeModel: ObservableObject {
     @Published var gameControlsVisible = false { didSet { updateNativeControlsOwnership() } }
     @Published var nativeSettingsPresented = false { didSet { updateNativeControlsOwnership() } }
     @Published private(set) var nativeControlsSelection = 0
+    /// The Start panel sits beside GTA's own open menu and leaves it the controller.
+    @Published private(set) var pauseControlsFollowGame = false
+    private var pauseCompanion = NativePauseCompanionPolicy()
     @Published private(set) var senseGameplayUtilitiesVisible = false
     @Published private(set) var sensePhoneNavigationVisible = false
     @Published private(set) var windowGameplayUtilitiesVisible = false
@@ -489,8 +492,16 @@ final class NativeRuntimeModel: ObservableObject {
         updateActivity()
     }
 
+    private var nativeControlsModal: Bool {
+        nativeSettingsPresented || (gameControlsVisible && !pauseControlsFollowGame)
+    }
+
     private func updateNativeControlsOwnership() {
-        let modal = gameControlsVisible || nativeSettingsPresented
+        if !gameControlsVisible { pauseCompanion.closed() }
+        let companion = gameControlsVisible
+            && !pauseCompanion.panelOwnsController(visible: true, now: ProcessInfo.processInfo.systemUptime)
+        if pauseControlsFollowGame != companion { pauseControlsFollowGame = companion }
+        let modal = nativeControlsModal
         NativeControlsOwnership.shared.set(modal: modal || immersivePhonePreparationActive, utility: senseUtilityInteractionActive)
         nativeControlsRouter = NativeControlsRouter()
         nativeControlsSelection = 0
@@ -501,11 +512,18 @@ final class NativeRuntimeModel: ObservableObject {
         updateSenseUtilitiesVisibility()
         nativeControlsTask?.cancel()
         nativeControlsTask = nil
-        guard modal else { return }
+        guard modal || companion else { return }
         nativeControlsTask = Task { @MainActor [weak self] in
             while !Task.isCancelled {
                 guard let self else { return }
                 let input = SpatialGamepadInput.shared.nativeControlsInput()
+                guard modal else {
+                    // GTA's menu owns this input. Only remember Cross, so a
+                    // coincident system Button event cannot also hit the panel.
+                    self.pauseCompanion.observeConfirm(input.confirm, now: ProcessInfo.processInfo.systemUptime)
+                    do { try await Task.sleep(for: .milliseconds(16)) } catch { return }
+                    continue
+                }
                 let event = self.nativeControlsRouter.update(input, selection: self.nativeControlsSelection,
                     now: ProcessInfo.processInfo.systemUptime)
                 self.nativeControlsSelection = event.selection
@@ -547,6 +565,10 @@ final class NativeRuntimeModel: ObservableObject {
 
     func activatePauseButton(_ action: SantosControlAction) {
         guard gameControlsVisible, !nativeSettingsPresented, !isQuitting else { return }
+        if pauseControlsFollowGame {
+            guard SantosControlAction.companionActions(immersive: compositorOwnsHeadTracking).contains(action),
+                  pauseCompanion.acceptsCompanionActivation(now: ProcessInfo.processInfo.systemUptime) else { return }
+        }
         guard nativeControlsActivationGate.direct(now: ProcessInfo.processInfo.systemUptime) else { return }
         pendingNativeControlsConfirmation = nil
         nativeControlsConfirmation?.cancel()
@@ -657,7 +679,7 @@ final class NativeRuntimeModel: ObservableObject {
     private func clearSenseUtilityDirections() {
         senseUtilityOwnership.clear()
         synchronizeSenseUtilityDirections()
-        NativeControlsOwnership.shared.set(modal: gameControlsVisible || nativeSettingsPresented || immersivePhonePreparationActive, utility: false)
+        NativeControlsOwnership.shared.set(modal: nativeControlsModal || immersivePhonePreparationActive, utility: false)
     }
 
     private func refreshSenseUtilityDirections() {
@@ -963,8 +985,23 @@ final class NativeRuntimeModel: ObservableObject {
     private func observeMenuPressCount(_ presses: UInt64) {
         guard let event = nativeMenuPressObserver.consume(presses) else { return }
         menuPressCount = event.count
-        if event.toggle { gameControlsVisible.toggle() }
+        if event.toggle {
+            let visible = pauseCompanion.startPressed(visible: gameControlsVisible,
+                                                      now: ProcessInfo.processInfo.systemUptime)
+            if visible != gameControlsVisible { gameControlsVisible = visible }
+        }
         Task { await cloudSaves.backupNow() }
+    }
+
+    /// The panel closes with GTA's own menu; grace expiry and GTA's menu
+    /// opening change the controller owner without changing visibility.
+    private func observeGuestMenu(_ raw: UInt32) {
+        let visible = pauseCompanion.observe(NativePauseCompanionPolicy.GuestMenu(rawValue: raw) ?? .unknown,
+                                             visible: gameControlsVisible)
+        if visible != gameControlsVisible { gameControlsVisible = visible; return }
+        let companion = gameControlsVisible
+            && !pauseCompanion.panelOwnsController(visible: true, now: ProcessInfo.processInfo.systemUptime)
+        if companion != pauseControlsFollowGame { updateNativeControlsOwnership() }
     }
 
     private func startFastMenuPolling() {
@@ -974,6 +1011,7 @@ final class NativeRuntimeModel: ObservableObject {
                 guard let self else { return }
                 #if SV_GAME_RUNTIME
                 self.observeMenuPressCount(sv_native_menu_press_count_v1())
+                self.observeGuestMenu(sv_native_menu_context_v1())
                 #endif
                 self.refreshSenseUtilityDirections()
                 do { try await Task.sleep(for: .milliseconds(50)) } catch { return }
@@ -1049,6 +1087,8 @@ final class NativeRuntimeModel: ObservableObject {
             "native_controls_owns_input": NativeControlsOwnership.shared.read(),
             "native_controls_input_policy_v2": NativeControlsOwnership.shared.readPolicy(),
             "native_controls_selection": nativeControlsSelection,
+            "pause_controls_follow_game": pauseControlsFollowGame,
+            "guest_menu_context": pauseCompanion.guest.rawValue,
             "sense_gameplay_utilities_visible": senseGameplayUtilitiesVisible,
             "sense_gameplay_ui_eligible": senseGameplayUIEligible.map { $0 as Any } ?? NSNull(),
             "sense_phone_navigation_visible": sensePhoneNavigationVisible,

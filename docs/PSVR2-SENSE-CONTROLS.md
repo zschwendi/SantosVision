@@ -30,14 +30,14 @@ Constructing this input registry does not run an accessory tracking provider.
 | --- | --- | --- |
 | Left stick | Move/steer | Navigate |
 | Right stick | Look using existing 75% sensitivity | Existing behavior |
-| L2 / R2 | Aim/fire; brake/accelerate in vehicles | Existing behavior |
-| L1 grip | Weapon wheel | Tab |
-| R1 grip | Cover; handbrake in vehicles | No |
-| Square | Jump | Apply |
-| Triangle | Enter/exit vehicle | Yes |
-| Cross | Sprint/confirm | Confirm |
-| Circle | Reload/back | Back |
-| Right Menu/Options | Pause | Pause/back |
+| L2 / R2 | Aim/fire; brake/accelerate in vehicles | None; left free for native-button select |
+| L1 grip | Weapon wheel | Previous tab (Q, FRONTEND_LB) |
+| R1 grip | Cover; handbrake in vehicles | Next tab (E, FRONTEND_RB) |
+| Square | Jump | Apply (Space, FRONTEND_X) |
+| Triangle | Enter/exit vehicle | GTA's Y action (Tab, FRONTEND_Y) |
+| Cross | Sprint/confirm | Select (Enter) |
+| Circle | Reload/back | Back (Backspace) |
+| Right Menu/Options | Pause | GTA pause/back (Escape) |
 | Left Menu/Create, if exposed | Cycle camera, replacing absent touchpad | Inactive |
 | Right stick click | Existing rear-view action | Existing behavior |
 | Hold left stick click + deflect left stick | Virtual D-pad; suppress movement | Directional navigation |
@@ -55,6 +55,11 @@ keys, axes or triggers. Replacing/disconnecting the left device, changing input
 backend or suspending the runtime clears pending modifier/tap state. A click held
 at connection/resume must release before becoming a new chord. Full/partial
 disconnects go through the established key/button release mapper.
+
+GTA menu keys follow GTA's fixed PC front-end bindings in the shipped
+`x64/data/control/fixed.meta`; DualSense uses the same menu keys. While GTA's
+own pause menu is open, the Start panel no longer owns the controller. See
+[GTA menus with Sense](SENSE-GTA-MENUS-20261024.md).
 
 ## Pairing and validation
 
