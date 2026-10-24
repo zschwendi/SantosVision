@@ -110,7 +110,14 @@ final class NativeRuntimeModel: ObservableObject {
     @Published private(set) var windowSurfaceReady = false
     @Published private(set) var controllerSummary = "Controller not connected"
     @Published private(set) var menuPressCount: UInt64 = 0
-    @Published var gameControlsVisible = false
+    @Published var gameControlsVisible = false { didSet { updateNativeControlsOwnership() } }
+    @Published var nativeSettingsPresented = false { didSet { updateNativeControlsOwnership() } }
+    @Published private(set) var nativeControlsSelection = 0
+    @Published private(set) var nativeControlsActivation: UInt64 = 0
+    @Published private(set) var nativeControlsStatus = ""
+    private var nativeControlsTask: Task<Void, Never>?
+    private var nativeControlsRouter = NativeControlsRouter()
+    private var handledNativeControlsActivation: UInt64 = 0
     let windowGameMode: Bool
     let isLinked = NativeRuntime.isLinked
     let gameRoot: URL
@@ -132,6 +139,7 @@ final class NativeRuntimeModel: ObservableObject {
     private var windowIsAttached = false
     private var windowSceneIsActive = true
     private var immersiveSceneIsActive = false
+    private var nativeControlsSceneIsActive = false
     private var capturePaths = Set<String>()
     private var captureRequests: [[String: Any]] = []
     private var compositorOwnsHeadTracking = false
@@ -395,6 +403,47 @@ final class NativeRuntimeModel: ObservableObject {
         updateActivity()
     }
 
+    func setNativeControlsSceneActive(_ active: Bool) {
+        nativeControlsSceneIsActive = active
+        updateActivity()
+    }
+
+    private func updateNativeControlsOwnership() {
+        let owns = gameControlsVisible || nativeSettingsPresented
+        NativeControlsOwnership.shared.set(owns)
+        nativeControlsRouter = NativeControlsRouter()
+        nativeControlsTask?.cancel()
+        nativeControlsTask = nil
+        guard owns else { return }
+        nativeControlsTask = Task { @MainActor [weak self] in
+            while !Task.isCancelled {
+                guard let self else { return }
+                let input = SpatialGamepadInput.shared.nativeControlsInput()
+                let event = self.nativeControlsRouter.update(input, selection: self.nativeControlsSelection,
+                    now: ProcessInfo.processInfo.systemUptime)
+                self.nativeControlsSelection = event.selection
+                if self.nativeSettingsPresented {
+                    if event.dismiss { self.nativeSettingsPresented = false }
+                } else if event.dismiss {
+                    self.sendMenuAction(13)
+                    self.gameControlsVisible = false
+                } else if event.activate {
+                    self.nativeControlsActivation &+= 1
+                }
+                do { try await Task.sleep(for: .milliseconds(16)) } catch { return }
+            }
+        }
+    }
+
+    func selectNativeControl(_ action: SantosControlAction) { nativeControlsSelection = action.rawValue }
+
+    func consumeNativeControlActivation(_ sequence: UInt64, immersive: Bool) -> Bool {
+        guard sequence > handledNativeControlsActivation, immersive == compositorOwnsHeadTracking,
+              gameControlsVisible, !nativeSettingsPresented else { return false }
+        handledNativeControlsActivation = sequence
+        return true
+    }
+
     func setWindowAttached(_ attached: Bool) {
         windowIsAttached = attached
         // UIKit attachment callbacks can run during SwiftUI construction.
@@ -403,7 +452,7 @@ final class NativeRuntimeModel: ObservableObject {
     }
 
     private func updateActivity(deferReport: Bool = false) {
-        let active = (compositorOwnsHeadTracking && immersiveSceneIsActive)
+        let active = nativeControlsSceneIsActive || (compositorOwnsHeadTracking && immersiveSceneIsActive)
             || (appSceneIsActive && (!windowGameMode || (windowIsAttached && windowSceneIsActive)))
         let changed = active != isActive
         if active != isActive {
@@ -480,9 +529,15 @@ final class NativeRuntimeModel: ObservableObject {
         recordReport()
     }
 
-    func sendMenuAction(_ action: UInt32) {
+    @discardableResult
+    func sendMenuAction(_ action: UInt32) -> Bool {
         #if SV_GAME_RUNTIME
-        _ = sv_runtime_menu_action(action)
+        let code = sv_runtime_menu_action(action)
+        nativeControlsStatus = code == 0 ? "" : "Game action could not be queued (\(code))."
+        return code == 0
+        #else
+        nativeControlsStatus = "Game runtime is not linked."
+        return false
         #endif
     }
 
@@ -652,6 +707,9 @@ final class NativeRuntimeModel: ObservableObject {
             "presentation_mode": compositorOwnsHeadTracking ? "immersive" : (windowGameMode ? "window" : "diagnostic"),
             "window_surface_ready": windowSurfaceReady,
             "window_scene_policy": "single_instance_main",
+            "native_controls_owns_input": NativeControlsOwnership.shared.read(),
+            "native_controls_selection": nativeControlsSelection,
+            "native_controls_status": nativeControlsStatus,
             "window_attached": windowIsAttached,
             "window_scene_active": windowSceneIsActive,
             "app_scene_active": appSceneIsActive,

@@ -35,6 +35,11 @@ mod input {
     pub fn set_locked(_: bool) {}
 }
 mod mp { pub fn key_pressed(_: &str) {} }
+mod xr_motion_aim {
+    pub fn diagnostic_enabled() -> bool { false }
+    pub fn gameplay_enabled() -> bool { false }
+    pub fn filter_spatial_trigger(value: f32) -> f32 { value }
+}
 mod pad {
     include!(PAD_SOURCE_PATH);
     #[cfg(test)]
@@ -88,6 +93,37 @@ mod pad {
             poll_sample(Some(neutral));
             assert!(!crate::input::take().contains(&Event::Key("ControlLeft".into(), true)));
             suspend();
+        }
+        #[test]
+        fn native_modal_releases_actual_inputs_keeps_app_actions_and_requires_rearm() {
+            suspend();
+            MENU_NAVIGATION.store(false, Ordering::Relaxed);
+            IN_VEHICLE.store(false, Ordering::Relaxed);
+            let neutral = spatial::spatial_sample(3, 0, [0.0; 6], 42).unwrap();
+            let held = spatial::spatial_sample(3, 1, [0.0, 1.0, 0.0, 0.0, 1.0, 1.0], 42).unwrap();
+            poll_sample(Some(neutral));
+            poll_sample(Some(held));
+            crate::input::take();
+            TEST_NATIVE_CONTROLS_OWN_INPUT.store(true, Ordering::Relaxed);
+            assert!(queue_menu_action(3));
+            poll_sample(Some(held));
+            let events = crate::input::take();
+            assert!(events.contains(&Event::Key("KeyW".into(), false)));
+            assert!(events.contains(&Event::Button(0, false)));
+            assert!(events.contains(&Event::Button(2, false)));
+            assert!(events.contains(&Event::Key("Space".into(), true)), "Apply still reaches GTA while the native UI owns physical input");
+            TEST_NATIVE_CONTROLS_OWN_INPUT.store(false, Ordering::Relaxed);
+            poll_sample(Some(held));
+            let events = crate::input::take();
+            assert!(!events.contains(&Event::Button(0, true)));
+            assert!(!events.contains(&Event::Key("KeyW".into(), true)));
+            poll_sample(Some(neutral));
+            poll_sample(Some(held));
+            let events = crate::input::take();
+            assert!(events.contains(&Event::Button(0, true)));
+            assert!(events.contains(&Event::Key("KeyW".into(), true)));
+            suspend();
+            crate::input::take();
         }
         #[test]
         fn virtual_dpad_uses_actual_mapper_without_movement_or_delayed_l3() {

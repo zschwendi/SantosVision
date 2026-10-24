@@ -96,6 +96,27 @@ final class SpatialGamepadInput {
         return try await Accessory(device: device)
     }
 
+    /// Native modal navigation uses the same fixed-hand snapshots as gameplay.
+    func nativeControlsInput() -> NativeControlsInput {
+        var values = [Float](repeating: 0, count: 6)
+        var buttons: UInt32 = 0
+        var leftDevice: UInt64 = 0
+        let hands = values.withUnsafeMutableBufferPointer {
+            SpatialGamepadStore.shared.read(values: $0.baseAddress!, buttons: &buttons, leftDevice: &leftDevice)
+        }
+        if hands != 0 {
+            return NativeControlsInput(x: values[0], y: values[1], confirm: buttons & 1 != 0,
+                                       back: buttons & 2 != 0, pause: buttons & (1 << 9) != 0)
+        }
+        guard let pad = GCController.controllers().compactMap({ $0.extendedGamepad }).first else {
+            return NativeControlsInput()
+        }
+        let x = abs(pad.dpad.xAxis.value) > 0.3 ? pad.dpad.xAxis.value : pad.leftThumbstick.xAxis.value
+        let y = abs(pad.dpad.yAxis.value) > 0.3 ? pad.dpad.yAxis.value : pad.leftThumbstick.yAxis.value
+        return NativeControlsInput(x: x, y: y, confirm: pad.buttonA.isPressed,
+                                   back: pad.buttonB.isPressed, pause: pad.buttonMenu.isPressed)
+    }
+
     var report: [String: Any] {
         let state = SpatialGamepadStore.shared.state()
         return [
@@ -108,7 +129,7 @@ final class SpatialGamepadInput {
             "right_pause_button_available": state.rightMenu,
             "left_dpad_modifier_available": state.leftClick,
             "right_stick_click_available": state.rightClick,
-            "mapping": "left_move_right_look_l3_hold_left_stick_dpad_l3_tap_click_left_menu_camera_right_menu_pause",
+            "mapping": "left_move_right_look_l3_hold_left_stick_dpad_l3_tap_click_both_stick_click_camera_left_menu_camera_right_menu_pause",
             "motion_aim_enabled": false,
             "errors": Array(errors.values.sorted().prefix(8))
         ]

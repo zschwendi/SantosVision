@@ -58,27 +58,34 @@ struct ImmersiveGameControls: View {
     @Environment(\.openWindow) private var openWindow
     @Environment(\.dismissWindow) private var dismissWindow
     @Environment(\.dismissImmersiveSpace) private var dismissImmersiveSpace
-    @State private var showingSettings = false
+    @Environment(\.scenePhase) private var controlsScenePhase
+    @State private var returningToWindow = false
 
     var body: some View {
         VStack(spacing: 14) {
             Text("Los Santos").font(.title3.bold())
             SantosPauseControls(runtime: runtime,
                 windowAction: { Task { await returnToWindow() } },
-                settingsAction: { showingSettings = true })
+                settingsAction: { runtime.nativeSettingsPresented = true }, immersive: true)
             if !world.hasPresentedFrames {
                 Text(world.status).font(.caption).foregroundStyle(.secondary)
             }
         }
         .padding(18)
         .handlesGameControllerEvents(matching: .gamepad, withOptions: .receivesEventsInView(false))
-        .sheet(isPresented: $showingSettings) { SantosSettingsView(runtime: runtime) }
+        .onChange(of: controlsScenePhase, initial: true) { _, phase in
+            runtime.setNativeControlsSceneActive(phase == .active)
+        }
+        .onDisappear { runtime.setNativeControlsSceneActive(false) }
+        .sheet(isPresented: $runtime.nativeSettingsPresented) { SantosSettingsView(runtime: runtime) }
         .onChange(of: runtime.gameControlsVisible) { _, visible in
             if !visible, world.hasPresentedFrames { dismissWindow(id: "game-controls") }
         }
     }
 
     private func returnToWindow() async {
+        guard !returningToWindow else { return }
+        returningToWindow = true
         openWindow(id: "main")
         world.stopRenderer()
         await dismissImmersiveSpace()

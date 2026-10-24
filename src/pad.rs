@@ -99,50 +99,104 @@ struct State {
     menu_button_down: bool,
     blocked_context_buttons: u8,
     spatial_router: spatial::Router,
+    native_controls_require_neutral: bool,
 }
 static STATE: Mutex<Option<State>> = Mutex::new(None);
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum AppAction { Key(&'static str), Gameplay(&'static str), Resume }
 struct MenuActions {
-    queued: VecDeque<&'static str>,
+    queued: VecDeque<AppAction>,
     active: Option<(&'static str, Instant)>,
     gap_until: Option<Instant>,
+    waiting_for_gameplay: Option<(&'static str, Instant)>,
 }
 static MENU_ACTIONS: Mutex<MenuActions> = Mutex::new(MenuActions {
-    queued: VecDeque::new(), active: None, gap_until: None,
+    queued: VecDeque::new(), active: None, gap_until: None, waiting_for_gameplay: None,
 });
 const MENU_ACTION_HOLD: Duration = Duration::from_millis(120);
 const MENU_ACTION_GAP: Duration = Duration::from_millis(32);
 const MENU_ACTION_QUEUE_CAPACITY: usize = 8;
+const GAMEPLAY_ACTION_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// Queue one bounded keyboard action from the native pause controls.
-/// IDs: 1 Escape, 2 Enter, 3 Space, 4 Y, 5 N. Invalid/full queues reject.
-/// The gamepad poller merges these pulses with physical keys, so releasing a
-/// controller button cannot clear a simultaneous app action.
+/// Native actions merge into the actual input mapper, including while native UI
+/// owns physical input. Gameplay shortcuts wait for verified unpause, rather
+/// than applying a camera/phone key to GTA's paused settings screen.
 pub fn queue_menu_action(action: u32) -> bool {
-    let key = match action {
-        1 => "Escape", 2 => "Enter", 3 => "Space", 4 => "KeyY", 5 => "KeyN",
+    let action = match action {
+        1 => AppAction::Key("Escape"), 2 => AppAction::Key("Enter"),
+        3 => AppAction::Key("Space"), 4 => AppAction::Key("KeyY"), 5 => AppAction::Key("KeyN"),
+        6 => AppAction::Gameplay("KeyV"), 7 => AppAction::Gameplay("ArrowUp"),
+        8 => AppAction::Key("ArrowUp"), 9 => AppAction::Key("ArrowDown"),
+        10 => AppAction::Key("ArrowLeft"), 11 => AppAction::Key("ArrowRight"),
+        12 => AppAction::Key("Backspace"), 13 => AppAction::Resume,
+        14 => AppAction::Key("Tab"),
         _ => return false,
     };
     let mut actions = MENU_ACTIONS.lock().unwrap();
     if actions.queued.len() >= MENU_ACTION_QUEUE_CAPACITY { return false; }
-    actions.queued.push_back(key);
+    actions.queued.push_back(action);
     true
 }
 
-fn menu_action_key(actions: &mut MenuActions, now: Instant) -> Option<&'static str> {
+fn menu_action_key(actions: &mut MenuActions, now: Instant, paused: Option<bool>) -> Option<&'static str> {
+    if actions.waiting_for_gameplay.is_some_and(|(_, deadline)| now >= deadline) {
+        actions.waiting_for_gameplay = None;
+    }
     if let Some((_, until)) = actions.active {
         if now >= until {
             actions.active = None;
             actions.gap_until = Some(now + MENU_ACTION_GAP);
         }
     }
-    if actions.active.is_none() && actions.gap_until.is_none_or(|until| now >= until) {
-        actions.gap_until = None;
-        if let Some(key) = actions.queued.pop_front() {
+    if actions.active.is_some() { return actions.active.map(|(key, _)| key); }
+    if actions.gap_until.is_some_and(|until| now < until) { return None; }
+    actions.gap_until = None;
+    if let Some((key, deadline)) = actions.waiting_for_gameplay {
+        if now >= deadline { actions.waiting_for_gameplay = None; }
+        else if paused == Some(false) {
+            actions.waiting_for_gameplay = None;
             actions.active = Some((key, now + MENU_ACTION_HOLD));
-        }
+            return Some(key);
+        } else { return None; }
+    }
+    if let Some(action) = actions.queued.pop_front() {
+        let key = match action {
+            AppAction::Key(key) => Some(key),
+            AppAction::Resume => (paused == Some(true)).then_some("Escape"),
+            AppAction::Gameplay(key) => match paused {
+                Some(false) => Some(key),
+                Some(true) => {
+                    actions.waiting_for_gameplay = Some((key, now + GAMEPLAY_ACTION_TIMEOUT));
+                    Some("Escape")
+                }
+                None => None, // Unknown guest state must not invoke an accidental menu command.
+            },
+        };
+        if let Some(key) = key { actions.active = Some((key, now + MENU_ACTION_HOLD)); }
     }
     actions.active.map(|(key, _)| key)
+}
+
+#[cfg(all(target_os = "visionos", not(test)))]
+fn native_controls_own_input() -> bool {
+    extern "C" { fn sv_native_controls_owns_input_v1() -> u32; }
+    unsafe { sv_native_controls_owns_input_v1() != 0 }
+}
+#[cfg(test)]
+static TEST_NATIVE_CONTROLS_OWN_INPUT: AtomicBool = AtomicBool::new(false);
+#[cfg(test)]
+fn native_controls_own_input() -> bool { TEST_NATIVE_CONTROLS_OWN_INPUT.load(Ordering::Relaxed) }
+#[cfg(all(not(target_os = "visionos"), not(test)))]
+fn native_controls_own_input() -> bool { false }
+
+fn physical_sample_for_owner(sample: Option<Sample>, owns: bool, require_neutral: &mut bool) -> Option<Sample> {
+    if owns { *require_neutral = true; return None; }
+    if *require_neutral {
+        if sample.is_some_and(|sample| sample.neutral()) { *require_neutral = false; }
+        return None;
+    }
+    sample
 }
 
 const SWITCH_HOLD: Duration = Duration::from_millis(300);
@@ -297,7 +351,8 @@ fn poll_sample(gp: Option<Sample>) -> bool {
     let mut guard = STATE.lock().unwrap();
     let st = guard.get_or_insert_with(|| State { held: HashSet::new(), buttons: 0, last: Instant::now(), down_since: None,
         menu_navigation: MENU_NAVIGATION.load(Ordering::Relaxed), menu_button_down: false, blocked_context_buttons: 0,
-        spatial_router: spatial::Router::default() });
+        spatial_router: spatial::Router::default(), native_controls_require_neutral: false });
+    let gp = physical_sample_for_owner(gp, native_controls_own_input(), &mut st.native_controls_require_neutral);
     let gp = gp.map(|sample| st.spatial_router.apply(sample, Instant::now()));
     if gp.is_none() { st.spatial_router = spatial::Router::default(); }
     let dt = st.last.elapsed().as_secs_f64().min(0.05);
@@ -307,13 +362,13 @@ fn poll_sample(gp: Option<Sample>) -> bool {
     let mut keys: HashSet<&'static str> = HashSet::new();
     let mut buttons = 0u8;
     let mut looking = false;
-    let menu_key = menu_action_key(&mut MENU_ACTIONS.lock().unwrap(), Instant::now());
+    let guest = guest_context::read();
+    let menu_key = menu_action_key(&mut MENU_ACTIONS.lock().unwrap(), Instant::now(), guest.map(|context| context.paused));
     let menu_down = gp.as_ref().is_some_and(|gp| gp.menu);
     if menu_down && !st.menu_button_down {
         MENU_PRESS_COUNT.fetch_add(1, Ordering::Relaxed);
     }
     st.menu_button_down = menu_down;
-    let guest = guest_context::read();
     let escape_released = st.held.contains("Escape") && !menu_down && menu_key != Some("Escape");
     let (menu, phone_instantiated) = navigation_context(st.menu_navigation, escape_released, guest);
     let context_changed = menu != st.menu_navigation;
@@ -428,6 +483,7 @@ pub fn suspend() {
     actions.queued.clear();
     actions.active = None;
     actions.gap_until = None;
+    actions.waiting_for_gameplay = None;
     ACTIVE.store(false, Ordering::Relaxed);
     INPUT_PROFILE.store(0, Ordering::Relaxed);
     SPATIAL_HANDS.store(0, Ordering::Relaxed);
@@ -512,19 +568,57 @@ mod tests {
     fn menu_actions_hold_then_release_before_repeating() {
         let now = Instant::now();
         let mut actions = MenuActions {
-            queued: VecDeque::from(["Escape", "Escape"]), active: None, gap_until: None,
+            queued: VecDeque::from([AppAction::Key("Escape"), AppAction::Key("Escape")]), active: None, gap_until: None, waiting_for_gameplay: None,
         };
-        assert_eq!(menu_action_key(&mut actions, now), Some("Escape"));
-        assert_eq!(menu_action_key(&mut actions, now + MENU_ACTION_HOLD - Duration::from_millis(1)), Some("Escape"));
-        assert_eq!(menu_action_key(&mut actions, now + MENU_ACTION_HOLD), None);
-        assert_eq!(menu_action_key(&mut actions, now + MENU_ACTION_HOLD + MENU_ACTION_GAP - Duration::from_millis(1)), None);
-        assert_eq!(menu_action_key(&mut actions, now + MENU_ACTION_HOLD + MENU_ACTION_GAP), Some("Escape"));
+        assert_eq!(menu_action_key(&mut actions, now, None), Some("Escape"));
+        assert_eq!(menu_action_key(&mut actions, now + MENU_ACTION_HOLD - Duration::from_millis(1), None), Some("Escape"));
+        assert_eq!(menu_action_key(&mut actions, now + MENU_ACTION_HOLD, None), None);
+        assert_eq!(menu_action_key(&mut actions, now + MENU_ACTION_HOLD + MENU_ACTION_GAP - Duration::from_millis(1), None), None);
+        assert_eq!(menu_action_key(&mut actions, now + MENU_ACTION_HOLD + MENU_ACTION_GAP, None), Some("Escape"));
+    }
+
+    #[test]
+    fn gameplay_shortcuts_wait_for_real_unpause_and_fail_closed_when_unknown() {
+        let now = Instant::now();
+        let make = || MenuActions { queued: VecDeque::from([AppAction::Gameplay("KeyV")]),
+            active: None, gap_until: None, waiting_for_gameplay: None };
+        let mut actions = make();
+        assert_eq!(menu_action_key(&mut actions, now, Some(true)), Some("Escape"));
+        let after = now + MENU_ACTION_HOLD + MENU_ACTION_GAP;
+        assert_eq!(menu_action_key(&mut actions, now + MENU_ACTION_HOLD, Some(true)), None);
+        assert_eq!(menu_action_key(&mut actions, after, Some(true)), None);
+        assert_eq!(menu_action_key(&mut actions, after, Some(false)), Some("KeyV"));
+        let mut unknown = make();
+        assert_eq!(menu_action_key(&mut unknown, now, None), None);
+        assert!(unknown.queued.is_empty());
+        let mut timeout = make();
+        assert_eq!(menu_action_key(&mut timeout, now, Some(true)), Some("Escape"));
+        assert_eq!(menu_action_key(&mut timeout, now + GAMEPLAY_ACTION_TIMEOUT, Some(false)), None);
+        assert!(timeout.waiting_for_gameplay.is_none());
+        let mut resume = MenuActions { queued: VecDeque::from([AppAction::Resume]),
+            active: None, gap_until: None, waiting_for_gameplay: None };
+        assert_eq!(menu_action_key(&mut resume, now, Some(false)), None,
+            "Resume must not pause gameplay when only the native UI is open");
+    }
+
+    #[test]
+    fn modal_ownership_discards_inputs_then_requires_a_neutral_sample() {
+        let held = Sample { right_trigger: 1.0, left_stick: [0., 1.], ..Sample::default() };
+        let mut blocked = false;
+        assert_eq!(physical_sample_for_owner(Some(held), true, &mut blocked), None);
+        assert!(blocked);
+        assert_eq!(physical_sample_for_owner(Some(held), false, &mut blocked), None);
+        assert_eq!(physical_sample_for_owner(None, false, &mut blocked), None);
+        assert!(blocked);
+        assert_eq!(physical_sample_for_owner(Some(Sample::default()), false, &mut blocked), None);
+        assert!(!blocked);
+        assert_eq!(physical_sample_for_owner(Some(held), false, &mut blocked), Some(held));
     }
 
     #[test]
     fn menu_action_api_rejects_unknown_and_excess_actions() {
         assert!(!queue_menu_action(0));
-        assert!(!queue_menu_action(6));
+        assert!(!queue_menu_action(15));
         for action in [1, 2, 3, 4, 5, 1, 2, 3] { assert!(queue_menu_action(action)); }
         assert!(!queue_menu_action(4));
         MENU_ACTIONS.lock().unwrap().queued.clear();

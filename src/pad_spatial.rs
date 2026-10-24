@@ -19,6 +19,14 @@ pub(super) struct Sample {
     pub dpad: u8,
     pub spatial: Option<SpatialIdentity>,
 }
+impl Sample {
+    pub fn neutral(&self) -> bool {
+        self.left_stick.iter().chain(self.right_stick.iter()).all(|v| v.abs() < 0.3)
+            && self.left_trigger < 0.2 && self.right_trigger < 0.2
+            && self.face_and_shoulders == 0 && !self.left_click && !self.right_click
+            && !self.menu && !self.camera && self.dpad == 0
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(super) struct SpatialIdentity {
@@ -73,6 +81,9 @@ pub(super) struct Router {
     click_held: bool,
     used_direction: bool,
     tap_until: Option<Instant>,
+    camera_chord: bool,
+    camera_until: Option<Instant>,
+    right_release_required: bool,
 }
 
 impl Router {
@@ -92,6 +103,27 @@ impl Router {
         if self.require_release {
             self.require_release = click;
             if click { sample.left_stick = [0.0; 2]; }
+            return sample;
+        }
+        // Both stick clicks are always available on Sense and replace touchpad.
+        // Consume both normal clicks, never emit crouch/horn/rear-view afterward.
+        let camera_chord = click && sample.right_click;
+        if camera_chord && !self.camera_chord {
+            self.camera_until = Some(now + Duration::from_millis(120));
+            self.right_release_required = true;
+        }
+        self.camera_chord = camera_chord;
+        if self.right_release_required {
+            self.right_release_required = sample.right_click;
+            sample.right_click = false;
+        }
+        if camera_chord || self.camera_until.is_some_and(|until| now < until) {
+            self.used_direction = true;
+            self.click_held = click;
+            self.tap_until = None;
+            sample.camera = true;
+            sample.left_stick = [0.0; 2];
+            sample.left_click = false;
             return sample;
         }
         if click {
@@ -194,6 +226,20 @@ mod tests {
         assert!(router.apply(left(false, [0.0; 2], 42), now + Duration::from_millis(119)).left_click);
         assert!(!router.apply(left(false, [0.0; 2], 42), now + Duration::from_millis(120)).left_click);
         assert!(!router.apply(left(false, [0.0; 2], 42), now + Duration::from_millis(200)).left_click);
+    }
+
+    #[test]
+    fn both_clicks_cycle_camera_without_crouch_horn_rearview_or_delayed_l3() {
+        let now = Instant::now();
+        let mut router = Router::default();
+        router.apply(left(false, [0.0; 2], 42), now);
+        let mut chord = left(true, [0.0; 2], 42);
+        chord.right_click = true;
+        let routed = router.apply(chord, now);
+        assert!(routed.camera);
+        assert!(!routed.left_click && !routed.right_click);
+        let routed = router.apply(left(false, [0.0; 2], 42), now + Duration::from_millis(121));
+        assert!(!routed.camera && !routed.left_click && !routed.right_click);
     }
 
     #[test]

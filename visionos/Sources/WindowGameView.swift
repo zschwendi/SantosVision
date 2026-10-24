@@ -75,7 +75,6 @@ struct WindowGameView: View {
     @Environment(\.scenePhase) private var scenePhase
     @ObservedObject var runtime: NativeRuntimeModel
     @ObservedObject var surface: WindowGameSurface
-    @State private var showingSettings = false
     #if SV_GAME_RUNTIME
     @EnvironmentObject private var world: GameWorldModel
     @Environment(\.openImmersiveSpace) private var openImmersiveSpace
@@ -158,10 +157,10 @@ struct WindowGameView: View {
                   attachmentAnchor: .scene(.bottom), contentAlignment: .top) {
             SantosPauseControls(runtime: runtime,
                 windowAction: { runtime.gameControlsVisible = false },
-                settingsAction: { showingSettings = true })
+                settingsAction: { runtime.nativeSettingsPresented = true })
                 .padding(.top, 12)
         }
-        .sheet(isPresented: $showingSettings) { SantosSettingsView(runtime: runtime) }
+        .sheet(isPresented: $runtime.nativeSettingsPresented) { SantosSettingsView(runtime: runtime) }
         #if SV_GAME_RUNTIME
         .task {
             // Exercise the normal window-to-world transition after real window
@@ -193,7 +192,7 @@ struct WindowGameView: View {
                 Image(systemName: "sparkles").foregroundStyle(SantosTheme.glow)
                 Text("Los Santos").font(.title3.bold())
                 Spacer()
-                Button { showingSettings = true } label: {
+                Button { runtime.nativeSettingsPresented = true } label: {
                     Image(systemName: "gearshape").padding(4)
                 }
                 .accessibilityLabel("Settings")
@@ -346,7 +345,7 @@ struct SantosSettingsView: View {
                         .disabled(!runtime.canChangePlaySettings)
                     Text("Adjusts the right stick's look speed. GTA's own mouse sensitivity also applies.")
                         .font(.caption).foregroundStyle(.secondary)
-                    Text("Click the touchpad to cycle cameras. In GTA menus: D-pad to navigate, Cross to confirm, Circle to go back, Square to apply, and L1 for Tab. Start also reveals the Los Santos controls.")
+                    Text("DualSense: click the touchpad to change camera. Sense: click both sticks together to change camera; hold left stick click and move that stick for D-pad. Tap left stick click for normal L3. Start opens these controls, with Phone, Change camera and all four D-pad directions. In GTA menus: Cross selects, Circle goes back, Square applies, Triangle means Yes, and R1 means No.")
                         .font(.caption).foregroundStyle(.secondary)
                 }
                 Section {
@@ -393,29 +392,60 @@ struct SantosPauseControls: View {
     @ObservedObject var runtime: NativeRuntimeModel
     let windowAction: () -> Void
     let settingsAction: () -> Void
+    var immersive = false
 
     var body: some View {
         VStack(spacing: 12) {
-            HStack(spacing: 16) {
-                Button("Window", systemImage: "arrow.down.right.and.arrow.up.left", action: windowAction)
-                Button("Los Santos settings", systemImage: "gearshape", action: settingsAction)
-                Button("Quit", systemImage: "power", role: .destructive) {
-                    Task { await runtime.quitGame() }
+            LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 8), count: 4), spacing: 8) {
+                ForEach(SantosControlAction.allCases) { action in
+                    Button {
+                        runtime.selectNativeControl(action)
+                        perform(action)
+                    } label: {
+                        Label(action.title, systemImage: action.symbol)
+                            .font(.caption)
+                            .frame(maxWidth: .infinity, minHeight: 38)
+                            .padding(.horizontal, 4)
+                    }
+                    .buttonStyle(.bordered)
+                    .tint(action.rawValue == runtime.nativeControlsSelection ? SantosTheme.glow : SantosTheme.accent)
+                    .overlay(RoundedRectangle(cornerRadius: 14).stroke(
+                        action.rawValue == runtime.nativeControlsSelection ? SantosTheme.glow : .clear, lineWidth: 2))
+                    .accessibilityAddTraits(action.rawValue == runtime.nativeControlsSelection ? .isSelected : [])
                 }
             }
-            HStack(spacing: 16) {
-                Button("Resume") { runtime.sendMenuAction(1); runtime.gameControlsVisible = false }
-                Button("Apply") { runtime.sendMenuAction(3) }
-                Button("Yes") { runtime.sendMenuAction(4) }
-                Button("No") { runtime.sendMenuAction(5) }
-            }
-            Text("Cross · Select    Circle · Back    Square · Apply    Triangle · Yes    R1 · No")
+            Text("Left stick / D-pad · Move highlight    Cross · Use highlighted button    Circle / Start · Resume")
                 .font(.caption2).foregroundStyle(.secondary)
+            Text("Sense: both stick clicks · Camera    Hold left stick click + stick · D-pad")
+                .font(.caption2).foregroundStyle(.secondary)
+            if !runtime.nativeControlsStatus.isEmpty { Text(runtime.nativeControlsStatus).font(.caption) }
         }
+        .frame(width: 600)
         .padding(16)
         .glassBackgroundEffect()
         .tint(SantosTheme.accent)
         .disabled(runtime.isQuitting)
+        .onChange(of: runtime.nativeControlsActivation) { _, sequence in
+            guard runtime.consumeNativeControlActivation(sequence, immersive: immersive) else { return }
+            if let action = SantosControlAction(rawValue: runtime.nativeControlsSelection) { perform(action) }
+        }
+    }
+
+    private func perform(_ action: SantosControlAction) {
+        switch action {
+        case .window:
+            _ = runtime.sendMenuAction(13)
+            windowAction()
+        case .settings:
+            settingsAction()
+        case .quit:
+            Task { await runtime.quitGame() }
+        default:
+            guard let id = action.menuAction, runtime.sendMenuAction(id) else { return }
+            if action == .resume || action == .camera || action == .phone {
+                runtime.gameControlsVisible = false
+            }
+        }
     }
 }
 
