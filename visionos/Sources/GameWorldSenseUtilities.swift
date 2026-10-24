@@ -5,8 +5,9 @@ enum GameWorldSenseUtilityLayout {
     static let distance: Float = 2
     static let halfSize = SIMD2<Float>(repeating: 0.0675)
     static let horizontalPitch: Float = 0.15
-    // The current 60-degree, 16:9 HUD shares this 2m plane. Keep the
-    // two utility buttons centered and clear of the HUD corners.
+    // Move the small utility group toward the minimap, clear of the avatar
+    // and the central aiming area. The phone popup uses the same origin.
+    static let horizontalCenter: Float = -0.36
     static let verticalCenter: Float = -0.56
     static let namespace: UInt64 = 0x5356555400000000
     static var actions: [SantosSenseUtilityAction] { [.phone, .changeView] }
@@ -21,7 +22,7 @@ enum GameWorldSenseUtilityLayout {
     }
     static func center(index: Int) -> SIMD2<Float> {
         let midpoint = Float(actions.count - 1) * 0.5
-        return SIMD2((Float(index) - midpoint) * horizontalPitch, verticalCenter)
+        return SIMD2(horizontalCenter + (Float(index) - midpoint) * horizontalPitch, verticalCenter)
     }
     // Peel's exact 48x34-point arrow buttons with 10-point gaps, on the same
     // scale as the 44-point main control. Up sits above Left / Down / Right.
@@ -34,12 +35,12 @@ enum GameWorldSenseUtilityLayout {
         let pitch = 58 * metresPerPoint
         let mainX = 82 * metresPerPoint + 10 * metresPerPoint + halfSize.x
         switch action {
-        case .phone: return SIMD2(-mainX, verticalCenter)
-        case .changeView: return SIMD2(mainX, verticalCenter)
-        case .up: return SIMD2(0, verticalCenter + 44 * metresPerPoint)
-        case .down: return SIMD2(0, verticalCenter)
-        case .left: return SIMD2(-pitch, verticalCenter)
-        case .right: return SIMD2(pitch, verticalCenter)
+        case .phone: return SIMD2(horizontalCenter - mainX, verticalCenter)
+        case .changeView: return SIMD2(horizontalCenter + mainX, verticalCenter)
+        case .up: return SIMD2(horizontalCenter, verticalCenter + 44 * metresPerPoint)
+        case .down: return SIMD2(horizontalCenter, verticalCenter)
+        case .left: return SIMD2(horizontalCenter - pitch, verticalCenter)
+        case .right: return SIMD2(horizontalCenter + pitch, verticalCenter)
         }
     }
 }
@@ -182,6 +183,11 @@ final class GameWorldSenseUtilities: @unchecked Sendable {
         descriptor.vertexFunction = vertex
         descriptor.fragmentFunction = fragment
         descriptor.colorAttachments[0].pixelFormat = colorFormat
+        descriptor.colorAttachments[0].isBlendingEnabled = true
+        descriptor.colorAttachments[0].sourceRGBBlendFactor = .one
+        descriptor.colorAttachments[0].destinationRGBBlendFactor = .oneMinusSourceAlpha
+        descriptor.colorAttachments[0].sourceAlphaBlendFactor = .one
+        descriptor.colorAttachments[0].destinationAlphaBlendFactor = .oneMinusSourceAlpha
         descriptor.colorAttachments[1].pixelFormat = trackingFormat
         descriptor.depthAttachmentPixelFormat = depthFormat
         let state = MTLDepthStencilDescriptor()

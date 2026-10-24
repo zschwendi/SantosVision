@@ -55,6 +55,12 @@ struct HUDPolicyValidation {
         require(colors([left, right]) == worldColors, "Qualified pair uses both world-only images")
 
         let half = GameWorldHUDPolicy.halfSize(width: 1920, height: 1080, angularWidth: 60, distance: 2)!
+        let safeHalf = half * GameWorldHUDPolicy.immersiveScale
+        let safeY = half.y * GameWorldHUDPolicy.immersiveVerticalFraction
+        require(-safeHalf.x > -half.x && safeHalf.x < half.x,
+                "HUD safe area moves minimap right and money/ammo left, never moves minimap farther left")
+        require(safeY + safeHalf.y < half.y && safeY - safeHalf.y < -half.y,
+                "Both top-right HUD and minimap move lower")
         require(abs(half.x - 2 * tan(Float.pi / 6)) < 1e-6, "Configured HUD horizontal angle is 60 degrees")
         require(abs(half.y / half.x - 9.0 / 16.0) < 1e-6, "HUD preserves actual source aspect ratio")
         let scaled = GameWorldHUDPolicy.halfSize(width: 3840, height: 2160, angularWidth: 60, distance: 4)!
@@ -98,7 +104,7 @@ struct HUDPolicyValidation {
         let measuredIPD = abs(heads[1][3].x - heads[0][3].x)
         require((0.05...0.085).contains(measuredIPD), "Fixture contains real separated physical eyes")
         let positions: [SIMD4<Float>] = [-1.0, 0, 1].flatMap { x in
-            [-1.0, 0, 1].map { y in SIMD4(Float(x) * half.x, Float(y) * half.y, -2, 1) }
+            [-1.0, 0, 1].map { y in SIMD4(Float(x) * safeHalf.x, safeY + Float(y) * safeHalf.y, -2, 1) }
         }
         var maxHorizontal: Float = 0, maxVertical: Float = 0
         for eye in 0..<2 {

@@ -10,19 +10,19 @@ import simd
         }
         let actions = GameWorldSenseUtilityLayout.actions
         require(actions == [.phone, .changeView], "Only Phone and View are visible; directional arrows stay hidden")
-        // The native HUD producer currently publishes a60-degree,16:9 canvas
-        // at2m. Keep the row centered in its lower band, away from both corners.
+        // Utilities sit toward the minimap, away from the central avatar/aim.
         let hudHalfWidth = GameWorldSenseUtilityLayout.distance * tan(Float.pi / 6)
         let hudHalfHeight = hudHalfWidth * 9 / 16
         let centers = actions.indices.map { GameWorldSenseUtilityLayout.center(index: $0) }
-        require(abs(centers.map(\.x).reduce(0, +)) < 1e-6, "Immersive utility row is centered on the shared HUD, not a left strip")
+        require(abs(centers.map(\.x).reduce(0, +) / Float(centers.count) + 0.36) < 1e-6,
+                "Immersive utilities have moved left toward the minimap")
         for index in actions.indices {
             let center = centers[index], mirrored = centers[actions.count - index - 1]
             let half = GameWorldSenseUtilityLayout.halfSize
-            require(abs(center.x + mirrored.x) < 1e-6 && center.y == mirrored.y,
-                    "Buttons are symmetric about head/HUD center in the same lower row")
-            require(abs(center.x) + half.x <= hudHalfWidth * 0.4,
-                    "Utility buttons leave the outer30percent HUD columns clear on both sides")
+            require(abs(center.x + mirrored.x - 2 * GameWorldSenseUtilityLayout.horizontalCenter) < 1e-6 && center.y == mirrored.y,
+                    "Buttons share the left utility origin")
+            require(center.x + half.x < -0.2 && center.x - half.x > -hudHalfWidth * 0.7,
+                    "Controls leave both the central aiming area and minimap corner clear")
             require(center.y - half.y >= -hudHalfHeight && center.y + half.y <= -hudHalfHeight * 0.75,
                     "Complete button quads stay inside the lower central HUD band")
             if index > 0 {
@@ -99,11 +99,12 @@ import simd
             d.usage = [.renderTarget, .shaderRead]; d.storageMode = .shared
             return device.makeTexture(descriptor: d)!
         }
-        let atlasDescriptor = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba8Unorm, width: 7, height: 1, mipmapped: false)
+        let atlasDescriptor = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba8Unorm, width: 896, height: 1, mipmapped: false)
         atlasDescriptor.storageMode = .shared
         let atlas = device.makeTexture(descriptor: atlasDescriptor)!
-        let atlasBytes: [UInt8] = [255,0,0,255, 0,255,0,255, 0,0,255,255, 255,255,0,255, 255,0,255,255, 0,255,255,255, 255,255,255,255]
-        atlasBytes.withUnsafeBytes { atlas.replace(region: MTLRegionMake2D(0,0,7,1), mipmapLevel: 0, withBytes: $0.baseAddress!, bytesPerRow: 28) }
+        let slotColors: [[UInt8]] = [[255,0,0,255], [0,0,0,0], [0,0,255,255], [255,255,0,255], [255,0,255,255], [0,255,255,255], [255,255,255,255]]
+        let atlasBytes = slotColors.flatMap { color in (0..<128).flatMap { _ in color } }
+        atlasBytes.withUnsafeBytes { atlas.replace(region: MTLRegionMake2D(0,0,896,1), mipmapLevel: 0, withBytes: $0.baseAddress!, bytesPerRow: 896 * 4) }
         let depthDescriptor = MTLDepthStencilDescriptor(); depthDescriptor.depthCompareFunction = .always; depthDescriptor.isDepthWriteEnabled = true
         let depthState = device.makeDepthStencilState(descriptor: depthDescriptor)!
         for format in [MTLPixelFormat.r8Uint, .r16Uint] {
@@ -111,6 +112,11 @@ import simd
             p.vertexFunction = library.makeFunction(name: "gameWorldSenseUtilityVertex")
             p.fragmentFunction = library.makeFunction(name: "gameWorldSenseUtilityFragment")
             p.colorAttachments[0].pixelFormat = .rgba8Unorm
+            p.colorAttachments[0].isBlendingEnabled = true
+            p.colorAttachments[0].sourceRGBBlendFactor = .one
+            p.colorAttachments[0].destinationRGBBlendFactor = .oneMinusSourceAlpha
+            p.colorAttachments[0].sourceAlphaBlendFactor = .one
+            p.colorAttachments[0].destinationAlphaBlendFactor = .oneMinusSourceAlpha
             p.colorAttachments[1].pixelFormat = format
             p.depthAttachmentPixelFormat = .depth32Float
             let pipeline = try device.makeRenderPipelineState(descriptor: p)
@@ -148,6 +154,8 @@ import simd
                 idBytes.withUnsafeMutableBytes { ids.getBytes($0.baseAddress!, bytesPerRow: size * idStride, from: MTLRegionMake2D(0,0,size,size), mipmapLevel: 0) }
                 var depthPixels = [Float](repeating: 0, count: size * size)
                 depthPixels.withUnsafeMutableBytes { depth.getBytes($0.baseAddress!, bytesPerRow: size * 4, from: MTLRegionMake2D(0,0,size,size), mipmapLevel: 0) }
+                var colorPixels = [UInt8](repeating: 0, count: size * size * 4)
+                colorPixels.withUnsafeMutableBytes { color.getBytes($0.baseAddress!, bytesPerRow: size * 4, from: MTLRegionMake2D(0,0,size,size), mipmapLevel: 0) }
                 for index in renderedActions.indices {
                     let action = renderedActions[index]
                     let center = GameWorldSenseUtilityLayout.center(for: action, phoneOpen: phoneOpen)
@@ -159,6 +167,12 @@ import simd
                     let value = UInt32(idBytes[offset]) | (idStride == 2 ? UInt32(idBytes[offset+1]) << 8 : 0)
                     require(value == UInt32(index + 1), "Visible button pixel has exact system interaction ID")
                     require(abs(depthPixels[y * size + x] - 0.025) < 1e-6, "Interaction depth is the finite 2m plane")
+                    if action == .changeView {
+                        let c = (y * size + x) * 4
+                        require(abs(Int(colorPixels[c]) - 26) <= 1 && abs(Int(colorPixels[c+1]) - 51) <= 1
+                            && abs(Int(colorPixels[c+2]) - 77) <= 1,
+                            "Transparent control interior preserves the actual world color while remaining clickable")
+                    }
                 }
                 require(idBytes.prefix(64).allSatisfy { $0 == 0 }, "Outside pixels have no tracking region")
                 require(depthPixels[0] == 0, "Uncovered world depth is preserved")

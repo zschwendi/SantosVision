@@ -7,6 +7,7 @@ fn main() {
     println!("cargo::rustc-check-cfg=cfg(game_code)");
     println!("cargo:rerun-if-env-changed=MUGUET_GAME_CODE");
     println!("cargo:rerun-if-env-changed=MUGUET_MOTION_AOT_SHA256");
+    println!("cargo:rerun-if-env-changed=MUGUET_XR_MOTION_ARMS_DEFAULT");
     if std::env::var("MUGUET_GAME_CODE").is_ok_and(|p| std::path::Path::new(&p).is_file()) {
         println!("cargo:rustc-cfg=game_code");
     }

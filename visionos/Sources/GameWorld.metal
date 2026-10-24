@@ -31,9 +31,12 @@ fragment GameWorldSenseUtilityOutput gameWorldSenseUtilityFragment(GameWorldSens
     const float2 uv = float2((float(u.atlasIndex) + in.uv.x) / 7.0, in.uv.y);
     const float4 glyph = atlas.sample(s, uv);
     const float border = step(-.012, edge);
-    const float3 background = mix(float3(.025,.035,.038),float3(.11,.15,.16),border);
     GameWorldSenseUtilityOutput out;
-    out.color = float4(glyph.rgb + background * (1-glyph.a), 1);
+    // Premultiplied white outline and glyphs, with a clear interior. The
+    // entire rounded rectangle still carries the system's interaction ID.
+    const float outlineAlpha = border * .65;
+    out.color = float4(glyph.rgb + float3(outlineAlpha) * (1-glyph.a),
+                       glyph.a + outlineAlpha * (1-glyph.a));
     out.tracking = u.trackingValue;
     return out;
 }

@@ -31,6 +31,11 @@ enum GameWorldHUDPolicy {
         guard x.isFinite, y.isFinite, x > 0, y > 0 else { return nil }
         return SIMD2(x, y)
     }
+
+    // Bring both outside HUD corners inward and lower the whole canvas.
+    // Flat-window rendering keeps the original game coordinates.
+    static let immersiveScale: Float = 0.94
+    static let immersiveVerticalFraction: Float = -0.17
 }
 
 #if SV_GAME_RUNTIME
@@ -120,8 +125,10 @@ final class GameWorldHUD: @unchecked Sendable {
 
     func encode(_ encoder: any MTLRenderCommandEncoder, snapshot: Snapshot,
                 headFromEye: simd_float4x4, projection: simd_float4x4) {
-        var uniforms = Uniforms(clipFromHead: projection * headFromEye.inverse,
-            halfSize: snapshot.halfSize, distance: snapshot.native.distance_metres,
+        var placement = matrix_identity_float4x4
+        placement.columns.3.y = snapshot.halfSize.y * GameWorldHUDPolicy.immersiveVerticalFraction
+        var uniforms = Uniforms(clipFromHead: projection * headFromEye.inverse * placement,
+            halfSize: snapshot.halfSize * GameWorldHUDPolicy.immersiveScale, distance: snapshot.native.distance_metres,
             decodeForLinearTarget: decodeForLinearTarget)
         encoder.setRenderPipelineState(pipeline)
         encoder.setDepthStencilState(depth)

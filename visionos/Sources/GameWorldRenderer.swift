@@ -93,6 +93,8 @@ enum GameWorldEvent: Sendable {
     case lifecycle(GameWorldLifecycleEvent)
     case status(String)
     case presented(GameWorldPresentation)
+    // Cheap liveness signal; unlike .presented this never writes a report.
+    case gameFrameCompleted(uptime: Double)
     case singleSourcePresented(GameWorldSingleSourcePresentation)
     case gpuTiming(GameWorldGpuTimingSummary)
     case senseUtilityTracking(active: Bool, sequence: UInt64)
@@ -376,7 +378,8 @@ final class GameWorldRenderer: @unchecked Sendable {
     // stops every supplied provider on run failure; a stopped one cannot retry.
     private var tracking = WorldTrackingProvider()
     private let motionTracking = XRMotionTracking(enabled:
-        ProcessInfo.processInfo.arguments.contains("--sv-motion-tracking-preview")
+        sv_xr_motion_arms_enabled_v1() != 0
+        || ProcessInfo.processInfo.arguments.contains("--sv-motion-tracking-preview")
         || ProcessInfo.processInfo.environment["MUGUET_XR_MOTION_AIM"] == "1"
         || ProcessInfo.processInfo.environment["MUGUET_XR_MOTION_ARMS"] == "1")
     private let queue: any MTLCommandQueue
@@ -697,6 +700,8 @@ final class GameWorldRenderer: @unchecked Sendable {
         guard inFlight.wait(timeout: .now() + 0.1) == .success else { return }
         var ownsSlot = true
         defer { if ownsSlot { inFlight.signal() } }
+        // Do not enter a compositor submission that cannot be presented.
+        guard let commands = queue.makeCommandBuffer() else { return }
         guard let frame = layer.queryNextFrame() else { return }
         frame.startUpdate()
         frame.endUpdate()
@@ -707,7 +712,6 @@ final class GameWorldRenderer: @unchecked Sendable {
         let drawables = frame.queryDrawables()
         guard !drawables.isEmpty else { return } // Empty query invalidates the frame.
         defer { frame.endSubmission() }
-        guard let commands = queue.makeCommandBuffer() else { return }
         commands.label = "SantosVision actual game world compositor frame"
         var leases: [GameWorldLease] = []
         var cornerScratch = CornerScratchLease()
@@ -751,11 +755,12 @@ final class GameWorldRenderer: @unchecked Sendable {
                     return XRRetainedEyeView(headFromEye: drawable.views[index].transform,
                                       projectionFromEye: nativeProjection)
                 }
-                guard eyes.count == drawable.views.count else {
+                if eyes.count != drawable.views.count {
                     motionTracking.invalidate(reason: "Physical projection exceeds the native camera conversion budget")
                     reportStatus("The headset projection exceeds the native camera conversion budget.")
-                    continue
-                }
+                    // Even a rejected source request must clear and present
+                    // this acquired drawable before endSubmission().
+                } else {
                 // The request frame names the eye geometry; the head frame names the pose. Both are
                 // retained together so a lease can be checked against the exact pair it claims.
                 let requestFrame = WorldRequestCounter.shared.next()
@@ -841,6 +846,7 @@ final class GameWorldRenderer: @unchecked Sendable {
                         reportStatus("Waiting for both distinct native game eye views and their matching depth.")
                     }
                 }
+                }
             } else if builtIn, stageFromHead == nil {
                 motionTracking.invalidate(reason: "Head tracking unavailable")
                 XRHeadTracking.shared.submit(timestamp: timestamp, stageFromHead: nil, tracked: false)
@@ -898,7 +904,8 @@ final class GameWorldRenderer: @unchecked Sendable {
             }
             leases += drawableLeases
             if let senseUtilities {
-                senseUtilities.encode(drawable: drawable, commands: commands, tracked: stageFromHead != nil)
+                senseUtilities.encode(drawable: drawable, commands: commands,
+                    tracked: stageFromHead != nil && encoded.views == drawable.views.count && !sources.isEmpty)
             } else {
                 GameWorldSenseUtilities.clearTracking(drawable: drawable, commands: commands)
             }
@@ -943,6 +950,9 @@ final class GameWorldRenderer: @unchecked Sendable {
                     log.debug("Native world presentation acknowledgement rejected (\(result)); session may have ended.")
                 }
                 acknowledged = result == 0
+                if acknowledged, buffer.status == .completed {
+                    report(.gameFrameCompleted(uptime: ProcessInfo.processInfo.systemUptime))
+                }
             }
             if let gpuTiming,
                let summary = gpuTiming.record(completed: buffer.status == .completed, error: buffer.status == .error,
