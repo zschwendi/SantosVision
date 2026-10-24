@@ -39,7 +39,7 @@ Constructing this input registry does not run an accessory tracking provider.
 | Circle | Reload/back | Back (Backspace) |
 | Right Menu/Options | Pause | GTA pause/back (Escape) |
 | Left Menu/Create, if exposed | Cycle camera, replacing absent touchpad | Inactive |
-| Right stick click | Existing rear-view action | Existing behavior |
+| Right stick click | Rear view; while L2-aiming in first person, GTA sights toggle ([details](FIRST-PERSON-SIGHTS-20261024.md)) | Existing behavior |
 | Hold left stick click + deflect left stick | Virtual D-pad; suppress movement | Directional navigation |
 | Tap left stick click without directional use | Normal L3 click on release, held120ms | Existing behavior |
 

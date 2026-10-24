@@ -13,7 +13,12 @@ use std::time::{Duration, Instant};
 mod guest_context;
 #[path = "pad_spatial.rs"]
 mod spatial;
+#[path = "pad_sights.rs"]
+mod sights;
 use spatial::Sample;
+
+/// Script-tick GetFollowPedCamViewMode for the on-foot local player.
+pub(crate) fn record_follow_ped_view_mode(mode: i32) { sights::record_follow_ped_view_mode(mode) }
 
 pub static ACTIVE: AtomicBool = AtomicBool::new(false);
 static POLL_SAMPLES: AtomicU64 = AtomicU64::new(0);
@@ -87,6 +92,7 @@ pub(crate) fn status_json() -> serde_json::Value {
         "phone_instantiated": if GUEST_CONTEXT_AVAILABLE.load(Ordering::Relaxed) { Some(PHONE_INSTANTIATED.load(Ordering::Relaxed)) } else { None },
         "look_sensitivity_percent": LOOK_SENSITIVITY.get().copied(),
         "look_speed_units_per_second": LOOK_SENSITIVITY.get().map(|percent| LOOK_SPEED * percent / 100.0),
+        "first_person_sights": sights::status_json(),
     })
 }
 
@@ -121,6 +127,7 @@ struct State {
     spatial_router: spatial::Router,
     native_controls_require_neutral: bool,
     utility_source: Option<Option<spatial::SpatialIdentity>>,
+    sights: sights::Toggle,
 }
 static STATE: Mutex<Option<State>> = Mutex::new(None);
 
@@ -431,7 +438,8 @@ fn poll_sample_in_context(gp: Option<Sample>, context: impl FnOnce() -> Option<g
     let mut guard = STATE.lock().unwrap();
     let st = guard.get_or_insert_with(|| State { held: HashSet::new(), buttons: 0, last: Instant::now(), down_since: None,
         menu_navigation: MENU_NAVIGATION.load(Ordering::Relaxed), phone_navigation: false, menu_button_down: false, blocked_context_buttons: 0,
-        spatial_router: spatial::Router::default(), native_controls_require_neutral: false, utility_source: None });
+        spatial_router: spatial::Router::default(), native_controls_require_neutral: false, utility_source: None,
+        sights: sights::Toggle::default() });
     let source = gp.map(|sample| sample.spatial);
     if !connected || source != st.utility_source { clear_utility_dpad(); }
     st.utility_source = source;
@@ -445,8 +453,8 @@ fn poll_sample_in_context(gp: Option<Sample>, context: impl FnOnce() -> Option<g
         // Wait until a PREVIOUS mapper poll emitted the actual wheel key.
         // The threshold-crossing poll itself must never rotate the view first.
         && st.held.contains("AltLeft");
-    let gp = physical_sample_for_policy(gp, native_controls_input_policy(), wheel_navigation,
-        &mut st.native_controls_require_neutral);
+    let policy = native_controls_input_policy();
+    let gp = physical_sample_for_policy(gp, policy, wheel_navigation, &mut st.native_controls_require_neutral);
     let gp = gp.map(|sample| st.spatial_router.apply(sample, Instant::now()));
     if gp.is_none() { st.spatial_router = spatial::Router::default(); }
     let dt = st.last.elapsed().as_secs_f64().min(0.05);
@@ -455,6 +463,8 @@ fn poll_sample_in_context(gp: Option<Sample>, context: impl FnOnce() -> Option<g
     let mut keys: HashSet<&'static str> = HashSet::new();
     let mut buttons = 0u8;
     let mut looking = false;
+    let mut sights_wheel = 0;
+    let now = Instant::now();
     let (menu_key, wheel) = {
         let mut actions = MENU_ACTIONS.lock().unwrap();
         let key = menu_action_key(&mut actions, Instant::now(), guest.map(|context| context.paused));
@@ -487,12 +497,14 @@ fn poll_sample_in_context(gp: Option<Sample>, context: impl FnOnce() -> Option<g
         let allowed = context_buttons(&mut st.blocked_context_buttons, context_changed, pressed);
         let pressed = |bit| allowed & bit != 0;
         let [lx, ly] = gp.left_stick;
+        let mut look_behind = gp.right_click;
         if lx < -STICK_DEADZONE { keys.insert(if menu { "ArrowLeft" } else { "KeyA" }); }
         if lx > STICK_DEADZONE { keys.insert(if menu { "ArrowRight" } else { "KeyD" }); }
         if menu {
             if ly > STICK_DEADZONE { keys.insert("ArrowUp"); }
             if ly < -STICK_DEADZONE { keys.insert("ArrowDown"); }
             HORN_PAD.store(false, Ordering::Relaxed);
+            st.sights.interrupt(gp.right_click);
         } else if in_car {
             if ly > STICK_DEADZONE { keys.insert("Numpad8"); }
             if ly < -STICK_DEADZONE { keys.insert("Numpad2"); }
@@ -500,12 +512,23 @@ fn poll_sample_in_context(gp: Option<Sample>, context: impl FnOnce() -> Option<g
             if gp.left_trigger > 0.2 { keys.insert("KeyS"); }
             if pressed(RIGHT_SHOULDER) { keys.insert("Space"); }
             HORN_PAD.store(gp.left_click, Ordering::Relaxed);
+            st.sights.interrupt(gp.right_click);
         } else {
             if ly > STICK_DEADZONE { keys.insert("KeyW"); }
             if ly < -STICK_DEADZONE { keys.insert("KeyS"); }
             let right_trigger=if gp.spatial.is_some() {crate::xr_motion_aim::filter_spatial_trigger(gp.right_trigger)}else{gp.right_trigger};
             if right_trigger > 0.2 { buttons |= 1; }
-            if gp.left_trigger > 0.2 { buttons |= 2; }
+            // L2 is ordinary aim (RMB). GTA's first-person sights toggle is a
+            // separate input; see pad_sights.rs. Utility/modal policies never route it.
+            let aim = gp.left_trigger > 0.2;
+            if policy == 0 {
+                let route = st.sights.route(gp.spatial.is_some(), gp.right_click,
+                    aim && st.buttons & 2 != 0 && !phone_instantiated,
+                    sights::first_person_on_foot(now), guest_context::read_sights, now);
+                look_behind = route.look_behind;
+                sights_wheel = route.wheel;
+            } else { st.sights.interrupt(gp.right_click); }
+            if aim || st.sights.holds_aim(now) { buttons |= 2; }
             if pressed(RIGHT_SHOULDER) { keys.insert("KeyQ"); }
             if gp.left_click { keys.insert("ControlLeft"); }
         }
@@ -517,7 +540,7 @@ fn poll_sample_in_context(gp: Option<Sample>, context: impl FnOnce() -> Option<g
         } else {
             if pressed(TRIANGLE) { keys.insert("KeyF"); }
             if pressed(LEFT_SHOULDER) { keys.insert("Tab"); }
-            if gp.right_click { keys.insert("KeyC"); }
+            if look_behind { keys.insert("KeyC"); }
         }
         if !menu {
             if gp.camera { keys.insert("KeyV"); }
@@ -538,6 +561,7 @@ fn poll_sample_in_context(gp: Option<Sample>, context: impl FnOnce() -> Option<g
         st.menu_button_down = false;
         st.blocked_context_buttons = 0;
         HORN_PAD.store(false, Ordering::Relaxed);
+        st.sights.interrupt(false);
     }
     // UI holds bypass physical modal filtering intentionally, but still use
     // the identical direction/character-wheel semantics and normal key diff.
@@ -564,16 +588,24 @@ fn poll_sample_in_context(gp: Option<Sample>, context: impl FnOnce() -> Option<g
     }
     st.held = keys;
     for (bit, dom) in [(1u8, 0usize), (2, 2)] {
-        if (buttons ^ st.buttons) & bit != 0 { emit_button(dom, buttons & bit != 0); }
+        if (buttons ^ st.buttons) & bit != 0 {
+            emit_button(dom, buttons & bit != 0);
+            if bit == 2 { sights::record_aim_edge(buttons & bit != 0); }
+        }
     }
     st.buttons = buttons;
+    // After the button diff: INPUT_AIM already reached the guest earlier.
+    if sights_wheel != 0 {
+        WHEEL_EVENTS.fetch_add(1, Ordering::Relaxed);
+        input::wheel(sights_wheel);
+    }
     connected
 }
 
 fn release(st: State) {
     for k in st.held { emit_key(k, false); }
     if st.buttons & 1 != 0 { emit_button(0, false); }
-    if st.buttons & 2 != 0 { emit_button(2, false); }
+    if st.buttons & 2 != 0 { emit_button(2, false); sights::record_aim_edge(false); }
 }
 
 /// Release held controller input when the native application's scene deactivates.

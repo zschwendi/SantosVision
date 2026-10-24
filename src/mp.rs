@@ -902,6 +902,8 @@ pub fn script_tick(caller: &mut Caller<'_, HostState>, thread: u64, tls: u64) ->
             let ped = c.i("PlayerPedId", &[]);
             let in_car = ped != 0 && c.exists(ped) && c.i("IsPedInAnyVehicle", &[i(ped), b(false)]) != 0;
             crate::pad::IN_VEHICLE.store(in_car, Ordering::Relaxed);
+            // Unavailable/zero is third person: R3 keeps its look-behind meaning.
+            crate::pad::record_follow_ped_view_mode(if ped != 0 && !in_car { c.i("GetFollowPedCamViewMode", &[]) } else { 0 });
 
             static HORN_AT: Mutex<Option<Instant>> = Mutex::new(None);
             let mut horn_at = HORN_AT.lock().unwrap();

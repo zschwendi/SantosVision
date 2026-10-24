@@ -405,6 +405,120 @@ mod pad {
             suspend();
             crate::input::take();
         }
+        fn sense(buttons: u32, lt: f32) -> Sample { spatial::spatial_sample(3, buttons, [0.0, 0.0, 0.0, 0.0, lt, 0.0], 42).unwrap() }
+        const SENSE_R3: u32 = 1 << 7;
+        fn gameplay() -> Option<guest_context::Context> { Some(guest_context::Context { paused: false, phone: false }) }
+        fn aim_events(events: &[Event]) -> Vec<Event> {
+            events.iter().filter(|event| matches!(event, Event::Button(2, _) | Event::Wheel(_)) || matches!(event, Event::Key(k, _) if k == "KeyC")).cloned().collect()
+        }
+        fn reset_sights_lifecycle() -> std::sync::MutexGuard<'static, ()> {
+            let guard = sights::TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+            sights::reset_learning_for_test();
+            suspend();
+            TEST_NATIVE_CONTROLS_OWN_INPUT.store(false, Ordering::Relaxed);
+            TEST_NATIVE_CONTROLS_POLICY.store(0, Ordering::Relaxed);
+            MENU_NAVIGATION.store(false, Ordering::Relaxed);
+            IN_VEHICLE.store(false, Ordering::Relaxed);
+            crate::input::take();
+            guard
+        }
+        #[test]
+        fn l2_aim_press_hold_release_emits_exactly_one_right_button_edge_for_both_profiles() {
+            let _guard = reset_sights_lifecycle();
+            for spatial in [true, false] {
+                let held = |lt| if spatial { sense(0, lt) } else { Sample { left_trigger: lt, ..Sample::default() } };
+                poll_sample_in_context(Some(held(0.0)), gameplay);
+                crate::input::take();
+                poll_sample_in_context(Some(held(0.9)), gameplay);
+                assert_eq!(aim_events(&crate::input::take()), vec![Event::Button(2, true)]);
+                for _ in 0..5 { poll_sample_in_context(Some(held(0.9)), gameplay); }
+                assert!(aim_events(&crate::input::take()).is_empty(), "held aim never repeats or flickers");
+                // Below the existing 0.2 threshold is release, not partial aim.
+                poll_sample_in_context(Some(held(0.15)), gameplay);
+                assert_eq!(aim_events(&crate::input::take()), vec![Event::Button(2, false)]);
+                suspend(); crate::input::take();
+            }
+        }
+        #[test]
+        fn first_person_r3_while_aiming_toggles_gta_sights_with_one_wheel_notch_per_press() {
+            let _guard = reset_sights_lifecycle();
+            let routed = || status_json()["first_person_sights"]["routed_r3_presses"].as_u64().unwrap();
+            let before = routed();
+            record_follow_ped_view_mode(4);
+            poll_sample_in_context(Some(sense(0, 0.0)), gameplay);
+            // R3 at the same poll as the first aim cannot outrun INPUT_AIM.
+            poll_sample_in_context(Some(sense(SENSE_R3, 1.0)), gameplay);
+            assert_eq!(aim_events(&crate::input::take()), vec![Event::Key("KeyC".into(), true), Event::Button(2, true)]);
+            poll_sample_in_context(Some(sense(0, 1.0)), gameplay);
+            assert_eq!(aim_events(&crate::input::take()), vec![Event::Key("KeyC".into(), false)]);
+            poll_sample_in_context(Some(sense(SENSE_R3, 1.0)), gameplay);
+            assert_eq!(aim_events(&crate::input::take()), vec![Event::Wheel(1)], "sights notch replaces look-behind");
+            for _ in 0..3 { poll_sample_in_context(Some(sense(SENSE_R3, 1.0)), gameplay); }
+            assert!(aim_events(&crate::input::take()).is_empty(), "held R3 is one press");
+            poll_sample_in_context(Some(sense(0, 1.0)), gameplay);
+            poll_sample_in_context(Some(sense(SENSE_R3, 1.0)), gameplay);
+            assert_eq!(aim_events(&crate::input::take()), vec![Event::Wheel(-1)], "second press leaves sights");
+            // Releasing L2 right after a notch keeps INPUT_AIM until the guest consumed it.
+            poll_sample_in_context(Some(sense(SENSE_R3, 0.0)), gameplay);
+            assert!(aim_events(&crate::input::take()).is_empty());
+            std::thread::sleep(Duration::from_millis(130));
+            poll_sample_in_context(Some(sense(0, 0.0)), gameplay);
+            assert_eq!(aim_events(&crate::input::take()), vec![Event::Button(2, false)]);
+            assert_eq!(routed() - before, 2);
+            assert!(status_json()["first_person_sights"]["aim_button_presses"].as_u64().unwrap() >= 1);
+            suspend(); crate::input::take();
+        }
+        #[test]
+        fn third_person_unknown_view_and_dualsense_keep_r3_look_behind_while_aiming() {
+            let _guard = reset_sights_lifecycle();
+            for (mode, spatial) in [(1, true), (0, true), (4, false)] {
+                record_follow_ped_view_mode(mode);
+                let sample = |click: bool, lt: f32| if spatial { sense(if click { SENSE_R3 } else { 0 }, lt) }
+                    else { Sample { right_click: click, left_trigger: lt, ..Sample::default() } };
+                poll_sample_in_context(Some(sample(false, 1.0)), gameplay);
+                poll_sample_in_context(Some(sample(false, 1.0)), gameplay);
+                crate::input::take();
+                poll_sample_in_context(Some(sample(true, 1.0)), gameplay);
+                assert_eq!(aim_events(&crate::input::take()), vec![Event::Key("KeyC".into(), true)], "mode={mode} spatial={spatial}");
+                suspend(); crate::input::take();
+            }
+        }
+        #[test]
+        fn sights_notch_never_leaks_through_menu_phone_vehicle_utility_modal_or_loss() {
+            let _guard = reset_sights_lifecycle();
+            record_follow_ped_view_mode(4);
+            let aimed = |context: fn() -> Option<guest_context::Context>| {
+                suspend(); crate::input::take();
+                poll_sample_in_context(Some(sense(0, 0.0)), gameplay);
+                poll_sample_in_context(Some(sense(0, 1.0)), gameplay);
+                crate::input::take();
+                poll_sample_in_context(Some(sense(SENSE_R3, 1.0)), context);
+                crate::input::take()
+            };
+            let paused = || Some(guest_context::Context { paused: true, phone: false });
+            let phone = || Some(guest_context::Context { paused: false, phone: true });
+            for (name, events) in [("pause", aimed(paused)), ("phone", aimed(phone))] {
+                assert!(!events.iter().any(|e| matches!(e, Event::Wheel(_))), "{name}");
+            }
+            IN_VEHICLE.store(true, Ordering::Relaxed);
+            assert!(!aimed(gameplay).iter().any(|e| matches!(e, Event::Wheel(_))), "vehicle");
+            IN_VEHICLE.store(false, Ordering::Relaxed);
+            for policy in [1, 2] {
+                TEST_NATIVE_CONTROLS_POLICY.store(policy, Ordering::Relaxed);
+                assert!(!aimed(gameplay).iter().any(|e| matches!(e, Event::Wheel(_) | Event::Button(2, true))), "policy {policy}");
+            }
+            TEST_NATIVE_CONTROLS_POLICY.store(0, Ordering::Relaxed);
+            // Loss while aiming releases aim; reconnecting with R3 already held is not a press.
+            suspend(); crate::input::take();
+            poll_sample_in_context(Some(sense(0, 1.0)), gameplay);
+            poll_sample_in_context(Some(sense(0, 1.0)), gameplay);
+            poll_sample_in_context(None, gameplay);
+            assert_eq!(aim_events(&crate::input::take()), vec![Event::Button(2, true), Event::Button(2, false)]);
+            poll_sample_in_context(Some(sense(SENSE_R3, 1.0)), gameplay);
+            poll_sample_in_context(Some(sense(SENSE_R3, 1.0)), gameplay);
+            assert!(!crate::input::take().iter().any(|e| matches!(e, Event::Wheel(_))));
+            suspend(); crate::input::take();
+        }
         #[test]
         fn moving_with_l3_uses_actual_movement_and_never_opens_phone() {
             suspend();
@@ -430,7 +544,7 @@ mod pad {
 }
 '''.replace('PAD_SOURCE_PATH', json.dumps(str(root/'src/pad.rs')))
 (out/'harness/src/lib.rs').write_text(source)
-files = ['src/pad.rs', 'src/pad_spatial.rs', 'src/pad_guest_context.rs', 'scripts/test-pad-routing.sh']
+files = ['src/pad.rs', 'src/pad_spatial.rs', 'src/pad_guest_context.rs', 'src/pad_sights.rs', 'scripts/test-pad-routing.sh']
 (out/'source-hashes.json').write_text(json.dumps({f: hashlib.sha256((root/f).read_bytes()).hexdigest() for f in files}, indent=2)+'\n')
 PY
 export CARGO_HOME=${CARGO_HOME:-$PWD/.tools/cargo}

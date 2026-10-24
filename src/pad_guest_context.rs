@@ -27,6 +27,17 @@ const PAUSE_MODAL: u64 = 19_569_536;
 const PAUSE_OVERLAY: u64 = 19_582_216;
 // IS_MOBILE_PHONE_INSTANTIATED script wrapper (function 59243).
 const PHONE_INSTANTIATED: u64 = 19_505_748;
+// CGameWorld::GetMainPlayerInfo (function 47305): local ped at factory+8, then
+// CPed+4328. CPlayerInfo::ProcessFPSState (function 41680) owns +4664 value 2,
+// GTA's first-person sights flag, changed only by INPUT_ACCURATE_AIM while aiming.
+const PED_FACTORY: u64 = 20_159_720;
+const PED_PLAYER_INFO: u64 = 4_328;
+const PLAYER_FPS_FLAGS: u64 = 4_664;
+const FPS_SIGHTS: u64 = 2;
+// camGameplayDirector at 19235320, active camera +960. This vtable is the
+// scoped camFirstPersonAimCamera; its wheel is sniper zoom, not sights.
+const CAMERA_DIRECTOR: u64 = 19_235_320;
+const SCOPED_AIM_CAMERA_VTABLE: u64 = 4_663_048;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct Context {
@@ -47,6 +58,32 @@ pub(super) fn read() -> Option<Context> {
 }
 
 pub(super) fn abi_verified() -> Option<bool> { VERIFIED_ABI.get().copied() }
+
+/// Value-only first-person weapon state under the same exact-ABI gate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct Sights {
+    pub on: bool,
+    pub scoped_camera: bool,
+}
+
+pub(super) fn read_sights() -> Option<Sights> {
+    let runtime = crate::RT.get()?;
+    if !*VERIFIED_ABI.get_or_init(verify_embedded_abi) { return None; }
+    let (base, length) = crate::mem_base_len(&runtime.mem);
+    read_sights_from(|address, width| unsafe { read_word(base, length, address, width) })
+}
+
+fn read_sights_from(mut read: impl FnMut(u64, usize) -> Option<u64>) -> Option<Sights> {
+    let nonzero = |value: u64| (value != 0).then_some(value);
+    let factory = nonzero(read(PED_FACTORY, 8)?)?;
+    let ped = nonzero(read(factory.checked_add(8)?, 8)?)?;
+    let info = nonzero(read(ped.checked_add(PED_PLAYER_INFO)?, 8)?)?;
+    let on = read(info.checked_add(PLAYER_FPS_FLAGS)?, 1)? & FPS_SIGHTS != 0;
+    let director = read(CAMERA_DIRECTOR, 8)?;
+    let camera = if director == 0 { 0 } else { read(director.checked_add(960)?, 8)? };
+    let scoped_camera = camera != 0 && read(camera, 8)? == SCOPED_AIM_CAMERA_VTABLE;
+    Some(Sights { on, scoped_camera })
+}
 
 fn read_context(mut read: impl FnMut(u64, usize) -> Option<u64>) -> Option<Context> {
     let active = read(PAUSE_ACTIVE, 1)? & 1 != 0;
@@ -126,6 +163,35 @@ fn verify_embedded_abi() -> bool {
     }
     #[cfg(not(all(target_os = "visionos", not(feature = "jit"), game_code)))]
     { false }
+}
+
+#[cfg(test)]
+mod sights_tests {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn sights_follow_local_player_info_and_scoped_camera_without_guessing() {
+        let mut memory = BTreeMap::from([
+            ((PED_FACTORY, 8), 0x1000), ((0x1008, 8), 0x2000), ((0x2000 + PED_PLAYER_INFO, 8), 0x3000),
+            ((0x3000 + PLAYER_FPS_FLAGS, 1), 0b1_1001), ((CAMERA_DIRECTOR, 8), 0x4000), ((0x4000 + 960, 8), 0x5000),
+            ((0x5000, 8), 77),
+        ]);
+        let read = |m: &BTreeMap<(u64, usize), u64>| read_sights_from(|a, w| m.get(&(a, w)).copied());
+        assert_eq!(read(&memory), Some(Sights { on: false, scoped_camera: false }), "other FPS bits are not sights");
+        memory.insert((0x3000 + PLAYER_FPS_FLAGS, 1), 0b10);
+        assert_eq!(read(&memory), Some(Sights { on: true, scoped_camera: false }));
+        memory.insert((0x5000, 8), SCOPED_AIM_CAMERA_VTABLE);
+        assert_eq!(read(&memory), Some(Sights { on: true, scoped_camera: true }));
+        memory.insert((0x4000 + 960, 8), 0);
+        assert_eq!(read(&memory), Some(Sights { on: true, scoped_camera: false }));
+        // Absent local player/info or an unreadable field is unknown, never off.
+        memory.insert((0x2000 + PED_PLAYER_INFO, 8), 0);
+        assert_eq!(read(&memory), None);
+        memory.insert((0x1008, 8), 0);
+        assert_eq!(read(&memory), None);
+        assert_eq!(read_sights_from(|_, _| None), None);
+    }
 }
 
 #[cfg(all(test, feature = "jit"))]
