@@ -56,6 +56,7 @@ final class GameWorldModel: ObservableObject {
     private var renderer: GameWorldRenderer?
     private var startup: Task<Void, Never>?
     private var generation = UUID()
+    var sceneGeneration: UUID { generation }
     private var appActive = true
     private var frameWatchdog = GameWorldFrameWatchdog()
     private var lifecycle: [[String: Any]] = []
@@ -67,6 +68,7 @@ final class GameWorldModel: ObservableObject {
     private var diagnosticRenderingMethod: String?
     private var recordedStatusKeys = Set<String>()
     private weak var runtime: NativeRuntimeModel?
+    private weak var gameScenes: GameSceneTransitions?
     private var senseUtilityVisibilityObservation: AnyCancellable?
     private var senseUtilityPhoneObservation: AnyCancellable?
     private var senseUtilityLayer: LayerRenderer?
@@ -77,9 +79,14 @@ final class GameWorldModel: ObservableObject {
     private var senseUtilityLastInput: [String: Any] = [:]
     private let log = Logger(subsystem: "com.zephyrstudios.santosvision", category: "GameWorldStatus")
 
-    func startRenderer(_ layer: LayerRenderer, runtime: NativeRuntimeModel) {
+    func recordSceneTransition(_ stage: String, serial: UInt64) {
+        recordState(stage, detail: "window_return_serial=\(serial)")
+    }
+
+    func startRenderer(_ layer: LayerRenderer, runtime: NativeRuntimeModel, gameScenes: GameSceneTransitions) {
         stopRenderer()
         self.runtime = runtime
+        self.gameScenes = gameScenes
         hasPresentedFrames = false
         frameWatchdog.start(at: ProcessInfo.processInfo.systemUptime, active: appActive)
         runtime.beginWorldTracking()
@@ -157,6 +164,7 @@ final class GameWorldModel: ObservableObject {
                         self.isImmersiveActive = false
                         self.recordState("renderer_ended", detail: reason)
                         self.runtime?.endWorldTracking()
+                        self.gameScenes?.requestReturn(generation: self.generation, reason: "renderer_ended")
                     }
                     self.log.info("\(self.status, privacy: .public)")
                 }

@@ -9,7 +9,7 @@ import simd
             precondition(condition(), message); checks += 1
         }
         let actions = GameWorldSenseUtilityLayout.actions
-        require(actions == [.phone, .changeView], "Only Phone and View are visible; directional arrows stay hidden")
+        require(actions == [.phone], "Only Phone is visible; camera uses the existing physical shortcut")
         // Utilities sit toward the minimap, away from the central avatar/aim.
         let hudHalfWidth = GameWorldSenseUtilityLayout.distance * tan(Float.pi / 6)
         let hudHalfHeight = hudHalfWidth * 9 / 16
@@ -31,7 +31,9 @@ import simd
             }
         }
         let phoneActions = GameWorldSenseUtilityLayout.visibleActions(phoneOpen: true)
-        require(phoneActions.count == 6, "Four arrows appear only with the phone")
+        require(phoneActions == [.phone, .up, .down, .left, .right], "Four arrows appear only with the phone; no duplicate camera button")
+        require(GameWorldSenseUtilityLayout.action(identifier: GameWorldSenseUtilityLayout.identifier(.changeView)) == nil,
+                "Stale hits on the removed camera button cannot change views")
         let up = GameWorldSenseUtilityLayout.center(for: .up, phoneOpen: true)
         let down = GameWorldSenseUtilityLayout.center(for: .down, phoneOpen: true)
         let left = GameWorldSenseUtilityLayout.center(for: .left, phoneOpen: true)

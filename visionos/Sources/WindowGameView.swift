@@ -77,6 +77,7 @@ struct WindowGameView: View {
     @ObservedObject var surface: WindowGameSurface
     #if SV_GAME_RUNTIME
     @EnvironmentObject private var world: GameWorldModel
+    @EnvironmentObject private var gameScenes: GameSceneTransitions
     @Environment(\.openImmersiveSpace) private var openImmersiveSpace
     @Environment(\.dismissImmersiveSpace) private var dismissImmersiveSpace
     @Environment(\.dismissWindow) private var dismissWindow
@@ -165,7 +166,8 @@ struct WindowGameView: View {
             .buttonStyle(.plain)
             .glassBackgroundEffect(in: Circle())
             .accessibilityLabel("Enter immersive view")
-            .disabled(world.isOpening || world.isImmersiveActive || runtime.engineFailed)
+            .disabled(world.isOpening || world.isImmersiveActive || gameScenes.pending || runtime.engineFailed || runtime.gtaPauseMenuOpen)
+            .accessibilityHint(runtime.gtaPauseMenuOpen ? "Close GTA's pause menu before entering immersive view." : "Open the game world around you.")
             #endif
         }
         .ornament(visibility: runtime.hasStarted && runtime.gameControlsVisible ? .visible : .hidden,
@@ -251,7 +253,8 @@ struct WindowGameView: View {
 
     #if SV_GAME_RUNTIME
     private func expandGame() async {
-        guard runtime.hasStarted, !runtime.engineFailed, !world.isOpening, !world.isImmersiveActive else { return }
+        guard runtime.hasStarted, !runtime.engineFailed, !runtime.gtaPauseMenuOpen, !world.isOpening, !world.isImmersiveActive,
+              !gameScenes.pending else { return }
         world.isOpening = true
         guard await runtime.preparePhoneForImmersiveTransition() else {
             world.isOpening = false
@@ -277,9 +280,7 @@ struct WindowGameView: View {
 
     private func returnToWindow() async {
         runtime.cancelPhonePreparation()
-        world.stopRenderer(reason: "window_transition_cancelled")
-        await dismissImmersiveSpace()
-        world.isImmersiveActive = false
+        gameScenes.requestReturn(generation: world.sceneGeneration, reason: "window_transition_cancelled")
     }
     #endif
 
@@ -380,7 +381,7 @@ struct SantosSettingsView: View {
                         .disabled(!runtime.canChangePlaySettings)
                     Text("Adjusts the right stick's look speed. GTA's own mouse sensitivity also applies.")
                         .font(.caption).foregroundStyle(.secondary)
-                    Text("DualSense: click the touchpad to change camera. Sense: click both sticks together to change camera. Left stick always moves; its click is normal L3. Use the phone arrow buttons for D-pad navigation. The Phone and View buttons sit below the game. Look at a native button and press either Sense trigger to select it. Start opens GTA's pause menu, with Los Santos settings and Quit beside it (plus Window when immersive). In GTA menus and Settings: stick moves, Cross selects, Circle goes back, L1/R1 change tabs, Square applies and Triangle is GTA's Tab. GTA shows keyboard keys: Enter ✕, Backspace ○, Space □, Tab △, Q/E L1/R1.")
+                    Text("DualSense: click the touchpad to change camera. Sense: click both sticks together to change camera. Left stick always moves; its click is normal L3. Use the Phone button and its arrow pad for the phone. Look at a native button and press either Sense trigger to select it. Start opens GTA's own pause menu in the game window, with Los Santos settings and Quit beside it. In GTA Settings: stick moves, Cross selects, Circle goes back, L1/R1 change tabs, Square applies and Triangle is GTA's Tab. GTA keys: Enter ✕, Backspace ○, Space □, Tab △, Q/E L1/R1.")
                         .font(.caption).foregroundStyle(.secondary)
                 }
                 Section {
@@ -485,7 +486,6 @@ struct SenseGameplayUtilities: View {
                 SensePhoneArrowOrnament(runtime: runtime)
                     .padding()
             }
-            mainButton(.changeView)
         }
         .padding(8)
         .handlesGameControllerEvents(matching: .gamepad, withOptions: .receivesEventsInView(true))

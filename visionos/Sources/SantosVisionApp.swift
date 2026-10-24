@@ -11,8 +11,13 @@ struct SantosVisionApp: App {
     @StateObject private var windowSurface = WindowGameSurface()
     #if SV_GAME_RUNTIME
     @StateObject private var world = GameWorldModel()
+    @StateObject private var gameScenes = GameSceneTransitions()
+    @State private var windowReturnTask: Task<Void, Never>?
+    @State private var controlsWindowRequested = false
     #endif
     @Environment(\.scenePhase) private var scenePhase
+    @Environment(\.openWindow) private var openWindow
+    @Environment(\.dismissWindow) private var dismissWindow
     @Environment(\.dismissImmersiveSpace) private var dismissImmersiveSpace
 
     var body: some Scene {
@@ -21,6 +26,7 @@ struct SantosVisionApp: App {
             if runtime.windowGameMode {
                 WindowGameView(runtime: runtime, surface: windowSurface)
                     .environmentObject(world)
+                    .environmentObject(gameScenes)
             } else {
             LauncherView(model: model, runtime: runtime)
                 .environmentObject(world)
@@ -31,9 +37,20 @@ struct SantosVisionApp: App {
         }
         .defaultSize(width: 1000, height: 680)
         .restorationBehavior(.disabled)
+        .defaultLaunchBehavior(.presented)
         .onChange(of: scenePhase, initial: true) { _, phase in
             runtime.setActive(phase == .active)
+            #if SV_GAME_RUNTIME
+            if phase == .active { restoreGameWindowIfRequested(); updateControlsWindow() }
+            #endif
         }
+        #if SV_GAME_RUNTIME
+        .onChange(of: gameScenes.policy.serial) { _, _ in restoreGameWindowIfRequested() }
+        .onChange(of: runtime.gameControlsVisible) { _, _ in updateControlsWindow() }
+        .onChange(of: runtime.gtaPauseMenuOpen) { _, _ in updateControlsWindow() }
+        .onChange(of: runtime.pauseControlsFollowGame) { _, _ in updateControlsWindow() }
+        .onChange(of: world.isImmersiveActive) { _, _ in updateControlsWindow() }
+        #endif
 
         ImmersiveSpace(id: DiagnosticModel.spaceID) {
             CompositorLayer(configuration: CalibrationConfiguration()) { layer in
@@ -50,23 +67,98 @@ struct SantosVisionApp: App {
 
         #if SV_GAME_RUNTIME
         Window("Los Santos controls", id: "game-controls") {
-            ImmersiveGameControls(runtime: runtime, world: world)
+            ImmersiveGameControls(runtime: runtime, world: world, gameScenes: gameScenes)
         }
         .defaultSize(width: 460, height: 260)
         .windowResizability(.contentSize)
         .restorationBehavior(.disabled)
+        .defaultLaunchBehavior(.suppressed)
 
         ImmersiveSpace(id: GameWorldModel.spaceID) {
-            GameImmersiveScene(runtime: runtime, world: world)
+            GameImmersiveScene(runtime: runtime, world: world, gameScenes: gameScenes)
             .onDisappear {
-                world.stopRenderer()
-                runtime.endWorldTracking()
+                if world.isImmersiveActive || world.isOpening { world.stopRenderer(reason: "immersive_scene_disappeared") }
                 world.isImmersiveActive = false
+                // Queue restoration at App scope; never create a new scene
+                // from the disappearing compositor's environment actions.
+                if !runtime.isQuitting {
+                    gameScenes.sceneDisappeared(generation: world.sceneGeneration)
+                }
             }
         }
         .immersionStyle(selection: .constant(.full), in: .full)
         #endif
     }
+
+    #if SV_GAME_RUNTIME
+    private func updateControlsWindow() {
+        guard scenePhase == .active, !runtime.isQuitting else { return }
+        if world.isImmersiveActive, runtime.gtaPauseMenuOpen {
+            // GTA's front end is an ordinary 2D presentation, without a new
+            // qualified stereo world/depth pair. Show the actual game menu in
+            // its game window instead of going black until the world watchdog
+            // fires. Keep GTA paused and keep the controller routed to GTA.
+            gameScenes.requestReturn(generation: world.sceneGeneration, reason: "gta_pause_menu_in_window")
+            return
+        }
+        guard !gameScenes.pending else { return }
+        // During the verified game's pause-open grace, wait for its own menu
+        // before creating an app-only controls scene.
+        if runtime.gameControlsVisible, runtime.pauseControlsFollowGame { return }
+        let needed = runtime.gameControlsVisible && world.isImmersiveActive
+        guard needed != controlsWindowRequested else { return }
+        controlsWindowRequested = needed
+        if needed { openWindow(id: "game-controls") }
+        else { dismissWindow(id: "game-controls") }
+    }
+
+    /// App owns scene operations for the whole transition. The source window
+    /// and compositor may disappear while an openWindow request is in flight.
+    private func restoreGameWindowIfRequested() {
+        guard windowReturnTask == nil,
+              let ticket = gameScenes.begin(active: scenePhase == .active, quitting: runtime.isQuitting) else { return }
+        world.recordSceneTransition("main_window_requested", serial: ticket.serial)
+        openWindow(id: "main")
+        windowReturnTask = Task { @MainActor in
+            defer { windowReturnTask = nil }
+            while !Task.isCancelled {
+                let gameWindowConnected = runtime.windowReadyForReturn
+                    && windowSurface.view.window?.windowScene?.activationState == .foregroundActive
+                switch gameScenes.poll(ticket, windowReady: gameWindowConnected,
+                                       active: scenePhase == .active, quitting: runtime.isQuitting) {
+                case .waiting:
+                    do { try await Task.sleep(for: .milliseconds(50)) } catch { return }
+                case .closeSpace:
+                    // A late request must never stop a new immersive renderer.
+                    if world.isImmersiveActive, world.sceneGeneration != ticket.rendererGeneration {
+                        gameScenes.finish(ticket)
+                        world.recordSceneTransition("stale_window_return_ignored", serial: ticket.serial)
+                        return
+                    }
+                    world.recordSceneTransition("main_window_attached_before_immersive_close", serial: ticket.serial)
+                    if world.isImmersiveActive || world.isOpening || runtime.immersiveWindowReturnNeedsDismissal {
+                        world.stopRenderer(reason: "coordinated_window_return")
+                        await dismissImmersiveSpace()
+                        world.isImmersiveActive = false
+                        world.isOpening = false
+                    }
+                    // Keep the native Start companion when GTA is still paused.
+                    // Its ornament now belongs to the actual returned game window.
+                    dismissWindow(id: "game-controls")
+                    controlsWindowRequested = false
+                    gameScenes.finish(ticket)
+                    world.recordSceneTransition("window_return_complete", serial: ticket.serial)
+                    return
+                case .timedOut:
+                    world.status = "The game window could not reconnect. Immersive view has been kept open."
+                    world.recordSceneTransition("main_window_attach_timeout", serial: ticket.serial)
+                    return
+                case .stale, .cancelled: return
+                }
+            }
+        }
+    }
+    #endif
 }
 
 @MainActor
@@ -191,7 +283,7 @@ private struct LauncherView: View {
                 }
             } else {
                 Button("Enter immersive GTA world") { Task { await openGame() } }
-                    .disabled(!runtime.hasStarted || runtime.engineFailed || world.isOpening || model.isOpening || model.isImmersiveActive)
+                    .disabled(!runtime.hasStarted || runtime.engineFailed || runtime.gtaPauseMenuOpen || world.isOpening || model.isOpening || model.isImmersiveActive)
             }
             Text(world.status).font(.callout).foregroundStyle(.secondary)
             #endif
@@ -304,7 +396,7 @@ private struct LauncherView: View {
 
     #if SV_GAME_RUNTIME
     private func openGame() async {
-        guard runtime.hasStarted, !runtime.engineFailed, !world.isOpening, !world.isImmersiveActive,
+        guard runtime.hasStarted, !runtime.engineFailed, !runtime.gtaPauseMenuOpen, !world.isOpening, !world.isImmersiveActive,
               !model.isImmersiveActive, !model.isOpening else { return }
         world.isOpening = true
         runtime.beginWorldTracking()

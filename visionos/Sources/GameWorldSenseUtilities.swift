@@ -10,14 +10,16 @@ enum GameWorldSenseUtilityLayout {
     static let horizontalCenter: Float = -0.36
     static let verticalCenter: Float = -0.56
     static let namespace: UInt64 = 0x5356555400000000
-    static var actions: [SantosSenseUtilityAction] { [.phone, .changeView] }
+    static var actions: [SantosSenseUtilityAction] { [.phone] }
+    // Keep atlas slots stable; the redundant View button has no visible area
+    // or accepted tracking identifier. Physical camera shortcuts are unchanged.
     static var atlasActions: [SantosSenseUtilityAction] { [.phone, .changeView, .up, .down, .left, .right] }
-    static func visibleActions(phoneOpen: Bool) -> [SantosSenseUtilityAction] { phoneOpen ? atlasActions : actions }
+    static func visibleActions(phoneOpen: Bool) -> [SantosSenseUtilityAction] { phoneOpen ? [.phone, .up, .down, .left, .right] : actions }
     static func identifier(_ action: SantosSenseUtilityAction) -> UInt64 { namespace | UInt64(action.rawValue) }
     static func action(identifier: UInt64) -> SantosSenseUtilityAction? {
         guard identifier & 0xffff_ffff_0000_0000 == namespace else { return nil }
         guard let action = SantosSenseUtilityAction(rawValue: UInt32(truncatingIfNeeded: identifier)),
-              atlasActions.contains(action) else { return nil }
+              visibleActions(phoneOpen: true).contains(action) else { return nil }
         return action
     }
     static func center(index: Int) -> SIMD2<Float> {

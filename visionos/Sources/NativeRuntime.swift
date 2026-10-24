@@ -175,6 +175,7 @@ final class NativeRuntimeModel: ObservableObject {
     @Published private(set) var nativeControlsSelection = 0
     /// The Start panel sits beside GTA's own open menu and leaves it the controller.
     @Published private(set) var pauseControlsFollowGame = false
+    @Published private(set) var gtaPauseMenuOpen = false
     private var pauseCompanion = NativePauseCompanionPolicy()
     @Published private(set) var senseGameplayUtilitiesVisible = false
     @Published private(set) var sensePhoneNavigationVisible = false
@@ -481,6 +482,11 @@ final class NativeRuntimeModel: ObservableObject {
         windowSceneIsActive = active
         updateActivity()
     }
+
+    /// setWindowAttached comes from the real retained GameMetalView and the
+    /// scene phase comes from its containing window, not an openWindow request.
+    var windowReadyForReturn: Bool { windowIsAttached && windowSceneIsActive }
+    var immersiveWindowReturnNeedsDismissal: Bool { compositorOwnsHeadTracking || immersiveSceneIsActive }
 
     func setImmersiveSceneActive(_ active: Bool) {
         immersiveSceneIsActive = active
@@ -996,7 +1002,9 @@ final class NativeRuntimeModel: ObservableObject {
     /// The panel closes with GTA's own menu; grace expiry and GTA's menu
     /// opening change the controller owner without changing visibility.
     private func observeGuestMenu(_ raw: UInt32) {
-        let visible = pauseCompanion.observe(NativePauseCompanionPolicy.GuestMenu(rawValue: raw) ?? .unknown,
+        let guest = NativePauseCompanionPolicy.GuestMenu(rawValue: raw) ?? .unknown
+        if gtaPauseMenuOpen != (guest == .paused) { gtaPauseMenuOpen = guest == .paused }
+        let visible = pauseCompanion.observe(guest,
                                              visible: gameControlsVisible)
         if visible != gameControlsVisible { gameControlsVisible = visible; return }
         let companion = gameControlsVisible
@@ -1089,6 +1097,7 @@ final class NativeRuntimeModel: ObservableObject {
             "native_controls_selection": nativeControlsSelection,
             "pause_controls_follow_game": pauseControlsFollowGame,
             "guest_menu_context": pauseCompanion.guest.rawValue,
+            "gta_pause_menu_open": gtaPauseMenuOpen,
             "sense_gameplay_utilities_visible": senseGameplayUtilitiesVisible,
             "sense_gameplay_ui_eligible": senseGameplayUIEligible.map { $0 as Any } ?? NSNull(),
             "sense_phone_navigation_visible": sensePhoneNavigationVisible,
