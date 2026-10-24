@@ -377,7 +377,8 @@ final class GameWorldRenderer: @unchecked Sendable {
     private var tracking = WorldTrackingProvider()
     private let motionTracking = XRMotionTracking(enabled:
         ProcessInfo.processInfo.arguments.contains("--sv-motion-tracking-preview")
-        || ProcessInfo.processInfo.environment["MUGUET_XR_MOTION_AIM"] == "1")
+        || ProcessInfo.processInfo.environment["MUGUET_XR_MOTION_AIM"] == "1"
+        || ProcessInfo.processInfo.environment["MUGUET_XR_MOTION_ARMS"] == "1")
     private let queue: any MTLCommandQueue
     private let pipeline: any MTLRenderPipelineState
     private let reticle: GameWorldReticle?
