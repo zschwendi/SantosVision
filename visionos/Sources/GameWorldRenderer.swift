@@ -33,7 +33,8 @@ struct GameWorldConfiguration: CompositorLayerConfiguration {
         let layouts = capabilities.supportedLayouts(options: [])
         configuration.layout = layouts.contains(.dedicated) ? .dedicated
             : layouts.contains(.layered) ? .layered : .shared
-        configuration.defaultDepthRange = SIMD2<Float>(1_000, max(0.05, capabilities.supportedMinimumNearPlaneDistance))
+        configuration.defaultDepthRange = SIMD2<Float>(GameWorldDepthRange.selectedFar(nativeFar: sv_xr_native_far_plane_metres()),
+            max(0.05, capabilities.supportedMinimumNearPlaneDistance))
         let selectedColor = configuration.colorFormat.rawValue
         let selectedDepth = configuration.depthFormat.rawValue
         Logger(subsystem: "com.zephyrstudios.santosvision", category: "GameCompositor")
