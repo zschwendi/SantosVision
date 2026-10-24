@@ -36,17 +36,21 @@ static PENDING_MAILBOX: LazyLock<Mutex<HashSet<u64>>> = LazyLock::new(|| Mutex::
 static ANY_PENDING: AtomicU64 = AtomicU64::new(0);
 static STUB_SEQ: AtomicU64 = AtomicU64::new(0);
 
-// mailbox_reachability certifies that the exact original has no sender this
-// host can reach: every task enqueue is in do_proxy, whose only entries are the
-// JS-glue _emscripten_run_js_on_main_thread exports. These counters are a
-// tripwire for builds outside that certificate. They never change delivery.
+// mailbox_reachability is a structural certificate, not a proof that no sender
+// can ever run: closed over direct calls and literal table slots, the original's
+// only notifier (do_proxy) is entered only through the JS-glue
+// _emscripten_run_js_on_main_thread exports, which host source never names.
+// Computed function pointers and constructed export names are assumptions.
+// These counters see only import73 notifications and the deliveries they cause,
+// never do_proxy's waiting_async atomic-notify branch. They never change delivery.
 static MAILBOX_NOTIFICATIONS: AtomicU64 = AtomicU64::new(0);
 static MAILBOX_DELIVERIES: AtomicU64 = AtomicU64::new(0);
 static MAILBOX_PRODUCER_DELIVERIES: AtomicU64 = AtomicU64::new(0);
 static MAILBOX_UNQUALIFIED_DELIVERIES: AtomicU64 = AtomicU64::new(0);
 
-// The only original functions with atomic RMW on producer mutex 8348864. A
-// live frame of one is a superset of "this pthread may hold that mutex".
+// The only original functions whose atomic RMW names producer mutex 8348864 by
+// literal offset. A live frame of one is a superset of "this pthread may hold
+// that mutex" for that structural scan.
 const PRODUCER_LOCK_FUNCTIONS: [&str; 3] = [
     "wasm_gpu::Init()",
     "wasm_gpu::Emit(unsigned int, unsigned int const*, unsigned int)",
@@ -102,7 +106,7 @@ pub fn mailbox_await(mem: &SharedMemory, pthread_ptr: u64) {
 
 fn notify_mailbox(target: u64) {
     if MAILBOX_NOTIFICATIONS.fetch_add(1, Ordering::Relaxed) == 0 {
-        eprintln!("[host] mailbox notification for pthread 0x{target:x}: outside the mailbox reachability certificate");
+        eprintln!("[host] mailbox notification for pthread 0x{target:x}: an assumption of the structural mailbox certificate failed");
     }
     if PENDING_MAILBOX.lock().unwrap().insert(target) {
         ANY_PENDING.fetch_add(1, Ordering::Relaxed);
@@ -135,14 +139,14 @@ pub fn mailbox_status_json() -> serde_json::Value {
         "deliveries": MAILBOX_DELIVERIES.load(Ordering::Relaxed),
         "deliveries_with_producer_frame": MAILBOX_PRODUCER_DELIVERIES.load(Ordering::Relaxed),
         "deliveries_unqualified_stack": MAILBOX_UNQUALIFIED_DELIVERIES.load(Ordering::Relaxed),
-        "scope": "Certified original has no host-reachable sender; nonzero notifications falsify that for this build. Delivery policy is unchanged.",
+        "scope": "Counts import73 notifications and the resulting host deliveries only. Zero on one run excludes this host-delivery path on that run, not do_proxy's unobserved waiting_async atomic-notify branch or other startup failures. Nonzero means an assumption of the structural certificate failed. Delivery policy is unchanged.",
     })
 }
 
 // One place owns pending delivery. Normal callers use the false policy; the
 // experimental true policy has no production activation path because eventual
-// delivery on every real producer thread is not certified. In the certified
-// original nothing can become pending (see mailbox_reachability).
+// delivery on every real producer thread is not certified. Under the structural
+// certificate's assumptions nothing becomes pending (see mailbox_reachability).
 fn deliver_pending_mailbox<const DEFER_EMIT: bool>(caller: &mut Caller<'_, HostState>, name: &str, mem: &SharedMemory) -> Result<()> {
     // The certified Emit hook runs while its producer mutex is held and before
     // publishing head. Guest mailbox work here can reenter Emit or replace the
@@ -189,7 +193,8 @@ pub fn call(mut caller: Caller<'_, HostState>, idx: usize, params: &[Val], resul
 
     // Preserve normal runtime scheduling until a safe polling/liveness boundary
     // is certified for every producer. The true policy is test-only groundwork.
-    // With the certified original nothing is pending, so this is a load.
+    // Under the structural certificate's assumptions nothing is pending, so
+    // this is normally one load.
     deliver_pending_mailbox::<false>(&mut caller, name, mem)?;
 
     if name.starts_with("invoke_") {

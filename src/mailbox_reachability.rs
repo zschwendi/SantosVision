@@ -1,15 +1,23 @@
-// Certificate for the pending-mailbox hazard at producer-locked imports.
+// Structural certificate for the pending-mailbox hazard at producer-locked
+// imports. It is not a proof that no sender can ever run.
 //
-// The exact original sends host-visible mailbox notifications only from
-// do_proxy, and do_proxy is reachable only from the JS-glue exports
-// _emscripten_run_js_on_main_thread[_done]. Their task callbacks are
-// address-taken only inside that same island. This host never names those
-// exports, so _emscripten_notify_mailbox_postmessage cannot run and
-// deliver_pending_mailbox has nothing to deliver, at the Emit midpoint, in
-// Reserve551 wasm_now_ms or elsewhere. The same island is the only task
-// enqueuer, so _emscripten_yield's system-queue callback has no task either.
-// Indices are original; every factory appends imports after these and keeps
-// these bodies canonical except patch5's Emit midpoint.
+// Checked on the exact original: import73 (_emscripten_notify_mailbox_postmessage)
+// is called only by do_proxy, in its waiting_async==0 branch, and do_proxy is the
+// only task enqueuer. Closing over direct callers and over every code, data or
+// global-initializer literal equal to a member's table slot leaves only the JS-glue
+// exports _emscripten_run_js_on_main_thread[_done] as entries; no patch-exported
+// mp: command target joins that island.
+//
+// Assumptions this certificate cannot discharge:
+// A1 every table index reaching call_indirect or host invoke_* originates from
+//    such a literal (no computed or corrupted function pointer);
+// A2 every host export lookup is a literal or "mp:"-prefixed name (enumerated in
+//    docs/MAILBOX-REACHABILITY-20261024.md; guarded lexically below);
+// A3 the running module derives from this original through factories that keep
+//    these bodies canonical (patch5 changes only the Emit midpoint).
+// Under them nothing reaches deliver_pending_mailbox. Senders that take
+// do_proxy's atomic-notify branch are invisible to the host in any case.
+// Indices are original; factories append imports after the original 85.
 //
 // Parser only: the private game is never instantiated, compiled or executed.
 
@@ -172,9 +180,10 @@ impl Module {
     }
 }
 
+// Lexical regression guard for A2: it catches literal names, not constructed
+// strings. Comments may cite the names.
 #[test]
-fn host_source_never_enters_proxy_or_crash_exports() {
-    // Exact export literals only: comments may cite them, calls cannot avoid them.
+fn host_source_has_no_literal_proxy_or_crash_export_name() {
     let forbidden = ["\"_emscripten_run_js_on_main_thread", "\"_emscripten_thread_crashed", "\"emscripten_proxy_"];
     let mut pending = vec![std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src")];
     let mut scanned = 0;
@@ -193,7 +202,7 @@ fn host_source_never_enters_proxy_or_crash_exports() {
 
 #[test]
 #[ignore = "requires exact private original; parser only, never game instantiation"]
-fn private_original_has_no_host_reachable_mailbox_sender() {
+fn private_original_sender_island_closed_over_calls_and_literal_slots() {
     let bytes = std::fs::read(ORIGINAL).unwrap();
     assert_eq!(crate::xr_motion_patch::sha256(&bytes).unwrap(), ORIGINAL_SHA256);
     let m = Module::parse(&bytes);
@@ -215,7 +224,8 @@ fn private_original_has_no_host_reachable_mailbox_sender() {
     assert!(m.call_sites(enqueue).iter().all(|(f, _)| *f == do_proxy) && !m.call_sites(enqueue).is_empty());
 
     // Close over direct callers and every code site materializing a member's
-    // table slot. No slot may escape through data, globals or ref.func.
+    // table slot as a literal. No slot literal may appear in data, globals or
+    // ref.func. Computed slots are assumption A1, not checked.
     let ref_funcs: BTreeSet<u32> = m.bodies.values().flat_map(|b| b.ref_funcs.iter().copied()).collect();
     // A slot no code materializes (a directized pthread_once target) adds no
     // reachability; that exact set is pinned below.
@@ -239,15 +249,24 @@ fn private_original_has_no_host_reachable_mailbox_sender() {
     let names: BTreeSet<&str> = island.iter().map(|f| m.name(*f)).collect();
     assert!(["call_then_finish_task", "cancel_ctx", "cancel_active_ctxs", "emscripten_proxy_sync_with_ctx", "init_active_ctxs"].iter().all(|n| names.contains(n)), "{names:?}");
 
-    // Yield's strongref/exit branch needs a crash word only the never-called
-    // _emscripten_thread_crashed export writes.
+    // A2's "mp:" names resolve only to patch-added exports: no original export
+    // has the prefix and patch5 exports mp: names only for mp::COMMANDS.
+    assert!(m.exports.values().all(|e| !e.starts_with("mp:")));
+    let by_name: BTreeMap<&str, u32> = m.names.iter().map(|(f, n)| (n.as_str(), *f)).collect();
+    let commands: Vec<u32> = crate::mp::COMMANDS.iter().filter_map(|(_, f)| by_name.get(f).copied()).collect();
+    assert!(!commands.is_empty());
+    for f in commands { assert!(!island.contains(&f), "mp: command {} enters the sender island", m.name(f)); }
+
+    // Yield's strongref/exit branch needs a crash word whose only literal
+    // writer is the _emscripten_thread_crashed export, which has no callers.
     let (crashed, yield_fn) = (m.named("_emscripten_thread_crashed"), m.named("_emscripten_yield"));
     assert_eq!(m.materializers(CRASHED_THREAD_ID), BTreeSet::from([crashed, yield_fn]));
     assert!(m.exports.contains_key(&crashed) && m.call_sites(crashed).is_empty() && !m.slots.contains_key(&crashed));
     assert!(m.call_sites(37).iter().chain(m.call_sites(38).iter()).all(|(f, _)| *f == yield_fn));
 
-    // Producer mutex ownership is confined to the host's named functions,
-    // each reached only by direct call; its address never escapes.
+    // Literal-offset RMW on the producer mutex is confined to the host's named
+    // functions, each reached only by direct call; the address literal does
+    // not appear in data or globals.
     let owners: BTreeSet<&str> = m.bodies.iter()
         .filter(|(_, b)| b.accesses.iter().any(|(_, off, w, _)| *off == PRODUCER_MUTEX && *w))
         .map(|(f, _)| m.name(*f)).collect();
