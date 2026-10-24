@@ -480,6 +480,7 @@ final class GameWorldRenderer: @unchecked Sendable {
     private var nextViewRecoverySample: Double = 0
     private var loggedFrame = false
     private let debugPrefix = GameWorldDebugCapture.requestedPrefix()
+    private let debugMotionPolicy = GameWorldCaptureMotionPolicy(arguments: ProcessInfo.processInfo.arguments)
     private var didDebugCapture = false
     private let log = Logger(subsystem: "com.zephyrstudios.santosvision", category: "GameCompositor")
     private let probeLog = Logger(subsystem: "com.zephyrstudios.santosvision", category: "GameCompositorProbe")
@@ -944,6 +945,7 @@ final class GameWorldRenderer: @unchecked Sendable {
                         let uniforms = worldUniforms(eye: captureSource, stageFromHead: stageFromHead,
                             headFromEye: view.transform,
                             projection: displayProjection)
+                        if debugMotionPolicy?.allows(uniforms.currentEyeFromSourceEye) == true {
                         debugCapture = GameWorldDebugCapture(prefix: debugPrefix, device: layer.device, commands: commands,
                             color: encoded.hudIsolated ? (lease.hud?.worldColor ?? lease.color) : lease.color,
                             depth: lease.depth,
@@ -960,6 +962,7 @@ final class GameWorldRenderer: @unchecked Sendable {
                                 : "single_source_depth_stereo") + (encoded.hudIsolated ? "_single_hud_canvas" : ""))
                         didDebugCapture = true
                         if debugCapture == nil { log.error("Live world capture unsupported or exceeded its 96 MiB bound.") }
+                        }
                     }
                 }
             }
