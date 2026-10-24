@@ -1,20 +1,28 @@
 import Foundation
 import simd
 
-/// Optional extra source coverage. The physical display projection is never
+/// Extra source coverage for display-time head reprojection. The physical display projection is never
 /// changed: the expanded matrix must travel through the request and source
 /// lease so reprojection still uses the camera that actually rendered it.
 enum GameWorldSourceGuardBand {
+    // The user can outrun the old source image during a turn. Render a real
+    // margin on both axes instead of stretching the edge or delaying the head.
+    // 1.30 contains the angular directions of both registered head-turn captures
+    // (maximum required scales 1.191 and 1.276). This is a bounded margin, not a
+    // guarantee for arbitrary turns or translation disocclusions. The original
+    // 1.0 projection remains available for controlled clarity comparisons.
+    static let defaultScale: Float = 1.3
+    static let allowedScales: ClosedRange<Float> = 1...1.35
     static let configuredScale = resolveScale(ProcessInfo.processInfo.environment)
 
     static func resolveScale(_ environment: [String: String]) -> Float {
         guard let value = environment["MUGUET_XR_SOURCE_GUARD_BAND"],
-              let scale = Float(value), scale.isFinite, (1...1.2).contains(scale) else { return 1 }
+              let scale = Float(value), scale.isFinite, allowedScales.contains(scale) else { return defaultScale }
         return scale
     }
 
     static func projection(_ physical: simd_float4x4, scale: Float = configuredScale) -> simd_float4x4? {
-        guard scale.isFinite, (1...1.2).contains(scale),
+        guard scale.isFinite, allowedScales.contains(scale),
               let converted = GameWorldProjection.nativePinhole(physical) else { return nil }
         var source = converted.matrix
         if scale == 1 { return source }

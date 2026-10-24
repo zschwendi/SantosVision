@@ -22,7 +22,7 @@ struct SourceGuardBandValidation {
             let canonical = conversion.matrix
             precondition(GameWorldSourceGuardBand.projection(original, scale: 1)! == canonical)
             let inverse = original.inverse
-            for scale: Float in [1.05, 1.1, 1.2] {
+            for scale: Float in [1.05, 1.1, 1.2, 1.3, 1.35] {
                 let source = GameWorldSourceGuardBand.projection(original, scale: scale)!
                 precondition(source[2][2] == canonical[2][2] && source[3][2] == canonical[3][2])
                 for zi in 0...10 {
@@ -44,17 +44,25 @@ struct SourceGuardBandValidation {
                 }
             }
         }
-        for value in ["", "nan", "inf", "0.9", "1.21", "garbage"] {
-            precondition(GameWorldSourceGuardBand.resolveScale(["MUGUET_XR_SOURCE_GUARD_BAND": value]) == 1)
+        for value in ["", "nan", "inf", "0.9", "1.36", "garbage"] {
+            precondition(GameWorldSourceGuardBand.resolveScale(["MUGUET_XR_SOURCE_GUARD_BAND": value]) == 1.3)
         }
-        precondition(GameWorldSourceGuardBand.resolveScale([:]) == 1)
+        precondition(GameWorldSourceGuardBand.resolveScale([:]) == 1.3)
+        precondition(GameWorldSourceGuardBand.resolveScale(["MUGUET_XR_SOURCE_GUARD_BAND": "1"]) == 1)
         precondition(GameWorldSourceGuardBand.resolveScale(["MUGUET_XR_SOURCE_GUARD_BAND": "1.1"]) == 1.1)
-        for scale: Float in [.nan, .infinity, 0.9, 1.21] {
+        precondition(GameWorldSourceGuardBand.resolveScale(["MUGUET_XR_SOURCE_GUARD_BAND": "1.35"]) == 1.35)
+        for scale: Float in [.nan, .infinity, 0.9, 1.36] {
             precondition(GameWorldSourceGuardBand.projection(physical, scale: scale) == nil)
         }
         var oblique = physical; oblique[0][2] = 0.01
         precondition(GameWorldSourceGuardBand.projection(oblique, scale: 1.1) == nil)
-        print("PASS: \(checked) source coverage/depth rays, default identity, asymmetric frusta, invalid configuration and oblique rejection")
+        // These are the maximum angular budgets from the registered normal
+        // gameplay and initial-turn captures. Containment does not synthesize
+        // missing source color/depth or establish physical latency.
+        for required: Float in [1.190764, 1.275312] {
+            precondition(required < GameWorldSourceGuardBand.defaultScale)
+        }
+        print("PASS: \(checked) source coverage/depth rays, default 1.30 margin, explicit identity override, asymmetric frusta, invalid configuration and oblique rejection")
         print("Physical capture supplies one eye; the second case mirrors its horizontal asymmetry. No device or latency claim.")
     }
 }
