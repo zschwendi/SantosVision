@@ -15,7 +15,8 @@ let device = MTLCreateSystemDefaultDevice()!
 let queue = device.makeCommandQueue()!
 let source = try String(contentsOf: root.appendingPathComponent("visionos/Sources/GameWorld.metal"), encoding: .utf8)
 let library = try device.makeLibrary(source: source, options: nil)
-let experiment = GameWorldFiniteSkySupport(device: device, library: library, colorFormat: .rgba8Unorm, depthFormat: .depth32Float)!
+let experiment = GameWorldFiniteSkySupport(device: device, library: library, colorFormat: .rgba8Unorm, depthFormat: .depth32Float, precomputeCorners: true)!
+let originalExperiment = GameWorldFiniteSkySupport(device: device, library: library, colorFormat: .rgba8Unorm, depthFormat: .depth32Float, precomputeCorners: false)!
 let baselineDescriptor = MTLRenderPipelineDescriptor()
 baselineDescriptor.vertexFunction = library.makeFunction(name: "gameWorldVertex")!
 baselineDescriptor.fragmentFunction = library.makeFunction(name: "gameWorldFragment")!
@@ -79,9 +80,13 @@ struct Rendered {
     let color: [UInt8]
     let depth: [Float]
     let owner: [UInt8]
+    let cornersPrecomputed: Bool
+    let gpuMilliseconds: Double
 }
 func render(uniforms: GameWorldUniforms, color: any MTLTexture, depth: any MTLTexture,
-            targetSize: SIMD2<Int>, experimental: Bool) -> Rendered {
+            targetSize: SIMD2<Int>, experimental: Bool, sharedCorners: Bool = true,
+            expectCornerFallback: Bool = false) -> Rendered {
+    let experiment = sharedCorners ? experiment : originalExperiment
     let target = texture(.rgba8Unorm, targetSize.x, targetSize.y, [.renderTarget, .shaderRead])
     let ztarget = texture(.depth32Float, targetSize.x, targetSize.y, [.renderTarget, .shaderRead])
     let pass = MTLRenderPassDescriptor()
@@ -96,11 +101,15 @@ func render(uniforms: GameWorldUniforms, color: any MTLTexture, depth: any MTLTe
     let viewport = MTLViewport(originX: 0, originY: 0, width: Double(targetSize.x), height: Double(targetSize.y), znear: 0, zfar: 1)
     let commands = queue.makeCommandBuffer()!
     var ownerBuffer: (any MTLBuffer)?
+    var cornersPrecomputed = false
     let rowBytes = (targetSize.x + 255) & ~255
     if experimental {
         let result = experiment.encode(commands: commands, pass: pass, viewport: viewport,
             projection: uniforms.currentClipFromEye, far: 1000, uniforms: uniforms, color: color, depth: depth)!
+        cornersPrecomputed = result.cornersPrecomputed
+        require(cornersPrecomputed == (sharedCorners && !expectCornerFallback), "Unexpected finite-sky corner path")
         require(experiment.pool.statistics.busy == 1, "Mask was returned before GPU completion")
+        if cornersPrecomputed { require(experiment.cornerPool.statistics.busy == 1, "Corners returned before GPU completion") }
         require(pass.colorAttachments[1].texture == nil, "Experiment mutated caller MRT descriptor")
         ownerBuffer = device.makeBuffer(length: rowBytes * targetSize.y, options: .storageModeShared)!
         let blit = commands.makeBlitCommandEncoder()!
@@ -133,7 +142,9 @@ func render(uniforms: GameWorldUniforms, color: any MTLTexture, depth: any MTLTe
     }
     // Completion handlers release the mask before waitUntilCompleted returns.
     require(experiment.pool.statistics.busy == 0, "GPU-complete mask leaked its lease")
-    return Rendered(color: readColor(target), depth: readDepth(ztarget), owner: owner)
+    if !expectCornerFallback { require(experiment.cornerPool.statistics.busy == 0, "GPU-complete corners leaked their lease") }
+    return Rendered(color: readColor(target), depth: readDepth(ztarget), owner: owner,
+        cornersPrecomputed: cornersPrecomputed, gpuMilliseconds: (commands.gpuEndTime - commands.gpuStartTime) * 1000)
 }
 func sourceTextures(width: Int, height: Int, rgba: [UInt8], depths: [Float]) -> (any MTLTexture, any MTLTexture) {
     let color = texture(.rgba8Unorm, width, height, .shaderRead)
@@ -148,7 +159,11 @@ var cases = [[String: Any]]()
 func compare(_ name: String, uniforms: GameWorldUniforms, color: any MTLTexture,
              depth: any MTLTexture, targetSize: SIMD2<Int>, expectFarGeometry: Bool = false) {
     let normal = render(uniforms: uniforms, color: color, depth: depth, targetSize: targetSize, experimental: false)
+    let original = render(uniforms: uniforms, color: color, depth: depth, targetSize: targetSize, experimental: true, sharedCorners: false)
     let repaired = render(uniforms: uniforms, color: color, depth: depth, targetSize: targetSize, experimental: true)
+    require(original.color == repaired.color, "\(name): shared corner path changed finite-sky RGB")
+    require(original.owner == repaired.owner, "\(name): shared corner path changed final source ownership")
+    require(zip(original.depth, repaired.depth).allSatisfy { $0.bitPattern == $1.bitPattern }, "\(name): shared corner path changed final GPU depth")
     require(normal.color == repaired.color, "\(name): experiment changed original color")
     var counts = [0, 0, 0], finiteBeyondSupport = 0, maximumRadiusError: Float = 0
     for index in normal.depth.indices {
@@ -181,7 +196,10 @@ func compare(_ name: String, uniforms: GameWorldUniforms, color: any MTLTexture,
     if expectFarGeometry { require(finiteBeyondSupport > 100, "900m geometry was not actually visible in final GPU result") }
     cases.append(["name": name, "uncovered": counts[0], "sky": counts[1], "finite": counts[2],
         "finite_beyond_850m_preserved": finiteBeyondSupport, "max_sphere_radius_error_m": maximumRadiusError,
-        "rgb_byte_identical": true, "finite_uncovered_depth_bit_identical": true])
+        "rgb_byte_identical": true, "finite_uncovered_depth_bit_identical": true,
+        "shared_corner_color_ownership_depth_identical": true,
+        "original_finite_sky_gpu_ms": original.gpuMilliseconds,
+        "shared_corner_finite_sky_gpu_ms": repaired.gpuMilliseconds])
 }
 
 // Actual registered game color/depth, with the exact captured source/target
@@ -194,6 +212,27 @@ let actualUniforms = GameWorldUniforms(sourceEyeFromClip: matrix("source_eye_fro
     currentEyeFromSourceEye: matrix("current_eye_from_source_eye"), currentClipFromEye: matrix("current_clip_from_eye"),
     sourceSize: SIMD2(UInt32(sw), UInt32(sh)))
 compare("registered_physical_source_capture", uniforms: actualUniforms, color: gameColor, depth: gameDepth, targetSize: SIMD2(1888, 1792))
+
+// A small warmed, alternating comparison avoids treating pipeline warm-up as
+// a speed result. GPU timestamps include both ownership and depth-repair
+// passes, plus the same owner readback blit; these are Mac-only measurements.
+var originalTimes = [Double](), sharedTimes = [Double]()
+for run in 0..<8 {
+    for shared in (run % 2 == 0 ? [false, true] : [true, false]) {
+        let sample = render(uniforms: actualUniforms, color: gameColor, depth: gameDepth,
+            targetSize: SIMD2(1888, 1792), experimental: true, sharedCorners: shared)
+        if run >= 2 {
+            if shared { sharedTimes.append(sample.gpuMilliseconds) } else { originalTimes.append(sample.gpuMilliseconds) }
+        }
+    }
+}
+func median(_ values: [Double]) -> Double {
+    let sorted = values.sorted()
+    return (sorted[(sorted.count - 1) / 2] + sorted[sorted.count / 2]) * 0.5
+}
+let timing: [String: Any] = ["scope": "Warmed alternating Mac Metal, one registered source, not headset performance",
+    "original_gpu_ms": originalTimes, "shared_corner_gpu_ms": sharedTimes,
+    "original_median_ms": median(originalTimes), "shared_corner_median_ms": median(sharedTimes)]
 
 // Independent 900m plane depth from the projection, sky around it, invalid
 // holes, and real black finite geometry. Black color never identifies owners.
@@ -297,6 +336,25 @@ for skyFirst in [true, false] {
         "900m_final_depth_verified_pixels": preservedFar, "supported_sky_pixels": supportedSky])
 }
 
+// Exhaust the production corner pool: the finite-sky owner/repair path must
+// still render exactly through its original vertex stage, with no lost lease.
+var heldCorners = CornerScratchLease()
+for _ in 0..<CornerScratchPool.maximumTextures {
+    heldCorners.textures.append(experiment.cornerPool.acquire(device: device, width: width, height: height)!)
+}
+require(experiment.cornerPool.acquire(device: device, width: width, height: height) == nil, "Corner pool exceeded six busy textures")
+let fallbackOriginal = render(uniforms: fixtureUniforms, color: fixtureColor, depth: fixtureDepth,
+    targetSize: SIMD2(320, 180), experimental: true, sharedCorners: false)
+let fallback = render(uniforms: fixtureUniforms, color: fixtureColor, depth: fixtureDepth,
+    targetSize: SIMD2(320, 180), experimental: true, expectCornerFallback: true)
+require(fallbackOriginal.color == fallback.color && fallbackOriginal.owner == fallback.owner &&
+    zip(fallbackOriginal.depth, fallback.depth).allSatisfy { $0.bitPattern == $1.bitPattern },
+    "Exhausted corner pool changed finite-sky output instead of falling back")
+require(experiment.cornerPool.statistics.busy == 6, "Fallback prematurely released another command's corners")
+experiment.cornerPool.release(heldCorners)
+require(experiment.cornerPool.statistics.busy == 0, "Corner pool release leaked resources")
+cases.append(["name": "corner_pool_exhaustion_original_vertex_fallback", "color_owner_depth_identical": true])
+
 // Bounded allocation is enforced with all six masks busy, then with a change
 // of dimensions while busy resources must remain retained.
 let pool = GameWorldSkyOwnershipPool()
@@ -310,7 +368,7 @@ require(pool.statistics.textures == 6 && pool.statistics.busy == 6, "Resize lost
 
 let result: [String: Any] = ["passed": true, "device": device.name,
     "scope": "Actual offscreen Mac Metal of production optional helper and shaders; not Vision Pro system composition or proof of screenshot causality.",
-    "physical_capture": capture.path, "cases": cases, "ownership_pool_bounds_passed": true,
+    "physical_capture": capture.path, "cases": cases, "warmed_timing": timing, "ownership_pool_bounds_passed": true,
     "finite_sky_requested_by_current_launch_policy": GameWorldFiniteSkySupport.requested]
 try FileManager.default.createDirectory(at: destination, withIntermediateDirectories: true)
 try JSONSerialization.data(withJSONObject: result, options: [.prettyPrinted, .sortedKeys]).write(to: destination.appendingPathComponent("result.json"))

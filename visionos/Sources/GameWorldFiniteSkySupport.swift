@@ -16,6 +16,12 @@ final class GameWorldFiniteSkySupport: @unchecked Sendable {
 
     private let worldPipeline: any MTLRenderPipelineState
     private let repairPipeline: any MTLRenderPipelineState
+    /// The exact existing nine-sample corner fit, evaluated once per geometric
+    /// corner rather than once for each of its four source-texel owners.
+    /// Diagnostic opt-in: the registered Mac source was slower after warming,
+    /// so the original vertex path stays the normal-play default.
+    private let corners: (kernel: any MTLComputePipelineState, world: any MTLRenderPipelineState)?
+    let cornerPool = CornerScratchPool()
     private let worldDepth: any MTLDepthStencilState
     private let repairDepth: any MTLDepthStencilState
     let pool = GameWorldSkyOwnershipPool()
@@ -31,6 +37,13 @@ final class GameWorldFiniteSkySupport: @unchecked Sendable {
     struct Result {
         let ownership: any MTLTexture
         let radius: Float
+        let cornersPrecomputed: Bool
+    }
+
+    private struct CornerCompletionLease: @unchecked Sendable {
+        let pool: CornerScratchPool
+        let lease: CornerScratchLease
+        func release() { pool.release(lease) }
     }
 
     private struct RepairUniforms {
@@ -44,7 +57,8 @@ final class GameWorldFiniteSkySupport: @unchecked Sendable {
     }
 
     init?(device: any MTLDevice, library: any MTLLibrary,
-          colorFormat: MTLPixelFormat, depthFormat: MTLPixelFormat) {
+          colorFormat: MTLPixelFormat, depthFormat: MTLPixelFormat,
+          precomputeCorners: Bool = ProcessInfo.processInfo.environment["MUGUET_COMPOSITOR_CORNER_PRECOMPUTE"] == "1") {
         guard let vertex = library.makeFunction(name: "gameWorldVertex"),
               let ownerFragment = library.makeFunction(name: "gameWorldSkyOwnershipFragment"),
               let repairVertex = library.makeFunction(name: "gameWorldSkyRepairVertex"),
@@ -72,6 +86,20 @@ final class GameWorldFiniteSkySupport: @unchecked Sendable {
               let wd = device.makeDepthStencilState(descriptor: worldState),
               let rd = device.makeDepthStencilState(descriptor: repairState) else { return nil }
         worldPipeline = wp
+        var precomputed: (kernel: any MTLComputePipelineState, world: any MTLRenderPipelineState)?
+        if precomputeCorners,
+           let cornerKernel = library.makeFunction(name: "gameWorldCornerDepths"),
+           let cornerVertex = library.makeFunction(name: "gameWorldPrecomputedVertex"),
+           let kernel = try? device.makeComputePipelineState(function: cornerKernel) {
+            // Fragment, MRT formats and depth ownership remain identical.
+            let sharedWorld = world.copy() as! MTLRenderPipelineDescriptor
+            sharedWorld.label = "Finite sky: shared corner depths, original final ownership"
+            sharedWorld.vertexFunction = cornerVertex
+            if let state = try? device.makeRenderPipelineState(descriptor: sharedWorld) {
+                precomputed = (kernel, state)
+            }
+        }
+        corners = precomputed
         repairPipeline = rp
         worldDepth = wd
         repairDepth = rd
@@ -105,6 +133,30 @@ final class GameWorldFiniteSkySupport: @unchecked Sendable {
               let ownership = pool.acquire(device: target.device, width: target.width, height: target.height) else { return nil }
         let completedOwnership = CompletionLease(pool: pool, texture: ownership)
         commands.addCompletedHandler { _ in completedOwnership.release() }
+        // If a bounded corner texture or compute encoder is unavailable, draw
+        // the original vertex path. Acquired textures stay exclusively leased
+        // until this command completes even when precompute cannot be encoded.
+        var cornerDepths: (any MTLTexture)?
+        if let corners,
+           let texture = cornerPool.acquire(device: target.device, width: color.width, height: color.height) {
+            let completion = CornerCompletionLease(pool: cornerPool, lease: CornerScratchLease(textures: [texture]))
+            commands.addCompletedHandler { _ in completion.release() }
+            if let compute = commands.makeComputeCommandEncoder() {
+                compute.label = "Finite sky: once-per-corner depth qualification"
+                compute.setComputePipelineState(corners.kernel)
+                var values = uniforms
+                compute.setBytes(&values, length: MemoryLayout<GameWorldUniforms>.stride, index: 0)
+                compute.setTexture(depth, index: 0)
+                compute.setTexture(texture, index: 1)
+                let width = corners.kernel.threadExecutionWidth
+                let height = max(1, corners.kernel.maxTotalThreadsPerThreadgroup / width)
+                compute.dispatchThreadgroups(MTLSize(width: (texture.width + width - 1) / width,
+                    height: (texture.height + height - 1) / height, depth: 1),
+                    threadsPerThreadgroup: MTLSize(width: width, height: height, depth: 1))
+                compute.endEncoding()
+                cornerDepths = texture
+            }
+        }
         // Copy before attaching the private MRT: fallback and reticle passes
         // must keep their original single-color-attachment pipeline contract.
         let world = pass.copy() as! MTLRenderPassDescriptor
@@ -115,13 +167,15 @@ final class GameWorldFiniteSkySupport: @unchecked Sendable {
         guard let encoder = commands.makeRenderCommandEncoder(descriptor: world) else { return nil }
         encoder.label = "EXPERIMENT final sky ownership (0 uncovered, 1 sky, 2 finite)"
         encoder.setViewport(viewport)
-        encoder.setRenderPipelineState(worldPipeline)
+        if cornerDepths != nil, let corners { encoder.setRenderPipelineState(corners.world) }
+        else { encoder.setRenderPipelineState(worldPipeline) }
         encoder.setDepthStencilState(worldDepth)
         encoder.setCullMode(.none)
         var uniforms = uniforms
         encoder.setVertexBytes(&uniforms, length: MemoryLayout<GameWorldUniforms>.stride, index: 0)
         encoder.setFragmentBytes(&uniforms, length: MemoryLayout<GameWorldUniforms>.stride, index: 0)
         encoder.setVertexTexture(depth, index: 0)
+        if let cornerDepths { encoder.setVertexTexture(cornerDepths, index: 1) }
         encoder.setFragmentTexture(color, index: 0)
         encoder.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4,
                                instanceCount: Int(uniforms.sourceSize.x) * Int(uniforms.sourceSize.y))
@@ -130,7 +184,7 @@ final class GameWorldFiniteSkySupport: @unchecked Sendable {
         let radius = far * 0.8
         guard encodeRepair(commands: commands, depth: targetDepth, slice: pass.depthAttachment.slice,
             ownership: ownership, viewport: viewport, projection: projection, radius: radius) else { return nil }
-        return Result(ownership: ownership, radius: radius)
+        return Result(ownership: ownership, radius: radius, cornersPrecomputed: cornerDepths != nil)
     }
 
     /// A separate ordered pass is essential: a support sphere may be nearer

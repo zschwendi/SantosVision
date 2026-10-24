@@ -9,7 +9,9 @@ import pathlib, sys
 source = pathlib.Path('visionos/Sources/GameWorldRenderer.swift').read_text()
 start = source.index('struct GameWorldUniforms {')
 end = source.index('\n}', start) + 2
-pathlib.Path(sys.argv[1]).write_text('import simd\n' + source[start:end] + '\n')
+pool_start = source.index('// BEGIN CornerScratchPool')
+pool_end = source.index('// END CornerScratchPool', pool_start)
+pathlib.Path(sys.argv[1]).write_text('import simd\nimport Foundation\nimport Metal\n' + source[start:end] + '\n' + source[pool_start:pool_end] + '\n')
 PY
 cp visionos/Tests/FiniteSkySupportMetalValidation.swift "$out/build/main.swift"
 xcrun swiftc -O -D SV_GAME_RUNTIME "$out/build/GameWorldUniforms.swift" \
