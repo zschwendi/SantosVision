@@ -34,6 +34,8 @@ final class XRMotionTracking: @unchecked Sendable {
     private var lastFlags: UInt32 = 0
     private var lastHeadFrame: UInt64 = 0
     private var headTracked = false
+    private var sourceSamples: [String: [String: Any]] = [:]
+    private var firstSourcePose: [String: (grip: simd_float4x4, aim: simd_float4x4)] = [:]
 
     init(enabled: Bool) { self.enabled = enabled }
 
@@ -50,6 +52,8 @@ final class XRMotionTracking: @unchecked Sendable {
             configuration = token
             prepared = true
             active = true
+            sourceSamples.removeAll()
+            firstSourcePose.removeAll()
             self.session = session
             status = "Preparing supported motion providers"
         }
@@ -153,6 +157,7 @@ final class XRMotionTracking: @unchecked Sendable {
             trackedAccessoryIDs.removeAll()
             lastFlags = 0
             headTracked = false
+            firstSourcePose.removeAll()
             return true
         }
         if changed { XRMotionTransport.shared.invalidate(owner) }
@@ -164,6 +169,7 @@ final class XRMotionTracking: @unchecked Sendable {
             trackedAccessoryIDs.removeAll()
             lastFlags = 0
             headTracked = false
+            firstSourcePose.removeAll()
             status = String(reason.prefix(240))
         }
         XRMotionTransport.shared.invalidate(owner)
@@ -282,7 +288,11 @@ final class XRMotionTracking: @unchecked Sendable {
             if full { trackedAccessoryIDs.insert(id); return false }
             return trackedAccessoryIDs.remove(id) != nil
         }
-        if lost { invalidate(reason: "Accessory lost full position/orientation tracking") }
+        if lost {
+            let hand = update.anchor.accessory.inherentChirality
+            invalidateSources(hand == .left ? 1 : hand == .right ? 2 : 0,
+                              reason: "Accessory lost full position/orientation tracking")
+        }
     }
 
     private func handUpdate(_ update: AnchorUpdate<HandAnchor>, token: UUID) {
@@ -297,7 +307,46 @@ final class XRMotionTracking: @unchecked Sendable {
             originalHands[hand] = update.anchor
             return false
         }
-        if lost { invalidate(reason: "Bare hand tracking lost") }
+        if lost { invalidateSources(update.anchor.chirality == .left ? 1 : 2, reason: "Bare hand tracking lost") }
+    }
+
+    /// Source occlusion is independent per hand. Transport generation fences
+    /// also reject an ARKit read already in progress when this loss arrives.
+    private func invalidateSources(_ flags: UInt32, reason: String) {
+        guard flags & 3 != 0 else { return }
+        lock.withLock {
+            lastFlags &= ~(flags | (flags << 8))
+            if flags & 1 != 0 { originalHands.removeValue(forKey: .left) }
+            if flags & 2 != 0 { originalHands.removeValue(forKey: .right) }
+            status = String(reason.prefix(240))
+        }
+        XRMotionTransport.shared.invalidateSources(flags, owner: owner)
+    }
+
+    /// Bounded evidence that actual named controller poses change, rather than
+    /// treating connection/validity bits or native hook counts as movement.
+    private func recordSource(left: Bool, grip: simd_float4x4, aim: simd_float4x4,
+                              originalTime: Double, targetTime: Double, headFrame: UInt64, sourceEpoch: UInt64, configuration expected: UUID) {
+        lock.withLock {
+            guard configuration == expected, prepared, started, active else { return }
+            let key = left ? "left" : "right"
+            let continuing = firstSourcePose[key] != nil
+            let first = firstSourcePose[key] ?? (grip, aim)
+            firstSourcePose[key] = first
+            let positionDelta = simd_length(grip.columns.3 - first.grip.columns.3)
+            let firstAim = simd_normalize(simd_quatf(first.aim)), latestAim = simd_normalize(simd_quatf(aim))
+            let dot = min(1, max(0, abs(simd_dot(firstAim.vector, latestAim.vector))))
+            let rotationDegrees = 2 * acos(dot) * 180 / Float.pi
+            let previous = continuing ? sourceSamples[key] ?? [:] : [:]
+            sourceSamples[key] = ["accepted_samples": (previous["accepted_samples"] as? UInt64 ?? 0) + 1,
+                "last_head_frame": headFrame, "transport_epoch": sourceEpoch, "original_source_time_seconds": originalTime,
+                "target_presentation_time_seconds": targetTime,
+                "source_age_at_target_ms": (targetTime - originalTime) * 1000,
+                "stage_grip_position_m": [grip.columns.3.x, grip.columns.3.y, grip.columns.3.z],
+                "stage_aim_negative_z": [-aim.columns.2.x, -aim.columns.2.y, -aim.columns.2.z],
+                "maximum_grip_displacement_from_first_m": max(previous["maximum_grip_displacement_from_first_m"] as? Float ?? 0, positionDelta),
+                "maximum_aim_rotation_from_first_degrees": max(previous["maximum_aim_rotation_from_first_degrees"] as? Float ?? 0, rotationDegrees)]
+        }
     }
 
     /// Call immediately after XRHeadTracking.submit accepts this same head
@@ -311,7 +360,7 @@ final class XRMotionTracking: @unchecked Sendable {
             guard enabled, prepared, started, active else { return nil }
             return (configuration, accessoryProvider, handProvider, accessoryIDs, originalHands, Set(accessoryChiralities.values))
         }
-        guard let state, let epoch = XRMotionTransport.shared.currentEpoch(owner) else { return }
+        guard let state, let sourceLease = XRMotionTransport.shared.samplingLease(owner) else { return }
         guard headFrame != 0, timestamp.isFinite, let stageFromHead, XRMotionPosePolicy.rigid(stageFromHead) else {
             let hadPose = lock.withLock { headTracked }
             if hadPose { invalidate(reason: "Head tracking unavailable") }
@@ -321,10 +370,13 @@ final class XRMotionTracking: @unchecked Sendable {
         var matrices = [stageFromHead] + Array(repeating: simd_float4x4(), count: 4)
         var times = [timestamp, 0, 0]
         var flags: UInt32 = 0
+        var queriedSources: UInt32 = 0
         let accessoryHands = state.5
         let accessoryRead = accessoryGate.beginRead()
         defer { if accessoryRead { accessoryGate.endRead() } }
         if accessoryRead, let provider = state.1, provider.state == .running {
+            if accessoryHands.contains(.left) { queriedSources |= 1 }
+            if accessoryHands.contains(.right) { queriedSources |= 2 }
             for original in provider.latestAnchors where state.3.contains(original.accessory.id) {
                 let hand = original.accessory.inherentChirality
                 guard hand == .left || hand == .right else { continue }
@@ -349,6 +401,8 @@ final class XRMotionTracking: @unchecked Sendable {
             }
         }
         if let provider = state.2, provider.state == .running {
+            if !accessoryHands.contains(.left) { queriedSources |= 1 }
+            if !accessoryHands.contains(.right) { queriedSources |= 2 }
             let predicted = provider.handAnchors(at: timestamp)
             for (hand, anchor) in [(HandAnchor.Chirality.left, predicted.leftHand), (.right, predicted.rightHand)] {
                 let left = hand == .left
@@ -369,13 +423,27 @@ final class XRMotionTracking: @unchecked Sendable {
         }
         let stillActive = lock.withLock { configuration == state.0 && started && active }
         guard stillActive else { return }
-        if lock.withLock({ lastFlags & 3 & ~(flags & 3) != 0 }) {
-            invalidate(reason: "Motion source lost fresh full tracking; prior exact-head snapshots cleared")
-            return
+        let lostSources = lock.withLock {
+            XRMotionPosePolicy.lostSources(previous: lastFlags, current: flags, queried: queriedSources)
         }
-        let packet = XRMotionPacket(matrices: matrices, times: times, ids: [1, epoch, headFrame, 0], flags: flags)
-        if XRMotionTransport.shared.publish(packet, owner: owner, epoch: epoch) {
-            lock.withLock { lastFlags = flags; lastHeadFrame = headFrame }
+        if lostSources != 0 {
+            invalidateSources(lostSources, reason: "Motion source lost fresh full tracking; independent healthy source retained")
+        }
+        let packet = XRMotionPacket(matrices: matrices, times: times, ids: [1, sourceLease.epoch, headFrame, 0], flags: flags)
+        if let publishedFlags = XRMotionTransport.shared.publish(packet, owner: owner, lease: sourceLease) {
+            lock.withLock {
+                lastFlags = publishedFlags
+                lastHeadFrame = headFrame
+                if publishedFlags & 3 != 0 { status = "Fresh motion packet published; flags=\(publishedFlags & 0x303)" }
+            }
+            for left in [true, false] {
+                let index = left ? 1 : 3, bit: UInt32 = left ? 1 : 2
+                if publishedFlags & bit != 0 && publishedFlags & (bit << 8) == 0 {
+                    recordSource(left: left, grip: matrices[index], aim: matrices[index + 1],
+                                 originalTime: times[left ? 1 : 2], targetTime: timestamp, headFrame: headFrame,
+                                 sourceEpoch: sourceLease.epoch, configuration: state.0)
+                }
+            }
         }
     }
 
@@ -388,6 +456,9 @@ final class XRMotionTracking: @unchecked Sendable {
              "configured_accessories": providerAccessoryIDs.count, "currently_eligible_accessories": accessoryIDs.count,
              "last_pose_flags": lastFlags,
              "last_native_head_frame": lastHeadFrame, "max_original_source_age_seconds": XRMotionPosePolicy.maximumSourceAge,
+             "named_accessory_source_samples": sourceSamples,
+             "named_accessory_source_samples_scope": "historical; extents reset at head/session-origin invalidation, retained on exit; timestamps do not imply current validity",
+             "source_loss_policy": "per-hand revocation fences; head/session loss revokes whole epoch",
              "location_transform": "originFromAnchor * inverse(referenceFromAnchor_none) * referenceFromNamedLocation_none",
              "bare_hand_source": "tracked skeleton wrist; aim matrix zero; not gun barrel",
              "gameplay_mutation": false]

@@ -11,6 +11,12 @@ enum XRMotionPosePolicy {
             && target - source <= maximumSourceAge && source - target <= maximumFutureSource
     }
 
+    /// Not querying an AR_MT_UNSAFE provider while it is being updated is not
+    /// evidence of tracking loss. The new head still has no unqueried pose.
+    static func lostSources(previous: UInt32, current: UInt32, queried: UInt32) -> UInt32 {
+        previous & queried & 3 & ~current
+    }
+
     static func activeBareHandLost(wasTracked: Bool, left: Bool, lastFlags: UInt32) -> Bool {
         wasTracked && lastFlags & (left ? (1 << 8) : (1 << 9)) != 0
     }
@@ -93,6 +99,13 @@ final class XRMotionProviderGate: @unchecked Sendable {
     var updatePending: Bool { lock.withLock { updating } }
 }
 
+/// A sampling operation captures each hand's revocation generation before
+/// querying ARKit. A later source loss cannot be resurrected by that query.
+struct XRMotionSourceLease: Sendable {
+    let epoch: UInt64
+    let generations: SIMD2<UInt64>
+}
+
 /// One active immersive owner. Old renderer cleanup cannot clear a newer
 /// owner's snapshots. Every immutable packet names its exact accepted head.
 final class XRMotionTransport: @unchecked Sendable {
@@ -102,6 +115,8 @@ final class XRMotionTransport: @unchecked Sendable {
     private var epoch: UInt64 = 0
     private var sequence: UInt64 = 0
     private var packets: [XRMotionPacket] = []
+    private var sourceGenerations = SIMD2<UInt64>.zero
+    private var revokedThroughSequence = SIMD2<UInt64>.zero
     static let capacity = 64
 
     @discardableResult
@@ -111,6 +126,8 @@ final class XRMotionTransport: @unchecked Sendable {
             epoch &+= 1
             if epoch == 0 { epoch = 1 }
             packets.removeAll(keepingCapacity: true)
+            sourceGenerations = .zero
+            revokedThroughSequence = .zero
             return epoch
         }
     }
@@ -122,6 +139,8 @@ final class XRMotionTransport: @unchecked Sendable {
             epoch &+= 1
             if epoch == 0 { epoch = 1 }
             packets.removeAll(keepingCapacity: true)
+            sourceGenerations = .zero
+            revokedThroughSequence = .zero
             return epoch
         }
     }
@@ -130,20 +149,48 @@ final class XRMotionTransport: @unchecked Sendable {
         lock.withLock { owner == requestingOwner ? epoch : nil }
     }
 
+    func samplingLease(_ requestingOwner: UUID) -> XRMotionSourceLease? {
+        lock.withLock { owner == requestingOwner ? XRMotionSourceLease(epoch: epoch, generations: sourceGenerations) : nil }
+    }
+
+    /// Losing one independent controller is not a session-origin change. Keep
+    /// healthy exact-head samples immutable and revoke only the lost source.
     @discardableResult
-    func publish(_ packet: XRMotionPacket, owner requestingOwner: UUID, epoch expectedEpoch: UInt64) -> Bool {
+    func invalidateSources(_ flags: UInt32, owner requestingOwner: UUID) -> Bool {
         lock.withLock {
-            guard owner == requestingOwner, epoch == expectedEpoch, packet.matrices.count == 5,
+            guard owner == requestingOwner else { return false }
+            for hand in 0..<2 where flags & (1 << hand) != 0 {
+                sourceGenerations[hand] &+= 1
+                revokedThroughSequence[hand] = sequence
+            }
+            return true
+        }
+    }
+
+    @discardableResult
+    func publish(_ packet: XRMotionPacket, owner requestingOwner: UUID,
+                 lease expected: XRMotionSourceLease) -> UInt32? {
+        lock.withLock {
+            guard owner == requestingOwner, epoch == expected.epoch, packet.matrices.count == 5,
                   packet.times.count == 3, packet.ids.count == 4, packet.ids[2] != 0,
-                  !packets.contains(where: { $0.ids[2] == packet.ids[2] }) else { return false }
+                  !packets.contains(where: { $0.ids[2] == packet.ids[2] }) else { return nil }
             var stored = packet
+            for hand in 0..<2 where expected.generations[hand] != sourceGenerations[hand] {
+                Self.clearSource(hand, packet: &stored)
+            }
             sequence &+= 1
             stored.ids = [1, epoch, packet.ids[2], sequence]
             packets.removeAll { stored.times[0] - $0.times[0] > XRMotionPosePolicy.maximumSourceAge }
             packets.append(stored)
             if packets.count > Self.capacity { packets.removeFirst(packets.count - Self.capacity) }
-            return true
+            return stored.flags
         }
+    }
+
+    private static func clearSource(_ hand: Int, packet: inout XRMotionPacket) {
+        packet.flags &= ~((1 << hand) | (1 << (hand + 8)))
+        packet.matrices[1 + hand * 2] = simd_float4x4()
+        packet.matrices[2 + hand * 2] = simd_float4x4()
     }
 
     func read(expectedHeadFrame: UInt64, now: Double) -> XRMotionPacket? {
@@ -155,7 +202,9 @@ final class XRMotionTransport: @unchecked Sendable {
                   XRMotionPosePolicy.rigid(packet.matrices[0]) else { return nil }
             for (bit, sourceBit, grip, aim, time) in [(UInt32(1), UInt32(1 << 8), 1, 2, 1), (UInt32(2), UInt32(1 << 9), 3, 4, 2)] {
                 let bare = packet.flags & sourceBit != 0
+                let hand = time - 1
                 let valid = packet.flags & bit != 0
+                    && packet.ids[3] > revokedThroughSequence[hand]
                     && XRMotionPosePolicy.fresh(source: packet.times[time], target: packet.times[0])
                     && XRMotionPosePolicy.fresh(source: packet.times[time], target: now)
                     && XRMotionPosePolicy.rigid(packet.matrices[grip])
