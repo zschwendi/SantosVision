@@ -91,6 +91,17 @@ typedef struct {
 } SVXRAimSnapshot;
 _Static_assert(sizeof(SVXRAimSnapshot) == 104, "SVXRAimSnapshot ABI layout must match Rust");
 int32_t sv_xr_get_aim_snapshot(SVXRAimSnapshot *snapshot, uint32_t byte_size);
+/* One actual tracked barrel ray and its independently qualified common reference.
+   producer_camera_sequence is an observation tag, not an older image-pose proof. */
+typedef struct {
+    uint32_t version, size;
+    SVXRAimSnapshot aim;
+    uint64_t reference_camera_sequence, reference_request_frame, reference_head_frame;
+    uint64_t producer_camera_sequence, scope_sequence;
+    double game_from_stage[16];
+} SVXRAimReferenceSnapshotV2;
+_Static_assert(sizeof(SVXRAimReferenceSnapshotV2) == 280, "SVXRAimReferenceSnapshotV2 ABI must match Rust");
+int32_t sv_xr_get_aim_reference_snapshot_v2(SVXRAimReferenceSnapshotV2 *snapshot, uint32_t byte_size);
 /* 1=current qualified native scope, 0=ordinary, -1=unknown/stale. */
 int32_t sv_xr_native_scope_active(void);
 /* Fresh exact original game-camera far plane in metres, or 0 when unavailable. */

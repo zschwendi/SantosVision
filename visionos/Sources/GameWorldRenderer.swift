@@ -458,6 +458,7 @@ final class GameWorldRenderer: @unchecked Sendable {
     private var hudSelectionAttempts: UInt64 = 0
     private var hudSelections: UInt64 = 0
     private var lastHUDGameFrame: UInt64 = 0
+    private var lastReticleReference: [String: Any] = [:]
     private var sourceCoverage = GameWorldSourceCoverage()
     private var sourceCoverageMagnification: Float = 1
     private let depthState: any MTLDepthStencilState
@@ -1275,6 +1276,40 @@ final class GameWorldRenderer: @unchecked Sendable {
         // Both eyes use one original-game aim sample, even if the script thread
         // publishes another sample between the two encoding calls.
         let gameplayAim = reticle == nil ? nil : GameWorldReticle.snapshot()
+        // One bounded tuple for the whole drawable. Source-generation gaps are
+        // explicit: a coherent current ray does not imply the older displayed
+        // foreground has already reached that pose.
+        var reticleAudit: [String: Any] = ["snapshot_available": gameplayAim != nil,
+            "scope": "CPU aim/reference selection; no rendered gun or impact certification"]
+        if let snapshot = gameplayAim {
+            reticleAudit["aim_view_epoch"] = snapshot.aim.view_epoch
+            reticleAudit["aim_flags"] = snapshot.aim.flags
+            reticleAudit["aim_age_seconds"] = snapshot.aim.age_seconds
+            reticleAudit["common_native_reference"] = snapshot.reference != nil
+            if let reference = snapshot.reference {
+                reticleAudit["reference_camera_sequence"] = reference.camera
+                reticleAudit["reference_request_frame"] = reference.request
+                reticleAudit["reference_head_frame"] = reference.head
+                reticleAudit["producer_camera_sequence_tag"] = reference.producer
+                reticleAudit["scope_sequence"] = reference.scope
+                reticleAudit["displayed_sources"] = sources.filter { $0.kind == .actual }.map { source -> [String: Any] in
+                    var row: [String: Any] = ["eye": source.viewIndex, "game_frame": source.gameFrame,
+                        "head_frame": source.headFrame, "request_frame": source.requestFrame]
+                    if let optical = source.lease?.opticalFrame {
+                        row["camera_sequence"] = optical.cameraSequence
+                        row["matching_view_epoch"] = optical.epoch == snapshot.aim.view_epoch
+                        if let lag = GameWorldAimReferencePolicy.displayedSourceLag(
+                            producer: reference.producer, source: optical.cameraSequence) {
+                            row["camera_generations_behind_producer_tag"] = lag
+                        }
+                    }
+                    return row
+                }
+            }
+        }
+        countersLock.lock()
+        lastReticleReference = reticleAudit
+        countersLock.unlock()
         // Keep the original complete game color unless every selected eye has
         // certified decomposition. Select ONE HUD once, never one per eye.
         let orderedSources = drawable.views.indices.compactMap { eye in
@@ -1371,10 +1406,11 @@ final class GameWorldRenderer: @unchecked Sendable {
                             hud?.encode(overlay, snapshot: hudSnapshot,
                                 headFromEye: view.transform, projection: physicalProjection, nativeScope: nativeScope)
                         }
-                        if let stageFromHead, let gameplayAim {
-                            let gameFromCurrentEye = worldDoubleMatrix(source.eye.gameFromStage)
+                        if let stageFromHead, let gameplayAim,
+                           gameplayAim.aim.view_epoch == source.eye.lease?.opticalFrame.epoch {
+                            let gameFromCurrentEye = gameplayAim.gameFromStage(fallback: source.eye.gameFromStage)
                                 * worldDoubleMatrix(stageFromHead) * worldDoubleMatrix(view.transform)
-                            reticle?.encode(overlay, aim: gameplayAim, gameFromCurrentEye: gameFromCurrentEye,
+                            reticle?.encode(overlay, aim: gameplayAim.aim, gameFromCurrentEye: gameFromCurrentEye,
                                             projection: projection, viewport: map.viewport)
                         }
                         overlay.endEncoding()
@@ -1459,10 +1495,11 @@ final class GameWorldRenderer: @unchecked Sendable {
             if source?.eye.kind == .actual, let hudSnapshot {
                 hud?.encode(encoder, snapshot: hudSnapshot, headFromEye: view.transform, projection: physicalProjection, nativeScope: nativeScope)
             }
-            if let source, source.eye.kind == .actual, let stageFromHead, let gameplayAim {
-                let gameFromCurrentEye = worldDoubleMatrix(source.eye.gameFromStage)
+            if let source, source.eye.kind == .actual, let stageFromHead, let gameplayAim,
+               gameplayAim.aim.view_epoch == source.eye.lease?.opticalFrame.epoch {
+                let gameFromCurrentEye = gameplayAim.gameFromStage(fallback: source.eye.gameFromStage)
                     * worldDoubleMatrix(stageFromHead) * worldDoubleMatrix(view.transform)
-                reticle?.encode(encoder, aim: gameplayAim, gameFromCurrentEye: gameFromCurrentEye,
+                reticle?.encode(encoder, aim: gameplayAim.aim, gameFromCurrentEye: gameFromCurrentEye,
                                 projection: projection, viewport: map.viewport)
             }
             encoder.endEncoding()
@@ -1480,6 +1517,7 @@ final class GameWorldRenderer: @unchecked Sendable {
         defer { countersLock.unlock() }
         return ["pipeline_available": hud != nil, "selection_attempts": hudSelectionAttempts,
             "all_eyes_qualified_selections": hudSelections, "last_selected_game_frame": lastHUDGameFrame,
+            "reticle_reference": lastReticleReference,
             "angular_width_degrees": 60, "distance_metres": 2,
             "stage": "CPU selection only; game presentation GPU completion is reported separately"]
     }
