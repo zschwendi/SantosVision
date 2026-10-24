@@ -12,6 +12,10 @@ use std::sync::{atomic::{AtomicBool,AtomicU64, Ordering}, LazyLock,Mutex};
 pub const IMPORT_MODULE: &str = "muguet_motion_aim_v1";
 static DIAGNOSTIC_ENABLED: AtomicBool = AtomicBool::new(false);
 static CANDIDATE: Mutex<Option<CameraCandidate>> = Mutex::new(None);
+static LEFT_CANDIDATE:Mutex<Option<LeftArmCandidate>>=Mutex::new(None);
+// Actual primary propagation provenance is independent of controller tracking.
+// Native cached rays are not desired IK targets and do not borrow a hand pose.
+static NATIVE_RAY_PRIMARY:Mutex<Option<(crate::xr_view::WorldView,Instant)>>=Mutex::new(None);
 static LATEST_CAMERA_SEQUENCE:AtomicU64=AtomicU64::new(0);
 static LAST_ACK: Mutex<Option<ShotAcknowledgement>> = Mutex::new(None);
 static NATIVE_MODE:Mutex<Option<(bool,Instant,u64,u64)>>=Mutex::new(None);
@@ -50,6 +54,24 @@ fn packet_rejection(head:u64,presentation:f64,flags:u32,times:[f64;3],ids:[u64;4
     if (times[0]-presentation).abs()>1e-6{return Some("accepted_head_presentation_time_mismatch");}
     if times[2]>times[0]+0.01{return Some("right_source_in_future");}
     if times[0]-times[2]>0.15{return Some("right_source_stale_at_capture");}None
+}
+fn left_packet_valid(head:u64,presentation:f64,flags:u32,times:[f64;3],ids:[u64;4])->bool{
+    flags&1!=0&&flags&(1<<8)==0&&ids[0]==1&&ids[1]!=0&&ids[2]==head&&head!=0&&ids[3]!=0
+        &&times.iter().all(|v|v.is_finite())&&(times[0]-presentation).abs()<=1e-6
+        &&times[1]<=times[0]+0.01&&times[0]-times[1]<=0.15
+}
+#[derive(Clone,Debug)]
+pub(crate) struct LeftArmCandidate{pub view_epoch:u64,pub camera_sequence:u64,pub head_frame:u64,pub tracking_epoch:u64,pub hand_sequence:u64,pub game_from_stage:[f32;16],pub stage_from_grip:[f32;16],pub recorded_at:Instant,pub source_age:Duration}
+impl LeftArmCandidate{fn valid(&self,now:Instant,epoch:u64)->bool{self.view_epoch==epoch&&epoch!=0&&self.camera_sequence!=0&&self.head_frame!=0&&self.tracking_epoch!=0&&self.hand_sequence!=0&&rigid(&self.game_from_stage)&&rigid(&self.stage_from_grip)&&now.checked_duration_since(self.recorded_at).and_then(|age|age.checked_add(self.source_age)).is_some_and(|age|age<=MAX_AGE)}}
+pub(crate) fn native_left_arm_candidate(first:bool)->Option<LeftArmCandidate>{
+    if !arms_enabled()||!current_supported_scope(first)||!NATIVE_MODE.lock().unwrap_or_else(|p|p.into_inner()).is_some_and(|(first,at,_,e)|first&&e==crate::xr_view::view_epoch()&&at.elapsed()<=MAX_AGE){return None;}
+    let c=LEFT_CANDIDATE.lock().unwrap_or_else(|p|p.into_inner()).clone()?;if !c.valid(Instant::now(),crate::xr_view::view_epoch())||LATEST_CAMERA_SEQUENCE.load(Ordering::Acquire)!=c.camera_sequence{return None;}
+    #[cfg(target_os="visionos")]{
+        extern "C"{fn sv_xr_motion_read_v1(frame:u64,f:*mut f32,fn_:u32,t:*mut f64,tn:u32,id:*mut u64,idn:u32)->u32;}
+        let mut f=[0.;80];let mut t=[0.;3];let mut ids=[0;4];let flags=unsafe{sv_xr_motion_read_v1(c.head_frame,f.as_mut_ptr(),80,t.as_mut_ptr(),3,ids.as_mut_ptr(),4)};
+        if flags&1==0||flags&(1<<8)!=0||ids!=[1,c.tracking_epoch,c.head_frame,c.hand_sequence]||!f[16..32].iter().zip(c.stage_from_grip).all(|(a,b)|a.to_bits()==b.to_bits()){return None;}Some(c)
+    }
+    #[cfg(not(target_os="visionos"))]{None}
 }
 pub fn diagnostic_enabled() -> bool { DIAGNOSTIC_ENABLED.load(Ordering::Acquire) }
 static GAMEPLAY_REQUESTED:LazyLock<bool>=LazyLock::new(||std::env::var("MUGUET_XR_MOTION_AIM").as_deref()==Ok("1"));
@@ -155,6 +177,8 @@ pub(crate) fn invalidate_camera() {
     crate::xr_motion_arms::invalidate_inputs();
     LATEST_CAMERA_SEQUENCE.store(0,Ordering::Release);
     *CANDIDATE.lock().unwrap_or_else(|p|p.into_inner())=None;
+    *LEFT_CANDIDATE.lock().unwrap_or_else(|p|p.into_inner())=None;
+    *NATIVE_RAY_PRIMARY.lock().unwrap_or_else(|p|p.into_inner())=None;
     *LAST_ACK.lock().unwrap_or_else(|p|p.into_inner())=None;
     *NATIVE_MODE.lock().unwrap_or_else(|p|p.into_inner())=None;
     *IK_PERMIT.lock().unwrap_or_else(|p|p.into_inner())=None;
@@ -172,14 +196,23 @@ pub(crate) fn capture_camera(view: crate::xr_view::WorldView, base_camera:[f32;1
         if LATEST_CAMERA_SEQUENCE.load(Ordering::Acquire)!=view.camera_sequence{capture_observed(view,"camera_replaced_before_capture",None);return;}
         *candidate=None;
     }
+    *NATIVE_RAY_PRIMARY.lock().unwrap_or_else(|p|p.into_inner())=None;
+    *LEFT_CANDIDATE.lock().unwrap_or_else(|p|p.into_inner())=None;
     if !view.headset_applied{capture_observed(view,"headset_not_applied_to_native_camera",None);return;}
     if !crate::xr_view::view_epoch_is_active(view.provenance_epoch){capture_observed(view,"inactive_view_epoch",None);return;}
+    *NATIVE_RAY_PRIMARY.lock().unwrap_or_else(|p|p.into_inner())=Some((view,Instant::now()));
     #[cfg(target_os="visionos")]
     {
         extern "C" { fn sv_xr_motion_read_v1(expected_head_frame:u64,
             floats:*mut f32,float_count:u32,times:*mut f64,time_count:u32,ids:*mut u64,id_count:u32)->u32; }
         let mut floats=[0f32;80];let mut times=[0f64;3];let mut ids=[0u64;4];
         let flags=unsafe{sv_xr_motion_read_v1(view.head_pose_frame,floats.as_mut_ptr(),80,times.as_mut_ptr(),3,ids.as_mut_ptr(),4)};
+        // Left position tracking has its own validity/source age. Losing the
+        // right accessory must not discard an accepted left Sense grip packet.
+        if left_packet_valid(view.head_pose_frame,view.presentation_time_seconds,flags,times,ids){
+            let left=LeftArmCandidate{view_epoch:view.provenance_epoch,camera_sequence:view.camera_sequence,head_frame:view.head_pose_frame,tracking_epoch:ids[1],hand_sequence:ids[3],game_from_stage:view.game_from_stage,stage_from_grip:floats[16..32].try_into().unwrap(),recorded_at:Instant::now(),source_age:Duration::from_secs_f64((times[0]-times[1]).max(0.))};
+            if left.valid(Instant::now(),view.provenance_epoch){let mut published=LEFT_CANDIDATE.lock().unwrap_or_else(|p|p.into_inner());if LATEST_CAMERA_SEQUENCE.load(Ordering::Acquire)==view.camera_sequence&&crate::xr_view::view_epoch_is_active(view.provenance_epoch){*published=Some(left);}}
+        }
         // Right-handed first slice. Bare wrist poses do not constitute a
         // calibrated weapon/barrel ray. One missing left hand is harmless.
         if let Some(reason)=packet_rejection(view.head_pose_frame,view.presentation_time_seconds,flags,times,ids){capture_observed(view,reason,Some((flags,times,ids)));return;}
@@ -201,6 +234,13 @@ pub(crate) fn capture_camera(view: crate::xr_view::WorldView, base_camera:[f32;1
     }
     #[cfg(not(target_os="visionos"))] {let _=base_camera;capture_observed(view,"not_visionos_host",None);}
 }
+pub(crate) fn native_ray_primary()->Option<crate::xr_view::WorldView>{
+    if !arms_enabled()||!current_supported_scope(true){return None;}
+    let(view,at)=(*NATIVE_RAY_PRIMARY.lock().unwrap_or_else(|p|p.into_inner()))?;
+    (at.elapsed()<=Duration::from_millis(100)&&view.headset_applied&&view.camera_sequence!=0
+        &&LATEST_CAMERA_SEQUENCE.load(Ordering::Acquire)==view.camera_sequence
+        &&crate::xr_view::view_epoch_is_active(view.provenance_epoch)).then_some(view)
+}
 
 pub fn status_json()->serde_json::Value {
     let capture={let audit=CAPTURE_AUDIT.lock().unwrap_or_else(|p|p.into_inner());serde_json::json!({"attempts":audit.attempts,"accepted":audit.accepted,"camera_invalidations":audit.invalidations,
@@ -211,10 +251,12 @@ pub fn status_json()->serde_json::Value {
         "ik_permit":permit.map(|(e,tracking,at)|serde_json::json!({"age_ms":at.elapsed().as_millis(),"tracking_epoch":tracking,"current_epoch":e==epoch,"fresh":e==epoch&&at.elapsed()<=MAX_AGE})),
         "last_arm_candidate_gate":match ARM_CANDIDATE_GATE.load(Ordering::Relaxed){0=>"not_observed",1=>"gameplay_motion_disabled",2=>"outside_supported_first_person_scope",3=>"native_first_person_mode_missing_or_stale",4=>"no_camera_candidate",5=>"camera_candidate_invalid_or_stale",6=>"exact_tracking_packet_no_longer_live",_=>"ready"}});
     let candidate=CANDIDATE.lock().unwrap_or_else(|p|p.into_inner());
+    let left_candidate=LEFT_CANDIDATE.lock().unwrap_or_else(|p|p.into_inner()).clone();
     let ack=LAST_ACK.lock().unwrap_or_else(|p|p.into_inner());
     serde_json::json!({"diagnostic_aot_certified":diagnostic_enabled(),"gameplay_motion_active":gameplay_enabled(),"native_arms":crate::xr_motion_arms::status_json(),
         "compiled_arms_default":option_env!("MUGUET_XR_MOTION_ARMS_DEFAULT")==Some("1"),"arms_launch_requested":*ARMS_REQUESTED,
         "capture_diagnostics":capture,"scope_diagnostics":scope,
+        "left_candidate":left_candidate.as_ref().map(|c|serde_json::json!({"view_epoch":c.view_epoch,"camera_sequence":c.camera_sequence,"head_frame":c.head_frame,"hand_sequence":c.hand_sequence,"tracking_epoch":c.tracking_epoch,"age_ms":c.recorded_at.elapsed().as_millis(),"source_age_ms":c.source_age.as_millis(),"valid_now":c.valid(Instant::now(),epoch),"requires_right_tracking":false})),
         "candidate":candidate.as_ref().map(|c|serde_json::json!({"view_epoch":c.view_epoch,
             "camera_sequence":c.camera_sequence,"head_frame":c.head_frame,"hand_sequence":c.hand_sequence,
             "tracking_epoch":c.tracking_epoch,"age_ms":c.recorded_at.elapsed().as_millis(),"original_source_age_ms":c.source_age_at_capture.as_millis(),"valid_now":c.valid(Instant::now(),epoch)})),
@@ -763,5 +805,11 @@ mod tests {
             (true,true,false,false,true),(true,true,true,true,true),(true,true,true,false,false)]{
             assert!(!supported_motion_scope(route.0,route.1,route.2,route.3,route.4));
         }
+    }
+    #[test]fn left_packet_and_position_candidate_remain_valid_when_right_accessory_is_lost(){
+        let times=[10.,9.98,1.];let ids=[1,4,12,13];assert!(left_packet_valid(12,10.,1,times,ids));assert_eq!(packet_rejection(12,10.,1,times,ids),Some("no_fresh_right_accessory"));
+        assert!(!left_packet_valid(12,10.,1|(1<<8),times,ids));assert!(!left_packet_valid(11,10.,1,times,ids));assert!(!left_packet_valid(12,10.,1,[10.,9.8,1.],ids));
+        let now=Instant::now();let mut left=LeftArmCandidate{view_epoch:7,camera_sequence:11,head_frame:12,tracking_epoch:4,hand_sequence:13,game_from_stage:identity(),stage_from_grip:identity(),recorded_at:now,source_age:Duration::from_millis(20)};
+        assert!(left.valid(now+Duration::from_millis(129),7));assert!(!left.valid(now+Duration::from_millis(131),7));assert!(!left.valid(now,8));left.stage_from_grip[0]=2.;assert!(!left.valid(now,7));
     }
 }

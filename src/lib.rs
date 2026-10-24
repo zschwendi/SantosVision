@@ -30,6 +30,8 @@ pub mod xr_motion_aim;
 pub mod xr_motion_arms;
 #[cfg(feature = "jit")]
 pub mod xr_motion_arms_patch;
+#[cfg(feature="jit")]
+pub mod xr_motion_cache_patch;
 #[cfg(feature = "jit")]
 pub mod xr_motion_patch;
 pub mod xr_foreground;
@@ -163,12 +165,14 @@ pub fn desktop_main() -> Result<()> {
         return Ok(());
     }
     #[cfg(feature = "jit")]
-    if matches!(argv.get(1).map(String::as_str),Some("--precompile-visionos-motion"|"--precompile-visionos-motion-arms")) {
+    if matches!(argv.get(1).map(String::as_str),Some("--precompile-visionos-motion"|"--precompile-visionos-motion-arms"|"--precompile-visionos-motion-arms-cache")) {
         let wasm=argv.get(2).context("--precompile-visionos-motion <original.wasm> <separate.cwasm>")?;
         let out=argv.get(3).context("--precompile-visionos-motion <original.wasm> <separate.cwasm>")?;
         anyhow::ensure!(!std::path::Path::new(out).exists(),"motion diagnostic output must be a new file");
         let original=std::fs::read(wasm)?;
-        let (artifact_wasm,mut manifest)=if argv[1]=="--precompile-visionos-motion-arms"{
+        let (artifact_wasm,mut manifest)=if argv[1]=="--precompile-visionos-motion-arms-cache"{
+            let a=xr_motion_cache_patch::generate(&original,mp::COMMANDS)?;(a.wasm,a.manifest)
+        }else if argv[1]=="--precompile-visionos-motion-arms"{
             let a=xr_motion_arms_patch::generate(&original,mp::COMMANDS)?;(a.wasm,a.manifest)
         }else{let a=xr_motion_patch::generate(&original,mp::COMMANDS)?;(a.wasm,a.manifest)};
         let mut config=engine_config_for(true);config.target("aarch64-apple-visionos").map_err(anyhow::Error::from)?;

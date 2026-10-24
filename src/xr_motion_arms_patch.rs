@@ -46,7 +46,7 @@ pub fn generate(original:&[u8],wanted:&[(&str,&str)])->Result<Artifact>{
 }
 fn ordinal(body:&FunctionBody<'_>,at:u64,check:impl Fn(&O<'_>)->bool)->Result<usize>{let mut r=body.get_operators_reader()?;let mut n=0;
     while !r.eof(){let offset=r.original_position()-body.range().start;let op=r.read()?;if offset==at{ensure!(check(&op),"native arm seam opcode changed");return Ok(n);}n+=1;}anyhow::bail!("native arm seam absent")}
-fn named_global(bytes:&[u8],name:&str)->Result<u32>{let mut found=vec![];
+pub(crate) fn named_global(bytes:&[u8],name:&str)->Result<u32>{let mut found=vec![];
     for p in Parser::new(0).parse_all(bytes){if let Payload::CustomSection(c)=p?{if let wasmparser::KnownCustom::Name(n)=c.as_known(){for n in n{if let wasmparser::Name::Global(m)=n?{for n in m{let n=n?;if n.name==name{found.push(n.index);}}}}}}}
     ensure!(found.len()==1,"native arm global name ambiguous/absent");Ok(found[0])}
 struct Info<'a>{imports:u32,entries:Vec<(String,String,TypeRef)>,types:Vec<FuncType>,funcs:Vec<u32>,bodies:Vec<FunctionBody<'a>>}

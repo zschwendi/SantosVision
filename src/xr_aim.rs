@@ -1,6 +1,6 @@
 //! Project the gameplay input ray independently in each eye. Ordinary controls
-//! retain the game's camera ray; tracked arms use the current attached weapon
-//! only after its native pose agrees with the accepted tracking target.
+//! retain the game's camera ray; tracked arms use qualified actual weapon
+//! geometry. A genuine cached barrel producer is independent of IK convergence.
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -19,6 +19,8 @@ pub const AIM_FREE_AIMING: u32 = 32;
 /// Read-only direction sampled from the current native attached weapon.
 /// This flag does not certify an impact or remove native spread/correction.
 pub const AIM_TRACKED_INPUT_DIRECTION: u32 = 64;
+/// Genuine native cached gun_muzzle direction, independent of desired IK pose.
+pub const AIM_NATIVE_CACHED_INPUT_DIRECTION:u32=128;
 const MAX_AGE: Duration = Duration::from_millis(100);
 static RETICLE_READY: AtomicBool = AtomicBool::new(false);
 static RETICLE_READY_EPOCH: AtomicU64 = AtomicU64::new(0);
@@ -336,6 +338,7 @@ fn select_snapshot(baseline: Option<SVXRAimSnapshot>, tracked_scope: bool,
     snapshot.age_seconds = ray.source_age.as_secs_f64();
     snapshot.capture_time_seconds = (now_seconds - snapshot.age_seconds).max(0.);
     snapshot.flags |= AIM_TRACKED_INPUT_DIRECTION;
+    if ray.native_cached{snapshot.flags|=AIM_NATIVE_CACHED_INPUT_DIRECTION;}
     Some(snapshot)
 }
 
@@ -343,7 +346,7 @@ fn tracked_scope(baseline: Option<SVXRAimSnapshot>) -> bool {
     baseline.is_some_and(|s| s.flags & AIM_FIRST_PERSON != 0 && s.flags & AIM_IN_VEHICLE == 0)
         && crate::xr_motion_aim::arms_enabled() && crate::pad::spatial_controls_selected()
         && crate::pad::verified_guest_gameplay_context()
-        && !crate::xr_motion_arms::native_fallback_active()
+        && !crate::xr_motion_arms::reticle_native_fallback_active()
 }
 
 fn current_snapshot(baseline: Option<SVXRAimSnapshot>, epoch: u64) -> Option<SVXRAimSnapshot> {
@@ -382,6 +385,7 @@ pub fn status_json() -> serde_json::Value {
     let pending_tracked = tracked_scope(baseline);
     let snapshot = current_snapshot(baseline, epoch);
     let tracked = snapshot.is_some_and(|s| s.flags & AIM_TRACKED_INPUT_DIRECTION != 0);
+    let cached=snapshot.is_some_and(|s|s.flags&AIM_NATIVE_CACHED_INPUT_DIRECTION!=0);
     serde_json::json!({"abi_version": AIM_VERSION,"byte_size": AIM_SIZE,"samples":samples,
         "native_reticle_hides":hidden,"failures":failures,"fresh":snapshot.is_some(),
         "replacement_frontend_ready":reticle_ready_for_epoch(epoch),"maximum_age_ms":MAX_AGE.as_millis(),
@@ -400,7 +404,7 @@ pub fn status_json() -> serde_json::Value {
         "gameplay_ui_eligible":gameplay_ui.map(|(alive,_,_)|alive),
         "gameplay_ui_age_seconds":gameplay_ui_age,
         "gameplay_ui_view_epoch":gameplay_ui.map(|(_,epoch,_)|epoch),
-        "last_error":last_error,"aim_source":if scope.is_some_and(|s|s.active==Some(true)) {"original native scoped optic; generic marker suppressed"} else if tracked {"current native attached weapon direction; exact tracked packet and native pose agreement"} else if pending_tracked {"tracked native weapon pending current packet and pose agreement"} else {"original controller gameplay camera; head movement is free look"},
+        "last_error":last_error,"aim_source":if scope.is_some_and(|s|s.active==Some(true)) {"original native scoped optic; generic marker suppressed"} else if cached {"actual native cached gun_muzzle; current producer, bone and primary view agreement"} else if tracked {"current native attached weapon direction; exact tracked packet and native pose agreement"} else if pending_tracked {"native weapon direction pending current producer or pose agreement"} else {"original controller gameplay camera; head movement is free look"},
         "bullet_scope":if tracked {"native weapon input direction; not an impact; native spread and correction remain"} else {"camera forward ray; weapon spread, recoil, muzzle parallax and assisted target are not synthesized"}})
 }
 
@@ -504,12 +508,13 @@ mod tests {
     fn tracked_reticle_uses_current_native_ray_and_waits_for_pose_agreement() {
         let baseline = make_snapshot(sample(), 7, 10.).unwrap();
         let ray = || crate::xr_motion_arms::CurrentInputRay { origin:[8.,9.,10.], direction:[1.,0.,0.],
-            source_age:Duration::from_millis(25), camera_sequence:123 };
+            source_age:Duration::from_millis(25), camera_sequence:123,native_cached:false };
         let tracked = select_snapshot(Some(baseline), true, Some(ray()), 10.).unwrap();
         assert_eq!(tracked.origin, [8.,9.,10.]); assert_eq!(tracked.direction, [1.,0.,0.]);
         assert_eq!(tracked.sequence, 123); assert_eq!(tracked.view_epoch, 7);
         assert_eq!(tracked.flags & !AIM_TRACKED_INPUT_DIRECTION, baseline.flags);
         assert_eq!(tracked.age_seconds, 0.025); assert_eq!(tracked.capture_time_seconds, 9.975);
+        let mut cached=ray();cached.native_cached=true;let native=select_snapshot(Some(baseline),true,Some(cached),10.).unwrap();assert_ne!(native.flags&AIM_NATIVE_CACHED_INPUT_DIRECTION,0);
         assert!(select_snapshot(Some(baseline), true, None, 10.).is_none());
         let mut stale = ray(); stale.source_age = Duration::from_millis(101);
         assert!(select_snapshot(Some(baseline), true, Some(stale), 10.).is_none());
