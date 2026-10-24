@@ -54,7 +54,7 @@ final class SpatialGamepadInput {
             controllers[id] = controller
             resolving[id] = Task { [weak self, controller] in
                 do {
-                    let accessory = try await Accessory(device: controller)
+                    let accessory = try await Self.resolveAccessory(for: id)
                     guard let self, !Task.isCancelled, self.controllers[id] === controller else { return }
                     let hand: UInt32
                     switch accessory.inherentChirality {
@@ -80,6 +80,20 @@ final class SpatialGamepadInput {
                 }
             }
         }
+    }
+
+    private enum ResolutionError: Error { case disconnected }
+
+    /// Only a Sendable identity leaves the UI actor. Obtain the framework's
+    /// current device reference in this nonisolated acquisition task and pass
+    /// it directly to ARKit; never send our actor-owned registry reference to
+    /// the @concurrent initializer. The UI actor verifies identity again after
+    /// the await before binding any controls or keeping the returned Accessory.
+    nonisolated private static func resolveAccessory(for id: ObjectIdentifier) async throws -> Accessory {
+        guard let device = GCController.controllers().first(where: { ObjectIdentifier($0) == id }) else {
+            throw ResolutionError.disconnected
+        }
+        return try await Accessory(device: device)
     }
 
     var report: [String: Any] {
