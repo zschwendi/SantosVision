@@ -10,6 +10,26 @@ import simd
         }
         let actions = GameWorldSenseUtilityLayout.actions
         require(actions.count == 6 && Set(actions).count == 6, "Only Phone, View and D-pad utilities")
+        // The native HUD producer currently publishes a60-degree,16:9 canvas
+        // at2m. Keep the row centered in its lower band, away from both corners.
+        let hudHalfWidth = GameWorldSenseUtilityLayout.distance * tan(Float.pi / 6)
+        let hudHalfHeight = hudHalfWidth * 9 / 16
+        let centers = actions.indices.map { GameWorldSenseUtilityLayout.center(index: $0) }
+        require(abs(centers.map(\.x).reduce(0, +)) < 1e-6, "Immersive utility row is centered on the shared HUD, not a left strip")
+        for index in actions.indices {
+            let center = centers[index], mirrored = centers[actions.count - index - 1]
+            let half = GameWorldSenseUtilityLayout.halfSize
+            require(abs(center.x + mirrored.x) < 1e-6 && center.y == mirrored.y,
+                    "Buttons are symmetric about head/HUD center in the same lower row")
+            require(abs(center.x) + half.x <= hudHalfWidth * 0.4,
+                    "Utility buttons leave the outer30percent HUD columns clear on both sides")
+            require(center.y - half.y >= -hudHalfHeight && center.y + half.y <= -hudHalfHeight * 0.75,
+                    "Complete button quads stay inside the lower central HUD band")
+            if index > 0 {
+                require(center.x - centers[index - 1].x > half.x * 2,
+                        "System interaction rectangles have real horizontal separation")
+            }
+        }
         for action in actions {
             require(GameWorldSenseUtilityLayout.action(identifier: GameWorldSenseUtilityLayout.identifier(action)) == action,
                     "System tracking identifiers round trip")

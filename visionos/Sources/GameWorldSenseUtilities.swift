@@ -4,6 +4,10 @@ import simd
 enum GameWorldSenseUtilityLayout {
     static let distance: Float = 2
     static let halfSize = SIMD2<Float>(repeating: 0.0675)
+    static let horizontalPitch: Float = 0.15
+    // The current60-degree,16:9 HUD shares this2m plane. This row occupies
+    // its lower central38.3%, leaving the minimap/health and right HUD corners.
+    static let verticalCenter: Float = -0.56
     static let namespace: UInt64 = 0x5356555400000000
     static var actions: [SantosSenseUtilityAction] { [.phone, .changeView, .up, .down, .left, .right] }
     static func identifier(_ action: SantosSenseUtilityAction) -> UInt64 { namespace | UInt64(action.rawValue) }
@@ -11,7 +15,10 @@ enum GameWorldSenseUtilityLayout {
         guard identifier & 0xffff_ffff_0000_0000 == namespace else { return nil }
         return SantosSenseUtilityAction(rawValue: UInt32(truncatingIfNeeded: identifier))
     }
-    static func center(index: Int) -> SIMD2<Float> { SIMD2(-0.98 + Float(index) * 0.15, -0.79) }
+    static func center(index: Int) -> SIMD2<Float> {
+        let midpoint = Float(actions.count - 1) * 0.5
+        return SIMD2((Float(index) - midpoint) * horizontalPitch, verticalCenter)
+    }
 }
 
 struct GameWorldSenseUtilityInteraction<ID: Hashable> {
