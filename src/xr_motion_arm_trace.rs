@@ -12,7 +12,7 @@ static RENDERED:Mutex<[Option<Rendered>;2]>=Mutex::new([None,None]);
 fn position(m:&[f32;16])->[f32;3]{[m[12],m[13],m[14]]}
 fn distance(a:&[f32;16],b:&[f32;16])->f32{(0..3).map(|i|(a[12+i]-b[12+i]).powi(2)).sum::<f32>().sqrt()}
 fn finite(value:u32)->Option<f32>{let f=f32::from_bits(value);f.is_finite().then_some(f)}
-fn bone_world<M:Memory>(s:&mut Snapshot<'_,M>,skel:u64,bone:u16)->Option<[f32;16]>{
+pub(super) fn bone_world<M:Memory>(s:&mut Snapshot<'_,M>,skel:u64,bone:u16)->Option<[f32;16]>{
     let count=s.u32(skel.checked_add(32)?)?;if count==0||count>MAX_BONES||u32::from(bone)>=count{return None;}
     let reference=s.u64(skel.checked_add(8)?)?;if reference==0{return None;}let reference=s.matrix(reference)?;
     let bank=s.u64(skel.checked_add(24)?)?;if bank==0{return None;}

@@ -124,5 +124,39 @@ int32_t sv_world_frame_optics_v1(uint64_t world_lease, SVWorldOpticsFrame *optic
 int32_t sv_xr_set_reticle_ready(uint32_t enabled);
 /* Qualified tracked-arm mode, including the signed build's normal-launch default. */
 uint32_t sv_xr_motion_arms_enabled_v1(void);
+/* Explicit left grip-to-native-hand calibration. phase: 0 idle, 1 card open
+   waiting, 2 GTA's own left hand shown, 3 capturing, 4 captured. failure: last
+   failed capture reason for result_session, cleared by the next capture.
+   flags: 1 supported, 2 eligible, 4 calibration present, 8 controller matches,
+   16 native hand shown, 32 calibrated target recently applied. */
+typedef struct {
+    uint32_t version, size;
+    uint64_t session, result_session;
+    uint32_t phase, reason, samples, required_samples, flags;
+    float translation_m, rotation_degrees;
+    uint32_t failure;
+} SVLeftWristState;
+_Static_assert(sizeof(SVLeftWristState) == 56, "SVLeftWristState ABI layout must match Rust");
+typedef struct {
+    uint32_t version, size;
+    uint64_t controller;
+    uint32_t bone_count;
+    uint16_t hand, aux;
+    uint32_t samples;
+    float forearm_m;
+    float hand_from_aux[12], grip_from_hand[12];
+} SVLeftWristCalibration;
+_Static_assert(sizeof(SVLeftWristCalibration) == 128, "SVLeftWristCalibration ABI layout must match Rust");
+/* Product and fixed-hand identity of the current left Sense controller; 0 none. */
+int32_t sv_xr_left_wrist_controller_v1(uint64_t identity);
+/* Opening suspends left arm requests so GTA's own left hand is shown. */
+uint64_t sv_xr_left_wrist_open_v1(void);
+int32_t sv_xr_left_wrist_capture_v1(uint64_t session);
+int32_t sv_xr_left_wrist_close_v1(uint64_t session);
+/* Reading state is the open card's heartbeat. */
+int32_t sv_xr_left_wrist_state_v1(SVLeftWristState *state, uint32_t byte_size);
+int32_t sv_xr_left_wrist_export_v1(SVLeftWristCalibration *calibration, uint32_t byte_size);
+/* NULL clears the calibration and returns to position-only left tracking. */
+int32_t sv_xr_left_wrist_import_v1(const SVLeftWristCalibration *calibration, uint32_t byte_size);
 
 #endif

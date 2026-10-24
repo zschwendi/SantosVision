@@ -223,7 +223,21 @@ impl Reencode for Hook{type Error=anyhow::Error;
         let mut exports=ExportSection::new();exports.export("slice",ExportKind::Func,calls.len()as u32);m.section(&exports);
         struct Map(Vec<u32>);impl Reencode for Map{type Error=anyhow::Error;fn function_index(&mut self,i:u32)->Result<u32,Error<Self::Error>>{self.0.iter().position(|c|*c==i).map(|p|p as u32).ok_or(Error::UserError(anyhow::anyhow!("slice call outside map")))}}
         let mut map=Map(calls.iter().map(|c|c.0).collect());let mut f=map.new_function_with_parsed_locals(body).map_err(|e|anyhow::anyhow!("{e:?}"))?;
-        for op in prologue{f.instruction(op);}for op in ops{f.instruction(&map.instruction(op).map_err(|e|anyhow::anyhow!("{e:?}"))?);}for op in epilogue{f.instruction(op);}
+        for op in prologue{f.instruction(op);}
+        for op in ops{
+            // A slice has no original table. Each call_indirect becomes an
+            // explicit type-shaped stub (drops, zero results); callers must
+            // prove the executed path never reaches one.
+            if let O::CallIndirect{type_index,..}=op{
+                let t=info.types.get(type_index as usize).context("slice indirect type")?;
+                for _ in 0..=t.params().len(){f.instruction(&Instruction::Drop);}
+                for r in t.results(){f.instruction(&match r{wasmparser::ValType::I32=>Instruction::I32Const(0),wasmparser::ValType::I64=>Instruction::I64Const(0),
+                    wasmparser::ValType::F32=>Instruction::F32Const(0f32.into()),wasmparser::ValType::F64=>Instruction::F64Const(0f64.into()),_=>anyhow::bail!("slice indirect result type")});}
+                continue;
+            }
+            f.instruction(&map.instruction(op).map_err(|e|anyhow::anyhow!("{e:?}"))?);
+        }
+        for op in epilogue{f.instruction(op);}
         let mut code=CodeSection::new();code.function(&f);m.section(&code);let wasm=m.finish();wasmparser::Validator::new().validate_all(&wasm).context("slice validation")?;
         Ok(Slice{wasm,seam:prologue.len()+seam-first,calls})
     }

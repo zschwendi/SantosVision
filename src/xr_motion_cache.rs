@@ -73,6 +73,8 @@ pub(super) fn host_hook(caller:&mut wasmtime::Caller<'_,crate::HostState>,params
     anyhow::ensure!(params.len()==4&&results.is_empty(),"native cache import ABI mismatch");let mut observation=Observation("scope_or_tls");
     let(Val::I64(weapon),Val::I64(temporary),Val::I64(tls),Val::I32(first))=(&params[0],&params[1],&params[2],&params[3])else{anyhow::bail!("native cache argument type mismatch")};
     if !scope_ready()||*first!=1||*tls==0||crate::guest_call_scope::producer_store_lifetime(caller.data())==0{return Ok(());}
+    // Post-IK point for the left calibration card's native-hand observation.
+    super::left_wrist::observe(&Guest(mem));
     //28266 allocates exactly64B at global SP into local3 for this muzzle.
     observation.0="original_stack_matrix_identity";if active_stack(caller)!=Some(*temporary as u64){return Ok(());}
     observation.0="fresh_primary_missing";let Some(primary)=crate::xr_motion_aim::native_ray_primary()else{return Ok(());};

@@ -145,7 +145,7 @@ impl Arms{
     }
 }
 
-#[cfg(test)]mod tests{
+#[cfg(test)]pub(crate) mod tests{
     use super::*;
     fn fixture()->(Vec<u8>,Config){
         use wasm_encoder::*;
@@ -178,6 +178,9 @@ impl Arms{
         for op in ops{iterate.instruction(&op);}code.function(&iterate);m.section(&code);
         (m.finish(),Config{pre:4,iterate:5,predicate:0,request:1,convert:2,sp:0,tls:1,pre_ordinal:6,target_ordinal})
     }
+    /// The real instrumented fixture for layered factory tests: imports
+    /// predicate0 request1(native stand-in) convert2 event3, hooks4..6, pre7.
+    pub(crate) fn instrumented_fixture()->Vec<u8>{let(bytes,config)=fixture();instrument(&bytes,config,None).unwrap()}
     #[test]fn executable_request_order_private_target_native_blend_and_false_fallback(){
         use std::sync::{Arc,Mutex,atomic::{AtomicBool,Ordering}};
         use wasmtime::{Config as EngineConfig,Engine,Linker,Store,SharedMemory,MemoryTypeBuilder};

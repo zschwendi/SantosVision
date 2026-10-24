@@ -390,6 +390,7 @@ struct SantosSettingsView: View {
                         .disabled(!runtime.canChangePlaySettings)
                     Text("Adjusts the right stick's look speed. GTA's own mouse sensitivity also applies.")
                         .font(.caption).foregroundStyle(.secondary)
+                    LeftWristCalibrationSettingsRow(model: runtime.leftWrist) { dismiss() }
                     Text("DualSense: click the touchpad to change camera. Sense: click both sticks together to change camera; in first person, hold L2 and click R3 to toggle sights. Left stick always moves; its click is normal L3. Use the Phone button and its arrow pad for the phone. Look at a native button and press either Sense trigger to select it. Start opens GTA's own pause menu in the game window, with Los Santos settings and Quit beside it. In GTA Settings: stick moves, Cross selects, Circle goes back, L1/R1 change tabs, Square applies and Triangle is GTA's Tab. GTA keys: Enter ✕, Backspace ○, Space □, Tab △, Q/E L1/R1.")
                         .font(.caption).foregroundStyle(.secondary)
                 }
@@ -423,6 +424,7 @@ struct SantosSettingsView: View {
             }
             .navigationTitle("Settings")
             .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Done") { dismiss() } } }
+            .onAppear { runtime.leftWrist.refresh() }
         }
         .frame(width: 560, height: 540)
         .tint(SantosTheme.accent)

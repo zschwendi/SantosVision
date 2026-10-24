@@ -26,6 +26,22 @@ final class SpatialGamepadInput {
         }
     }
 
+    /// Product and fixed-hand identity of the single resolved left Sense
+    /// controller for the left-hand calibration. GameController exposes no
+    /// persistent per-unit serial; 0 means absent or ambiguous.
+    func leftControllerIdentity() -> UInt64 {
+        let connected = GCController.controllers()
+        let lefts = accessories.filter { $0.value.inherentChirality == .left }
+            .compactMap { entry in connected.first { ObjectIdentifier($0) == entry.key } }
+        guard lefts.count == 1, let controller = lefts.first else { return 0 }
+        var hash: UInt64 = 0xcbf2_9ce4_8422_2325
+        for byte in "\(controller.productCategory)|\(controller.vendorName ?? "")|left".utf8 {
+            hash ^= UInt64(byte)
+            hash &*= 0x0000_0100_0000_01b3
+        }
+        return hash == 0 ? 1 : hash
+    }
+
     func start() {
         guard observations.isEmpty else { return }
         for name in [Notification.Name.GCControllerDidConnect, .GCControllerDidDisconnect] {

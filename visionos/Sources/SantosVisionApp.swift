@@ -42,14 +42,18 @@ struct SantosVisionApp: App {
             runtime.setActive(phase == .active)
             #if SV_GAME_RUNTIME
             if phase == .active { restoreGameWindowIfRequested(); updateControlsWindow() }
+            updateLeftWristReadiness()
             #endif
         }
         #if SV_GAME_RUNTIME
         .onChange(of: gameScenes.policy.serial) { _, _ in restoreGameWindowIfRequested() }
-        .onChange(of: runtime.gameControlsVisible) { _, _ in updateControlsWindow() }
-        .onChange(of: runtime.gtaPauseMenuOpen) { _, _ in updateControlsWindow() }
+        .onChange(of: runtime.gameControlsVisible) { _, _ in updateControlsWindow(); updateLeftWristReadiness() }
+        .onChange(of: runtime.gtaPauseMenuOpen) { _, _ in updateControlsWindow(); updateLeftWristReadiness() }
         .onChange(of: runtime.pauseControlsFollowGame) { _, _ in updateControlsWindow() }
-        .onChange(of: world.isImmersiveActive) { _, _ in updateControlsWindow() }
+        .onChange(of: world.isImmersiveActive) { _, _ in updateControlsWindow(); updateLeftWristReadiness() }
+        .onChange(of: world.hasPresentedFrames) { _, _ in updateLeftWristReadiness() }
+        .onChange(of: gameScenes.pending) { _, _ in updateLeftWristReadiness() }
+        .onChange(of: runtime.leftWristCardVisible) { _, _ in updateControlsWindow() }
         #endif
 
         ImmersiveSpace(id: DiagnosticModel.spaceID) {
@@ -108,11 +112,19 @@ struct SantosVisionApp: App {
         // During the verified game's pause-open grace, wait for its own menu
         // before creating an app-only controls scene.
         if runtime.gameControlsVisible, runtime.pauseControlsFollowGame { return }
-        let needed = runtime.gameControlsVisible && world.isImmersiveActive
+        let needed = (runtime.gameControlsVisible || runtime.leftWristCardVisible) && world.isImmersiveActive
         guard needed != controlsWindowRequested else { return }
         controlsWindowRequested = needed
         if needed { openWindow(id: "game-controls") }
         else { dismissWindow(id: "game-controls") }
+    }
+
+    /// The calibration card needs actual immersive frames with GTA in play: no
+    /// GTA pause menu, no Start panel and no pending window return. Losing
+    /// this gate (Crown, Window, GTA pause) closes an open card.
+    private func updateLeftWristReadiness() {
+        runtime.leftWrist.setImmersiveReady(scenePhase == .active && !runtime.isQuitting && world.isImmersiveActive
+            && world.hasPresentedFrames && !gameScenes.pending && !runtime.gtaPauseMenuOpen && !runtime.gameControlsVisible)
     }
 
     /// App owns scene operations for the whole transition. The source window

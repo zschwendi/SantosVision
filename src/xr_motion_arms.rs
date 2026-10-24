@@ -9,8 +9,12 @@ mod cached;
 mod trace;
 #[path="xr_viewmodel.rs"]
 mod viewmodel;
+#[path="xr_left_wrist.rs"]
+mod left_wrist;
 
 pub const IMPORT_MODULE: &str = "muguet_motion_arms_v1";
+/// Opted-in left-wrist artifact: host-chosen native38506 flags for the left request.
+pub const LEFT_REQUEST_FLAGS_IMPORT: &str = "left_request_flags";
 const MAX_AGE: Duration = Duration::from_millis(150);
 const MANAGER_VTABLE:u64=5_169_184;
 const SOLVER_VTABLE:u64=5_169_304;
@@ -49,11 +53,15 @@ pub(crate) fn reticle_native_fallback_active()->bool{native_fallback_active()&&!
 // Visual IK eligibility is separate from firing authority. The render-stage
 // cached gun_muzzle branch cannot borrow the physical root's ray certificate.
 #[derive(Clone,Copy,Debug,PartialEq,Eq)]
-enum PoseCapability{PhysicalRootRay,CachedMuzzlePose,GripPosition}
+enum PoseCapability{PhysicalRootRay,CachedMuzzlePose,GripPosition,CalibratedLeftWrist}
 impl PoseCapability{
     fn ray_qualified(self)->bool{self==Self::PhysicalRootRay}
     fn full_pose(self)->bool{self!=Self::GripPosition}
-    fn name(self)->&'static str{match self{Self::PhysicalRootRay=>"qualified physical root ray",Self::CachedMuzzlePose=>"cached gun_muzzle visual pose only",Self::GripPosition=>"native wrist; tracked grip translation only"}}
+    fn name(self)->&'static str{match self{Self::PhysicalRootRay=>"qualified physical root ray",Self::CachedMuzzlePose=>"cached gun_muzzle visual pose only",Self::GripPosition=>"native wrist; tracked grip translation only",
+        Self::CalibratedLeftWrist=>"calibrated grip-to-native-hand full pose; native flags256"}}
+    /// The live left attachment qualifies only the position-only rig; the
+    /// calibrated pose is a lease property, never a weapon/ray capability.
+    fn attachment(self)->Self{if self==Self::CalibratedLeftWrist{Self::GripPosition}else{self}}
 }
 #[derive(Clone)]struct WeaponInput{token:u32,generation:(u64,u64,u64),tracking:u64,weapon:[f32;16],capability:PoseCapability,at:Instant}
 pub(crate) fn invalidate_inputs(){LEASES.lock().unwrap_or_else(|p|p.into_inner()).clear();*INPUT.lock().unwrap_or_else(|p|p.into_inner())=None;*LEFT_INPUT.lock().unwrap_or_else(|p|p.into_inner())=None;*SUPPORT.lock().unwrap_or_else(|p|p.into_inner())=None;cached::invalidate();STATUS.store(0,Ordering::Relaxed);}
@@ -66,7 +74,7 @@ pub fn status_json()->serde_json::Value{
         "right_input_generation":input.as_ref().map(|i|serde_json::json!({"view_epoch":i.generation.0,"camera_sequence":i.generation.1,"hand_sequence":i.generation.2,"tracking_epoch":i.tracking,"age_ms":i.at.elapsed().as_millis()})),
         "right_pose_capability":input.as_ref().map(|i|i.capability.name()),
         "right_tracked_ray_qualified":input.as_ref().is_some_and(|i|i.capability.ray_qualified()&&i.at.elapsed()<=MAX_AGE),
-        "left_orientation_policy":"native wrist; tracked grip translation only","unsupported_weapon_native_fallback":native_fallback_active(),"last_unsupported_weapon":unsupported,
+        "left_orientation_policy":left_wrist::policy_name(),"left_wrist_calibration":left_wrist::status(),"unsupported_weapon_native_fallback":native_fallback_active(),"last_unsupported_weapon":unsupported,
         "right_input_state":match STATUS.load(Ordering::Relaxed){0=>"inactive",1=>"waiting for qualified request and exact tracking packet",2=>"native target accepted; waiting for weapon pose agreement",3=>"actual weapon ray ready",5=>"visual target accepted; cached muzzle uses native firing",_=>"live weapon or packet qualification pending"},
         "pose_agreement_translation_m":0.03,"pose_agreement_rotation_degrees":3,"ray_is_impact":false,"hook_diagnostics":audit,"native_cached_ray":cached::status(),"geometry_observations":trace::status(),"first_person_viewmodel":viewmodel::status()})
 }
@@ -119,7 +127,9 @@ pub(crate) fn camera_frame_for_candidate(c:&CameraCandidate)->Option<[f32;16]>{
 
 #[derive(Clone)]
 struct Lease {token:u32,arm:u32,generation:(u64,u64,u64), tracking:u64, hand:[f32;16],
-    attachment:[f32;16], chain:[f32;16], muzzle:Option<[f32;16]>,capability:PoseCapability,bones:(u16,u16), at:Instant, committed:bool}
+    attachment:[f32;16], chain:[f32;16], muzzle:Option<[f32;16]>,capability:PoseCapability,bones:(u16,u16), at:Instant, committed:bool,
+    /// Native38506 request flags: right 256; left 0, or 256 only when calibrated.
+    flags:u32}
 #[derive(Default)]
 pub struct StoreState {pending:Vec<(u32,u64)>,touched:Vec<(u64,u32,Instant)>,cache_touched:Vec<(u64,u64,Instant)>,sequence:u64,depth:u64,pub requests:u64,pub applied:u64,pub fallback:u64}
 pub struct BoundaryPrefix{floor:u64,depth:u64}
@@ -333,6 +343,8 @@ pub(crate) fn host_hook(caller:&mut wasmtime::Caller<'_,crate::HostState>,name:&
             let guest=Guest(mem);let local=observed_local_ped(&guest).and_then(|p|p.checked_add(3888))==Some(manager_pointer);
             let mut audit=HookObservation::new(arm,true,local,first);audit.gate="request_stack_dt_or_tls";
             let dt=params[1].f32().unwrap_or(f32::NAN);if !dt.is_finite()||dt<=0.||tls==0||active_stack(caller)!=Some(position){return Ok(());}
+            // An open calibration card shows GTA's own left hand: no left request.
+            if arm==0&&left_wrist::suspends_left_requests(){audit.gate="left_calibration_shows_native_hand";return Ok(());}
             audit.gate="camera_scope_or_exact_tracking";let Some(candidate)=current_arm(first,arm)else{return Ok(())};audit.qualified=true;let mut read=Snapshot::new(&guest);
             STATUS.store(1,Ordering::Relaxed);
             audit.gate="local_manager_skeleton_or_native_branch";
@@ -344,7 +356,11 @@ pub(crate) fn host_hook(caller:&mut wasmtime::Caller<'_,crate::HostState>,name:&
                 if arm==1{if let Some(observed)=weapon_support_observation(&mut read,ped,bone as u16).filter(|o|!o.supported){if read.unchanged(){audit.gate="unsupported_native_weapon";*SUPPORT.lock().unwrap_or_else(|p|p.into_inner())=Some((false,candidate.generation().0,Instant::now()));*LAST_UNSUPPORTED.lock().unwrap_or_else(|p|p.into_inner())=Some((observed,candidate.generation().0,Instant::now()));}}}return Ok(());
             };
             audit.gate="desired_hand_or_left_grip";
-            let hand=match &candidate{ArmSource::Right(c)=>{let Some(h)=desired_attachment_hand(c,&attachment)else{return Ok(())};h},ArmSource::Left(c)=>{let mut h=identity();let g=multiply(&c.game_from_stage,&c.stage_from_grip);h[12..15].copy_from_slice(&g[12..15]);h}};
+            let(hand,capability,flags)=match &candidate{ArmSource::Right(c)=>{let Some(h)=desired_attachment_hand(c,&attachment)else{return Ok(())};(h,attachment.capability,256)},
+                ArmSource::Left(c)=>{let g=multiply(&c.game_from_stage,&c.stage_from_grip);
+                    let rig=read.u32(skel+32).map(|bone_count|left_wrist::Rig{bone_count,hand:attachment.hand,aux:attachment.bone,hand_from_aux:attachment.k});
+                    match rig.and_then(|rig|left_wrist::calibrated_hand(&g,&rig)){Some(h)=>(h,PoseCapability::CalibratedLeftWrist,256),
+                        None=>{let mut h=identity();h[12..15].copy_from_slice(&g[12..15]);(h,attachment.capability,0)}}}};
             audit.gate="request_snapshot_or_generation_changed";if !read.unchanged()||current_arm(first,arm).is_none_or(|c|c.generation()!=candidate.generation()){return Ok(());}
             // A cached fallback decision requires the same stable snapshot as
             // posing. Never publish native fallback from a changing bank/read.
@@ -358,10 +374,20 @@ pub(crate) fn host_hook(caller:&mut wasmtime::Caller<'_,crate::HostState>,name:&
             let mut leases=LEASES.lock().unwrap_or_else(|p|p.into_inner());leases.retain(|l|l.at.elapsed()<=MAX_AGE);
             if leases.len()>=64{leases.pop_front();}
             leases.push_back(Lease{token,arm,generation:candidate.generation(),tracking:candidate.tracking(),hand,
-                attachment:attachment.a,chain:attachment.k,muzzle:attachment.muzzle,capability:attachment.capability,bones:(attachment.hand,attachment.bone),at:Instant::now(),committed:false});
+                attachment:attachment.a,chain:attachment.k,muzzle:attachment.muzzle,capability,bones:(attachment.hand,attachment.bone),at:Instant::now(),committed:false,flags});
             audit.gate="boundary_journal_capacity";if !caller.data_mut().motion_arms.touch(token){leases.retain(|l|l.token!=token);return Ok(());}
             caller.data_mut().motion_arms.pending.push((token,tls));caller.data_mut().motion_arms.requests+=1;results[0]=Val::I64(token as i64);
+            if arm==0{left_wrist::note_left_request(token);}
             audit.gate="requested";
+        },
+        // Opted-in left-wrist artifact only: the flags the host chose for this
+        // exact pending left request are passed to native38506.
+        "left_request_flags"=>{
+            anyhow::ensure!(params.len()==2&&results.len()==1,"native left flags ABI mismatch");results[0]=Val::I32(0);
+            let(token,tls)=(arg(0)? as u32,arg(1)?);
+            if caller.data().motion_arms.pending.last()!=Some(&(token,tls)){return Ok(());}
+            let flags=LEASES.lock().unwrap_or_else(|p|p.into_inner()).iter().find(|l|l.token==token&&l.arm==0&&!l.committed).map_or(0,|l|l.flags);
+            results[0]=Val::I32(flags as i32);
         },
         "request_complete"=>{
             anyhow::ensure!(params.len()==2&&results.is_empty(),"native arm completion ABI mismatch");let(token,tls)=(arg(0)? as u32,arg(1)?);
@@ -382,18 +408,20 @@ pub(crate) fn host_hook(caller:&mut wasmtime::Caller<'_,crate::HostState>,name:&
             let mut read=Snapshot::new(&guest);audit.gate="local_manager_skeleton_or_native_branch";
             let Some(ped)=read.u64(solver+480)else{return Ok(())};let Some((owner,skel))=manager(&mut read,ped.saturating_add(3888))else{return Ok(())};
             audit.gate="native_solver_request_identity";if ped!=owner||passed!=skel||resolved!=skel||read.u64(solver)!=Some(SOLVER_VTABLE)||read.u64(ped+3888+272)!=Some(solver)
-                ||goal!=solver+32+96*arm||request!=solver+224+128*arm||read.u64(request+80)!=Some(0)||read.u32(request+112)!=Some(if arm==1{256}else{0}){return Ok(());}
+                ||goal!=solver+32+96*arm||request!=solver+224+128*arm||read.u64(request+80)!=Some(0)||!read.u32(request+112).is_some_and(|f|f==256||(arm==0&&f==0)){return Ok(());}
+            if arm==0&&left_wrist::suspends_left_requests(){audit.gate="left_calibration_shows_native_hand";return Ok(());}
             audit.gate="request_cookie_absent";let Some(token)=read.u32(request+12).and_then(decode_cookie)else{return Ok(())};
             audit.gate="target_cookie_mismatch";
             if read.u32(target+60)!=Some(cookie(token)){return Ok(());}
             let lease=LEASES.lock().unwrap_or_else(|p|p.into_inner()).iter().find(|l|l.token==token).cloned();
             audit.gate="request_lease_uncommitted_stale_or_different_generation";let Some(lease)=lease.filter(|l|l.arm==arm as u32&&l.committed&&l.generation==candidate.generation()&&l.tracking==candidate.tracking()&&l.at.elapsed()<=MAX_AGE)else{return Ok(())};
+            audit.gate="native_request_flags_differ_from_lease";if read.u32(request+112)!=Some(lease.flags){return Ok(());}
             audit.gate="native_goal_bone_interval";let Some((hand,bone))=read.u16(goal+72).zip(read.u16(goal+78))else{return Ok(())};
             let Some((upper,end))=read.u16(goal+76).zip(read.u16(goal+88))else{return Ok(())};
             if (hand,bone)!=lease.bones||bone<=upper||bone>=end||read.u32(skel+32).is_none_or(|n|u32::from(end)>n){return Ok(());}
             audit.gate="live_attachment_or_bone_chain";let Some(a)=arm_attachment(&mut read,ped,skel,arm as u32,hand,bone)else{return Ok(())};
             audit.gate="attachment_or_chain_changed_since_request";
-            if a.a!=lease.attachment||!close(&a.k,&lease.chain)||a.capability!=lease.capability
+            if a.a!=lease.attachment||!close(&a.k,&lease.chain)||a.capability!=lease.capability.attachment()
                 ||match(a.muzzle,lease.muzzle){(Some(a),Some(b))=>!close(&a,&b),(None,None)=>false,_=>true}{return Ok(());}
             audit.gate="native_request_position_changed";for i in 0..3{if read.u32(request+i as u64*4)!=Some(lease.hand[12+i].to_bits()){return Ok(());}}
             audit.gate="native_reference_transform_mismatch";
@@ -415,7 +443,8 @@ pub(crate) fn host_hook(caller:&mut wasmtime::Caller<'_,crate::HostState>,name:&
             *INPUT.lock().unwrap_or_else(|p|p.into_inner())=Some(WeaponInput{token:lease.token,generation:lease.generation,tracking:lease.tracking,weapon,capability:lease.capability,at:Instant::now()});
             if lease.capability.ray_qualified(){if let ArmSource::Right(c)=&candidate{crate::xr_motion_aim::accept_native_arm_input(c);}}
             STATUS.store(if lease.capability.ray_qualified(){2}else{5},Ordering::Relaxed);
-            }else{*LEFT_INPUT.lock().unwrap_or_else(|p|p.into_inner())=Some((token,lease.generation,Instant::now()));}
+            }else{*LEFT_INPUT.lock().unwrap_or_else(|p|p.into_inner())=Some((token,lease.generation,Instant::now()));
+                if lease.capability==PoseCapability::CalibratedLeftWrist{left_wrist::note_calibrated_applied();}}
             caller.data_mut().motion_arms.applied+=1;
             audit.gate="applied";
         },
@@ -522,7 +551,7 @@ pub(crate) fn host_hook(caller:&mut wasmtime::Caller<'_,crate::HostState>,name:&
     #[test]fn failed_boundary_discards_uncommitted_and_committed_child_leases(){let mut s=StoreState::default();let root=s.boundary_prefix();s.pending.push((1,7));s.touch(1);let p=s.boundary_prefix();s.pending.push((2,7));s.touch(2);s.touch(3);s.recover_boundary(&p);assert!(s.pending.is_empty());assert_eq!(s.touched.len(),1);s.recover_boundary(&root);assert!(s.pending.is_empty());}
     #[test]fn successful_child_then_failed_outer_revokes_committed_and_applied_values(){
         let mut state=StoreState::default();let outer=state.boundary_prefix();let inner=state.boundary_prefix();let token=0x7e1234;
-        let c=candidate();let lease=Lease{token,arm:1,generation:generation(&c),tracking:c.tracking_epoch,hand:identity(),attachment:identity(),chain:identity(),muzzle:None,capability:PoseCapability::PhysicalRootRay,bones:(5,6),at:Instant::now(),committed:true};
+        let c=candidate();let lease=Lease{token,arm:1,generation:generation(&c),tracking:c.tracking_epoch,hand:identity(),attachment:identity(),chain:identity(),muzzle:None,capability:PoseCapability::PhysicalRootRay,bones:(5,6),at:Instant::now(),committed:true,flags:256};
         LEASES.lock().unwrap().push_back(lease);*INPUT.lock().unwrap()=Some(WeaponInput{token,generation:generation(&c),tracking:c.tracking_epoch,weapon:identity(),capability:PoseCapability::PhysicalRootRay,at:Instant::now()});
         state.touch(token);state.finish_boundary(&inner);assert_eq!(state.touched.len(),1);state.recover_boundary(&outer);
         assert!(!LEASES.lock().unwrap().iter().any(|l|l.token==token));assert!(INPUT.lock().unwrap().is_none());assert_eq!(state.depth,0);

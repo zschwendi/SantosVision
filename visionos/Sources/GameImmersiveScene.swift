@@ -52,16 +52,22 @@ struct ImmersiveGameControls: View {
 
     var body: some View {
         VStack(spacing: 14) {
-            Text("Los Santos").font(.title3.bold())
-            SantosPauseControls(runtime: runtime,
-                windowAction: {
-                    gameScenes.requestReturn(generation: world.sceneGeneration, reason: "player_requested_window")
-                    // Window resumes play in the window; an app-only modal
-                    // panel must not keep the controller after the return.
-                    if !runtime.pauseControlsFollowGame { runtime.gameControlsVisible = false }
-                }, immersive: true)
-            if !world.hasPresentedFrames {
-                Text(world.status).font(.caption).foregroundStyle(.secondary)
+            if runtime.leftWristCardVisible, !runtime.gameControlsVisible {
+                // The same single controls window hosts the temporary
+                // calibration card; no new scene is created for it.
+                LeftWristCalibrationCard(model: runtime.leftWrist)
+            } else {
+                Text("Los Santos").font(.title3.bold())
+                SantosPauseControls(runtime: runtime,
+                    windowAction: {
+                        gameScenes.requestReturn(generation: world.sceneGeneration, reason: "player_requested_window")
+                        // Window resumes play in the window; an app-only modal
+                        // panel must not keep the controller after the return.
+                        if !runtime.pauseControlsFollowGame { runtime.gameControlsVisible = false }
+                    }, immersive: true)
+                if !world.hasPresentedFrames {
+                    Text(world.status).font(.caption).foregroundStyle(.secondary)
+                }
             }
         }
         .padding(18)

@@ -212,6 +212,11 @@ final class NativeRuntimeModel: ObservableObject {
     let saveRoot: URL
     let reportURL: URL
     let cloudSaves: CloudSaveModel
+    /// Explicit left grip-to-native-hand calibration (Settings action + card).
+    let leftWrist = LeftWristCalibrationModel()
+    /// Mirrors the card so scenes and modal ownership react to it.
+    @Published private(set) var leftWristCardVisible = false
+    private var leftWristObservation: AnyCancellable?
     @Published private(set) var isQuitting = false
     private var didBootstrap = false
     private var polling: Task<Void, Never>?
@@ -283,6 +288,11 @@ final class NativeRuntimeModel: ObservableObject {
         }
         if let device = MTLCreateSystemDefaultDevice() { recordMetalCapabilities(device) }
         SpatialGamepadInput.shared.start()
+        leftWristObservation = leftWrist.$flow.map(\.cardVisible).removeDuplicates().dropFirst().sink { [weak self] visible in
+            guard let self else { return }
+            self.leftWristCardVisible = visible
+            self.updateNativeControlsOwnership()
+        }
         if !isLinked { status = "This build contains the native immersive tracking test. Build game mode to link the GTA engine." }
     }
 
@@ -381,6 +391,7 @@ final class NativeRuntimeModel: ObservableObject {
         recordReport()
         if hasStarted {
             await cloudSaves.gameplayStarted()
+            leftWrist.engineStarted()
             activeReturnCode = NativeRuntime.setActive(isActive)
             configureCaptures()
             startPolling()
@@ -518,7 +529,9 @@ final class NativeRuntimeModel: ObservableObject {
     }
 
     private var nativeControlsModal: Bool {
-        nativeSettingsPresented || (gameControlsVisible && !pauseControlsFollowGame)
+        // The calibration card blocks gameplay input like the app pause panel;
+        // pad.rs then withholds Start/Escape from GTA as well.
+        nativeSettingsPresented || leftWristCardVisible || (gameControlsVisible && !pauseControlsFollowGame)
     }
 
     private func updateNativeControlsOwnership() {
@@ -554,6 +567,10 @@ final class NativeRuntimeModel: ObservableObject {
                 self.nativeControlsSelection = event.selection
                 if self.nativeSettingsPresented {
                     if event.dismiss { self.nativeSettingsPresented = false }
+                } else if self.leftWristCardVisible, !self.gameControlsVisible {
+                    // Circle or Start cancels the card; Confirm is only a real
+                    // gaze/trigger hit on its button.
+                    if event.dismiss { self.leftWrist.cancel() }
                 } else if event.dismiss {
                     self.performPauseAction(.resume)
                 } else {
