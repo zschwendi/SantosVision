@@ -73,7 +73,8 @@ A real fix would need a separate qualified factory with post-release joins in bo
 - clear;
 - unqualified: 20 or more frames, or a nameless frame.
 
-Delivery itself is unchanged. Root will add `"mailbox": crate::host::mailbox_status_json(),` to `native::sv_runtime_status`.
+Delivery itself is unchanged. Native runtime status includes `mailbox` through
+`host::mailbox_status_json()`; the app report retains that native status.
 
 `notifications=0` and `deliveries=0` on one run means only that **this host-delivery path (import73 → pending set → `_emscripten_check_mailbox`) did not occur on that run**. It says nothing about the separate atomic-notify branch, which the host cannot see. It neither excludes nor explains any other cold-start failure. A nonzero value means an assumption failed for that build or run.
 
