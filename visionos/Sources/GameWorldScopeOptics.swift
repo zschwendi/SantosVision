@@ -152,7 +152,7 @@ enum GameWorldScopeOptics {
         func failure(_ reason: String) -> ProjectionAdmission {
             .init(passed: false, reason: reason, maximumRayError: .infinity, maximumDepthError: .infinity)
         }
-        guard guardScale.isFinite, (1...1.35).contains(guardScale),
+        guard guardScale.isFinite, GameWorldSourceGuardBand.allowedScales.contains(guardScale),
               finitePerspective(source),
               let optical = projection(retainedPhysical, optics: optics) else { return failure("invalid_projection") }
         var target = optical

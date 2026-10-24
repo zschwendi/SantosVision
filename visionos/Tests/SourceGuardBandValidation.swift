@@ -22,7 +22,7 @@ struct SourceGuardBandValidation {
             let canonical = conversion.matrix
             precondition(GameWorldSourceGuardBand.projection(original, scale: 1)! == canonical)
             let inverse = original.inverse
-            for scale: Float in [1.05, 1.1, 1.2, 1.3, 1.35] {
+            for scale: Float in [1.05, 1.1, 1.2, 1.3, 1.35, 1.75, 2, 3] {
                 let source = GameWorldSourceGuardBand.projection(original, scale: scale)!
                 precondition(source[2][2] == canonical[2][2] && source[3][2] == canonical[3][2])
                 for zi in 0...10 {
@@ -44,14 +44,14 @@ struct SourceGuardBandValidation {
                 }
             }
         }
-        for value in ["", "nan", "inf", "0.9", "1.36", "garbage"] {
+        for value in ["", "nan", "inf", "0.9", "3.01", "garbage"] {
             precondition(GameWorldSourceGuardBand.resolveScale(["MUGUET_XR_SOURCE_GUARD_BAND": value]) == 1.3)
         }
         precondition(GameWorldSourceGuardBand.resolveScale([:]) == 1.3)
         precondition(GameWorldSourceGuardBand.resolveScale(["MUGUET_XR_SOURCE_GUARD_BAND": "1"]) == 1)
         precondition(GameWorldSourceGuardBand.resolveScale(["MUGUET_XR_SOURCE_GUARD_BAND": "1.1"]) == 1.1)
         precondition(GameWorldSourceGuardBand.resolveScale(["MUGUET_XR_SOURCE_GUARD_BAND": "1.35"]) == 1.35)
-        for scale: Float in [.nan, .infinity, 0.9, 1.36] {
+        for scale: Float in [.nan, .infinity, 0.9, 3.01] {
             precondition(GameWorldSourceGuardBand.projection(physical, scale: scale) == nil)
         }
         var oblique = physical; oblique[0][2] = 0.01
@@ -62,7 +62,7 @@ struct SourceGuardBandValidation {
         for required: Float in [1.190764, 1.275312] {
             precondition(required < GameWorldSourceGuardBand.defaultScale)
         }
-        print("PASS: \(checked) source coverage/depth rays, default 1.30 margin, explicit identity override, asymmetric frusta, invalid configuration and oblique rejection")
+        print("PASS: \(checked) source coverage/depth rays, base 1.30 margin, dynamic scales through3, explicit identity override, asymmetric frusta, invalid configuration and oblique rejection")
         print("Physical capture supplies one eye; the second case mirrors its horizontal asymmetry. No device or latency claim.")
     }
 }

@@ -114,13 +114,14 @@ struct ScopeOpticsValidation {
             for eye in 0..<2 {
                 let vals = (0..<16).map { index in Float(bitPattern: data.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: 96 + eye * 128 + index * 4, as: UInt32.self) }) }
                 let raw = simd_float4x4(columns: (SIMD4(vals[0], vals[1], vals[2], vals[3]), SIMD4(vals[4], vals[5], vals[6], vals[7]), SIMD4(vals[8], vals[9], vals[10], vals[11]), SIMD4(vals[12], vals[13], vals[14], vals[15])))
+                for guardScale: Float in [1.3, 1.75, 2, 3] {
                 var requested = GameWorldProjection.nativePinhole(raw)!.matrix
-                for c in 0..<4 { requested[c][0] /= 1.3; requested[c][1] /= 1.3 }
+                for c in 0..<4 { requested[c][0] /= guardScale; requested[c][1] /= guardScale }
                 for fov: Float in [45, 30, 15, 10, 7.5, 5] {
                     let o = optics(fov)
                     for reversed in [true, false] {
                         let actual = GameWorldScopeOptics.expectedSourceProjection(requested, optics: o, depthReversed: reversed)!
-                        let admission = GameWorldScopeOptics.admitSource(actual, depthReversed: reversed, retainedPhysical: raw, guardScale: 1.3, optics: o)
+                        let admission = GameWorldScopeOptics.admitSource(actual, depthReversed: reversed, retainedPhysical: raw, guardScale: guardScale, optics: o)
                         check(admission.passed, "actual physical AVP calibration retains unchanged admission budget")
                         let display = GameWorldScopeOptics.projection(raw, optics: o)!
                         for c in 0..<4 { check(display[c][2].bitPattern == raw[c][2].bitPattern && display[c][3].bitPattern == raw[c][3].bitPattern, "actual physical calibrated Z/W unchanged") }
@@ -133,6 +134,7 @@ struct ScopeOpticsValidation {
                         } } }
                     }
                 }
+            }
             }
         }
         print("PASS: \(checks) scope optics assertions; pure source/display projection, immutable binocular selection and physical-calibration admission. No game/GPU/headset execution.")

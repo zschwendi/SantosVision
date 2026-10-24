@@ -70,6 +70,8 @@ struct GameWorldLifecycleEvent: Sendable {
     var trackedPose: Bool? = nil
     var requestBytesHex: String? = nil
     var motionTrackingJSON: String? = nil
+    var sourceGuardBandScale: Float? = nil
+    var sourceCoverageSaturated: Bool? = nil
 
     var reportValue: [String: Any] {
         var value: [String: Any] = ["stage": stage, "uptime_seconds": uptime,
@@ -80,7 +82,8 @@ struct GameWorldLifecycleEvent: Sendable {
         if let viewCount { value["view_count"] = viewCount }
         if let trackedPose { value["tracked_pose"] = trackedPose }
         if let requestBytesHex { value["request_bytes_hex"] = requestBytesHex }
-        value["source_guard_band_scale"] = GameWorldSourceGuardBand.configuredScale
+        value["source_guard_band_scale"] = sourceGuardBandScale ?? GameWorldSourceGuardBand.configuredScale
+        if let sourceCoverageSaturated { value["source_coverage_saturated"] = sourceCoverageSaturated }
         if let motionTrackingJSON, let data = motionTrackingJSON.data(using: .utf8),
            let motion = try? JSONSerialization.jsonObject(with: data) {
             value["motion_tracking"] = motion
@@ -454,6 +457,8 @@ final class GameWorldRenderer: @unchecked Sendable {
     private var hudSelectionAttempts: UInt64 = 0
     private var hudSelections: UInt64 = 0
     private var lastHUDGameFrame: UInt64 = 0
+    private var sourceCoverage = GameWorldSourceCoverage()
+    private var sourceCoverageMagnification: Float = 1
     private let depthState: any MTLDepthStencilState
     private let report: @Sendable (GameWorldEvent) -> Void
     private let gpuTiming = ProcessInfo.processInfo.environment["MUGUET_COMPOSITOR_GPU_TIMING"] == "1"
@@ -531,7 +536,7 @@ final class GameWorldRenderer: @unchecked Sendable {
         let adaptiveRequested = RenderingOptimizations.adaptiveMeshEnabled
         let skyFanRequested = RenderingOptimizations.skyFanEnabled
         let skyRequested = GameWorldFiniteSkySupport.requested
-        let skyCompatible = !cornerRequested && !copyRequested && !probeRequested && !adaptiveRequested
+        let skyCompatible = !copyRequested && !probeRequested && !adaptiveRequested
         finiteSkySupport = skyRequested && skyCompatible
             ? GameWorldFiniteSkySupport(device: layer.device, library: library,
                 colorFormat: layer.configuration.colorFormat, depthFormat: layer.configuration.depthFormat) : nil
@@ -675,7 +680,9 @@ final class GameWorldRenderer: @unchecked Sendable {
 
     private func recordLifecycle(_ stage: String, detail: String? = nil,
                                  viewCount: Int? = nil, trackedPose: Bool? = nil,
-                                 requestBytesHex: String? = nil) {
+                                 requestBytesHex: String? = nil,
+                                 sourceGuardBandScale: Float? = nil,
+                                 sourceCoverageSaturated: Bool? = nil) {
         let motionJSON = (try? JSONSerialization.data(withJSONObject: motionTracking.report, options: [.sortedKeys]))
             .flatMap { String(data: $0, encoding: .utf8) }
         report(.lifecycle(GameWorldLifecycleEvent(stage: stage,
@@ -685,7 +692,8 @@ final class GameWorldRenderer: @unchecked Sendable {
             rendererActive: isActive, rendererStopped: isStopped,
             ownsWorldCamera: WorldCameraOwnership.shared.isOwner(sessionToken),
             detail: detail, viewCount: viewCount, trackedPose: trackedPose,
-            requestBytesHex: requestBytesHex, motionTrackingJSON: motionJSON)))
+            requestBytesHex: requestBytesHex, motionTrackingJSON: motionJSON,
+            sourceGuardBandScale: sourceGuardBandScale, sourceCoverageSaturated: sourceCoverageSaturated)))
     }
 
     private func renderLoop() {
@@ -772,7 +780,9 @@ final class GameWorldRenderer: @unchecked Sendable {
             if builtIn, sampleTime >= nextLifecycleSample {
                 nextLifecycleSample = sampleTime + 5
                 recordLifecycle("frame_sample", viewCount: drawable.views.count,
-                                trackedPose: stageFromHead != nil)
+                                trackedPose: stageFromHead != nil,
+                                sourceGuardBandScale: sourceCoverage.scale,
+                                sourceCoverageSaturated: sourceCoverage.saturated)
             }
             var sources: [GameWorldSourceEye] = []
             var drawableLeases: [GameWorldLease] = []
@@ -781,16 +791,21 @@ final class GameWorldRenderer: @unchecked Sendable {
             var singleSource: GameWorldSourceEye?
             var singleSourceEpoch: UInt64?
             if builtIn, let stageFromHead, (1...2).contains(drawable.views.count) {
+                let physicalProjections = drawable.views.indices.map {
+                    drawable.computeProjection(convention: .rightUpBack, viewIndex: $0)
+                }
+                let sourceScale = sourceCoverage.sample(timestamp: timestamp, pose: stageFromHead,
+                    projections: physicalProjections, magnification: sourceCoverageMagnification)
                 let eyes = drawable.views.indices.compactMap { index -> XRRetainedEyeView? in
-                    let physicalProjection = drawable.computeProjection(convention: .rightUpBack, viewIndex: index)
+                    let physicalProjection = physicalProjections[index]
                     // Retain precisely the projection submitted to the game's
                     // scalar camera bridge. Encoding below still uses the full
                     // compositor projection for display-time reprojection.
-                    guard let nativeProjection = GameWorldSourceGuardBand.projection(physicalProjection) else { return nil }
+                    guard let nativeProjection = GameWorldSourceGuardBand.projection(physicalProjection, scale: sourceScale) else { return nil }
                     return XRRetainedEyeView(headFromEye: drawable.views[index].transform,
                                       projectionFromEye: nativeProjection,
                                       physicalProjectionFromEye: physicalProjection,
-                                      sourceGuardBandScale: GameWorldSourceGuardBand.configuredScale)
+                                      sourceGuardBandScale: sourceScale)
                 }
                 if eyes.count != drawable.views.count {
                     motionTracking.invalidate(reason: "Physical projection exceeds the native camera conversion budget")
@@ -894,6 +909,12 @@ final class GameWorldRenderer: @unchecked Sendable {
             let encoded = encode(drawable: drawable, stageFromHead: stageFromHead, sources: sources, pairQualified: pairQualified,
                                  timestamp: timestamp, commands: commands, cornerScratch: &cornerScratch, adaptiveScratch: &adaptiveScratch,
                                  singleSource: singleSource)
+            if builtIn {
+                sourceCoverageMagnification = encoded.displayOptics.magnification
+                for source in sources where source.kind == .actual {
+                    sourceCoverage.observeSourceAge(timestamp - source.presentationTime)
+                }
+            }
             if builtIn, encoded.views == drawable.views.count, !sources.isEmpty {
                 if let first = sources.first, first.kind != .actual {
                     // Probe output: a separate namespace. Never a game presentation, never acknowledged.
