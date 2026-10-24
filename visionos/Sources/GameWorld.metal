@@ -1,6 +1,36 @@
 #include <metal_stdlib>
 using namespace metal;
 
+struct GameWorldHUDUniforms {
+    float4x4 clipFromHead;
+    float2 halfSize;
+    float distance;
+    uint decodeForLinearTarget;
+};
+struct GameWorldHUDVertex { float4 position [[position]]; float2 uv; };
+vertex GameWorldHUDVertex gameWorldHUDVertex(uint id [[vertex_id]],
+        constant GameWorldHUDUniforms &u [[buffer(0)]]) {
+    const float2 corners[4] = { float2(-1,-1), float2(-1,1), float2(1,-1), float2(1,1) };
+    const float2 xy = corners[id];
+    GameWorldHUDVertex out;
+    out.position = u.clipFromHead * float4(xy * u.halfSize, -u.distance, 1);
+    out.uv = float2(xy.x * .5 + .5, .5 - xy.y * .5);
+    return out;
+}
+fragment float4 gameWorldHUDFragment(GameWorldHUDVertex in [[stage_in]],
+        constant GameWorldHUDUniforms &u [[buffer(0)]], texture2d<float> hud [[texture(0)]]) {
+    constexpr sampler s(filter::linear, address::clamp_to_edge);
+    float4 pixel = hud.sample(s, in.uv);
+    const float coverage = clamp(pixel.a, 0.0, 1.0);
+    if (!all(isfinite(pixel)) || coverage <= 0) { discard_fragment(); }
+    if (u.decodeForLinearTarget != 0) {
+        float3 rgb = max(pixel.rgb / max(coverage, 1e-8), 0.0);
+        rgb = select(pow((rgb + .055) / 1.055, float3(2.4)), rgb / 12.92, rgb <= .04045);
+        pixel.rgb = rgb * coverage;
+    }
+    return float4(pixel.rgb, coverage);
+}
+
 struct GameWorldReticleUniforms { float4 clipPosition; float2 halfSizeNDC; float2 padding; };
 struct GameWorldReticleVertex { float4 position [[position]]; float2 local; };
 vertex GameWorldReticleVertex gameWorldReticleVertex(uint id [[vertex_id]],

@@ -154,6 +154,7 @@ private final class GameWorldLease: @unchecked Sendable {
     let sourceProjection: simd_float4x4
     let gameFromEye: simd_float4x4
     let gameFromStage: simd_float4x4
+    let hud: GameWorldHUD.Snapshot?
     private let lock = NSLock()
     private var released = false
 
@@ -185,6 +186,7 @@ private final class GameWorldLease: @unchecked Sendable {
         sourceProjection = projection
         gameFromEye = eyeTransform
         gameFromStage = stageTransform
+        hud = GameWorldHUD.Snapshot(world: native, device: device)
     }
 
     func release() {
@@ -267,7 +269,7 @@ final class CornerScratchPool: @unchecked Sendable {
 private struct GameWorldSourceEye: @unchecked Sendable {
     let kind: GameWorldSourceKind
     let viewIndex: Int
-    let color: any MTLTexture
+    var color: any MTLTexture
     let depth: any MTLTexture
     let width: UInt32
     let height: UInt32
@@ -372,6 +374,7 @@ final class GameWorldRenderer: @unchecked Sendable {
     private let queue: any MTLCommandQueue
     private let pipeline: any MTLRenderPipelineState
     private let reticle: GameWorldReticle?
+    private let hud: GameWorldHUD?
     /// Optional exact corner-depth precompute (MUGUET_COMPOSITOR_CORNER_PRECOMPUTE=1); nil keeps the
     /// single-pass pipeline above. Off by default.
     private let cornerPrecompute: (kernel: any MTLComputePipelineState, pipeline: any MTLRenderPipelineState,
@@ -398,6 +401,9 @@ final class GameWorldRenderer: @unchecked Sendable {
     private let countersLock = NSLock()
     private var adaptiveFanTiles: UInt64 = 0
     private var adaptiveFallbackTiles: UInt64 = 0
+    private var hudSelectionAttempts: UInt64 = 0
+    private var hudSelections: UInt64 = 0
+    private var lastHUDGameFrame: UInt64 = 0
     private let depthState: any MTLDepthStencilState
     private let report: @Sendable (GameWorldEvent) -> Void
     private let gpuTiming = ProcessInfo.processInfo.environment["MUGUET_COMPOSITOR_GPU_TIMING"] == "1"
@@ -455,6 +461,10 @@ final class GameWorldRenderer: @unchecked Sendable {
         cornerPrecompute = precompute
         let copyRequested = environment["MUGUET_COMPOSITOR_SOURCE_ANCHOR_COPY"] == "1"
         let probeRequested = environment["MUGUET_COMPOSITOR_ANCHOR_PROBE"] == "1"
+        hud = !copyRequested && !probeRequested
+            && !ProcessInfo.processInfo.arguments.contains("--sv-world-single-source-stereo")
+            ? GameWorldHUD(device: layer.device, library: library,
+                colorFormat: layer.configuration.colorFormat, depthFormat: layer.configuration.depthFormat) : nil
         // The probe compares mesh against copy, so it needs the copy pipeline even when the
         // game-facing copy flag is off; with the probe on, no game frame reaches either path.
         sourceCopy = copyRequested || probeRequested
@@ -542,7 +552,8 @@ final class GameWorldRenderer: @unchecked Sendable {
         }
         try Task.checkCancellation()
         let acquired: Int32? = stopLock.withLock {
-            stopped ? nil : WorldCameraOwnership.shared.acquire(sessionToken, reticleReady: reticle != nil)
+            stopped ? nil : WorldCameraOwnership.shared.acquire(sessionToken,
+                reticleReady: reticle != nil, hudReady: hud != nil)
         }
         guard let result = acquired else { session.stop(); return }
         recordLifecycle("world_camera_requested", detail: "return_code=\(result)")
@@ -728,7 +739,8 @@ final class GameWorldRenderer: @unchecked Sendable {
                 let viewRequestAccepted = submitViews(drawable: drawable, timestamp: timestamp,
                                                        requestFrame: requestFrame, eyes: eyes)
                 if viewRequestAccepted {
-                    WorldCameraOwnership.shared.refreshReticleReady(sessionToken, ready: reticle != nil)
+                    WorldCameraOwnership.shared.refreshReady(sessionToken,
+                        reticleReady: reticle != nil, hudReady: hud != nil)
                 }
                 if let anchorProbe {
                     // Probe: no native lease is acquired; the analytic pair stands in for the game.
@@ -830,7 +842,8 @@ final class GameWorldRenderer: @unchecked Sendable {
                             headFromEye: view.transform,
                             projection: drawable.computeProjection(convention: .rightUpBack, viewIndex: 0))
                         debugCapture = GameWorldDebugCapture(prefix: debugPrefix, device: layer.device, commands: commands,
-                            color: lease.color, depth: lease.depth,
+                            color: encoded.hudIsolated ? (lease.hud?.worldColor ?? lease.color) : lease.color,
+                            depth: lease.depth,
                             outputColor: drawable.colorTextures[view.textureMap.textureIndex],
                             outputDepth: drawable.depthTextures[view.textureMap.textureIndex],
                             slice: view.textureMap.sliceIndex, viewport: view.textureMap.viewport, native: lease.native,
@@ -838,10 +851,10 @@ final class GameWorldRenderer: @unchecked Sendable {
                             currentEyeFromSourceEye: uniforms.currentEyeFromSourceEye,
                             currentClipFromEye: uniforms.currentClipFromEye,
                             nearFadeDistances: uniforms.nearFadeDistances, timestamp: timestamp,
-                            outputViewIndex: 0, renderingMethod: singleSource == nil
+                            outputViewIndex: 0, renderingMethod: (singleSource == nil
                                 ? (encoded.finiteSkyFirstEye ? "finite_sky_support_experiment_depth_mesh"
                                     : (encoded.copy ? "source_anchor_copy" : "independent_eye_depth_mesh"))
-                                : "single_source_depth_stereo")
+                                : "single_source_depth_stereo") + (encoded.hudIsolated ? "_single_hud_canvas" : ""))
                         didDebugCapture = true
                         if debugCapture == nil { log.error("Live world capture unsupported or exceeded its 96 MiB bound.") }
                     }
@@ -1136,13 +1149,39 @@ final class GameWorldRenderer: @unchecked Sendable {
                         sources: [GameWorldSourceEye], pairQualified: Bool, timestamp: Double,
                         commands: any MTLCommandBuffer, cornerScratch: inout CornerScratchLease,
                         adaptiveScratch: inout AdaptiveScratchLease,
-                        singleSource: GameWorldSourceEye? = nil) -> (views: Int, copy: Bool, finiteSkyFirstEye: Bool) {
+                        singleSource: GameWorldSourceEye? = nil) -> (views: Int, copy: Bool, finiteSkyFirstEye: Bool, hudIsolated: Bool) {
         var clearedTextures = Set<String>()
         var encodedViews = 0
         var finiteSkyFirstEye = false
         // Both eyes use one original-game aim sample, even if the script thread
         // publishes another sample between the two encoding calls.
         let gameplayAim = reticle == nil ? nil : GameWorldReticle.snapshot()
+        // Keep the original complete game color unless every selected eye has
+        // certified decomposition. Select ONE HUD once, never one per eye.
+        let orderedSources = drawable.views.indices.compactMap { eye in
+            sources.first(where: { $0.viewIndex == eye })
+        }
+        let hudIndex = hud != nil && stageFromHead != nil && singleSource == nil
+            ? GameWorldHUDPolicy.selectedIndex(orderedSources.map { $0.lease?.hud?.candidate },
+                viewCount: drawable.views.count) : nil
+        let hudSnapshot = hudIndex.flatMap { orderedSources[$0].lease?.hud }
+        if hud != nil, !sources.isEmpty {
+            countersLock.lock()
+            hudSelectionAttempts &+= 1
+            if let hudSnapshot {
+                hudSelections &+= 1
+                lastHUDGameFrame = hudSnapshot.native.game_frame
+            }
+            countersLock.unlock()
+        }
+        var displaySources = sources
+        if hudSnapshot != nil {
+            for index in displaySources.indices {
+                if let isolated = displaySources[index].lease?.hud {
+                    displaySources[index].color = isolated.worldColor
+                }
+            }
+        }
         // Copy path decision for the whole drawable. The probe may force the mesh for A/B/A.
         var copyDecision: (retained: XRRetainedHeadPose, verified: [GameWorldSourcePoseCheck.Result])?
         if singleSource == nil, sourceCopy != nil, stageFromHead != nil, anchorProbe?.useCopyPath(now: timestamp) ?? true {
@@ -1170,7 +1209,7 @@ final class GameWorldRenderer: @unchecked Sendable {
             pass.depthAttachment.clearDepth = 0
             var source: (eye: GameWorldSourceEye, uniforms: GameWorldUniforms)?
             let projection = drawable.computeProjection(convention: .rightUpBack, viewIndex: eye)
-            if let stageFromHead, let sourceEye = singleSource ?? sources.first(where: { $0.viewIndex == eye }) {
+            if let stageFromHead, let sourceEye = singleSource ?? displaySources.first(where: { $0.viewIndex == eye }) {
                 source = (sourceEye, worldUniforms(eye: sourceEye, stageFromHead: stageFromHead, headFromEye: view.transform,
                                                    projection: projection))
             }
@@ -1192,17 +1231,28 @@ final class GameWorldRenderer: @unchecked Sendable {
                 if eye == 0 { finiteSkyFirstEye = true }
                 // Ownership and depth repair have finished. This new pass has
                 // only attachment0, matching the normal reticle pipeline.
-                if let stageFromHead, let gameplayAim {
+                if hudSnapshot != nil || gameplayAim != nil {
                     pass.colorAttachments[0].loadAction = .load
                     pass.depthAttachment.loadAction = .load
                     if let overlay = commands.makeRenderCommandEncoder(descriptor: pass) {
-                        overlay.label = "Gameplay reticle after finite sky experiment"
+                        overlay.label = "Single HUD canvas and gameplay reticle after finite sky support"
                         overlay.setViewport(map.viewport)
-                        let gameFromCurrentEye = worldDoubleMatrix(source.eye.gameFromStage)
-                            * worldDoubleMatrix(stageFromHead) * worldDoubleMatrix(view.transform)
-                        reticle?.encode(overlay, aim: gameplayAim, gameFromCurrentEye: gameFromCurrentEye,
-                                        projection: projection, viewport: map.viewport)
+                        if let hudSnapshot {
+                            hud?.encode(overlay, snapshot: hudSnapshot,
+                                headFromEye: view.transform, projection: projection)
+                        }
+                        if let stageFromHead, let gameplayAim {
+                            let gameFromCurrentEye = worldDoubleMatrix(source.eye.gameFromStage)
+                                * worldDoubleMatrix(stageFromHead) * worldDoubleMatrix(view.transform)
+                            reticle?.encode(overlay, aim: gameplayAim, gameFromCurrentEye: gameFromCurrentEye,
+                                            projection: projection, viewport: map.viewport)
+                        }
                         overlay.endEncoding()
+                    } else {
+                        // The world is already encoded; do not acknowledge it
+                        // as a complete UI presentation if its overlay failed.
+                        encodedViews -= 1
+                        reportStatus("The immersive HUD overlay could not be encoded; waiting for the next complete frame.")
                     }
                 }
                 continue
@@ -1276,6 +1326,9 @@ final class GameWorldRenderer: @unchecked Sendable {
                     log.info("Actual GTA source eye \(eye): kind=\(sourceEye.kind.rawValue, privacy: .public) size=\(sourceEye.width)x\(sourceEye.height) format=\(sourceEye.color.pixelFormat.rawValue) color_device=\(sourceEye.color.device.registryID) compositor_device=\(self.layer.device.registryID) eye_x=\(view.transform.columns.3.x) projection_x=\(uniforms.currentClipFromEye.columns.2.x) source_near=\(sourceEye.depthNear) source_far=\(sourceEye.depthFar) corner_precompute=\(corners != nil) adaptive=\(adaptiveSet != nil) copy=\(copyDecision != nil)")
                 }
             }
+            if source?.eye.kind == .actual, let hudSnapshot {
+                hud?.encode(encoder, snapshot: hudSnapshot, headFromEye: view.transform, projection: projection)
+            }
             if let source, source.eye.kind == .actual, let stageFromHead, let gameplayAim {
                 let gameFromCurrentEye = worldDoubleMatrix(source.eye.gameFromStage)
                     * worldDoubleMatrix(stageFromHead) * worldDoubleMatrix(view.transform)
@@ -1285,12 +1338,21 @@ final class GameWorldRenderer: @unchecked Sendable {
             encoder.endEncoding()
             if let adaptiveSet, let adaptiveMesh { adaptiveMesh.encodeCounterCopy(commands: commands, set: adaptiveSet) }
         }
-        return (encodedViews, copyDecision != nil, finiteSkyFirstEye)
+        return (encodedViews, copyDecision != nil, finiteSkyFirstEye, hudSnapshot != nil)
     }
 
     /// Synchronized compact snapshot read by the existing lifecycle report.
     /// CPU encode outcomes are deliberately separate from GPU/pixel acceptance.
     func finiteSkySupportStatus() -> [String: Any] { finiteSkyTelemetry.reportValue }
+
+    func hudCanvasStatus() -> [String: Any] {
+        countersLock.lock()
+        defer { countersLock.unlock() }
+        return ["pipeline_available": hud != nil, "selection_attempts": hudSelectionAttempts,
+            "all_eyes_qualified_selections": hudSelections, "last_selected_game_frame": lastHUDGameFrame,
+            "angular_width_degrees": 60, "distance_metres": 2,
+            "stage": "CPU selection only; game presentation GPU completion is reported separately"]
+    }
 
     private func worldUniforms(eye: GameWorldSourceEye, stageFromHead: simd_float4x4,
                                headFromEye: simd_float4x4, projection: simd_float4x4) -> GameWorldUniforms {
@@ -1361,13 +1423,14 @@ private final class WorldCameraOwnership: @unchecked Sendable {
         defer { lock.unlock() }
         return owner == token
     }
-    func acquire(_ token: UUID, reticleReady: Bool) -> Int32 {
+    func acquire(_ token: UUID, reticleReady: Bool, hudReady: Bool) -> Int32 {
         lock.lock()
         defer { lock.unlock() }
         let result = sv_xr_world_camera_set_enabled(1)
         if result == 0 {
             owner = token
             _ = sv_xr_set_reticle_ready(reticleReady ? 1 : 0)
+            _ = sv_xr_set_hud_ready(hudReady ? 1 : 0)
         }
         return result
     }
@@ -1377,15 +1440,17 @@ private final class WorldCameraOwnership: @unchecked Sendable {
         guard owner == token else { return }
         owner = nil
         _ = sv_xr_set_reticle_ready(0)
+        _ = sv_xr_set_hud_ready(0)
         _ = sv_xr_world_camera_set_enabled(0)
     }
-    func refreshReticleReady(_ token: UUID, ready: Bool) {
+    func refreshReady(_ token: UUID, reticleReady: Bool, hudReady: Bool) {
         lock.lock()
         defer { lock.unlock() }
         guard owner == token else { return }
         // Tracking loss/recenter advances the native epoch without replacing
         // the Swift renderer. Rebind readiness without resetting the camera.
-        _ = sv_xr_set_reticle_ready(ready ? 1 : 0)
+        _ = sv_xr_set_reticle_ready(reticleReady ? 1 : 0)
+        _ = sv_xr_set_hud_ready(hudReady ? 1 : 0)
     }
 }
 #endif

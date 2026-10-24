@@ -63,4 +63,33 @@ int32_t sv_world_release_frame(uint64_t lease);
  * status is MTLCommandBufferStatus (4 means completed). The native side verifies
  * every eye token before counting a world frame; release leases afterwards. */
 int32_t sv_world_complete_frame(const uint64_t *leases, uint32_t view_count, uint32_t metal_status);
+
+/* Optional HUD decomposition, borrowed for exactly the supplied world lease.
+ * The original WorldFrame color is always the unmodified complete game image.
+ * Use world_color_texture ONLY if every selected eye has valid HUD metadata
+ * for the same provenance epoch, then show ONE chosen HUD in both eyes.
+ * Otherwise use the original WorldFrame colors and no extra HUD layer. */
+typedef struct {
+    uint32_t abi_version;
+    uint32_t byte_size;
+    uint64_t lease;
+    uint64_t provenance_epoch;
+    uint64_t game_frame;
+    uint64_t request_frame;
+    uint64_t head_frame;
+    uint64_t color_texture;
+    uint64_t world_color_texture;
+    double presentation_time;
+    uint32_t width;
+    uint32_t height;
+    uint32_t source_eye;
+    uint32_t flags; /* 1 = original UNORM numeric RGB, premultiplied coverage. */
+    float angular_width_degrees;
+    float distance_metres;
+    uint32_t reserved[2];
+} SVWorldHudFrame;
+_Static_assert(sizeof(SVWorldHudFrame) == 104, "SVWorldHudFrame ABI layout must match Rust");
+int32_t sv_world_frame_hud_v1(uint64_t world_lease, SVWorldHudFrame *hud);
+/* Readiness is held by the current Swift world-camera owner. */
+int32_t sv_xr_set_hud_ready(uint32_t enabled);
 #endif

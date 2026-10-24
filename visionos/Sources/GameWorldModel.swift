@@ -18,6 +18,7 @@ final class GameWorldModel: ObservableObject {
     private var lifecycle: [[String: Any]] = []
     private var latestRendererState: [String: Any] = [:]
     private var latestFiniteSkySupport: [String: Any] = [:]
+    private var latestHUDCanvas: [String: Any] = [:]
     private var lastFailure: String?
     private var latestViewRequestFailure: [String: Any] = [:]
     private var diagnosticRenderingMethod: String?
@@ -34,6 +35,7 @@ final class GameWorldModel: ObservableObject {
         lastFailure = nil
         latestRendererState = [:]
         latestFiniteSkySupport = [:]
+        latestHUDCanvas = [:]
         latestViewRequestFailure = [:]
         diagnosticRenderingMethod = nil
         recordedStatusKeys.removeAll(keepingCapacity: true)
@@ -156,13 +158,17 @@ final class GameWorldModel: ObservableObject {
             lifecycle.append(event)
             if lifecycle.count > 32 { lifecycle.removeFirst(lifecycle.count - 32) }
         }
-        if let renderer { latestFiniteSkySupport = renderer.finiteSkySupportStatus() }
+        if let renderer {
+            latestFiniteSkySupport = renderer.finiteSkySupportStatus()
+            latestHUDCanvas = renderer.hudCanvasStatus()
+        }
         var value: [String: Any] = ["stage": stage, "status": status,
             "scene_active": appActive, "immersive_open": isImmersiveActive,
             "opening": isOpening, "has_presented_game_frames": hasPresentedFrames,
             "renderer_exists": renderer != nil, "generation": generation.uuidString,
             "renderer": latestRendererState, "events": lifecycle,
             "finite_sky_support": latestFiniteSkySupport,
+            "hud_canvas": latestHUDCanvas,
             "latest_rejected_view_request": latestViewRequestFailure]
         if let lastFailure { value["last_failure"] = lastFailure }
         if let diagnosticRenderingMethod { value["rendering_method"] = diagnosticRenderingMethod }
