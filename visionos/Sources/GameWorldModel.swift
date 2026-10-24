@@ -70,8 +70,6 @@ final class GameWorldModel: ObservableObject {
     private var recordedStatusKeys = Set<String>()
     private weak var runtime: NativeRuntimeModel?
     private weak var gameScenes: GameSceneTransitions?
-    private var senseUtilityVisibilityObservation: AnyCancellable?
-    private var senseUtilityPhoneObservation: AnyCancellable?
     private var senseUtilityLayer: LayerRenderer?
     private var senseUtilityInteraction = GameWorldSenseUtilityInteraction<SpatialEventCollection.Event.ID>()
     private var senseUtilityTrackingLive = false
@@ -107,8 +105,9 @@ final class GameWorldModel: ObservableObject {
         recordState("renderer_constructor_started")
         let token = generation
         do {
-            let atlas = GameWorldSenseUtilities.makeAtlas(device: layer.device)
-            let renderer = try GameWorldRenderer(layer: layer, utilityAtlas: atlas) { [weak self] event in
+            // Phone utilities belong to the game window. Without an atlas the
+            // renderer clears tracking areas and draws no immersive buttons.
+            let renderer = try GameWorldRenderer(layer: layer) { [weak self] event in
                 Task { @MainActor [weak self] in
                     guard let self, self.generation == token else { return }
                     switch event {
@@ -157,8 +156,6 @@ final class GameWorldModel: ObservableObject {
                         return
                     case .ended(let reason):
                         self.hasPresentedFrames = false
-                        self.senseUtilityVisibilityObservation = nil
-                        self.senseUtilityPhoneObservation = nil
                         self.senseUtilityLayer?.onSpatialEvent = { _ in }
                         self.senseUtilityLayer = nil
                         self.clearSenseUtilityInteraction()
@@ -174,26 +171,8 @@ final class GameWorldModel: ObservableObject {
             }
             self.renderer = renderer
             senseUtilityLayer = layer
-            layer.onSpatialEvent = { [weak self] events in
-                guard let self, self.generation == token else { return }
-                self.handleSenseUtilityEvents(events)
-            }
-            renderer.setSenseUtilitiesVisible(runtime.senseGameplayUtilitiesVisible)
-            renderer.setSenseUtilitiesPhoneOpen(runtime.sensePhoneNavigationVisible)
-            senseUtilityVisibilityObservation = runtime.$senseGameplayUtilitiesVisible.removeDuplicates().sink { [weak self] visible in
-                Task { @MainActor [weak self] in
-                    guard let self, self.generation == token else { return }
-                    self.renderer?.setSenseUtilitiesVisible(visible)
-                    if !visible { self.clearSenseUtilityInteraction(preserveGestureCancellation: true) }
-                }
-            }
-            senseUtilityPhoneObservation = runtime.$sensePhoneNavigationVisible.removeDuplicates().sink { [weak self] open in
-                Task { @MainActor [weak self] in
-                    guard let self, self.generation == token else { return }
-                    self.renderer?.setSenseUtilitiesPhoneOpen(open)
-                    self.clearSenseUtilityInteraction(preserveGestureCancellation: true)
-                }
-            }
+            // No invisible phone hit regions or input ownership in immersion.
+            layer.onSpatialEvent = { _ in }
             recordState("renderer_constructor_succeeded")
             renderer.setActive(appActive)
             startup = Task {
@@ -276,8 +255,6 @@ final class GameWorldModel: ObservableObject {
         hasPresentedFrames = false
         generation = UUID()
         frameWatchdog.stop()
-        senseUtilityVisibilityObservation = nil
-        senseUtilityPhoneObservation = nil
         senseUtilityLayer?.onSpatialEvent = { _ in }
         senseUtilityLayer = nil
         clearSenseUtilityInteraction()
@@ -374,7 +351,7 @@ final class GameWorldModel: ObservableObject {
             "finite_sky_support": latestFiniteSkySupport,
             "hud_canvas": latestHUDCanvas,
             "image_quality": latestImageQuality,
-            "sense_utility_input": ["events": senseUtilityEventCounts, "last_event": senseUtilityLastInput,
+            "sense_utility_input": ["enabled": false, "events": senseUtilityEventCounts, "last_event": senseUtilityLastInput,
                 "tracking_live": senseUtilityTrackingLive, "input_scope": "system hit identifiers only; no gaze coordinates"],
             "latest_rejected_view_request": latestViewRequestFailure]
         if let lastFailure { value["last_failure"] = lastFailure }
