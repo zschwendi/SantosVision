@@ -57,6 +57,12 @@ struct HUDPolicyValidation {
         let half = GameWorldHUDPolicy.halfSize(width: 1920, height: 1080, angularWidth: 60, distance: 2)!
         let safeHalf = half * GameWorldHUDPolicy.immersiveScale
         let safeY = half.y * GameWorldHUDPolicy.immersiveVerticalFraction
+        let scope = GameWorldHUDPolicy.placement(halfSize: half, nativeScope: true)
+        let ordinary = GameWorldHUDPolicy.placement(halfSize: half, nativeScope: false)
+        require(scope.halfSize == half && scope.y == 0,
+                "Native scope crosshair stays centered and uses its original canvas extent")
+        require(ordinary.halfSize == safeHalf && ordinary.y == safeY,
+                "Ordinary HUD retains the lower inset safe area")
         require(-safeHalf.x > -half.x && safeHalf.x < half.x,
                 "HUD safe area moves minimap right and money/ammo left, never moves minimap farther left")
         require(safeY + safeHalf.y < half.y && safeY - safeHalf.y < -half.y,

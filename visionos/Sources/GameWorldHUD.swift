@@ -36,6 +36,9 @@ enum GameWorldHUDPolicy {
     // Flat-window rendering keeps the original game coordinates.
     static let immersiveScale: Float = 0.94
     static let immersiveVerticalFraction: Float = -0.17
+    static func placement(halfSize: SIMD2<Float>, nativeScope: Bool) -> (halfSize: SIMD2<Float>, y: Float) {
+        nativeScope ? (halfSize, 0) : (halfSize * immersiveScale, halfSize.y * immersiveVerticalFraction)
+    }
 }
 
 #if SV_GAME_RUNTIME
@@ -124,11 +127,12 @@ final class GameWorldHUD: @unchecked Sendable {
     }
 
     func encode(_ encoder: any MTLRenderCommandEncoder, snapshot: Snapshot,
-                headFromEye: simd_float4x4, projection: simd_float4x4) {
+                headFromEye: simd_float4x4, projection: simd_float4x4, nativeScope: Bool) {
+        let layout = GameWorldHUDPolicy.placement(halfSize: snapshot.halfSize, nativeScope: nativeScope)
         var placement = matrix_identity_float4x4
-        placement.columns.3.y = snapshot.halfSize.y * GameWorldHUDPolicy.immersiveVerticalFraction
+        placement.columns.3.y = layout.y
         var uniforms = Uniforms(clipFromHead: projection * headFromEye.inverse * placement,
-            halfSize: snapshot.halfSize * GameWorldHUDPolicy.immersiveScale, distance: snapshot.native.distance_metres,
+            halfSize: layout.halfSize, distance: snapshot.native.distance_metres,
             decodeForLinearTarget: decodeForLinearTarget)
         encoder.setRenderPipelineState(pipeline)
         encoder.setDepthStencilState(depth)

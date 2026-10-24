@@ -180,6 +180,7 @@ final class NativeRuntimeModel: ObservableObject {
     @Published private(set) var immersivePhonePreparationStatus = ""
     private var sensePhoneInstantiated = false
     private var sensePhoneContextKnown = false
+    private var senseGameplayUIEligible: Bool?
     private var immersivePhonePreparationToken: UUID?
     @Published private(set) var nativeControlsStatus = ""
     private var fastMenuPolling: Task<Void, Never>?
@@ -688,7 +689,11 @@ final class NativeRuntimeModel: ObservableObject {
         // Phone close remains reachable with DualSense, Sense or hand pinch.
         // Inactive focus keeps the flat ornament present; accepting an action
         // still requires the real active lifecycle above.
+        // Only a fresh native local-ped death observation can hide gameplay
+        // utilities. Unknown state keeps them available; an open phone always
+        // retains its escape controls.
         windowGameplayUtilitiesVisible = ready && (connected || sensePhoneInstantiated)
+            && (senseGameplayUIEligible != false || sensePhoneInstantiated)
         senseGameplayUtilitiesVisible = windowGameplayUtilitiesVisible && isActive
         sensePhoneNavigationVisible = windowGameplayUtilitiesVisible && sensePhoneInstantiated
         if !senseGameplayUtilitiesVisible { clearSenseUtilityDirections() }
@@ -1015,6 +1020,7 @@ final class NativeRuntimeModel: ObservableObject {
         }
         let nativeStatus = lastStatus?.payload.data(using: .utf8)
             .flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }
+        senseGameplayUIEligible = (nativeStatus?["immersive_aim"] as? [String: Any])?["gameplay_ui_eligible"] as? Bool
         // Unknown context cannot certify that a previously open phone closed.
         // Retain its escape controls until the native getter reports false.
         let phone = (nativeStatus?["controller"] as? [String: Any])?["phone_instantiated"] as? Bool
@@ -1045,6 +1051,7 @@ final class NativeRuntimeModel: ObservableObject {
             "native_controls_input_policy_v2": NativeControlsOwnership.shared.readPolicy(),
             "native_controls_selection": nativeControlsSelection,
             "sense_gameplay_utilities_visible": senseGameplayUtilitiesVisible,
+            "sense_gameplay_ui_eligible": senseGameplayUIEligible.map { $0 as Any } ?? NSNull(),
             "sense_phone_navigation_visible": sensePhoneNavigationVisible,
             "window_gameplay_utilities_visible": windowGameplayUtilitiesVisible,
             "phone_context_known": sensePhoneContextKnown,

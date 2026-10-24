@@ -91,6 +91,8 @@ typedef struct {
 } SVXRAimSnapshot;
 _Static_assert(sizeof(SVXRAimSnapshot) == 104, "SVXRAimSnapshot ABI layout must match Rust");
 int32_t sv_xr_get_aim_snapshot(SVXRAimSnapshot *snapshot, uint32_t byte_size);
+/* 1=current qualified native scope, 0=ordinary, -1=unknown/stale. */
+int32_t sv_xr_native_scope_active(void);
 int32_t sv_xr_set_reticle_ready(uint32_t enabled);
 /* Qualified tracked-arm mode, including the signed build's normal-launch default. */
 uint32_t sv_xr_motion_arms_enabled_v1(void);

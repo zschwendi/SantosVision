@@ -1207,6 +1207,9 @@ final class GameWorldRenderer: @unchecked Sendable {
         // Both eyes use one original-game aim sample, even if the script thread
         // publishes another sample between the two encoding calls.
         let gameplayAim = reticle == nil ? nil : GameWorldReticle.snapshot()
+        // Sample once for both eyes. This current script predicate restores
+        // native optic UI centering; it is not per-lease optical magnification.
+        let nativeScope = sv_xr_native_scope_active() == 1
         // Keep the original complete game color unless every selected eye has
         // certified decomposition. Select ONE HUD once, never one per eye.
         let orderedSources = drawable.views.indices.compactMap { eye in
@@ -1290,7 +1293,7 @@ final class GameWorldRenderer: @unchecked Sendable {
                         overlay.setViewport(map.viewport)
                         if let hudSnapshot {
                             hud?.encode(overlay, snapshot: hudSnapshot,
-                                headFromEye: view.transform, projection: projection)
+                                headFromEye: view.transform, projection: projection, nativeScope: nativeScope)
                         }
                         if let stageFromHead, let gameplayAim {
                             let gameFromCurrentEye = worldDoubleMatrix(source.eye.gameFromStage)
@@ -1378,7 +1381,7 @@ final class GameWorldRenderer: @unchecked Sendable {
                 }
             }
             if source?.eye.kind == .actual, let hudSnapshot {
-                hud?.encode(encoder, snapshot: hudSnapshot, headFromEye: view.transform, projection: projection)
+                hud?.encode(encoder, snapshot: hudSnapshot, headFromEye: view.transform, projection: projection, nativeScope: nativeScope)
             }
             if let source, source.eye.kind == .actual, let stageFromHead, let gameplayAim {
                 let gameFromCurrentEye = worldDoubleMatrix(source.eye.gameFromStage)
