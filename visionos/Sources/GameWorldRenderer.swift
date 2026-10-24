@@ -457,6 +457,9 @@ final class GameWorldRenderer: @unchecked Sendable {
     private var adaptiveFallbackTiles: UInt64 = 0
     private var hudSelectionAttempts: UInt64 = 0
     private var hudSelections: UInt64 = 0
+    private var scopedHUDSelectionAttempts: UInt64 = 0
+    private var scopedHUDCanvasUnavailable: UInt64 = 0
+    private var scopedVirtualBaselineDrawables: UInt64 = 0
     private var lastHUDGameFrame: UInt64 = 0
     private var lastReticleReference: [String: Any] = [:]
     private var sourceCoverage = GameWorldSourceCoverage()
@@ -942,9 +945,14 @@ final class GameWorldRenderer: @unchecked Sendable {
                        lease.native.game_frame >= GameWorldDebugCapture.minimumGameFrame,
                        let view = drawable.views.first {
                         let physical = drawable.computeProjection(convention: .rightUpBack, viewIndex: 0)
-                        let displayProjection = GameWorldScopeOptics.projection(physical, optics: encoded.displayOptics) ?? physical
+                        let displayProjection = GameWorldScopeOptics.displayProjection(physical, headFromEye: view.transform,
+                            optics: encoded.displayOptics) ?? physical
+                        // Record the exact eye-0 world uniforms encode() used.
+                        let physicalEyes = drawable.views.map(\.transform)
+                        let worldEye = GameWorldScopeOptics.eyeTransforms(physicalEyes, optics: encoded.displayOptics)?.first
+                            ?? view.transform
                         let uniforms = worldUniforms(eye: captureSource, stageFromHead: stageFromHead,
-                            headFromEye: view.transform,
+                            headFromEye: worldEye,
                             projection: displayProjection)
                         if debugMotionPolicy?.allows(uniforms.currentEyeFromSourceEye) == true {
                         debugCapture = GameWorldDebugCapture(prefix: debugPrefix, device: layer.device, commands: commands,
@@ -1336,6 +1344,22 @@ final class GameWorldRenderer: @unchecked Sendable {
                 hudSelections &+= 1
                 lastHUDGameFrame = hudSnapshot.native.game_frame
             }
+            // A scoped drawable without the single canvas shows each eye's own
+            // baked GTA HUD at its asymmetric source center (about 20 degrees
+            // outward per eye on the captured calibration): never collimated.
+            if nativeScope {
+                scopedHUDSelectionAttempts &+= 1
+                if hudSnapshot == nil { scopedHUDCanvasUnavailable &+= 1 }
+            }
+            countersLock.unlock()
+        }
+        // Scoped world only: virtual eyes at 1/m baseline (natural disparity
+        // after magnification). The HUD canvas keeps the physical eye pose.
+        let physicalEyes = drawable.views.map(\.transform)
+        let worldEyes = GameWorldScopeOptics.eyeTransforms(physicalEyes, optics: displayOptics) ?? physicalEyes
+        if displayOptics.magnification != 1, !sources.isEmpty {
+            countersLock.lock()
+            scopedVirtualBaselineDrawables &+= 1
             countersLock.unlock()
         }
         var displaySources = opticsQualified ? sources : []
@@ -1373,9 +1397,11 @@ final class GameWorldRenderer: @unchecked Sendable {
             pass.depthAttachment.clearDepth = 0
             var source: (eye: GameWorldSourceEye, uniforms: GameWorldUniforms)?
             let physicalProjection = drawable.computeProjection(convention: .rightUpBack, viewIndex: eye)
-            let projection = GameWorldScopeOptics.projection(physicalProjection, optics: displayOptics) ?? physicalProjection
+            let projection = GameWorldScopeOptics.displayProjection(physicalProjection, headFromEye: view.transform,
+                optics: displayOptics) ?? physicalProjection
+            let worldEye = worldEyes.indices.contains(eye) ? worldEyes[eye] : view.transform
             if let stageFromHead, let sourceEye = singleSource ?? displaySources.first(where: { $0.viewIndex == eye }) {
-                source = (sourceEye, worldUniforms(eye: sourceEye, stageFromHead: stageFromHead, headFromEye: view.transform,
+                source = (sourceEye, worldUniforms(eye: sourceEye, stageFromHead: stageFromHead, headFromEye: worldEye,
                                                    projection: projection))
             }
             let skyOutcome: GameWorldFiniteSkyTelemetry.Outcome
@@ -1409,7 +1435,7 @@ final class GameWorldRenderer: @unchecked Sendable {
                         if let stageFromHead, let gameplayAim,
                            gameplayAim.aim.view_epoch == source.eye.lease?.opticalFrame.epoch {
                             let gameFromCurrentEye = gameplayAim.gameFromStage(fallback: source.eye.gameFromStage)
-                                * worldDoubleMatrix(stageFromHead) * worldDoubleMatrix(view.transform)
+                                * worldDoubleMatrix(stageFromHead) * worldDoubleMatrix(worldEye)
                             reticle?.encode(overlay, aim: gameplayAim.aim, gameFromCurrentEye: gameFromCurrentEye,
                                             projection: projection, viewport: map.viewport)
                         }
@@ -1498,7 +1524,7 @@ final class GameWorldRenderer: @unchecked Sendable {
             if let source, source.eye.kind == .actual, let stageFromHead, let gameplayAim,
                gameplayAim.aim.view_epoch == source.eye.lease?.opticalFrame.epoch {
                 let gameFromCurrentEye = gameplayAim.gameFromStage(fallback: source.eye.gameFromStage)
-                    * worldDoubleMatrix(stageFromHead) * worldDoubleMatrix(view.transform)
+                    * worldDoubleMatrix(stageFromHead) * worldDoubleMatrix(worldEye)
                 reticle?.encode(encoder, aim: gameplayAim.aim, gameFromCurrentEye: gameFromCurrentEye,
                                 projection: projection, viewport: map.viewport)
             }
@@ -1517,6 +1543,9 @@ final class GameWorldRenderer: @unchecked Sendable {
         defer { countersLock.unlock() }
         return ["pipeline_available": hud != nil, "selection_attempts": hudSelectionAttempts,
             "all_eyes_qualified_selections": hudSelections, "last_selected_game_frame": lastHUDGameFrame,
+            "native_scope_selection_attempts": scopedHUDSelectionAttempts,
+            "native_scope_canvas_unavailable": scopedHUDCanvasUnavailable,
+            "scoped_world_virtual_baseline_drawables": scopedVirtualBaselineDrawables,
             "reticle_reference": lastReticleReference,
             "angular_width_degrees": 60, "distance_metres": 2,
             "stage": "CPU selection only; game presentation GPU completion is reported separately"]

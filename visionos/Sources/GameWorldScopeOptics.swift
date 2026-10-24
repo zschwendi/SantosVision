@@ -104,20 +104,72 @@ enum GameWorldScopeOptics {
     /// Magnify angles around THIS eye's forward-axis principal point. Scaling
     /// all clip XY about zero would incorrectly magnify asymmetric eye offsets.
     /// Z/W are byte-identical, so native depth direction/range stays unchanged.
+    /// This is the native source operation; display uses `displayProjection`.
     static func projection(_ physical: simd_float4x4, optics: Optics) -> simd_float4x4? {
         guard finitePerspective(physical) else { return nil }
         if optics.magnification == 1 { return physical }
+        // Column2 is the principal-axis ray itself; algebraically it is
+        // unchanged. Preserve it exactly instead of cancelling rounded terms.
+        return magnified(physical, m: optics.magnification, about: SIMD3(0, 0, -1), columns: [0, 1, 3])
+    }
+
+    /// The collimated native graticule is centered on the HEAD forward axis
+    /// (`GameWorldHUDPolicy.clipFromHead` removes only eye translation). Both
+    /// displayed eyes must magnify about that same physical direction. Each
+    /// calibrated eye's own -Z differs slightly (captured packet: 0.041 degrees
+    /// vertically); magnifying about it adds (m - 1) times that difference as a
+    /// constant binocular misregistration at every distance. Source leases keep
+    /// their own-axis operation; reprojection maps between the two exactly.
+    static func displayProjection(_ physical: simd_float4x4, headFromEye: simd_float4x4,
+                                  optics: Optics) -> simd_float4x4? {
+        guard finitePerspective(physical) else { return nil }
+        if optics.magnification == 1 { return physical }
+        let r = headFromEye
+        guard (0..<4).allSatisfy({ c in (0..<4).allSatisfy { r[c][$0].isFinite } }) else { return nil }
+        // Rotation-only inverse applied to head -Z; the NDC center is scale-free.
+        let axis = SIMD3(-r[0].z, -r[1].z, -r[2].z)
+        return magnified(physical, m: optics.magnification, about: axis, columns: [0, 1, 2, 3])
+    }
+
+    /// Orthostereo inside the magnified view. Display magnification multiplies
+    /// every binocular disparity by m, while the native graticule is collimated
+    /// at infinity: a target at distance D otherwise shows m*b/D of disparity
+    /// against it (captured 67.98mm IPD, m 9.487, 20m: 1.82 degrees). Scale only
+    /// the inter-ocular translation by 1/m about the two calibrated eyes'
+    /// midpoint, so the magnified world keeps the natural b/D. Rotations, the
+    /// cyclopean point and both distinct eye renders remain. Identity optics and
+    /// one-view drawables return the exact input. The native source applies the
+    /// same arithmetic to its own consumed request (xr_view ScopedEyeBaseline).
+    static func eyeTransforms(_ headFromEyes: [simd_float4x4], optics: Optics) -> [simd_float4x4]? {
+        if optics.magnification == 1 || headFromEyes.count != 2 { return headFromEyes }
         let m = optics.magnification
-        let axis = physical * SIMD4<Float>(0, 0, -1, 0)
+        guard m.isFinite, (1...10).contains(m),
+              headFromEyes.allSatisfy({ e in (0..<4).allSatisfy { c in (0..<4).allSatisfy { e[c][$0].isFinite } } })
+        else { return nil }
+        let result = headFromEyes.map { eye -> simd_float4x4 in
+            var virtual = eye
+            for axis in 0..<3 {
+                let mid = (Double(headFromEyes[0][3][axis]) + Double(headFromEyes[1][3][axis])) * 0.5
+                virtual[3][axis] = Float(mid + (Double(eye[3][axis]) - mid) / Double(m))
+            }
+            return virtual
+        }
+        return result.allSatisfy({ e in (0..<3).allSatisfy { e[3][$0].isFinite } }) ? result : nil
+    }
+
+    /// Scale clip X/Y about the NDC point where `direction` (eye space) lands.
+    /// clipXY' = m*clipXY + (1 - m)*c*clipW; Z/W are untouched.
+    private static func magnified(_ physical: simd_float4x4, m: Float, about direction: SIMD3<Float>,
+                                  columns: [Int]) -> simd_float4x4? {
+        let axis = physical * SIMD4<Float>(direction, 0)
+        guard axis.w > 0 else { return nil }
         let center = SIMD2(axis.x, axis.y) / axis.w
         guard center.x.isFinite, center.y.isFinite else { return nil }
         var result = physical
-        for column in [0, 1, 3] {
+        for column in columns {
             result[column][0] = m * physical[column][0] + (1 - m) * center.x * physical[column][3]
             result[column][1] = m * physical[column][1] + (1 - m) * center.y * physical[column][3]
         }
-        // Column2 is the principal-axis ray itself; algebraically it is
-        // unchanged. Preserve it exactly instead of cancelling rounded terms.
         return finitePerspective(result) ? result : nil
     }
 

@@ -108,6 +108,36 @@ fn optical_projection(mut projection:[f32;16], magnification:f32)->Option<[f32;1
     projection.iter().all(|v|v.is_finite()).then_some(projection)
 }
 
+// BEGIN ScopedEyeBaseline (the standalone sniper22 test compiles this block verbatim)
+/// Orthostereo inside a qualified magnified scope. Both source and display
+/// magnify by m, multiplying every binocular disparity by m, while the native
+/// graticule is collimated at infinity. Scale only the inter-ocular
+/// translation by 1/m about the two calibrated eyes' midpoint so the magnified
+/// world keeps natural disparity. Rotation, the cyclopean point and distinct
+/// eye renders remain; m == 1 returns the exact physical transform. Swift
+/// GameWorldScopeOptics.eyeTransforms performs the same f64 arithmetic.
+pub(crate) fn scoped_head_from_eye(views: [[f32; 16]; 2], eye: usize, magnification: f32) -> Option<[f32; 16]> {
+    if eye > 1 || !magnification.is_finite() || !(1. ..=10.).contains(&magnification)
+        || views.iter().flatten().any(|v| !v.is_finite()) { return None; }
+    let mut result = views[eye];
+    if magnification == 1. { return Some(result); }
+    for axis in 12..15 {
+        let mid = (f64::from(views[0][axis]) + f64::from(views[1][axis])) * 0.5;
+        result[axis] = (mid + (f64::from(views[eye][axis]) - mid) / f64::from(magnification)) as f32;
+    }
+    result.iter().all(|v| v.is_finite()).then_some(result)
+}
+// END ScopedEyeBaseline
+
+/// The eye pose this source actually renders: physical, or the qualified
+/// scoped baseline above. Unqualified optics never change the request.
+fn source_head_from_eye(request: &SVXRViewRequest, eye: usize, optics: ScopeOptics) -> [f32; 16] {
+    let physical = request.views[eye].head_from_eye;
+    if optics.scope_sequence == 0 || !optics.valid() || request.view_count != 2 { return physical; }
+    scoped_head_from_eye([request.views[0].head_from_eye, request.views[1].head_from_eye], eye, optics.magnification)
+        .unwrap_or(physical)
+}
+
 /// Ephemeral live pointers are never copied into WorldView or frame leases.
 #[derive(Clone,Copy,Debug,PartialEq,Eq)]
 struct OpticalAuthority {
@@ -916,7 +946,7 @@ pub fn camera_post(caller: &mut Caller<'_, HostState>, source: u64, _frame: u64)
         projection_from_eye: projection, depth_reverse_z, headset_applied: false, optics:crate::xr_view::ScopeOptics::default() };
     let override_matrices = if ready && world_camera_enabled() && request.is_some() {
         prepared.filter(|pose| rigid(&pose.relative) && pose.relative[12..15].iter().all(|n| n.abs() <= 5.)).map(|pose| {
-            let head_from_eye = request.map(|r| r.views[eye_index as usize].head_from_eye).unwrap_or_else(identity);
+            let head_from_eye = request.map(|r| source_head_from_eye(&r, eye_index as usize, source_optics)).unwrap_or_else(identity);
             let desired_camera = multiply(&multiply(&camera, &pose.relative), &head_from_eye);
             let desired_projection = request.and_then(|r| reverse_z(&projection).and_then(|direction|
                 optical_projection(for_game_depth(r.views[eye_index as usize].projection_from_eye,direction),source_optics.magnification)));
@@ -947,7 +977,7 @@ pub fn camera_post(caller: &mut Caller<'_, HostState>, source: u64, _frame: u64)
                 view.game_from_eye = desired_camera;
                 if let Some(projection) = desired_projection { view.projection_from_eye = projection; }
                 let native_pose = prepared.expect("guarded prepared pose").native;
-                let head_from_eye = request.map(|r| r.views[eye_index as usize].head_from_eye).unwrap_or_else(identity);
+                let head_from_eye = request.map(|r| source_head_from_eye(&r, eye_index as usize, source_optics)).unwrap_or_else(identity);
                 let stage_from_eye = multiply(&native_pose.stage_from_head, &head_from_eye);
                 view.game_from_stage = multiply(&desired_camera, &rigid_inverse(&stage_from_eye));
                 view.presentation_time_seconds = native_pose.presentation_time_seconds;
@@ -1350,6 +1380,34 @@ mod tests {
             assert!(projection_scalars(&optical).is_some());
         }
         for m in [0.,0.99,10.01,f32::NAN,f32::INFINITY] {assert!(optical_projection(source,m).is_none());}
+    }
+    #[test]
+    fn scoped_source_eyes_keep_rotation_and_midpoint_and_scale_only_baseline() {
+        // Captured physical packet translations (scope-optics-design/physical-request.bin).
+        let mut left=identity();left[12]=-0.03425;left[13]=-0.02519;left[14]=-0.0358;left[0]=0.9999;left[2]=0.0005;
+        let mut right=identity();right[12]=0.03373;right[13]=-0.02566;right[14]=-0.03464;
+        let views=[left,right];
+        for eye in 0..2 {assert!(same_matrix_bits(&scoped_head_from_eye(views,eye,1.).unwrap(),&views[eye]));}
+        for m in [3.1462643_f32,6.3196,9.48705] {
+            let (l,r)=(scoped_head_from_eye(views,0,m).unwrap(),scoped_head_from_eye(views,1,m).unwrap());
+            for index in (0..12).chain([15]) {assert_eq!(l[index].to_bits(),left[index].to_bits());assert_eq!(r[index].to_bits(),right[index].to_bits());}
+            for axis in 12..15 {
+                assert!(((l[axis]+r[axis])-(left[axis]+right[axis])).abs()<=2e-7,"cyclopean midpoint is unchanged");
+                assert!(((r[axis]-l[axis])*m-(right[axis]-left[axis])).abs()<=2e-6,"baseline is exactly 1/m");
+            }
+        }
+        for m in [0.,0.99,10.01,f32::NAN] {assert!(scoped_head_from_eye(views,0,m).is_none());}
+        assert!(scoped_head_from_eye(views,2,2.).is_none());
+        let mut request=SVXRViewRequest{version:1,size:288,frame:4,presentation_time_seconds:1.,view_count:2,reserved:0,
+            views:[SVXREyeView{head_from_eye:left,projection_from_eye:projection()},SVXREyeView{head_from_eye:right,projection_from_eye:projection()}]};
+        let unqualified=ScopeOptics::default();
+        assert!(same_matrix_bits(&source_head_from_eye(&request,1,unqualified),&right));
+        let scoped=OpticalAuthority{camera:1,metadata:2,helper:3,helper_metadata:4,scope_sequence:9,
+            reference_bits:45f32.to_bits(),actual_bits:5f32.to_bits()}.optics().unwrap();
+        assert!(scoped.valid());
+        assert!(same_matrix_bits(&source_head_from_eye(&request,1,scoped),&scoped_head_from_eye(views,1,scoped.magnification).unwrap()));
+        request.view_count=1;
+        assert!(same_matrix_bits(&source_head_from_eye(&request,0,scoped),&left));
     }
     #[cfg(feature="jit")]
     #[test]

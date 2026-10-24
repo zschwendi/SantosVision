@@ -419,6 +419,7 @@ pub fn status_json() -> serde_json::Value {
     let epoch = crate::xr_view::view_epoch();
     let baseline = fresh_snapshot(&state, Instant::now(), epoch, reticle_ready_for_epoch(epoch));
     let (samples, hidden, failures, last_error) = (state.samples, state.hidden, state.failures, state.last_error.clone());
+    let scope_sequences_allocated = state.scope_sequence;
     let scope = fresh_scope(&state, Instant::now(), epoch, reticle_ready_for_epoch(epoch));
     let scope_age = state.scope.map(|(_, _, at)| at.elapsed().as_secs_f64());
     let scope_epoch = state.scope.map(|(_, epoch, _)| epoch);
@@ -444,6 +445,9 @@ pub fn status_json() -> serde_json::Value {
         "scope_gameplay_fov_degrees":scope.and_then(|s|s.gameplay_fov_degrees),
         "scope_zoom_control":scope.and_then(|s|s.zoom_control),
         "scope_sequence":scope.map(|s|s.scope_sequence),
+        // Cumulative: qualified scoped-optic sequences ever minted (entry,
+        // identity, epoch or stale recovery). Zero means never qualified.
+        "scope_sequences_allocated":scope_sequences_allocated,
         "scope_zoom_control_applied":false,
         "gameplay_ui_eligible":gameplay_ui.map(|(alive,_,_)|alive),
         "gameplay_ui_age_seconds":gameplay_ui_age,
