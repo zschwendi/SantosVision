@@ -10,6 +10,15 @@ import simd
 struct XRRetainedEyeView: Sendable {
     let headFromEye: simd_float4x4
     let projectionFromEye: simd_float4x4
+    let physicalProjectionFromEye: simd_float4x4?
+    let sourceGuardBandScale: Float
+    init(headFromEye: simd_float4x4, projectionFromEye: simd_float4x4,
+         physicalProjectionFromEye: simd_float4x4? = nil, sourceGuardBandScale: Float = 1) {
+        self.headFromEye = headFromEye
+        self.projectionFromEye = projectionFromEye
+        self.physicalProjectionFromEye = physicalProjectionFromEye
+        self.sourceGuardBandScale = sourceGuardBandScale
+    }
 }
 // END XRRetainedEyeView
 
@@ -108,7 +117,9 @@ final class XRHeadTracking: @unchecked Sendable {
         guard let published else { return nil }
         if retain, tracked, let stageFromHead {
             let finite = timestamp.isFinite && Self.isFinite(stageFromHead)
-                && eyes.allSatisfy { Self.isFinite($0.headFromEye) && Self.isFinite($0.projectionFromEye) }
+                && eyes.allSatisfy { Self.isFinite($0.headFromEye) && Self.isFinite($0.projectionFromEye)
+                    && ($0.physicalProjectionFromEye.map(Self.isFinite) ?? true)
+                    && $0.sourceGuardBandScale.isFinite && $0.sourceGuardBandScale >= 1 }
             if finite, anchor == nil || anchor?.isTracked == true {
                 retainLocked(XRRetainedHeadPose(headFrame: published, requestFrame: requestFrame, timestamp: timestamp,
                                                 stageFromHead: stageFromHead, anchor: anchor, eyes: eyes,

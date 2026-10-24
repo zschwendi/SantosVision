@@ -164,6 +164,7 @@ private final class GameWorldLease: @unchecked Sendable {
     let gameFromEye: simd_float4x4
     let gameFromStage: simd_float4x4
     let hud: GameWorldHUD.Snapshot?
+    let opticalFrame: GameWorldScopeOptics.Candidate
     private let lock = NSLock()
     private var released = false
 
@@ -189,9 +190,42 @@ private final class GameWorldLease: @unchecked Sendable {
               depth.pixelFormat == .r32Float,
               color.width == Int(native.width), color.height == Int(native.height),
               depth.width == color.width, depth.height == color.height else { return nil }
+        var optical = SVWorldOpticsFrame()
+        optical.abi_version = 1
+        optical.byte_size = UInt32(MemoryLayout<SVWorldOpticsFrame>.size)
+        guard MemoryLayout<SVWorldOpticsFrame>.size == 112,
+              sv_world_frame_optics_v1(native.lease, &optical) == 0,
+              optical.abi_version == 1, optical.byte_size == 112,
+              optical.lease == native.lease, optical.provenance_epoch != 0,
+              optical.game_frame == native.game_frame, optical.request_frame == native.request_frame,
+              optical.head_frame == native.head_frame, optical.presentation_time == native.presentation_time,
+              optical.source_eye == native.view_index, optical.view_count == native.view_count,
+              optical.reserved.0 == 0, optical.reserved.1 == 0,
+              optical.reserved.2 == 0, optical.reserved.3 == 0,
+              let optics = GameWorldScopeOptics.Optics(flags: optical.flags, magnification: optical.magnification,
+                  referenceFOV: optical.reference_fov_degrees, actualFOV: optical.actual_fov_degrees,
+                  scopeSequence: optical.scope_sequence) else { return nil }
+        let opticalFrame = GameWorldScopeOptics.Candidate(lease: native.lease, epoch: optical.provenance_epoch,
+            gameFrame: native.game_frame, requestFrame: native.request_frame, headFrame: native.head_frame,
+            cameraSequence: optical.camera_sequence, presentationTime: native.presentation_time,
+            sourceEye: eye, viewCount: viewCount, optics: optics)
+        guard opticalFrame.qualified else { return nil }
+        if optics.scoped {
+            let reversed = projection.columns.2.z >= 0
+            guard let retained = XRHeadTracking.shared.retainedPose(headFrame: native.head_frame, now: timestamp),
+                  retained.requestFrame == native.request_frame, retained.eyes.indices.contains(eye),
+                  let physical = retained.eyes[eye].physicalProjectionFromEye,
+                  let expected = GameWorldScopeOptics.expectedSourceProjection(retained.eyes[eye].projectionFromEye,
+                      optics: optics, depthReversed: true),
+                  GameWorldSourcePoseCheck.projectionError(retained: expected, lease: projection,
+                      leaseDepthReversed: reversed) <= GameWorldSourcePoseCheck.projectionTolerance,
+                  GameWorldScopeOptics.admitSource(projection, depthReversed: reversed, retainedPhysical: physical,
+                      guardScale: retained.eyes[eye].sourceGuardBandScale, optics: optics).passed else { return nil }
+        }
         self.native = native
         self.color = color
         self.depth = depth
+        self.opticalFrame = opticalFrame
         sourceProjection = projection
         gameFromEye = eyeTransform
         gameFromStage = stageTransform
@@ -409,8 +443,9 @@ final class GameWorldRenderer: @unchecked Sendable {
     /// Diagnostic only: one immutable native eye image reprojected into both
     /// physical eyes. Never a certified pair or a source-anchor copy.
     private let singleSourceStereo = ProcessInfo.processInfo.arguments.contains("--sv-world-single-source-stereo")
-    /// Anchors are retained only when a path can use them; legacy submission is otherwise untouched.
-    private var retainsAnchors: Bool { sourceCopy != nil || anchorProbe != nil || singleSourceStereo }
+    /// Per-lease optics also needs the exact physical/request projection pair.
+    /// The existing count/age bounds apply to normal world rendering too.
+    private var retainsAnchors: Bool { true }
     private var loggedPairUnavailable = false
     private var pathCounters = GameWorldPathCounters()
     private let countersLock = NSLock()
@@ -753,7 +788,9 @@ final class GameWorldRenderer: @unchecked Sendable {
                     // compositor projection for display-time reprojection.
                     guard let nativeProjection = GameWorldSourceGuardBand.projection(physicalProjection) else { return nil }
                     return XRRetainedEyeView(headFromEye: drawable.views[index].transform,
-                                      projectionFromEye: nativeProjection)
+                                      projectionFromEye: nativeProjection,
+                                      physicalProjectionFromEye: physicalProjection,
+                                      sourceGuardBandScale: GameWorldSourceGuardBand.configuredScale)
                 }
                 if eyes.count != drawable.views.count {
                     motionTracking.invalidate(reason: "Physical projection exceeds the native camera conversion budget")
@@ -880,9 +917,11 @@ final class GameWorldRenderer: @unchecked Sendable {
                        let lease = captureSource.lease,
                        lease.native.game_frame >= GameWorldDebugCapture.minimumGameFrame,
                        let view = drawable.views.first {
+                        let physical = drawable.computeProjection(convention: .rightUpBack, viewIndex: 0)
+                        let displayProjection = GameWorldScopeOptics.projection(physical, optics: encoded.displayOptics) ?? physical
                         let uniforms = worldUniforms(eye: captureSource, stageFromHead: stageFromHead,
                             headFromEye: view.transform,
-                            projection: drawable.computeProjection(convention: .rightUpBack, viewIndex: 0))
+                            projection: displayProjection)
                         debugCapture = GameWorldDebugCapture(prefix: debugPrefix, device: layer.device, commands: commands,
                             color: encoded.hudIsolated ? (lease.hud?.worldColor ?? lease.color) : lease.color,
                             depth: lease.depth,
@@ -1158,6 +1197,9 @@ final class GameWorldRenderer: @unchecked Sendable {
     private func copyEligibility(drawable: LayerRenderer.Drawable, sources: [GameWorldSourceEye], pairQualified: Bool,
                                  timestamp: Double) -> (retained: XRRetainedHeadPose, verified: [GameWorldSourcePoseCheck.Result])? {
         guard sourceCopy != nil else { return nil }
+        guard sources.allSatisfy({ $0.lease?.opticalFrame.optics.sourceCopyAllowed ?? true }) else {
+            pathCounters.copyFallback("scoped_optical_magnification"); return nil
+        }
         guard sources.count == drawable.views.count, !sources.isEmpty else { pathCounters.copyFallback("incomplete_sources"); return nil }
         if drawable.views.count == 2, !pairQualified { pathCounters.copyFallback("unpaired_eyes"); return nil }
         guard let first = sources.first,
@@ -1200,22 +1242,30 @@ final class GameWorldRenderer: @unchecked Sendable {
                         sources: [GameWorldSourceEye], pairQualified: Bool, timestamp: Double,
                         commands: any MTLCommandBuffer, cornerScratch: inout CornerScratchLease,
                         adaptiveScratch: inout AdaptiveScratchLease,
-                        singleSource: GameWorldSourceEye? = nil) -> (views: Int, copy: Bool, finiteSkyFirstEye: Bool, hudIsolated: Bool) {
+                        singleSource: GameWorldSourceEye? = nil) -> (views: Int, copy: Bool, finiteSkyFirstEye: Bool, hudIsolated: Bool,
+                            displayOptics: GameWorldScopeOptics.Optics) {
         var clearedTextures = Set<String>()
         var encodedViews = 0
         var finiteSkyFirstEye = false
         // Both eyes use one original-game aim sample, even if the script thread
         // publishes another sample between the two encoding calls.
         let gameplayAim = reticle == nil ? nil : GameWorldReticle.snapshot()
-        // Sample once for both eyes. This current script predicate restores
-        // native optic UI centering; it is not per-lease optical magnification.
-        let nativeScope = sv_xr_native_scope_active() == 1
         // Keep the original complete game color unless every selected eye has
         // certified decomposition. Select ONE HUD once, never one per eye.
         let orderedSources = drawable.views.indices.compactMap { eye in
             sources.first(where: { $0.viewIndex == eye })
         }
-        let hudIndex = hud != nil && stageFromHead != nil && singleSource == nil
+        let requiresOpticalPair = singleSource == nil && !orderedSources.isEmpty
+            && orderedSources.allSatisfy { $0.kind == .actual }
+        let opticalIndex = requiresOpticalPair
+            ? GameWorldScopeOptics.selectedIndex(orderedSources.map { $0.lease?.opticalFrame }, viewCount: drawable.views.count) : nil
+        let opticsQualified = !requiresOpticalPair || opticalIndex != nil
+        let displayOptics = opticalIndex.flatMap { orderedSources[$0].lease?.opticalFrame.optics }
+            ?? singleSource?.lease?.opticalFrame.optics ?? .identity
+        // Non-optical scope families retain the qualified native graphic too.
+        // This fallback affects HUD placement only, never optical authority.
+        let nativeScope = displayOptics.scoped || sv_xr_native_scope_active() == 1
+        let hudIndex = hud != nil && stageFromHead != nil && singleSource == nil && opticsQualified
             ? GameWorldHUDPolicy.selectedIndex(orderedSources.map { $0.lease?.hud?.candidate },
                 viewCount: drawable.views.count) : nil
         let hudSnapshot = hudIndex.flatMap { orderedSources[$0].lease?.hud }
@@ -1228,7 +1278,7 @@ final class GameWorldRenderer: @unchecked Sendable {
             }
             countersLock.unlock()
         }
-        var displaySources = sources
+        var displaySources = opticsQualified ? sources : []
         if hudSnapshot != nil {
             for index in displaySources.indices {
                 if let isolated = displaySources[index].lease?.hud {
@@ -1238,7 +1288,7 @@ final class GameWorldRenderer: @unchecked Sendable {
         }
         // Copy path decision for the whole drawable. The probe may force the mesh for A/B/A.
         var copyDecision: (retained: XRRetainedHeadPose, verified: [GameWorldSourcePoseCheck.Result])?
-        if singleSource == nil, sourceCopy != nil, stageFromHead != nil, anchorProbe?.useCopyPath(now: timestamp) ?? true {
+        if opticsQualified, singleSource == nil, sourceCopy != nil, stageFromHead != nil, anchorProbe?.useCopyPath(now: timestamp) ?? true {
             copyDecision = copyEligibility(drawable: drawable, sources: sources, pairQualified: pairQualified, timestamp: timestamp)
         }
         if let copyDecision {
@@ -1262,7 +1312,8 @@ final class GameWorldRenderer: @unchecked Sendable {
             pass.depthAttachment.storeAction = .store
             pass.depthAttachment.clearDepth = 0
             var source: (eye: GameWorldSourceEye, uniforms: GameWorldUniforms)?
-            let projection = drawable.computeProjection(convention: .rightUpBack, viewIndex: eye)
+            let physicalProjection = drawable.computeProjection(convention: .rightUpBack, viewIndex: eye)
+            let projection = GameWorldScopeOptics.projection(physicalProjection, optics: displayOptics) ?? physicalProjection
             if let stageFromHead, let sourceEye = singleSource ?? displaySources.first(where: { $0.viewIndex == eye }) {
                 source = (sourceEye, worldUniforms(eye: sourceEye, stageFromHead: stageFromHead, headFromEye: view.transform,
                                                    projection: projection))
@@ -1293,7 +1344,7 @@ final class GameWorldRenderer: @unchecked Sendable {
                         overlay.setViewport(map.viewport)
                         if let hudSnapshot {
                             hud?.encode(overlay, snapshot: hudSnapshot,
-                                headFromEye: view.transform, projection: projection, nativeScope: nativeScope)
+                                headFromEye: view.transform, projection: physicalProjection, nativeScope: nativeScope)
                         }
                         if let stageFromHead, let gameplayAim {
                             let gameFromCurrentEye = worldDoubleMatrix(source.eye.gameFromStage)
@@ -1381,7 +1432,7 @@ final class GameWorldRenderer: @unchecked Sendable {
                 }
             }
             if source?.eye.kind == .actual, let hudSnapshot {
-                hud?.encode(encoder, snapshot: hudSnapshot, headFromEye: view.transform, projection: projection, nativeScope: nativeScope)
+                hud?.encode(encoder, snapshot: hudSnapshot, headFromEye: view.transform, projection: physicalProjection, nativeScope: nativeScope)
             }
             if let source, source.eye.kind == .actual, let stageFromHead, let gameplayAim {
                 let gameFromCurrentEye = worldDoubleMatrix(source.eye.gameFromStage)
@@ -1392,7 +1443,7 @@ final class GameWorldRenderer: @unchecked Sendable {
             encoder.endEncoding()
             if let adaptiveSet, let adaptiveMesh { adaptiveMesh.encodeCounterCopy(commands: commands, set: adaptiveSet) }
         }
-        return (encodedViews, copyDecision != nil, finiteSkyFirstEye, hudSnapshot != nil)
+        return (encodedViews, copyDecision != nil, finiteSkyFirstEye, hudSnapshot != nil, displayOptics)
     }
 
     /// Synchronized compact snapshot read by the existing lifecycle report.

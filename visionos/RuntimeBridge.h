@@ -93,6 +93,18 @@ _Static_assert(sizeof(SVXRAimSnapshot) == 104, "SVXRAimSnapshot ABI layout must 
 int32_t sv_xr_get_aim_snapshot(SVXRAimSnapshot *snapshot, uint32_t byte_size);
 /* 1=current qualified native scope, 0=ordinary, -1=unknown/stale. */
 int32_t sv_xr_native_scope_active(void);
+/* Immutable source optics belonging to one acquired world lease. */
+typedef struct {
+    uint32_t abi_version, byte_size;
+    uint64_t lease, provenance_epoch, game_frame, request_frame, head_frame;
+    uint64_t camera_sequence, scope_sequence;
+    double presentation_time;
+    float magnification, reference_fov_degrees, actual_fov_degrees;
+    uint32_t source_eye, view_count, flags;
+    uint32_t reserved[4];
+} SVWorldOpticsFrame;
+_Static_assert(sizeof(SVWorldOpticsFrame) == 112, "SVWorldOpticsFrame ABI layout must match Rust");
+int32_t sv_world_frame_optics_v1(uint64_t world_lease, SVWorldOpticsFrame *optics);
 int32_t sv_xr_set_reticle_ready(uint32_t enabled);
 /* Qualified tracked-arm mode, including the signed build's normal-launch default. */
 uint32_t sv_xr_motion_arms_enabled_v1(void);
