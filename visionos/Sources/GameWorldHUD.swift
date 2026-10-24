@@ -39,6 +39,21 @@ enum GameWorldHUDPolicy {
     static func placement(halfSize: SIMD2<Float>, nativeScope: Bool) -> (halfSize: SIMD2<Float>, y: Float) {
         nativeScope ? (halfSize, 0) : (halfSize * immersiveScale, halfSize.y * immersiveVerticalFraction)
     }
+
+    /// Ordinary HUD belongs to its finite, comfortable reading plane. A scope
+    /// graticule instead denotes distant angular directions: placing it on that
+    /// same 2 m plane adds eye convergence unrelated to the telescopic scene.
+    /// Collimate only the qualified native scope canvas by retaining calibrated
+    /// eye rotation and projection while removing eye-origin translation. The
+    /// texture and its angular extent remain common to both physical eyes.
+    static func clipFromHead(headFromEye: simd_float4x4, projection: simd_float4x4,
+                             placementY: Float, nativeScope: Bool) -> simd_float4x4 {
+        var canvasHeadFromEye = headFromEye
+        if nativeScope { canvasHeadFromEye.columns.3 = SIMD4(0, 0, 0, 1) }
+        var placement = matrix_identity_float4x4
+        placement.columns.3.y = placementY
+        return projection * canvasHeadFromEye.inverse * placement
+    }
 }
 
 #if SV_GAME_RUNTIME
@@ -129,9 +144,8 @@ final class GameWorldHUD: @unchecked Sendable {
     func encode(_ encoder: any MTLRenderCommandEncoder, snapshot: Snapshot,
                 headFromEye: simd_float4x4, projection: simd_float4x4, nativeScope: Bool) {
         let layout = GameWorldHUDPolicy.placement(halfSize: snapshot.halfSize, nativeScope: nativeScope)
-        var placement = matrix_identity_float4x4
-        placement.columns.3.y = layout.y
-        var uniforms = Uniforms(clipFromHead: projection * headFromEye.inverse * placement,
+        var uniforms = Uniforms(clipFromHead: GameWorldHUDPolicy.clipFromHead(
+                headFromEye: headFromEye, projection: projection, placementY: layout.y, nativeScope: nativeScope),
             halfSize: layout.halfSize, distance: snapshot.native.distance_metres,
             decodeForLinearTarget: decodeForLinearTarget)
         encoder.setRenderPipelineState(pipeline)

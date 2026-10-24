@@ -109,6 +109,52 @@ struct HUDPolicyValidation {
         let projections = [matrix(at: 96), matrix(at: 224)]
         let measuredIPD = abs(heads[1][3].x - heads[0][3].x)
         require((0.05...0.085).contains(measuredIPD), "Fixture contains real separated physical eyes")
+
+        // Scope graticules are angular, unlike the ordinary finite HUD. Check
+        // the actual captured calibrated eye matrices, not equal NDC positions
+        // (which would be wrong for asymmetric physical projections).
+        var scopeRecovered = [[SIMD3<Float>]](repeating: [], count: 2)
+        var oldScopeRecovered = [[SIMD3<Float>]](repeating: [], count: 2)
+        for eye in 0..<2 {
+            let ordinaryClip = GameWorldHUDPolicy.clipFromHead(headFromEye: heads[eye],
+                projection: projections[eye], placementY: safeY, nativeScope: false)
+            var ordinaryPlacement = matrix_identity_float4x4
+            ordinaryPlacement[3].y = safeY
+            let originalOrdinaryClip = projections[eye] * heads[eye].inverse * ordinaryPlacement
+            require(ordinaryClip == originalOrdinaryClip, "Ordinary HUD matrix retains exact existing finite placement")
+            let scopeClip = GameWorldHUDPolicy.clipFromHead(headFromEye: heads[eye],
+                projection: projections[eye], placementY: 0, nativeScope: true)
+            var rotation = heads[eye]
+            rotation[3] = SIMD4(0, 0, 0, 1)
+            for x: Float in [-0.8, 0, 0.8] { for y: Float in [-0.8, 0, 0.8] {
+                let point = SIMD4<Float>(x * half.x, y * half.y, -2, 1)
+                let scoped = scopeClip * point
+                let recoveredEye = projections[eye].inverse * scoped
+                let recoveredHead = rotation * SIMD4<Float>(recoveredEye.x, recoveredEye.y, recoveredEye.z, 0)
+                let direction = simd_normalize(SIMD3(recoveredHead.x, recoveredHead.y, recoveredHead.z))
+                let expected = simd_normalize(SIMD3(point.x, point.y, point.z))
+                require(simd_length(direction - expected) < 2e-6,
+                        "Every native scope pixel represents the same head-space angular direction in either calibrated eye")
+                scopeRecovered[eye].append(direction)
+                let oldClip = projections[eye] * heads[eye].inverse * point
+                let oldEye = projections[eye].inverse * oldClip
+                let oldHead = rotation * SIMD4<Float>(oldEye.x, oldEye.y, oldEye.z, 0)
+                oldScopeRecovered[eye].append(simd_normalize(SIMD3(oldHead.x, oldHead.y, oldHead.z)))
+            } }
+            for distance: Float in [0.5, 2, 10] {
+                var moved = heads[eye]
+                moved[3] = SIMD4(eye == 0 ? -distance : distance, distance * 0.1, -distance * 0.2, 1)
+                require(GameWorldHUDPolicy.clipFromHead(headFromEye: moved, projection: projections[eye],
+                    placementY: 0, nativeScope: true) == scopeClip,
+                    "Scope collimation is independent of eye-origin translations without replacing calibrated rotation")
+            }
+        }
+        for index in 0..<9 {
+            require(simd_length(scopeRecovered[0][index] - scopeRecovered[1][index]) < 3e-6,
+                    "Scope graticule has no artificial finite-plane binocular disparity")
+        }
+        require(simd_length(oldScopeRecovered[0][4] - oldScopeRecovered[1][4]) > 0.02,
+                "Regression fixture exposes the old 2 m scope convergence, rather than silently passing the previous implementation")
         let positions: [SIMD4<Float>] = [-1.0, 0, 1].flatMap { x in
             [-1.0, 0, 1].map { y in SIMD4(Float(x) * safeHalf.x, safeY + Float(y) * safeHalf.y, -2, 1) }
         }

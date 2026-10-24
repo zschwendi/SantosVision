@@ -61,3 +61,23 @@ texture immutability, matching optical metadata, newer zoom-independent
 publication, released leases and stale generations. Physical scope appearance,
 absolute initial magnification, hand tracking, ballistics alignment and source
 coverage at large optical scales still require the parent hardware test.
+
+## Native scope graticule registration
+
+The immersive native scope canvas is collimated. It uses the same selected
+coverage-bearing HUD texture in both eyes, retaining each physical eye's
+calibrated rotation and projection while removing eye-origin translation from
+the canvas transform. Its original angular extent is unchanged. This prevents
+the distant scope graticule from inheriting the ordinary HUD's 2 m reading-plane
+convergence. The ordinary lowered HUD retains its exact existing finite-plane
+transform, and window rendering is unaffected. Source leases and optical world
+projection retain their existing independent per-eye provenance.
+
+Run `scripts/test-scope-canvas.sh` for the captured physical-eye regression.
+It checks 233 policy/projection assertions and executes the actual production
+HUD Metal shaders in four offscreen 2048x2048 renders. With the captured 67.98 mm
+IPD, the previous scope center introduced 1.98208 degrees of binocular
+convergence; the collimated center differs by 0.00033 degrees after rasterization.
+These are geometric and Mac Metal results. They do not establish that native
+HUD isolation succeeds during the user's scoped frame, nor physical headset
+acceptance of the complete scoped world and graticule.
