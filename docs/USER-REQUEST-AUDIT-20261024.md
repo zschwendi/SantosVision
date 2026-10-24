@@ -33,6 +33,19 @@ foreground merge remains off until actual pass ordering is captured and handled.
 The user also withdrew the immersive Phone button: phone utilities now belong
 only to the windowed presentation, reached through the existing pause/window flow.
 
+Subsequent player feedback again fails first-person immersive acceptance:
+orienting around the weapon feels wrong, and the world looks grainy and low
+detail. The interaction requirements have already been explained; further
+screenshots should identify particular visible defects without reopening those
+requirements. Preserve accepted third person. Internal hooks/builds do not
+establish progress on any of these visible failures.
+
+The retained 21:52:25Z run records 8.37 source versus 14.27 display vertical
+pixels per degree (about 1.71 display pixels per source texel). This establishes
+a detail shortfall, not the complete cause of the reported grain. Its capture
+flag is disabled; the earlier armed diagnostic session did not produce a
+retrieved manifest. Do not claim the player's subsequent run was captured.
+
 ## Current blockers and unfinished requests
 
 | Request | Current status | Owner / next acceptance |
