@@ -691,3 +691,162 @@ vertex GameWorldVertex gameWorldAdaptiveFallbackVertex(uint id [[vertex_id]],
     const float z = depth.read(pixel).r;
     return gameWorldCornerVertex(corner, z, continuousCornerDepth(corner, z, u, depth), u);
 }
+
+// ---- Opt-in depth-edge gap fill, after finite-sky ownership ----
+//
+// Owner 0 is an output pixel that no source texel reached. Inside the source
+// image these are the black gaps that head translation opens beside nearer
+// geometry, plus hairline cracks between isolated texel footprints. Each such
+// pixel walks its own current-eye ray through the source depth image, from
+// infinity toward the eye, i.e. along its epipolar line from the infinite
+// point, for at most maximumSteps source texels. Where the ray last passes
+// from behind a source surface to in front of one, it meets that surface:
+// beside an occluder this is the adjacent background. That texel's colour is
+// copied unchanged and its source depth is extended along this ray. Pixels
+// whose infinite point is outside the source image, behind either camera, or
+// without such a texel within the walk stay untouched. Covered pixels are
+// never written. This estimates hidden background; it renders nothing new.
+struct GameWorldDepthEdgeFillUniforms {
+    float4x4 currentEyeFromClip;
+    float4x4 currentClipFromEye;
+    float4x4 sourceClipFromCurrentEye;
+    float2 viewportOrigin;
+    float2 viewportSize;
+    uint2 sourceSize;
+    uint sourceDepthReversed;
+    uint colorTransfer;
+    float maximumInverseDistance;
+    float skyRadius;
+    uint maximumSteps;
+    uint reserved;
+};
+struct GameWorldDepthEdgeFillOut {
+    float4 color [[color(0)]];
+    float depth [[depth(any)]];
+};
+struct GameWorldDepthEdgeHit {
+    uint2 texel;
+    float sourceDepth;
+    float inverseDistance;
+    bool sky;
+};
+constant bool gameWorldDepthEdgeFillCounts [[function_constant(0)]];
+
+static float2 gameWorldDepthEdgeTexel(float4 clip, float2 size) {
+    const float2 ndc = clip.xy / clip.w;
+    return float2(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5) * size;
+}
+
+// Points on the current ray are (ray, s) homogeneously, s = 1 / distance, so
+// their source clip coordinates are h0 + s * h1. Equal image steps use the
+// perspective-correct map s = end * f * w0 / ((1 - f) * w1 + f * w0).
+static bool gameWorldDepthEdgeSearch(float3 ray, constant GameWorldDepthEdgeFillUniforms &u,
+                                     texture2d<float, access::read> depth,
+                                     thread GameWorldDepthEdgeHit &hit) {
+    const float4 h0 = u.sourceClipFromCurrentEye * float4(ray, 0);
+    const float4 h1 = u.sourceClipFromCurrentEye[3];
+    if (!all(isfinite(h0)) || !all(isfinite(h1)) || h0.w <= 1e-6
+        || !isfinite(u.maximumInverseDistance) || u.maximumInverseDistance <= 0
+        || any(u.sourceSize < 2) || u.maximumSteps == 0) { return false; }
+    float end = u.maximumInverseDistance;
+    // Stay strictly in front of the source camera for the whole walk.
+    if (h1.w < 0) { end = min(end, 0.5 * h0.w / -h1.w); }
+    const float2 size = float2(u.sourceSize);
+    const float2 start = gameWorldDepthEdgeTexel(h0, size);
+    float4 last = h0 + end * h1;
+    float span = distance(start, gameWorldDepthEdgeTexel(last, size));
+    if (!isfinite(span)) { return false; }
+    const float steps = float(u.maximumSteps);
+    if (span > steps) {
+        // Bound the walk to maximumSteps source texels from the infinite end.
+        const float f = steps / span;
+        end *= f * h0.w / ((1 - f) * last.w + f * h0.w);
+        last = h0 + end * h1;
+        span = steps;
+    }
+    const uint count = uint(clamp(ceil(span), 1.0, steps));
+    const float clearDepth = u.sourceDepthReversed != 0 ? 0.0 : 1.0;
+    bool free = false, found = false;
+    for (uint k = 0; k <= count; ++k) {
+        const float f = float(k) / float(count);
+        const float s = end * f * h0.w / ((1 - f) * last.w + f * h0.w);
+        const float4 h = h0 + s * h1;
+        if (!all(isfinite(h)) || h.w <= 1e-6) { break; }
+        // Outside the rendered source image there is no further evidence; the
+        // infinite end itself must be inside it.
+        if (any(abs(h.xy) > h.w)) { break; }
+        const uint2 texel = min(uint2(max(gameWorldDepthEdgeTexel(h, size), 0.0)), u.sourceSize - 1);
+        const float z = depth.read(texel).r;
+        if (!isfinite(z) || z < 0 || z > 1) { continue; }
+        const float rayDepth = h.z / h.w;
+        const bool behind = z == clearDepth
+            || (u.sourceDepthReversed != 0 ? z < rayDepth : z > rayDepth);
+        // The last entry into free space toward the eye is where this ray first
+        // meets a surface the source saw. Beside an occluder that surface is
+        // the background, and the entry texel is the one adjacent to the edge.
+        if (behind && !free) {
+            hit.texel = texel;
+            hit.sourceDepth = z;
+            hit.inverseDistance = s;
+            hit.sky = z == clearDepth;
+            found = true;
+        }
+        free = behind;
+    }
+    return found;
+}
+
+fragment GameWorldDepthEdgeFillOut gameWorldDepthEdgeFillFragment(GameWorldSkyRepairVertex in [[stage_in]],
+        constant GameWorldDepthEdgeFillUniforms &u [[buffer(0)]],
+        device atomic_uint *counts [[buffer(1), function_constant(gameWorldDepthEdgeFillCounts)]],
+        texture2d<uint, access::read> ownership [[texture(0)]],
+        texture2d<float> color [[texture(1)]],
+        texture2d<float, access::read> depth [[texture(2)]]) {
+    const uint2 pixel = uint2(in.position.xy);
+    if (pixel.x >= ownership.get_width() || pixel.y >= ownership.get_height()
+        || ownership.read(pixel).r != 0u) { discard_fragment(); }
+    if (gameWorldDepthEdgeFillCounts) { atomic_fetch_add_explicit(&counts[0], 1u, memory_order_relaxed); }
+    const float2 uv = (in.position.xy - u.viewportOrigin) / u.viewportSize;
+    const float4 eyePoint = u.currentEyeFromClip * float4(uv.x * 2 - 1, 1 - uv.y * 2, 0.5, 1);
+    float3 ray = eyePoint.xyz / eyePoint.w;
+    const float rayLength = length(ray);
+    GameWorldDepthEdgeHit hit = { uint2(0), 0, 0, false };
+    const bool found = all(isfinite(eyePoint)) && abs(eyePoint.w) > 1e-7
+        && isfinite(rayLength) && rayLength > 1e-7 && ray.z < 0
+        && gameWorldDepthEdgeSearch(ray / rayLength, u, depth, hit);
+    if (!found) {
+        if (gameWorldDepthEdgeFillCounts) { atomic_fetch_add_explicit(&counts[3], 1u, memory_order_relaxed); }
+        discard_fragment();
+    }
+    ray /= rayLength;
+    float3 rgb = color.read(hit.texel).rgb;
+    if (u.colorTransfer == 1) {
+        rgb = select(1.055 * pow(max(rgb, 0.0), float3(1.0 / 2.4)) - 0.055,
+                     12.92 * rgb, rgb <= 0.0031308);
+    } else if (u.colorTransfer == 2) {
+        rgb = select(pow((max(rgb, 0.0) + 0.055) / 1.055, float3(2.4)),
+                     rgb / 12.92, rgb <= 0.04045);
+    }
+    float4 point;
+    if (hit.sky) {
+        // The same finite support sphere the sky repair gives surviving sky.
+        point = float4(ray * u.skyRadius, 1);
+    } else {
+        // Where this ray meets the background texel's source depth:
+        // (h0.z + s h1.z) / (h0.w + s h1.w) = sourceDepth.
+        const float4 h0 = u.sourceClipFromCurrentEye * float4(ray, 0);
+        const float4 h1 = u.sourceClipFromCurrentEye[3];
+        const float s = (h0.z - hit.sourceDepth * h0.w) / (hit.sourceDepth * h1.w - h1.z);
+        point = float4(ray, isfinite(s) && s > 0 ? s : hit.inverseDistance);
+    }
+    const float4 clip = u.currentClipFromEye * point;
+    const float z = clip.z / clip.w;
+    GameWorldDepthEdgeFillOut out;
+    out.color = float4(rgb, 1);
+    // Out-of-range estimates keep the cleared far depth, never a near one.
+    out.depth = all(isfinite(clip)) && clip.w > 1e-7 && z >= 0 && z <= 1 ? z : 0;
+    if (gameWorldDepthEdgeFillCounts) {
+        atomic_fetch_add_explicit(&counts[hit.sky ? 2 : 1], 1u, memory_order_relaxed);
+    }
+    return out;
+}

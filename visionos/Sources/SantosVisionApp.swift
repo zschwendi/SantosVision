@@ -382,6 +382,11 @@ private struct LauncherView: View {
                 set: { runtime.setDrawSetupOverhead($0) }))
             Text("Rendering overhead reductions reuse unchanged setup work and avoid empty GPU work while preserving your graphics settings. Frame-copy reduction starts on; the experimental options start off. Choose before starting the game, then quit and reopen Los Santos to change these settings.")
                 .font(.caption).foregroundStyle(.secondary)
+            Toggle("Fill gaps beside near objects (experimental)", isOn: Binding(
+                get: { runtime.depthEdgeFillEnabled },
+                set: { runtime.setDepthEdgeFill($0) }))
+            Text("In the immersive world, head movement can open black gaps beside nearer objects. This fills them with the neighboring background from the same game frame. It starts off.")
+                .font(.caption).foregroundStyle(.secondary)
         }
         .disabled(!runtime.canChangeRenderingOptimizations)
     }

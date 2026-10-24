@@ -63,6 +63,7 @@ final class GameWorldModel: ObservableObject {
     private var latestRendererState: [String: Any] = [:]
     private var latestFiniteSkySupport: [String: Any] = [:]
     private var latestHUDCanvas: [String: Any] = [:]
+    private var latestImageQuality: [String: Any] = [:]
     private var lastFailure: String?
     private var latestViewRequestFailure: [String: Any] = [:]
     private var diagnosticRenderingMethod: String?
@@ -95,6 +96,7 @@ final class GameWorldModel: ObservableObject {
         latestRendererState = [:]
         latestFiniteSkySupport = [:]
         latestHUDCanvas = [:]
+        latestImageQuality = [:]
         senseUtilityTrackingLive = false
         senseUtilityTrackingSequence = 0
         senseUtilityEventCounts = [:]
@@ -354,6 +356,7 @@ final class GameWorldModel: ObservableObject {
         if let renderer {
             latestFiniteSkySupport = renderer.finiteSkySupportStatus()
             latestHUDCanvas = renderer.hudCanvasStatus()
+            latestImageQuality = renderer.imageQualityStatus()
         }
         var value: [String: Any] = ["stage": stage, "status": status,
             "scene_active": appActive, "immersive_open": isImmersiveActive,
@@ -366,6 +369,7 @@ final class GameWorldModel: ObservableObject {
             "renderer": latestRendererState, "events": lifecycle,
             "finite_sky_support": latestFiniteSkySupport,
             "hud_canvas": latestHUDCanvas,
+            "image_quality": latestImageQuality,
             "sense_utility_input": ["events": senseUtilityEventCounts, "last_event": senseUtilityLastInput,
                 "tracking_live": senseUtilityTrackingLive, "input_scope": "system hit identifiers only; no gaze coordinates"],
             "latest_rejected_view_request": latestViewRequestFailure]

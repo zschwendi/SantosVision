@@ -167,6 +167,7 @@ final class NativeRuntimeModel: ObservableObject {
     @Published private(set) var adaptiveRenderingEnabled = RenderingOptimizations.storedAdaptive
     @Published private(set) var frozenDepthHandoffEnabled = RenderingOptimizations.storedFrozenDepth
     @Published private(set) var drawSetupOverheadEnabled = RenderingOptimizations.storedDrawSetup
+    @Published private(set) var depthEdgeFillEnabled = GameWorldDepthEdgeFillPolicy.stored
     @Published private(set) var windowSurfaceReady = false
     @Published private(set) var controllerSummary = "Controller not connected"
     @Published private(set) var menuPressCount: UInt64 = 0
@@ -452,6 +453,13 @@ final class NativeRuntimeModel: ObservableObject {
         guard canChangeRenderingOptimizations else { return }
         drawSetupOverheadEnabled = enabled
         UserDefaults.standard.set(enabled, forKey: RenderingOptimizations.drawSetupKey)
+        recordReport()
+    }
+
+    func setDepthEdgeFill(_ enabled: Bool) {
+        guard canChangeRenderingOptimizations else { return }
+        depthEdgeFillEnabled = enabled
+        UserDefaults.standard.set(enabled, forKey: GameWorldDepthEdgeFillPolicy.storedKey)
         recordReport()
     }
 
@@ -1146,6 +1154,10 @@ final class NativeRuntimeModel: ObservableObject {
                 "metal_skip_empty_transit": RenderingOptimizations.metalSkipEmptyTransitEnabled,
                 "metal_skip_empty_prepass": RenderingOptimizations.metalSkipEmptyPrepassEnabled
             ],
+            "rendering_quality_requested": ["depth_edge_fill": depthEdgeFillEnabled],
+            "rendering_quality_effective": ["depth_edge_fill": GameWorldDepthEdgeFillPolicy.requested(
+                environment: ProcessInfo.processInfo.environment, arguments: ProcessInfo.processInfo.arguments,
+                stored: GameWorldDepthEdgeFillPolicy.stored)],
             "probe": payload(lastProbe), "start": payload(lastStart), "status": payload(lastStatus),
             "head_pose_source": windowGameMode && !compositorOwnsHeadTracking ? "disabled_in_window" : (SimulatorPoseFixture.shared == nil ? "ARKit" : "simulator_fixture"),
             "simulator_pose_fixture": SimulatorPoseFixture.shared?.reportValue ?? [:],

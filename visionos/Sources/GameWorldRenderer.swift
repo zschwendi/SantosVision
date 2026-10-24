@@ -440,6 +440,9 @@ final class GameWorldRenderer: @unchecked Sendable {
     private let finiteSkySupport: GameWorldFiniteSkySupport?
     private let finiteSkySupportUnavailable: GameWorldFiniteSkyTelemetry.Outcome?
     private let finiteSkyTelemetry: GameWorldFiniteSkyTelemetry
+    /// Opt-in owner-0 gap fill; needs the finite-sky ownership mask.
+    private let depthEdgeFill: GameWorldDepthEdgeFill?
+    private let imageQuality: GameWorldImageQualityTelemetry
     private let allowSyntheticAnchorCopy: Bool
     private let adaptiveMesh: GameWorldAdaptiveMesh?
     private let anchorProbe: GameWorldAnchorProbe?
@@ -551,6 +554,12 @@ final class GameWorldRenderer: @unchecked Sendable {
             : finiteSkySupport == nil ? .pipelineUnavailable : nil
         finiteSkyTelemetry = GameWorldFiniteSkyTelemetry(requested: skyRequested,
             available: finiteSkySupport != nil, unavailableReason: finiteSkySupportUnavailable)
+        let fillRequested = GameWorldDepthEdgeFillPolicy.requested(environment: environment,
+            arguments: ProcessInfo.processInfo.arguments, stored: GameWorldDepthEdgeFillPolicy.stored)
+        depthEdgeFill = fillRequested && finiteSkySupport != nil
+            ? GameWorldDepthEdgeFill(device: layer.device, library: library,
+                colorFormat: layer.configuration.colorFormat, depthFormat: layer.configuration.depthFormat) : nil
+        imageQuality = GameWorldImageQualityTelemetry(fillRequested: fillRequested, fillAvailable: depthEdgeFill != nil)
         adaptiveMesh = adaptiveRequested ? GameWorldAdaptiveMesh(device: layer.device, library: library,
                                                                  colorFormat: layer.configuration.colorFormat,
                                                                  depthFormat: layer.configuration.depthFormat,
@@ -569,6 +578,7 @@ final class GameWorldRenderer: @unchecked Sendable {
             log.info("Source-only guard band enabled: scale=\(GameWorldSourceGuardBand.configuredScale). Display projection and eye spacing unchanged; fixed-size source loses angular resolution.")
         }
         log.info("Finite sky support: requested=\(skyRequested) available=\(self.finiteSkySupport != nil) reason=\(self.finiteSkySupportUnavailable?.rawValue ?? "ready", privacy: .public); partial physical improvement, no unseen coverage")
+        log.info("Depth-edge gap fill: requested=\(fillRequested) available=\(self.depthEdgeFill != nil); owner-0 pixels inside the source image only")
         if cornerRequested {
             log.info("Corner-depth precompute requested: \(precompute == nil ? "unavailable, using the single-pass pipeline" : "enabled", privacy: .public)")
         }
@@ -1404,30 +1414,63 @@ final class GameWorldRenderer: @unchecked Sendable {
                 source = (sourceEye, worldUniforms(eye: sourceEye, stageFromHead: stageFromHead, headFromEye: worldEye,
                                                    projection: projection))
             }
+            if let source, source.eye.kind == .actual,
+               let density = GameWorldSamplingDensity.measure(eye: eye, displayProjection: projection,
+                   displayPixels: SIMD2(Int(map.viewport.width), Int(map.viewport.height)),
+                   sourceProjection: source.eye.sourceProjection,
+                   sourcePixels: SIMD2(Int(source.eye.width), Int(source.eye.height))) {
+                imageQuality.record(density: density)
+            }
             let skyOutcome: GameWorldFiniteSkyTelemetry.Outcome
+            var skyResult: GameWorldFiniteSkySupport.Result?
             if let unavailable = finiteSkySupportUnavailable { skyOutcome = unavailable }
             else if singleSource != nil { skyOutcome = .singleSourceDiagnostic }
             else if copyDecision != nil { skyOutcome = .sourceCopyActive }
             else if let source, source.eye.kind == .actual, let finiteSkySupport {
-                skyOutcome = finiteSkySupport.encode(commands: commands, pass: pass, viewport: map.viewport,
+                skyResult = finiteSkySupport.encode(commands: commands, pass: pass, viewport: map.viewport,
                     projection: projection, far: drawable.depthRange.x, uniforms: source.uniforms,
-                    color: source.eye.color, depth: source.eye.depth) != nil ? .encoded : .encodeUnavailable
+                    color: source.eye.color, depth: source.eye.depth)
+                skyOutcome = skyResult != nil ? .encoded : .encodeUnavailable
             } else { skyOutcome = .noQualifiedActualSource }
             finiteSkyTelemetry.record(view: eye, outcome: skyOutcome, source: source.map {
                 .init(eye: $0.eye.viewIndex, game: $0.eye.gameFrame,
                       request: $0.eye.requestFrame, head: $0.eye.headFrame)
             })
+            if imageQuality.fillRequested, skyOutcome != .encoded, source?.eye.kind == .actual {
+                imageQuality.record(view: eye, outcome: .finiteSkyOwnershipUnavailable)
+            }
             if skyOutcome == .encoded, let source {
                 encodedViews += 1
                 if eye == 0 { finiteSkyFirstEye = true }
+                // The fill reconstructs the exact frame the world pass drew.
+                var fill: GameWorldDepthEdgeFillUniforms?
+                if imageQuality.fillRequested {
+                    if depthEdgeFill == nil { imageQuality.record(view: eye, outcome: .pipelineUnavailable) }
+                    else if let skyResult {
+                        fill = GameWorldDepthEdgeFillPolicy.uniforms(sourceProjection: source.eye.sourceProjection,
+                            currentEyeFromSourceEye: source.uniforms.currentEyeFromSourceEye, displayProjection: projection,
+                            viewportOrigin: SIMD2(Float(map.viewport.originX), Float(map.viewport.originY)),
+                            viewportSize: SIMD2(Float(map.viewport.width), Float(map.viewport.height)),
+                            sourceSize: source.uniforms.sourceSize, sourceDepthReversed: source.uniforms.sourceDepthReversed,
+                            colorTransfer: source.uniforms.colorTransfer,
+                            nearestDistance: source.uniforms.nearFadeDistances.y, skyRadius: skyResult.radius)
+                        if fill == nil { imageQuality.record(view: eye, outcome: .invalidGeometry) }
+                    }
+                }
                 // Ownership and depth repair have finished. This new pass has
                 // only attachment0, matching the normal reticle pipeline.
-                if hudSnapshot != nil || gameplayAim != nil {
+                if fill != nil || hudSnapshot != nil || gameplayAim != nil {
                     pass.colorAttachments[0].loadAction = .load
                     pass.depthAttachment.loadAction = .load
                     if let overlay = commands.makeRenderCommandEncoder(descriptor: pass) {
-                        overlay.label = "Single HUD canvas and gameplay reticle after finite sky support"
+                        overlay.label = "Depth-edge fill, single HUD canvas and gameplay reticle after finite sky support"
                         overlay.setViewport(map.viewport)
+                        // Gaps first: HUD and reticle set their own pipeline and depth state.
+                        if let fill, let depthEdgeFill, let skyResult {
+                            imageQuality.record(view: eye, outcome: depthEdgeFill.encode(overlay, commands: commands,
+                                eye: eye, uniforms: fill, ownership: skyResult.ownership, color: source.eye.color,
+                                depth: source.eye.depth, telemetry: imageQuality) ? .encoded : .resourceMismatch)
+                        }
                         if let hudSnapshot {
                             hud?.encode(overlay, snapshot: hudSnapshot,
                                 headFromEye: view.transform, projection: physicalProjection, nativeScope: nativeScope)
@@ -1441,10 +1484,14 @@ final class GameWorldRenderer: @unchecked Sendable {
                         }
                         overlay.endEncoding()
                     } else {
+                        if fill != nil { imageQuality.record(view: eye, outcome: .encoderUnavailable) }
                         // The world is already encoded; do not acknowledge it
                         // as a complete UI presentation if its overlay failed.
-                        encodedViews -= 1
-                        reportStatus("The immersive HUD overlay could not be encoded; waiting for the next complete frame.")
+                        // Without HUD/reticle the unfilled world is still complete.
+                        if hudSnapshot != nil || gameplayAim != nil {
+                            encodedViews -= 1
+                            reportStatus("The immersive HUD overlay could not be encoded; waiting for the next complete frame.")
+                        }
                     }
                 }
                 continue
@@ -1537,6 +1584,8 @@ final class GameWorldRenderer: @unchecked Sendable {
     /// Synchronized compact snapshot read by the existing lifecycle report.
     /// CPU encode outcomes are deliberately separate from GPU/pixel acceptance.
     func finiteSkySupportStatus() -> [String: Any] { finiteSkyTelemetry.reportValue }
+
+    func imageQualityStatus() -> [String: Any] { imageQuality.reportValue }
 
     func hudCanvasStatus() -> [String: Any] {
         countersLock.lock()
