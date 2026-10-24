@@ -166,14 +166,22 @@ fn metal_foreground_clear_refreshes_proxy_after_snapshot_closes_overlay() {
 fn metal_foreground_colour_without_depth_refuses_publication_without_an_overlay() {
     let mut g = gpu();
     const REASON: &str = "foreground_opaque_colour_without_depth_write";
-    for live_first in [false, true] {
+    for scenario in 0..3 {
         g.fp_sessions = Default::default();
-        if live_first {
+        if scenario == 1 {
             assert_eq!(g.fp_sessions.foreground_depth_draw(1, 1,
                 fg::logic::Relation::LiveSame, 1, fg::logic::STREAM_PED), fg::logic::Decision::Combined);
         }
-        g.fp_sessions.poison(REASON);
-        assert!(g.fp_sessions.overlays.is_empty());
+        if scenario == 2 {
+            g.fp_sessions = sessions();
+            // Unsupported opaque depth on another target must also withdraw
+            // target 1, whose accepted overlay otherwise remains publishable.
+            assert!(!g.foreground_generic(2, REASON, true));
+            assert!(g.fp_sessions.publishable(1).is_err());
+        } else {
+            g.fp_sessions.poison(REASON);
+            assert!(g.fp_sessions.overlays.is_empty());
+        }
         let before = crate::world_frame::status_json()["dropped"].as_u64().unwrap();
         g.publish_world_frame(0);
         let after = crate::world_frame::status_json();
@@ -182,4 +190,27 @@ fn metal_foreground_colour_without_depth_refuses_publication_without_an_overlay(
         assert!(g.fp_sessions.poisoned.is_none(), "poison is consumed per present");
     }
     assert_eq!(g.errors.load(Ordering::Relaxed), 0);
+}
+
+#[test]
+fn foreground_blend_classification_includes_enabled_destination_replacement() {
+    let classify = |blend| foreground_colour_replaces_destination(blend, ColorWrites::ALL);
+    assert!(classify(None));
+    assert!(!foreground_colour_replaces_destination(None, ColorWrites::empty()));
+    assert!(classify(Some(BlendState::REPLACE)));
+    assert!(!classify(Some(BlendState::ALPHA_BLENDING)));
+    assert!(!classify(Some(BlendState::PREMULTIPLIED_ALPHA_BLENDING)));
+    for source in [BlendFactor::Dst, BlendFactor::OneMinusDst] {
+        let mut blend = BlendState::REPLACE;
+        blend.color.src_factor = source;
+        assert!(!classify(Some(blend)));
+    }
+    for operation in [BlendOperation::Min, BlendOperation::Max] {
+        let mut blend = BlendState::REPLACE;
+        blend.color.operation = operation;
+        assert!(!classify(Some(blend)));
+    }
+    let mut blend = BlendState::REPLACE;
+    blend.color.src_factor = BlendFactor::SrcAlpha;
+    assert!(classify(Some(blend)));
 }

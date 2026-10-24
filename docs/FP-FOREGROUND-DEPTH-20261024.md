@@ -107,6 +107,10 @@ attributed opaque colour draw without a depth write poisons the entire present.
 The last case refuses publication even if no overlay opened or earlier writes
 combined directly into live world depth. It does not assume that an earlier
 prepass covered the colour. Supporting such a prepass needs actual evidence.
+An opaque attributed draw that fails qualification or writes depth to another
+target also poisons the whole present. Enabled destination-replacing blends
+(including One/Zero/Add) count as opaque here. Capture events record this
+classification and the blend-state words for the actual pass.
 Depth-only and translucent passes still require the physical capture below;
 the merge remains default off.
 

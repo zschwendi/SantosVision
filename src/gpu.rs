@@ -4925,17 +4925,18 @@ impl Gpu {
         // Attribution alone (capture) keeps every existing rule unchanged.
         if !fg::merge_requested() { return false; }
         fg::gpu_status().foreground_draws += 1;
+        let opaque_colour = self.foreground_opaque_colour(ps);
         if !may_write {
             // Opaque first-person colour without a depth write keeps the frozen
             // world depth under it in any merge: never merge this present.
-            if self.foreground_opaque_colour(ps) {
+            if opaque_colour {
                 self.fp_sessions.poison("foreground_opaque_colour_without_depth_write");
                 fg::note_generic("foreground_opaque_colour_without_depth_write");
             }
             return false;
         }
         fg::gpu_status().foreground_depth_draws += 1;
-        if let Err(reason) = self.foreground_draw_qualifies(&mark, ps) { return self.foreground_generic(ds.tex, reason); }
+        if let Err(reason) = self.foreground_draw_qualifies(&mark, ps) { return self.foreground_generic(ds.tex, reason, opaque_colour); }
         // A clear issued before this draw belongs to the image before it.
         self.materialize_clears(ds.tex);
         let identity = match (self.fp_images.get(&ds.tex), self.tex(ds.tex)) {
@@ -4947,29 +4948,32 @@ impl Gpu {
             fg::logic::Decision::Combined => { fg::gpu_status().combined_live_writes += 1; true }
             fg::logic::Decision::ContinueOverlay => { fg::gpu_status().overlay_writes += 1; true }
             fg::logic::Decision::OpenOverlay => {
-                if !self.foreground_snapshot(ds.tex, true) { return self.foreground_generic(ds.tex, "pre_foreground_snapshot_failed"); }
+                if !self.foreground_snapshot(ds.tex, true) { return self.foreground_generic(ds.tex, "pre_foreground_snapshot_failed", opaque_colour); }
                 self.fp_sessions.opened(ds.tex);
                 let mut status = fg::gpu_status();
                 status.overlays_opened += 1;
                 status.overlay_writes += 1;
                 true
             }
-            fg::logic::Decision::Generic(reason) => { fg::note_generic(reason); false }
+            fg::logic::Decision::Generic(reason) => self.foreground_generic(ds.tex, reason, opaque_colour),
         }
     }
 
-    /// Unblended colour written to a bound target by this pixel shader.
+    /// Colour that replaces the destination, including an enabled One/Zero blend.
     fn foreground_opaque_colour(&self, ps: Option<&Program>) -> bool {
         let Some(program) = ps else { return false; };
         let blend = self.state(self.s.blend.0);
         self.s.rt.iter().enumerate().any(|(slot, rt)| rt.tex != 0 && program.info.outputs.contains(&(slot as u32)) && {
             let (state, write) = blend_for(blend.as_deref(), slot);
-            state.is_none() && !write.is_empty()
+            foreground_colour_replaces_destination(state, write)
         })
     }
 
-    fn foreground_generic(&mut self, target: u32, reason: &'static str) -> bool {
+    fn foreground_generic(&mut self, target: u32, reason: &'static str, opaque_colour: bool) -> bool {
         self.fp_sessions.reject(target, reason);
+        // Its colour can land on the final target even if its unsupported
+        // depth went elsewhere. Reject all accepted overlays/live depth too.
+        if opaque_colour { self.fp_sessions.poison(reason); }
         fg::note_generic(reason);
         false
     }
@@ -5184,6 +5188,8 @@ impl Gpu {
         let rt0 = self.s.rt[0].clone();
         let event = serde_json::json!({"event":"draw","draw":self.draws,"depth":ds.tex,"depth_subresource":[ds.mip,ds.slice,ds.flags],
             "color0":[rt0.tex,rt0.mip,rt0.slice],"writes_depth":may_write,
+            "colour_replaces_destination":self.foreground_opaque_colour(ps),
+            "blend_state_words":self.state(self.s.blend.0).map(|state| state.words.iter().take(66).copied().collect::<Vec<_>>()),
             "depth_state":self.state(self.s.dss.0).map(|state| state.words.iter().take(3).copied().collect::<Vec<_>>()),
             "vertex":vs.label.chars().take(96).collect::<String>(),"pixel":ps.map(|program| program.label.chars().take(96).collect::<String>()),
             "viewport":self.s.viewports.first().copied(),
@@ -5306,6 +5312,13 @@ fn format_id(f: TextureFormat) -> i64 {
     let mut h: i64 = 1469598103934665603u64 as i64;
     for b in s.bytes() { h = (h ^ b as i64).wrapping_mul(1099511628211); }
     h
+}
+
+fn foreground_colour_replaces_destination(state: Option<BlendState>, write: ColorWrites) -> bool {
+    !write.is_empty() && state.is_none_or(|blend|
+        blend.color.dst_factor == BlendFactor::Zero
+        && !matches!(blend.color.src_factor, BlendFactor::Dst | BlendFactor::OneMinusDst)
+        && !matches!(blend.color.operation, BlendOperation::Min | BlendOperation::Max))
 }
 
 fn blend_for(state: Option<&StateObj>, rt: usize) -> (Option<BlendState>, ColorWrites) {
