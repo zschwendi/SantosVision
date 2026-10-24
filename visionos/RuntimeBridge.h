@@ -79,7 +79,7 @@ _Static_assert(sizeof(SVWorldFrame) == 288, "SVWorldFrame ABI layout must match 
 int32_t sv_xr_submit_views(const SVXRViewRequest *request);
 int32_t sv_xr_world_camera_set_enabled(uint32_t enabled);
 
-/* Original gameplay camera ray, not a synthetic ballistic trajectory. */
+/* Current gameplay camera or tracked native weapon input ray; never an impact. */
 typedef struct {
     uint32_t version, size;
     uint64_t sequence, view_epoch;

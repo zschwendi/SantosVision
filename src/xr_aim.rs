@@ -1,6 +1,6 @@
-//! Controller aim remains the original game's gameplay ray. Head tracking
-//! moves the rendered view independently; a reticle must project this ray in
-//! each eye rather than reuse the flat image's centre pixel.
+//! Project the gameplay input ray independently in each eye. Ordinary controls
+//! retain the game's camera ray; tracked arms use the current attached weapon
+//! only after its native pose agrees with the accepted tracking target.
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -15,6 +15,9 @@ pub const AIM_NATIVE_RETICLE_HIDDEN: u32 = 4;
 pub const AIM_IN_VEHICLE: u32 = 8;
 pub const AIM_FIRST_PERSON: u32 = 16;
 pub const AIM_FREE_AIMING: u32 = 32;
+/// Read-only direction sampled from the current native attached weapon.
+/// This flag does not certify an impact or remove native spread/correction.
+pub const AIM_TRACKED_INPUT_DIRECTION: u32 = 64;
 const MAX_AGE: Duration = Duration::from_millis(100);
 static RETICLE_READY: AtomicBool = AtomicBool::new(false);
 static RETICLE_READY_EPOCH: AtomicU64 = AtomicU64::new(0);
@@ -149,6 +152,42 @@ fn fresh_snapshot(state: &AimState, now: Instant, epoch: u64, active: bool) -> O
     Some(snapshot)
 }
 
+fn select_snapshot(baseline: Option<SVXRAimSnapshot>, tracked_scope: bool,
+    ray: Option<crate::xr_motion_arms::CurrentInputRay>, now_seconds: f64) -> Option<SVXRAimSnapshot> {
+    let mut snapshot = baseline?;
+    if !tracked_scope { return Some(snapshot); }
+    // The old gameplay camera is not a tracked weapon ray. While a tracked
+    // target is waiting for native blend/attachment agreement, show no marker.
+    let ray = ray?;
+    let direction = ray.direction.map(f64::from);
+    let norm: f64 = direction.iter().map(|v| v * v).sum();
+    if ray.camera_sequence == 0 || ray.source_age > MAX_AGE
+        || ray.origin.iter().any(|v| !v.is_finite() || v.abs() > 1_000_000.)
+        || direction.iter().any(|v| !v.is_finite()) || (norm - 1.).abs() > 0.002
+        || !now_seconds.is_finite() || now_seconds < 0. { return None; }
+    snapshot.sequence = ray.camera_sequence;
+    snapshot.origin = ray.origin.map(f64::from);
+    snapshot.direction = direction;
+    snapshot.age_seconds = ray.source_age.as_secs_f64();
+    snapshot.capture_time_seconds = (now_seconds - snapshot.age_seconds).max(0.);
+    snapshot.flags |= AIM_TRACKED_INPUT_DIRECTION;
+    Some(snapshot)
+}
+
+fn tracked_scope(baseline: Option<SVXRAimSnapshot>) -> bool {
+    baseline.is_some_and(|s| s.flags & AIM_FIRST_PERSON != 0 && s.flags & AIM_IN_VEHICLE == 0)
+        && crate::xr_motion_aim::arms_enabled() && crate::pad::spatial_controls_selected()
+        && crate::pad::verified_guest_gameplay_context()
+        && !crate::xr_motion_arms::native_fallback_active()
+}
+
+fn current_snapshot(baseline: Option<SVXRAimSnapshot>, epoch: u64) -> Option<SVXRAimSnapshot> {
+    let tracked_scope = tracked_scope(baseline);
+    let ray = tracked_scope.then(|| crate::xr_motion_arms::current_actual_input_ray(epoch)).flatten();
+    let time = crate::RT.get().map(|rt| rt.start.elapsed().as_secs_f64()).unwrap_or(0.);
+    select_snapshot(baseline, tracked_scope, ray, time)
+}
+
 /// Copies one fresh controller/gameplay ray. No guest calls occur here.
 /// Return0=valid,1=no current ray,-1=null output,-2=ABI size mismatch.
 #[no_mangle]
@@ -157,7 +196,8 @@ pub unsafe extern "C" fn sv_xr_get_aim_snapshot(output: *mut SVXRAimSnapshot, by
     if byte_size != AIM_SIZE { return -2; }
     let epoch = crate::xr_view::view_epoch();
     let active = reticle_ready_for_epoch(epoch);
-    let snapshot = fresh_snapshot(&STATE.lock().unwrap_or_else(|p| p.into_inner()), Instant::now(), epoch, active);
+    let baseline = fresh_snapshot(&STATE.lock().unwrap_or_else(|p| p.into_inner()), Instant::now(), epoch, active);
+    let snapshot = current_snapshot(baseline, epoch);
     if let Some(snapshot) = snapshot.filter(|_| reticle_ready_for_epoch(epoch)) { unsafe { output.write_unaligned(snapshot) }; 0 }
     else { unsafe { output.write_unaligned(SVXRAimSnapshot::default()) }; 1 }
 }
@@ -165,15 +205,20 @@ pub unsafe extern "C" fn sv_xr_get_aim_snapshot(output: *mut SVXRAimSnapshot, by
 pub fn status_json() -> serde_json::Value {
     let state = STATE.lock().unwrap_or_else(|p| p.into_inner());
     let epoch = crate::xr_view::view_epoch();
-    let snapshot = fresh_snapshot(&state, Instant::now(), epoch, reticle_ready_for_epoch(epoch));
-    serde_json::json!({"abi_version": AIM_VERSION,"byte_size": AIM_SIZE,"samples":state.samples,
-        "native_reticle_hides":state.hidden,"failures":state.failures,"fresh":snapshot.is_some(),
+    let baseline = fresh_snapshot(&state, Instant::now(), epoch, reticle_ready_for_epoch(epoch));
+    let (samples, hidden, failures, last_error) = (state.samples, state.hidden, state.failures, state.last_error.clone());
+    drop(state);
+    let pending_tracked = tracked_scope(baseline);
+    let snapshot = current_snapshot(baseline, epoch);
+    let tracked = snapshot.is_some_and(|s| s.flags & AIM_TRACKED_INPUT_DIRECTION != 0);
+    serde_json::json!({"abi_version": AIM_VERSION,"byte_size": AIM_SIZE,"samples":samples,
+        "native_reticle_hides":hidden,"failures":failures,"fresh":snapshot.is_some(),
         "replacement_frontend_ready":reticle_ready_for_epoch(epoch),"maximum_age_ms":MAX_AGE.as_millis(),
         "sequence":snapshot.map(|s|s.sequence),"view_epoch":snapshot.map(|s|s.view_epoch),
         "age_seconds":snapshot.map(|s|s.age_seconds),"origin":snapshot.map(|s|s.origin),
         "direction":snapshot.map(|s|s.direction),"flags":snapshot.map(|s|s.flags),
-        "last_error":state.last_error,"aim_source":"original controller gameplay camera; head movement is free look",
-        "bullet_scope":"camera forward ray; weapon spread, recoil, muzzle parallax and assisted target are not synthesized"})
+        "last_error":last_error,"aim_source":if tracked {"current native attached weapon direction; exact tracked packet and native pose agreement"} else if pending_tracked {"tracked native weapon pending current packet and pose agreement"} else {"original controller gameplay camera; head movement is free look"},
+        "bullet_scope":if tracked {"native weapon input direction; not an impact; native spread and correction remain"} else {"camera forward ray; weapon spread, recoil, muzzle parallax and assisted target are not synthesized"}})
 }
 
 fn invoke_reticle_hider<T: AsContextMut<Data = HostState>>(store: &mut T, table: Table, certified: bool) -> anyhow::Result<()> {
@@ -219,6 +264,25 @@ mod tests {
         assert!(fresh_snapshot(&state,now+Duration::from_millis(99),7,true).is_some());
         assert!(fresh_snapshot(&state,now+Duration::from_millis(101),7,true).is_none());
         assert!(fresh_snapshot(&state,now,8,true).is_none());assert!(fresh_snapshot(&state,now,7,false).is_none());
+    }
+    #[test]
+    fn tracked_reticle_uses_current_native_ray_and_waits_for_pose_agreement() {
+        let baseline = make_snapshot(sample(), 7, 10.).unwrap();
+        let ray = || crate::xr_motion_arms::CurrentInputRay { origin:[8.,9.,10.], direction:[1.,0.,0.],
+            source_age:Duration::from_millis(25), camera_sequence:123 };
+        let tracked = select_snapshot(Some(baseline), true, Some(ray()), 10.).unwrap();
+        assert_eq!(tracked.origin, [8.,9.,10.]); assert_eq!(tracked.direction, [1.,0.,0.]);
+        assert_eq!(tracked.sequence, 123); assert_eq!(tracked.view_epoch, 7);
+        assert_eq!(tracked.flags & !AIM_TRACKED_INPUT_DIRECTION, baseline.flags);
+        assert_eq!(tracked.age_seconds, 0.025); assert_eq!(tracked.capture_time_seconds, 9.975);
+        assert!(select_snapshot(Some(baseline), true, None, 10.).is_none());
+        let mut stale = ray(); stale.source_age = Duration::from_millis(101);
+        assert!(select_snapshot(Some(baseline), true, Some(stale), 10.).is_none());
+        let mut invalid = ray(); invalid.direction = [0.,0.,0.];
+        assert!(select_snapshot(Some(baseline), true, Some(invalid), 10.).is_none());
+        let ordinary = select_snapshot(Some(baseline), false, Some(ray()), 10.).unwrap();
+        assert_eq!(ordinary.origin, baseline.origin); assert_eq!(ordinary.direction, baseline.direction);
+        assert_eq!(ordinary.flags, baseline.flags);
     }
     #[test]
     fn replacement_frontend_cannot_be_enabled_without_active_camera_owner() {
