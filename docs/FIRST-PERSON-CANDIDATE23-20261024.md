@@ -1,9 +1,10 @@
 # First-person candidate 23-r2 — October 24, 2026
 
-**Signed and verified; not installed or physically accepted.** Build 22 remains
-the last verified installed app. Its background launch and subsequent process
-query timed out; no foreground takeover or further connection loop followed.
-The user's build-22 gameplay feedback is pending.
+**Historical signed native baseline; this exact app was never installed.**
+[Build 24](PHONE-CONTROLS24-20261024.md) now carries this frozen native archive
+and AOT, with newer client UI, and its installed version was verified. The
+user's build-22 feedback failed visible hand/arm tracking. Physical acceptance
+remains open; default-off foreground depth is not a delivered tracking fix.
 
 Parent `w-14dea40fb6e248138ad507f85cf4384b`, topic `santosvision-immersive`.
 
@@ -73,6 +74,9 @@ and `startup-mailbox23/` under the verification root. The final foreground
 addendum's R1/R2 cases are repaired at `889bfe7`.
 
 ## Next physical test
+
+This is the original 23-r2 recipe. Use the installed build-24 equivalent in
+[the current notes](PHONE-CONTROLS24-20261024.md), preserving this frozen app.
 
 1. Resolve the pending **installed-22** check: normal startup, Start from
    immersive returning to the real GTA menu, Sense directions/tabs/Apply, then

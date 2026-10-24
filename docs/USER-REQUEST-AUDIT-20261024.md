@@ -5,20 +5,20 @@ headset feedback supersedes earlier passing source tests and target counters.
 The coordinator owns integration and the complete player experience. Parent:
 `w-14dea40fb6e248138ad507f85cf4384b`, topic `santosvision-immersive`.
 
-Build **22** is installed in place and its installed bundle version was verified.
-The frozen source is `db5f612`, tag
-`los-santos-first-person-candidate22-20261024`. The subsequent background-only
-launch request timed out; opening it and gameplay acceptance remain unconfirmed.
-No uninstall or save-data replacement occurred. Deployment receipt:
-`target/verification/device-session-20261024/first-person22-device/deployment-receipt.json`.
+Build **24** is installed in place and the installed bundle version was verified.
+Client source is `04456ad`, tag `los-santos-phone-ui-candidate24-20261024`.
+It links the frozen 23-r2 native archive from `889bfe7`, with its exact AOT.
+The signed client build, strict signature, physical provisioning, cloud
+entitlements, complete AOT embedding and RX segment checks passed. No uninstall,
+save replacement or foreground launch occurred. Details and next test:
+[build 24 notes](PHONE-CONTROLS24-20261024.md). Deployment receipt:
+`target/verification/device-session-20261024/phone-removal24/candidate-receipt.json`.
 
-The next signed app is **23-r2**, frozen at `889bfe7` / tag
-`los-santos-first-person-candidate23-r2-20261024`; it is **not installed**.
-Native/Swift/Metal build, signatures, provisioning and complete AOT byte
-embedding passed. [Candidate notes](FIRST-PERSON-CANDIDATE23-20261024.md)
-record its changes and the next actual headset test. Foreground merge/capture
-remain off for normal launch. Signed 22 and the original build-5 checkpoint
-are preserved.
+The [23-r2 source notes](FIRST-PERSON-CANDIDATE23-20261024.md) remain the native
+baseline. Foreground merge/capture remain off for normal launch. Signed 22,
+23-r2 and the original build-5 checkpoint are preserved. The last tested
+build-22 experience failed visible hand/arm acceptance; installing 24 does not
+close that failure.
 
 The user confirmed **Sense-driven hands and arms first**. Visible hands, arms
 and gun must follow the controllers, with barrel, reticle and native shots in
@@ -43,7 +43,7 @@ only to the windowed presentation, reached through the existing pause/window flo
 | Sense can navigate GTA Settings and controls in every view | **Source repair integrated; hardware check pending.** GTA keeps the controller while its menu is open; L1/R1/Triangle send its actual Q/E/Tab bindings. Combined menu/ADS routing passes 39 tests. | Dedicated Opus 5.5 `menus` task; actual directions, tabs, confirm/cancel and Apply/save. |
 | Actual tracked gun, hands and arms | **Player acceptance failed; unfinished.** Installed 22 corrects head/eye cancellation in the two skinned model families, but its ordinary immersive publication lacks a qualified foreground-depth route. Signed 23-r2 adds calibrated left-wrist orientation and conditional actual foreground-depth integration, disabled by default. Five Metal/classifier and sixteen foreground CPU checks pass; actual game draw-order evidence is still needed. Unarmed Sense-driven hands remain unfinished. | Dedicated Opus 5.5 `hands` task; actual skeleton, attachments and first-person draw transform must agree. |
 | Reticle always agrees with visible barrel and actual native aiming | **Incomplete.** Candidate 21 repairs an independent binocular-reference bug; it does not establish visible gun alignment. | Hands/ADS integration; near/far and independent head/hand movement. No fabricated center dot or desired-ray authority. |
-| Independent left wrist rotation | **Signed in 23-r2; not installed.** Explicit grip-to-native-hand calibration transports native flags256. Full artifact preservation, AOT generation and signed-app integration passed; 11 native state tests, 2 factory tests and 46 UI-flow checks pass after independent fixes. Physical acceptance remains. Installed 22 keeps native wrist orientation. | Hands task; proper calibrated frame and native orientation transport. |
+| Independent left wrist rotation | **Carried into installed 24; not physically accepted.** Explicit grip-to-native-hand calibration transports native flags256. Full artifact preservation, AOT generation and signed-app integration passed; 11 native state tests, 2 factory tests and 46 UI-flow checks pass after independent fixes. Uncalibrated play keeps native wrist orientation. | Hands task; proper calibrated frame and native orientation transport. |
 | First-person head looking, body turning and weapon aiming can be separated or chosen | **Partially implemented, choice unfinished.** Sense weapon aiming and headset view have separate source paths. There is no normal Settings choice for the requested first-person head-check/body-turn experiment. Preserve accepted third-person behavior. | Hands/aiming follow-up after actual barrel alignment is accepted. |
 | First-person immersive sniper is single and correctly zoomed | **Partial source repair; hardware pending.** Qualified scoped world now shares the graticule axis and uses a 1/m virtual baseline. Baked HUD fallback can still double when real HUD isolation is rejected; new counters identify it. | Dedicated Opus 5.5 `sniper` task. |
 | Crisp immersive graphics closer to the flat presentation | **Unaccepted.** New default-off display-resolution choice and experimental gap fill; Mac Metal parity passes for the fill. Source vertical density and alternating-eye limits remain. | Dedicated Opus 5.5 `quality` task; source/display evidence and explicit controls, no unsupported performance claims. |
@@ -52,9 +52,9 @@ only to the windowed presentation, reached through the existing pause/window flo
 | Near geometry fades instead of fighting the player's body | **Source exists; physical comfort not accepted.** Current fade range is 5–10 cm. This does not establish that all first-person arms, sights or nearby walls behave correctly. | Check alongside actual tracked arms and ADS; do not restore the old broad 15–45 cm fade. |
 | Stronger or more convincing stereo | **Unaccepted.** Use calibrated physical eye transforms; alternate-eye timing and foreground/HUD errors remain. No artificial IPD-strength setting has been added. | Accept coherent aiming/scope geometry before experimenting with perceived depth strength. |
 | Weapon wheel and Wasted are not duplicated; HUD stays visible | **Not fully accepted.** Prior reticle improvement does not prove all HUD elements. | Explicit UI/stereo checks; minimap lower without moving farther left, right HUD lower and inward. |
-| Phone/view utilities are minimal and out of the way | **Latest source removes immersive Phone utilities entirely**, including their tracking hit areas. Phone/Close-phone and phone-only directions remain in the game window; View ornament was already removed in both presentations. Physical camera shortcuts remain. | Coordinator: package the change and preserve working windowed phone access. |
+| Phone/view utilities are minimal and out of the way | **Installed 24 removes immersive Phone utilities entirely**, including their tracking hit areas. Phone/Close-phone and phone-only directions remain in the game window; View ornament was already removed in both presentations. Physical camera shortcuts remain. | Verify the requested removal and preserve working windowed phone access. |
 | Phone arrow pad only appears with phone, as an upright directional ornament; phone button closes phone | **Partial.** User previously accepted window behavior; immersive phone/open-transition failures remain. | Controls/lifecycle regression; preserve the working window path. |
-| Front of app feels concise and deliberate | **Trimmed in signed 23-r2; not installed.** Removed duplicate title/status and generic launcher decoration. Play, Settings, Quit and controller status remain; View ornament was already removed in build 22. | Coordinator; no replacement wall of diagnostic controls. |
+| Front of app feels concise and deliberate | **Trimmed in installed 24; player check pending.** Removed duplicate title/status and generic launcher decoration. Play, Settings, Quit and controller status remain. Footer includes the actual bundle build number. | Coordinator; no replacement wall of diagnostic controls. |
 | Original police-siren/Rockstar startup presentation instead of the current legal-only experience | **Missing asset confirmed.** The engine references platform:/movies/rockstar_logos, but none of the fourteen supplied archives contains the movie. Requires the original intro from the user's own copy; no new Rockstar asset bundled. | Coordinator; use the user's installed game assets, without embedding new proprietary assets in the app. |
 | Reliable iCloud save sync with redundant recovery | **Configured in signed build 22; story save/restore remains unverified.** CloudDocuments container/entitlements are present. Last received play configuration is Sandbox/developer mode ON; it does not establish a story-save round trip. | Inspect existing CloudSaveModel/recovery evidence and test actual save, restore and overwrite recovery. |
 | Vision Pro on the app icon instead of sunglasses | **Implemented and visually checked.** Asset catalog selects santos-five-visor.png, introduced by 5baebf1 in build 12 and retained in signed build 22. The prior audit entry was stale. | Keep the selected visor asset; APP-ICON.md provenance corrected. |
