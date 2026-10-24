@@ -129,7 +129,7 @@ final class SpatialGamepadInput {
             "right_pause_button_available": state.rightMenu,
             "left_dpad_modifier_available": state.leftClick,
             "right_stick_click_available": state.rightClick,
-            "mapping": "left_move_right_look_l3_hold_left_stick_dpad_l3_tap_click_both_stick_click_camera_left_menu_camera_right_menu_pause",
+            "mapping": "left_move_right_look_l3_normal_click_phone_ornament_phone_dpad_popup_both_stick_click_camera_left_menu_camera_right_menu_pause",
             "motion_aim_enabled": false,
             "errors": Array(errors.values.sorted().prefix(8))
         ]
