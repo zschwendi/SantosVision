@@ -1,5 +1,13 @@
 # First-person view model in immersion — October 24, 2026
 
+Update after physical build25: the earlier cache-stage observations below do
+not establish same-request solved-hand or visible tracking acceptance. Exact
+completed native goals now match the last sampled target positions, but remain
+before Solve. The actual same-eye/frame gun placement differs by172.766deg,
+while arms agree. [Build26](GUN-FIRST-PERSON-WORLD26-20261024.md) adds a qualified
+gun-only queued-world path; the old O-derived correction remains for arms and
+unqualified draws. Physical hands/arms/gun and firing agreement remain unaccepted.
+
 Worker `w-708b69ad7cb1407d952c27ea341b7404`; parent
 `w-14dea40fb6e248138ad507f85cf4384b`. Source change only. Root owns the
 nine-body artifact, AOT, signing and physical acceptance.

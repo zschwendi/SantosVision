@@ -5,7 +5,18 @@ headset feedback supersedes earlier passing source tests and target counters.
 The coordinator owns integration and the complete player experience. Parent:
 `w-14dea40fb6e248138ad507f85cf4384b`, topic `santosvision-immersive`.
 
-Build **25** is now installed in place and its bundle version was verified.
+Build **26** is now installed in place and its bundle version was verified.
+Source `eae9693`, tag `los-santos-gun-world-candidate26-20261024`. It changes
+only qualified local equipped first-person gun placement to use its queued
+native world matrix. Build25's one actual hardware snapshot found a172.766deg
+gun placement discrepancy while the paired arm placement agreed. Original
+source shows distinct regular/first-person attachment routes. Native build,
+signing/provisioning/cloud/full AOT embedding/RX checks and focused tests/review
+passed; the25 AOT and all prior frozen apps remain preserved. The new app was
+not activated after installation; **physical hand/gun/aim acceptance is pending**.
+See [build26 notes](GUN-FIRST-PERSON-WORLD26-20261024.md).
+
+Previous diagnostic baseline: Build **25** was installed in place and its bundle version was verified.
 Source `0d47441`, tag `los-santos-native-goal-diagnostics25-20261024`. It adds
 read-only exact post-native-goal and separate gun/arm observations, with a newly
 compiled matching AOT. Full compatibility, native/visionOS/signing/provisioning,
@@ -67,7 +78,7 @@ session produced the validated capture described in
 | Start in immersive must not crash; our settings must remain usable | **Source repair integrated; device acceptance pending.** Matching device crash is SwiftUI Missing app graph. The old sequence also crashes an isolated scene-only app; serialized restoration passes three cycles. GTA pause currently uses an explicit window fallback, not an immersive front-end compositor. | Coordinator with menus specialist; see SCENE-RETURN-STABILITY-20261024.md. Test Start, GTA tabs/Apply/save and return to immersive after closing GTA menu. |
 | First-person ADS in flat and immersive | **Source repair integrated; visible ADS unaccepted.** Sense L2 + R3 now reaches GTA's separate native sights toggle in both first-person views. Original L2-to-RMB mapping was already correct. Tracked-arm/sights interaction and wheel sign need a device check. | Dedicated Opus 5.5 `ads` task; test both first-person views. |
 | Sense can navigate GTA Settings and controls in every view | **Source repair integrated; hardware check pending.** GTA keeps the controller while its menu is open; L1/R1/Triangle send its actual Q/E/Tab bindings. Combined menu/ADS routing passes 39 tests. | Dedicated Opus 5.5 `menus` task; actual directions, tabs, confirm/cancel and Apply/save. |
-| Actual tracked gun, hands and arms | **Player acceptance failed; unfinished.** Actual build-24 capture proves the initial gun/arm draws precede world geometry and remain visible in published depth without merge. The earlier general missing-depth diagnosis is withdrawn for this arrangement. Same-request native solve-to-draw skeleton ownership is still unresolved; stale cache cookies do not prove a solve failure. Unarmed Sense-driven hands remain unfinished. | Dedicated Opus 5.5 `hands` task; actual skeleton, attachments and first-person draw transform must agree. |
+| Actual tracked gun, hands and arms | **Player acceptance failed; unfinished.** Actual build-24 capture proves the initial gun/arm draws precede world geometry and remain visible in published depth without merge. The earlier general missing-depth diagnosis is withdrawn for this arrangement. Build25 exact native goal positions match the last sampled controller targets; the separate FP candidate is close, but this is before Solve and not a movement-series or visible proof. Build26 corrects the qualified gun-only queued placement discrepancy; its physical selection and result remain unaccepted. Full arm/palette ownership, unarmed Sense hands and firing/reticle agreement remain unfinished; stale cache cookies do not prove a solve failure. | Dedicated Opus 5.5 `hands` task; actual skeleton, attachments and first-person draw transform must agree. |
 | Reticle always agrees with visible barrel and actual native aiming | **Incomplete.** Candidate 21 repairs an independent binocular-reference bug; it does not establish visible gun alignment. | Hands/ADS integration; near/far and independent head/hand movement. No fabricated center dot or desired-ray authority. |
 | Independent left wrist rotation | **Carried into installed 24; not physically accepted.** Explicit grip-to-native-hand calibration transports native flags256. Full artifact preservation, AOT generation and signed-app integration passed; 11 native state tests, 2 factory tests and 46 UI-flow checks pass after independent fixes. Uncalibrated play keeps native wrist orientation. | Hands task; proper calibrated frame and native orientation transport. |
 | First-person head looking, body turning and weapon aiming can be separated or chosen | **Partially implemented, choice unfinished.** Sense weapon aiming and headset view have separate source paths. There is no normal Settings choice for the requested first-person head-check/body-turn experiment. Preserve accepted third-person behavior. | Hands/aiming follow-up after actual barrel alignment is accepted. |
