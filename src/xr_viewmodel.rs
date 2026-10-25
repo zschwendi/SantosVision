@@ -132,7 +132,21 @@ pub(super) fn qualify_and_correct<M:Memory>(mem:&M,family:Family,draw:u64,stack:
 static HOOKS:[AtomicU64;2]=[AtomicU64::new(0),AtomicU64::new(0)];
 static APPLIED:[AtomicU64;2]=[AtomicU64::new(0),AtomicU64::new(0)];
 static LAST_GATE:Mutex<[Option<(Instant,&'static str)>;2]>=Mutex::new([None,None]);
-static LAST_APPLIED:Mutex<Option<(Instant,Applied)>>=Mutex::new(None);
+#[derive(Clone,Copy,Default)]
+struct AppliedObservations{latest:Option<(Instant,Applied)>,families:[Option<(Instant,Applied)>;2]}
+impl AppliedObservations{
+    fn record(&mut self,at:Instant,applied:Applied){
+        self.latest=Some((at,applied));
+        self.families[applied.family.slot()]=Some((at,applied));
+    }
+}
+static LAST_APPLIED:Mutex<AppliedObservations>=Mutex::new(AppliedObservations{latest:None,families:[None,None]});
+fn describe_applied(sample:Option<(Instant,Applied)>)->Option<serde_json::Value>{
+    sample.map(|(at,a)|serde_json::json!({"age_ms":at.elapsed().as_millis(),"family":a.family.index(),"view_epoch":a.view.provenance_epoch,
+        "camera_sequence":a.view.camera_sequence,"request_frame":a.view.request_frame,"head_pose_frame":a.view.head_pose_frame,
+        "eye_index":a.view.eye_index,"head_translation_m":a.head_translation_m,"head_rotation_degrees":a.head_rotation_deg,
+        "model_translation_shift_m":a.model_shift_m,"camera_relative_vs_draw_world":a.draw_world.map(|(t,r)|serde_json::json!({"translation_m":t,"rotation_degrees":r}))}))
+}
 
 pub(super) fn host_hook(caller:&mut wasmtime::Caller<'_,crate::HostState>,params:&[wasmtime::Val],results:&mut[wasmtime::Val],mem:&wasmtime::SharedMemory)->anyhow::Result<()>{
     use wasmtime::Val;
@@ -145,7 +159,7 @@ pub(super) fn host_hook(caller:&mut wasmtime::Caller<'_,crate::HostState>,params
         else if !crate::xr_view::world_camera_enabled(){"immersive_world_camera_inactive"}
         else if *tls==0||active_stack(caller)!=Some(*stack as u64){"frame_or_tls_identity"}
         else{match qualify_and_correct(&Guest(mem),family,*draw as u64,*stack as u64,*parent as u64,*qualified!=0,crate::xr_view::installed_headset_eye){
-            Ok(applied)=>{APPLIED[family.slot()].fetch_add(1,Ordering::Relaxed);*LAST_APPLIED.lock().unwrap_or_else(|p|p.into_inner())=Some((Instant::now(),applied));
+            Ok(applied)=>{APPLIED[family.slot()].fetch_add(1,Ordering::Relaxed);LAST_APPLIED.lock().unwrap_or_else(|p|p.into_inner()).record(Instant::now(),applied);
                 // Only a corrected completed model may attribute this invocation's
                 // emissions to its displaced parent eye (default off; host reads only).
                 let _=crate::xr_view::foreground_depth::bind_after_correction(caller.data(),mem,family.index() as u32,*stack as u64,*parent as u64,&applied.view);
@@ -156,11 +170,10 @@ pub(super) fn host_hook(caller:&mut wasmtime::Caller<'_,crate::HostState>,params
 pub(super) fn status()->serde_json::Value{
     let gates=*LAST_GATE.lock().unwrap_or_else(|p|p.into_inner());let last=*LAST_APPLIED.lock().unwrap_or_else(|p|p.into_inner());
     let family=|f:Family|serde_json::json!({"first_person_hooks":HOOKS[f.slot()].load(Ordering::Relaxed),"applied":APPLIED[f.slot()].load(Ordering::Relaxed),
-        "last_gate":gates[f.slot()].map(|(at,gate)|serde_json::json!({"gate":gate,"age_ms":at.elapsed().as_millis()}))});
+        "last_gate":gates[f.slot()].map(|(at,gate)|serde_json::json!({"gate":gate,"age_ms":at.elapsed().as_millis()})),
+        "last_applied":describe_applied(last.families[f.slot()])});
     serde_json::json!({"requested":crate::xr_motion_aim::viewmodel_enabled(),"stream_ped_44415":family(Family::StreamPed),"skinned_44355":family(Family::Skinned),
-        "last_applied":last.map(|(at,a)|serde_json::json!({"age_ms":at.elapsed().as_millis(),"family":a.family.index(),"view_epoch":a.view.provenance_epoch,
-            "camera_sequence":a.view.camera_sequence,"eye_index":a.view.eye_index,"head_translation_m":a.head_translation_m,"head_rotation_degrees":a.head_rotation_deg,
-            "model_translation_shift_m":a.model_shift_m,"camera_relative_vs_draw_world":a.draw_world.map(|(t,r)|serde_json::json!({"translation_m":t,"rotation_degrees":r}))})),
+        "last_applied":describe_applied(last.latest),
         "authority":"completed stack model matrix only; no displayed-pixel, depth, coverage or barrel-alignment certificate",
         "foreground_depth":crate::xr_view::foreground_depth::status_json()})
 }
@@ -245,6 +258,22 @@ pub(super) fn status()->serde_json::Value{
         let view=crate::xr_view::WorldView{provenance_epoch:3,camera_sequence:9,request_frame:4,head_pose_frame:5,presentation_time_seconds:1.,eye_index:1,view_count:2,
             game_from_eye:narrow(&sc.beye),game_from_stage:identity(),projection_from_eye:identity(),depth_reverse_z:true,headset_applied:true,optics:crate::xr_view::ScopeOptics::default()};
         (m,sc,view)
+    }
+    #[test]fn arm_report_does_not_replace_gun_observation_or_its_view_identity(){
+        let mut samples=AppliedObservations::default();
+        for(family,camera,error)in [(Family::Skinned,71,(0.46,158.)),(Family::StreamPed,72,(0.,0.))]{
+            let(m,sc,mut view)=fixture(family,15.);view.camera_sequence=camera;
+            let mut applied=qualify_and_correct(&m,family,DRAW,STACK,PARENT,true,|_|Some((view,narrow(&sc.b0)))).unwrap();
+            applied.draw_world=Some(error);
+            samples.record(Instant::now(),applied);
+        }
+        let gun=describe_applied(samples.families[Family::Skinned.slot()]).unwrap();
+        let arms=describe_applied(samples.families[Family::StreamPed.slot()]).unwrap();
+        assert_eq!(gun["family"],44355);assert_eq!(gun["camera_sequence"],71);
+        assert_eq!(gun["camera_relative_vs_draw_world"]["rotation_degrees"],158.);
+        assert_eq!(arms["family"],44415);assert_eq!(arms["camera_sequence"],72);
+        assert_eq!(arms["camera_relative_vs_draw_world"]["rotation_degrees"],0.);
+        assert_eq!(describe_applied(samples.latest).unwrap()["family"],44415);
     }
     #[test]fn both_seams_rewrite_only_the_twelve_model_coordinates_after_full_qualification(){
         for family in [Family::StreamPed,Family::Skinned]{
