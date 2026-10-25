@@ -5,7 +5,17 @@ headset feedback supersedes earlier passing source tests and target counters.
 The coordinator owns integration and the complete player experience. Parent:
 `w-14dea40fb6e248138ad507f85cf4384b`, topic `santosvision-immersive`.
 
-Build **24** is installed in place and the installed bundle version was verified.
+Build **25** is now installed in place and its bundle version was verified.
+Source `0d47441`, tag `los-santos-native-goal-diagnostics25-20261024`. It adds
+read-only exact post-native-goal and separate gun/arm observations, with a newly
+compiled matching AOT. Full compatibility, native/visionOS/signing/provisioning,
+cloud and AOT embedding/RX checks passed. This is **diagnostic progress**, not a
+hand-tracking fix or physical acceptance. The next test is ordinary immersive
+first person with Sense motion; see
+[build25 notes](NATIVE-GOAL-DIAGNOSTICS25-20261024.md). The build24 capture and
+its correction to the missing-depth hypothesis remain authoritative.
+
+Previous UI baseline: Build **24** was installed in place and its bundle version was verified.
 Client source is `04456ad`, tag `los-santos-phone-ui-candidate24-20261024`.
 It links the frozen 23-r2 native archive from `889bfe7`, with its exact AOT.
 The signed client build, strict signature, physical provisioning, cloud
