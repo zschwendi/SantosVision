@@ -251,8 +251,8 @@ impl NativeGraphics {
             .context("native graphics_preset must be existing, performance or clarity")?;
         let config = Self { width: integer("width")?, height: integer("height")?, fps_limit: integer("fps_limit")?, preset };
         ensure!(matches!((config.width, config.height),
-            (640, 360) | (960, 540) | (1280, 720) | (1920, 1080) | (2560, 1440) | (3840, 2160)),
-            "native resolution must be 640x360, 960x540, 1280x720, 1920x1080, 2560x1440 or 3840x2160");
+            (640, 360) | (960, 540) | (1280, 720) | (1920, 1080) | (2560, 1440) | (3840, 2160) | (2560, 2304)),
+            "native resolution must be a supported 16:9 size or the explicit 2560x2304 experiment");
         ensure!(matches!(config.fps_limit, 30 | 60), "native fps_limit must be 30 or 60");
         Ok(config)
     }
@@ -509,11 +509,22 @@ fn prepare_native_graphics(save_root: &Path) -> anyhow::Result<NativeGraphicsLau
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => (NATIVE_DEFAULT_SETTINGS.into(), false),
         Err(error) => return Err(error).with_context(|| format!("read {}", settings_path.display())),
     };
+    let tall_source_experiment = (config.width, config.height) == (2560, 2304);
+    if tall_source_experiment {
+        // Reuse the validated XML walker only as a read-only qualification.
+        // A forced or unknown game aspect must not distort the taller source;
+        // neither that setting nor the player's FOV is silently rewritten.
+        let (automatic, _) = settings_xml_with_values(&original,
+            [(("video", "AspectRatio"), "0".to_string())].into_iter().collect())
+            .context("validate Automatic aspect ratio for the taller source")?;
+        ensure!(automatic == original,
+            "Choose Automatic aspect ratio in GTA before using the 2560x2304 experimental resolution.");
+    }
     let preset_changed = applied_config.as_ref().map(|previous| previous.preset != config.preset)
         .unwrap_or(config.preset != NativeGraphicsPreset::Existing);
     let video_changed = applied_config.as_ref().map(|previous|
         (previous.width, previous.height, previous.fps_limit) != (config.width, config.height, config.fps_limit))
-        .unwrap_or(config.preset != NativeGraphicsPreset::Existing);
+        .unwrap_or(config.preset != NativeGraphicsPreset::Existing || tall_source_experiment);
     let (mut xml, mut changed_tags) = if !existed {
         low_settings_xml(&original, &config).context("create native low graphics defaults")?
     } else {
@@ -656,6 +667,76 @@ mod native_graphics_tests {
             }
         }
         assert_eq!(NativeGraphics::default(), NativeGraphics { width: 960, height: 540, fps_limit: 60, preset: NativeGraphicsPreset::Existing });
+    }
+
+    #[test]
+    fn opt_in_tall_source_requires_explicit_automatic_aspect_before_any_file_write() {
+        let fixture = Fixture::new();
+        fixture.preset(2560, 2304, 60, "existing");
+        let path = fixture.settings();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let original = NATIVE_DEFAULT_SETTINGS.replace("<AspectRatio value=\"0\" />", "<AspectRatio value=\"2\" />");
+        std::fs::write(&path, &original).unwrap();
+        write_native_graphics_marker(&fixture.marker(), &NativeGraphics::default()).unwrap();
+        let marker = std::fs::read(fixture.marker()).unwrap();
+        let error = prepare_native_graphics(&fixture.0).err().expect("forced aspect must reject the tall source");
+        assert!(error.to_string().contains("Automatic aspect ratio"), "{error:#}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        assert_eq!(std::fs::read(fixture.marker()).unwrap(), marker);
+        assert!(std::fs::read_dir(path.parent().unwrap()).unwrap().all(|entry|
+            !entry.unwrap().file_name().to_string_lossy().contains("backup")));
+
+        std::fs::write(&path, NATIVE_DEFAULT_SETTINGS).unwrap();
+        let launch = prepare_native_graphics(&fixture.0).unwrap();
+        assert_eq!((launch.config.width, launch.config.height), (2560, 2304));
+        let xml = std::fs::read_to_string(&path).unwrap();
+        assert!(xml.contains("<ScreenWidth value=\"2560\""));
+        assert!(xml.contains("<ScreenHeight value=\"2304\""));
+        assert!(xml.contains("<AspectRatio value=\"0\" />"));
+        assert_eq!(std::fs::read_to_string(launch.backup_path.unwrap()).unwrap(), NATIVE_DEFAULT_SETTINGS);
+        assert!(!launch.changed_tags.iter().any(|tag| tag == "AspectRatio"));
+    }
+
+    #[test]
+    fn tall_source_rejects_missing_and_duplicate_aspect_but_keeps_wide_behavior() {
+        for aspect in ["", "<AspectRatio value=\"0\" /><AspectRatio value=\"0\" />", "<AspectRatio value=\"Auto\" />"] {
+            let fixture = Fixture::new();
+            fixture.preset(2560, 2304, 30, "existing");
+            let path = fixture.settings();
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let xml = NATIVE_DEFAULT_SETTINGS.replace("<AspectRatio value=\"0\" />", aspect);
+            std::fs::write(&path, &xml).unwrap();
+            assert!(prepare_native_graphics(&fixture.0).is_err());
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), xml);
+            assert!(!fixture.marker().exists());
+        }
+        let fixture = Fixture::new();
+        fixture.preset(2560, 1440, 60, "existing");
+        let path = fixture.settings();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let xml = NATIVE_DEFAULT_SETTINGS.replace("<AspectRatio value=\"0\" />", "<AspectRatio value=\"2\" />");
+        std::fs::write(&path, &xml).unwrap();
+        prepare_native_graphics(&fixture.0).unwrap();
+        assert!(std::fs::read_to_string(&path).unwrap().contains("<AspectRatio value=\"2\" />"));
+    }
+
+    #[test]
+    fn explicit_tall_source_without_marker_updates_only_video_with_exact_backup() {
+        let fixture = Fixture::new();
+        fixture.preset(2560, 2304, 60, "existing");
+        let path = fixture.settings();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let original = NATIVE_DEFAULT_SETTINGS.replace("<video>",
+            "<video><ScreenWidth value=\"1920\"/><ScreenHeight value=\"1080\"/><RefreshRate value=\"60\"/>");
+        std::fs::write(&path, &original).unwrap();
+        let launch = prepare_native_graphics(&fixture.0).unwrap();
+        assert_eq!(launch.changed_tags, ["ScreenHeight", "ScreenWidth"]);
+        assert_eq!(launch.quality_action, "kept_existing");
+        assert_eq!(std::fs::read_to_string(launch.backup_path.unwrap()).unwrap(), original);
+        let wanted = original.replace("ScreenWidth value=\"1920\"", "ScreenWidth value=\"2560\"")
+            .replace("ScreenHeight value=\"1080\"", "ScreenHeight value=\"2304\"");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), wanted);
+        assert_eq!(prepare_native_graphics(&fixture.0).unwrap().settings_action, "unchanged");
     }
 
     #[test]

@@ -18,6 +18,7 @@ struct NativeGraphicsSettings: Codable, Equatable, Sendable {
         case fullHD = "1920x1080"
         case quadHD = "2560x1440"
         case ultraHD = "3840x2160"
+        case immersiveTall = "2560x2304"
 
         var id: String { rawValue }
         var dimensions: (width: Int, height: Int) {
@@ -28,9 +29,12 @@ struct NativeGraphicsSettings: Codable, Equatable, Sendable {
             case .fullHD: (1920, 1080)
             case .quadHD: (2560, 1440)
             case .ultraHD: (3840, 2160)
+            case .immersiveTall: (2560, 2304)
             }
         }
-        var label: String { "\(dimensions.width)×\(dimensions.height)" }
+        var label: String {
+            "\(dimensions.width)×\(dimensions.height)" + (self == .immersiveTall ? " (Experimental)" : "")
+        }
     }
 
     enum SettingsError: LocalizedError {

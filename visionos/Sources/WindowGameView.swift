@@ -47,7 +47,26 @@ private final class GameMetalView: UIView {
 @MainActor
 final class WindowGameSurface: ObservableObject {
     let view: UIView = GameMetalView(frame: .zero)
+    @Published private(set) var sourceAspectRatio: CGFloat = 16.0 / 9.0
     var metalLayer: CAMetalLayer { view.layer as! CAMetalLayer }
+
+    func refreshSourceAspectRatio() {
+        // The existing representable updates follow native status changes.
+        // Defer publication until SwiftUI has finished that update, then read
+        // the current layer instead of carrying an obsolete size across tasks.
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            self.updateSourceAspectRatio(self.metalLayer.drawableSize)
+        }
+    }
+
+    private func updateSourceAspectRatio(_ size: CGSize) {
+        guard size.width.isFinite, size.height.isFinite,
+              size.width > 0, size.height > 0,
+              size.width <= 16_384, size.height <= 16_384 else { return }
+        let aspect = size.width / size.height
+        if sourceAspectRatio != aspect { sourceAspectRatio = aspect }
+    }
     func observeAttachment(_ callback: @escaping (Bool) -> Void) {
         (view as! GameMetalView).windowAttachmentChanged = callback
     }
@@ -68,7 +87,9 @@ private struct GameCanvas: UIViewRepresentable {
         }
         return surface.view
     }
-    func updateUIView(_ view: UIView, context: Context) {}
+    func updateUIView(_ view: UIView, context: Context) {
+        surface.refreshSourceAspectRatio()
+    }
 }
 
 struct WindowGameView: View {
@@ -104,7 +125,7 @@ struct WindowGameView: View {
             // Keep this view mounted across launcher/play transitions. The
             // native renderer continues to own this exact CAMetalLayer.
             GameCanvas(runtime: runtime, surface: surface)
-                .aspectRatio(16 / 9, contentMode: .fit)
+                .aspectRatio(surface.sourceAspectRatio, contentMode: .fit)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .ignoresSafeArea()
             if !runtime.startupAttempted {

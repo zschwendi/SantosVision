@@ -18,6 +18,11 @@ struct NativeGraphicsSettingsValidation {
         let defaults = try NativeGraphicsSettings.load(from: path)
         check(defaults.width == 960 && defaults.height == 540 && defaults.fpsLimit == 60 && defaults.preset == .existing,
               "quality options preserve default resolution and cap")
+        check(defaults.resolution != .immersiveTall, "taller source is never the default")
+        check(NativeGraphicsSettings.Resolution.immersiveTall.label.contains("Experimental"), "unaccepted source option is explicit")
+        check(NativeGraphicsSettings.Resolution.immersiveTall.dimensions.width == 2560
+              && NativeGraphicsSettings.Resolution.immersiveTall.dimensions.height == 2304,
+              "only the bounded taller source is exposed")
         for preset in NativeGraphicsSettings.Preset.allCases {
             for resolution in NativeGraphicsSettings.Resolution.allCases {
                 for cap in [30, 60] {
