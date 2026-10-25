@@ -22,6 +22,14 @@ quality comparison. Unarmed hands, left-wrist calibration, sniper-specific
 acceptance, repeated startup stability and save recovery are not established by
 this feedback. Preserve accepted third-person behavior and the build-26 app.
 
+Build27 source is prepared for signed integration; it is not installed or
+physically accepted. It removes a redundant mode-history dependency at exact
+native arm callbacks, adds bounded death/fail HUD admission evidence, and keeps
+two image reconstruction experiments off. Actual registered-source replay
+supports the existing owner0 fill for the first physical comparison; neither
+expensive sharpening nor narrower coverage is promoted. See
+[polish27 evidence and next test](IMMERSIVE-FIDELITY-POLISH27-20261025.md).
+
 Build **26** is installed in place and its bundle version was verified.
 Source `eae9693`, tag `los-santos-gun-world-candidate26-20261024`. It changes
 only qualified local equipped first-person gun placement to use its queued

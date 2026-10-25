@@ -16,12 +16,13 @@ final class GameWorldFiniteSkySupport: @unchecked Sendable {
 
     private let worldPipeline: any MTLRenderPipelineState
     private let repairPipeline: any MTLRenderPipelineState
-    private let verticalReconstruction: Bool
+    private let verticalPipeline: (any MTLRenderPipelineState)?
     /// The exact existing nine-sample corner fit, evaluated once per geometric
     /// corner rather than once for each of its four source-texel owners.
     /// Diagnostic opt-in: the registered Mac source was slower after warming,
     /// so the original vertex path stays the normal-play default.
-    private let corners: (kernel: any MTLComputePipelineState, world: any MTLRenderPipelineState)?
+    private let corners: (kernel: any MTLComputePipelineState, world: any MTLRenderPipelineState,
+                          verticalWorld: (any MTLRenderPipelineState)?)?
     let cornerPool = CornerScratchPool()
     private let worldDepth: any MTLDepthStencilState
     private let repairDepth: any MTLDepthStencilState
@@ -39,6 +40,7 @@ final class GameWorldFiniteSkySupport: @unchecked Sendable {
         let ownership: any MTLTexture
         let radius: Float
         let cornersPrecomputed: Bool
+        let verticalReconstruction: Bool
     }
 
     private struct CornerCompletionLease: @unchecked Sendable {
@@ -62,8 +64,7 @@ final class GameWorldFiniteSkySupport: @unchecked Sendable {
           precomputeCorners: Bool = ProcessInfo.processInfo.environment["MUGUET_COMPOSITOR_CORNER_PRECOMPUTE"] == "1",
           verticalReconstruction: Bool = false) {
         guard let vertex = library.makeFunction(name: "gameWorldVertex"),
-              let ownerFragment = library.makeFunction(name: verticalReconstruction
-                ? "gameWorldSkyOwnershipVerticalReconstructionFragment" : "gameWorldSkyOwnershipFragment"),
+              let ownerFragment = library.makeFunction(name: "gameWorldSkyOwnershipFragment"),
               let repairVertex = library.makeFunction(name: "gameWorldSkyRepairVertex"),
               let repairFragment = library.makeFunction(name: "gameWorldSkyRepairFragment") else { return nil }
         let world = MTLRenderPipelineDescriptor()
@@ -88,9 +89,16 @@ final class GameWorldFiniteSkySupport: @unchecked Sendable {
               let rp = try? device.makeRenderPipelineState(descriptor: repair),
               let wd = device.makeDepthStencilState(descriptor: worldState),
               let rd = device.makeDepthStencilState(descriptor: repairState) else { return nil }
-        self.verticalReconstruction = verticalReconstruction
         worldPipeline = wp
-        var precomputed: (kernel: any MTLComputePipelineState, world: any MTLRenderPipelineState)?
+        let verticalFragment = verticalReconstruction
+            ? library.makeFunction(name: "gameWorldSkyOwnershipVerticalReconstructionFragment") : nil
+        if let verticalFragment {
+            let reconstructed = world.copy() as! MTLRenderPipelineDescriptor
+            reconstructed.fragmentFunction = verticalFragment
+            verticalPipeline = try? device.makeRenderPipelineState(descriptor: reconstructed)
+        } else { verticalPipeline = nil }
+        var precomputed: (kernel: any MTLComputePipelineState, world: any MTLRenderPipelineState,
+                          verticalWorld: (any MTLRenderPipelineState)?)?
         if precomputeCorners,
            let cornerKernel = library.makeFunction(name: "gameWorldCornerDepths"),
            let cornerVertex = library.makeFunction(name: "gameWorldPrecomputedVertex"),
@@ -100,7 +108,13 @@ final class GameWorldFiniteSkySupport: @unchecked Sendable {
             sharedWorld.label = "Finite sky: shared corner depths, original final ownership"
             sharedWorld.vertexFunction = cornerVertex
             if let state = try? device.makeRenderPipelineState(descriptor: sharedWorld) {
-                precomputed = (kernel, state)
+                var verticalPrecomputed: (any MTLRenderPipelineState)?
+                if verticalPipeline != nil, let verticalFragment {
+                    let reconstructed = sharedWorld.copy() as! MTLRenderPipelineDescriptor
+                    reconstructed.fragmentFunction = verticalFragment
+                    verticalPrecomputed = try? device.makeRenderPipelineState(descriptor: reconstructed)
+                }
+                precomputed = (kernel, state, verticalPrecomputed)
             }
         }
         corners = precomputed
@@ -115,7 +129,7 @@ final class GameWorldFiniteSkySupport: @unchecked Sendable {
     func encode(commands: any MTLCommandBuffer, pass: MTLRenderPassDescriptor,
                 viewport: MTLViewport, projection: simd_float4x4, far: Float,
                 uniforms: GameWorldUniforms, color: any MTLTexture,
-                depth: any MTLTexture) -> Result? {
+                depth: any MTLTexture, allowVerticalReconstruction: Bool = false) -> Result? {
         guard let target = pass.colorAttachments[0].texture,
               let targetDepth = pass.depthAttachment.texture,
               target.sampleCount == 1, targetDepth.sampleCount == 1,
@@ -171,8 +185,16 @@ final class GameWorldFiniteSkySupport: @unchecked Sendable {
         guard let encoder = commands.makeRenderCommandEncoder(descriptor: world) else { return nil }
         encoder.label = "EXPERIMENT final sky ownership (0 uncovered, 1 sky, 2 finite)"
         encoder.setViewport(viewport)
-        if cornerDepths != nil, let corners { encoder.setRenderPipelineState(corners.world) }
-        else { encoder.setRenderPipelineState(worldPipeline) }
+        var reconstructed = false
+        if cornerDepths != nil, let corners {
+            if allowVerticalReconstruction, let vertical = corners.verticalWorld {
+                encoder.setRenderPipelineState(vertical)
+                reconstructed = true
+            } else { encoder.setRenderPipelineState(corners.world) }
+        } else if allowVerticalReconstruction, let verticalPipeline {
+            encoder.setRenderPipelineState(verticalPipeline)
+            reconstructed = true
+        } else { encoder.setRenderPipelineState(worldPipeline) }
         encoder.setDepthStencilState(worldDepth)
         encoder.setCullMode(.none)
         var uniforms = uniforms
@@ -181,7 +203,7 @@ final class GameWorldFiniteSkySupport: @unchecked Sendable {
         encoder.setVertexTexture(depth, index: 0)
         if let cornerDepths { encoder.setVertexTexture(cornerDepths, index: 1) }
         encoder.setFragmentTexture(color, index: 0)
-        if verticalReconstruction { encoder.setFragmentTexture(depth, index: 1) }
+        if reconstructed { encoder.setFragmentTexture(depth, index: 1) }
         encoder.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4,
                                instanceCount: Int(uniforms.sourceSize.x) * Int(uniforms.sourceSize.y))
         encoder.endEncoding()
@@ -189,7 +211,8 @@ final class GameWorldFiniteSkySupport: @unchecked Sendable {
         let radius = far * 0.8
         guard encodeRepair(commands: commands, depth: targetDepth, slice: pass.depthAttachment.slice,
             ownership: ownership, viewport: viewport, projection: projection, radius: radius) else { return nil }
-        return Result(ownership: ownership, radius: radius, cornersPrecomputed: cornerDepths != nil)
+        return Result(ownership: ownership, radius: radius, cornersPrecomputed: cornerDepths != nil,
+                      verticalReconstruction: reconstructed)
     }
 
     /// A separate ordered pass is essential: a support sphere may be nearer

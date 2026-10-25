@@ -211,6 +211,7 @@ final class NativeRuntimeModel: ObservableObject {
     let gameRoot: URL
     let saveRoot: URL
     let reportURL: URL
+    private let reportSessionID = UUID().uuidString
     let cloudSaves: CloudSaveModel
     /// Explicit left grip-to-native-hand calibration (Settings action + card).
     let leftWrist = LeftWristCalibrationModel()
@@ -1124,6 +1125,9 @@ final class NativeRuntimeModel: ObservableObject {
             && nativeStatus?["immersive_game_renderer_connected"] as? Bool == true
         let report: [String: Any] = [
             "schema": 1, "timestamp": ISO8601DateFormatter().string(from: Date()),
+            "client_build": Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "unknown",
+            "client_version": Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "unknown",
+            "report_session_id": reportSessionID,
             "report_system_uptime_seconds": ProcessInfo.processInfo.systemUptime,
             "native_runtime_linked": isLinked, "game_root": gameRoot.path,
             "presentation_mode": compositorOwnsHeadTracking ? "immersive" : (windowGameMode ? "window" : "diagnostic"),

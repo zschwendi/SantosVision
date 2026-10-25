@@ -436,7 +436,7 @@ final class GameWorldRenderer: @unchecked Sendable {
     /// Optional exact corner-depth precompute (MUGUET_COMPOSITOR_CORNER_PRECOMPUTE=1); nil keeps the
     /// single-pass pipeline above. Off by default.
     private let cornerPrecompute: (kernel: any MTLComputePipelineState, pipeline: any MTLRenderPipelineState,
-                                   scratch: CornerScratchPool)?
+                                   verticalPipeline: (any MTLRenderPipelineState)?, scratch: CornerScratchPool)?
     private var loggedCornerFallback = false
     /// Experimental paths, all nil unless their flag is "1". See docs/REPROJECTION-IMPLEMENTATION-20261011.md.
     private let sourceCopy: GameWorldSourceCopy?
@@ -452,6 +452,7 @@ final class GameWorldRenderer: @unchecked Sendable {
     /// precomputed corners use the same surface reconstruction policy.
     private let smoothSurfaceContinuity = GameWorldSurfaceContinuityPolicy.requested
     private let verticalReconstruction: Bool
+    private let verticalPipeline: (any MTLRenderPipelineState)?
     private let allowSyntheticAnchorCopy: Bool
     private let adaptiveMesh: GameWorldAdaptiveMesh?
     private let anchorProbe: GameWorldAnchorProbe?
@@ -517,20 +518,27 @@ final class GameWorldRenderer: @unchecked Sendable {
             && !copyRequested && !probeRequested && !adaptiveRequested
             && library.makeFunction(name: "gameWorldSkyOwnershipVerticalReconstructionFragment") != nil
             ? library.makeFunction(name: "gameWorldVerticalReconstructionFragment") : nil
-        verticalReconstruction = reconstructionFragment != nil
         self.queue = queue
         let descriptor = MTLRenderPipelineDescriptor()
         descriptor.label = "Actual native GTA world depth reprojection"
         descriptor.vertexFunction = vertex
-        descriptor.fragmentFunction = reconstructionFragment ?? baselineFragment
+        descriptor.fragmentFunction = baselineFragment
         descriptor.colorAttachments[0].pixelFormat = layer.configuration.colorFormat
         descriptor.depthAttachmentPixelFormat = layer.configuration.depthFormat
         pipeline = try layer.device.makeRenderPipelineState(descriptor: descriptor)
+        if let reconstructionFragment {
+            let reconstructed = descriptor.copy() as! MTLRenderPipelineDescriptor
+            reconstructed.label = "Opt-in depth-qualified vertical world reconstruction"
+            reconstructed.fragmentFunction = reconstructionFragment
+            verticalPipeline = try? layer.device.makeRenderPipelineState(descriptor: reconstructed)
+        } else { verticalPipeline = nil }
+        verticalReconstruction = verticalPipeline != nil
         reticle = GameWorldReticle(device: layer.device, library: library,
                                    colorFormat: layer.configuration.colorFormat,
                                    depthFormat: layer.configuration.depthFormat)
         let cornerRequested = environment["MUGUET_COMPOSITOR_CORNER_PRECOMPUTE"] == "1"
-        var precompute: (kernel: any MTLComputePipelineState, pipeline: any MTLRenderPipelineState, scratch: CornerScratchPool)?
+        var precompute: (kernel: any MTLComputePipelineState, pipeline: any MTLRenderPipelineState,
+                         verticalPipeline: (any MTLRenderPipelineState)?, scratch: CornerScratchPool)?
         if cornerRequested, let kernelFunction = library.makeFunction(name: "gameWorldCornerDepths"),
            let precomputedVertex = library.makeFunction(name: "gameWorldPrecomputedVertex"),
            let kernel = try? layer.device.makeComputePipelineState(function: kernelFunction) {
@@ -538,7 +546,13 @@ final class GameWorldRenderer: @unchecked Sendable {
             descriptor.label = "Actual native GTA world depth reprojection, precomputed corners"
             descriptor.vertexFunction = precomputedVertex
             if let precomputed = try? layer.device.makeRenderPipelineState(descriptor: descriptor) {
-                precompute = (kernel, precomputed, CornerScratchPool())
+                var verticalPrecomputed: (any MTLRenderPipelineState)?
+                if verticalReconstruction, let reconstructionFragment {
+                    let reconstructed = descriptor.copy() as! MTLRenderPipelineDescriptor
+                    reconstructed.fragmentFunction = reconstructionFragment
+                    verticalPrecomputed = try? layer.device.makeRenderPipelineState(descriptor: reconstructed)
+                }
+                precompute = (kernel, precomputed, verticalPrecomputed, CornerScratchPool())
             }
         }
         cornerPrecompute = precompute
@@ -1446,7 +1460,8 @@ final class GameWorldRenderer: @unchecked Sendable {
             else if let source, source.eye.kind == .actual, let finiteSkySupport {
                 skyResult = finiteSkySupport.encode(commands: commands, pass: pass, viewport: map.viewport,
                     projection: projection, far: drawable.depthRange.x, uniforms: source.uniforms,
-                    color: source.eye.color, depth: source.eye.depth)
+                    color: source.eye.color, depth: source.eye.depth,
+                    allowVerticalReconstruction: hudSnapshot != nil)
                 skyOutcome = skyResult != nil ? .encoded : .encodeUnavailable
             } else { skyOutcome = .noQualifiedActualSource }
             finiteSkyTelemetry.record(view: eye, outcome: skyOutcome, source: source.map {
@@ -1560,12 +1575,22 @@ final class GameWorldRenderer: @unchecked Sendable {
                                              depth: sourceEye.depth, color: sourceEye.color)
                     pathCounters.adaptiveEyes &+= 1
                 } else {
+                    // Baked HUD fallback is part of world RGB. Reconstruct
+                    // color only after the complete drawable has a qualified
+                    // separate HUD canvas; otherwise keep the original sampler.
+                    var reconstructed = false
                     if let corners, let precompute = cornerPrecompute {
-                        encoder.setRenderPipelineState(precompute.pipeline)
+                        if hudSnapshot != nil, let vertical = precompute.verticalPipeline {
+                            encoder.setRenderPipelineState(vertical)
+                            reconstructed = true
+                        } else { encoder.setRenderPipelineState(precompute.pipeline) }
                         encoder.setVertexTexture(corners, index: 1)
                         pathCounters.precomputeEyes &+= 1
                     } else {
-                        encoder.setRenderPipelineState(pipeline)
+                        if hudSnapshot != nil, let verticalPipeline {
+                            encoder.setRenderPipelineState(verticalPipeline)
+                            reconstructed = true
+                        } else { encoder.setRenderPipelineState(pipeline) }
                         pathCounters.legacyEyes &+= 1
                     }
                     encoder.setDepthStencilState(depthState)
@@ -1574,7 +1599,7 @@ final class GameWorldRenderer: @unchecked Sendable {
                     encoder.setFragmentBytes(&uniforms, length: MemoryLayout<GameWorldUniforms>.stride, index: 0)
                     encoder.setVertexTexture(sourceEye.depth, index: 0)
                     encoder.setFragmentTexture(sourceEye.color, index: 0)
-                    if verticalReconstruction { encoder.setFragmentTexture(sourceEye.depth, index: 1) }
+                    if reconstructed { encoder.setFragmentTexture(sourceEye.depth, index: 1) }
                     encoder.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4,
                         instanceCount: Int(sourceEye.width) * Int(sourceEye.height))
                 }
@@ -1608,8 +1633,9 @@ final class GameWorldRenderer: @unchecked Sendable {
         value["reconstruction_configuration"] = [
             "smooth_continuity": smoothSurfaceContinuity,
             "vertical_reconstruction_requested": GameWorldVerticalReconstructionPolicy.requested,
-            "vertical_reconstruction_pipeline_selected": verticalReconstruction,
-            "scope": "Pipeline configuration only; per-pixel support qualification and visible quality are not counted."
+            "vertical_reconstruction_pipeline_available": verticalReconstruction,
+            "vertical_reconstruction_requires_qualified_hud": true,
+            "scope": "Pipeline availability only; each drawable also needs qualified HUD isolation. Per-pixel support qualification and visible quality are not counted."
         ] as [String: Any]
         return value
     }
