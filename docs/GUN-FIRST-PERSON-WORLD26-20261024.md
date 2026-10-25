@@ -39,8 +39,9 @@ Original game WASM/AOT and frozen build25 executable were preserved.
 
 Build **26 is installed in place** and its bundle version was verified.
 No uninstall or save replacement occurred. The coordinator did not launch or
-activate it after installation: the earlier app process had exited, and whether
-that was intentional or a crash remains unanswered. No new matching named
+activate it after installation: the earlier app process had exited, and the user later reported
+that it might have crashed. The cause remains unconfirmed; see
+[the exit investigation](EXIT25-INVESTIGATION-20261025.md). No new matching named
 SantosVision crash log was listed, which does not rule out Jetsam or another exit.
 
 Frozen app and exact recipes/receipts:
