@@ -32,11 +32,15 @@ pub fn generate(original:&[u8],wanted:&[(&str,&str)])->Result<Artifact>{
     ensure!(old.ty(9209)?.params()==[ValType::I64,ValType::I32,ValType::I64]&&old.ty(9209)?.results()==[ValType::I32],"native bone conversion ABI changed");
     let pre=ordinal(old.body(PRE)?,3523,|o|matches!(o,O::LocalGet{local_index:0}))?;
     let target=ordinal(old.body(ITERATE)?,0x1604be7-0x1604985,|o|matches!(o,O::If{..}))?;
+    let reset=ordinal(old.body(ITERATE)?,0x1604be3-0x1604985,|o|matches!(o,O::Call{function_index:38487}))?;
+    let goal=ordinal(old.body(ITERATE)?,0x1609911-0x1604985,|o|matches!(o,O::I32Store8{memarg}if memarg.offset==64&&memarg.memory==0))?;
     let config=Config{pre:PRE+shift,iterate:ITERATE+shift,predicate:45913+shift,request:38506+shift,convert:9209+shift,
-        sp:0,tls:named_global(&base.wasm,"__tls_base")?,pre_ordinal:pre,target_ordinal:target};
+        sp:0,tls:named_global(&base.wasm,"__tls_base")?,pre_ordinal:pre,target_ordinal:target,reset_ordinal:reset,goal_ordinal:goal};
     let manifest=serde_json::json!({"schema":"muguet.motion-arms","version":1,"base":base.manifest,
         "changed_original_bodies":[76735,82184,76770,76778,PRE,ITERATE],"arm_request":"38481+3523 after stock requests, native38506 flags256",
         "target":"38548 after original38487 true at0x01604be7, private stack+96 before inverse/blend",
+        "post_native_goal":{"seam":"38548 after original goal-active store0x01609911; before arm loop continuation","transport":"same target import signature; arm bit31 = read-only post-goal phase; ordinary arm0/1 unchanged",
+            "invocation":"private marker reset before each native38487 call; set only after target hook; consumed before post hook; per-Store accepted target consumed once","authority":"numeric completed goal only; no Solve/skin/display acceptance"},
         "native_blend_preserved":true,"shared_goal_writes":false,"bone_or_weapon_writes":false,
         "request_scratch_bytes":32,"arm":"right full pose with live K/A; left grip translation preserving native wrist; exact packet padding cookies",
         "left_orientation_policy":"native wrist basis and native flags0; tracked grip translation only",
@@ -61,7 +65,7 @@ struct Remap{imports:u32,shift:u32}
 impl Reencode for Remap{type Error=anyhow::Error;fn function_index(&mut self,i:u32)->Result<u32,Error<Self::Error>>{Ok(i+if i>=self.imports{self.shift}else{0})}}
 fn canonical(body:&FunctionBody<'_>,imports:u32,shift:u32)->Result<Vec<u8>>{let mut r=Remap{imports,shift};let mut f=r.new_function_with_parsed_locals(body).map_err(|e|anyhow::anyhow!("arm locals {e:?}"))?;
     let mut reader=body.get_operators_reader()?;while !reader.eof(){f.instruction(&r.parse_instruction(&mut reader).map_err(|e|anyhow::anyhow!("arm canonical {e:?}"))?);}Ok(f.into_raw_body())}
-#[derive(Clone,Copy)]struct Config{pre:u32,iterate:u32,predicate:u32,request:u32,convert:u32,sp:u32,tls:u32,pre_ordinal:usize,target_ordinal:usize}
+#[derive(Clone,Copy)]struct Config{pre:u32,iterate:u32,predicate:u32,request:u32,convert:u32,sp:u32,tls:u32,pre_ordinal:usize,target_ordinal:usize,reset_ordinal:usize,goal_ordinal:usize}
 fn instrument(bytes:&[u8],config:Config,manifest:Option<&serde_json::Value>)->Result<Vec<u8>>{
     let info=Info::parse(bytes)?;ensure!(!info.entries.iter().any(|e|e.0==MODULE),"arm artifact already instrumented");
     let mut r=Arms{imports:info.imports,types:info.types.len()as u32,next:info.imports,config,changed:0};let mut m=wasm_encoder::Module::new();
@@ -131,17 +135,32 @@ impl Arms{
         if inserted!=1{return Err(Error::UserError(anyhow::anyhow!("arm pre seam count mismatch")));}out.function(&f);Ok(())
     }
     fn iterate(&mut self,out:&mut wasm_encoder::CodeSection,body:FunctionBody<'_>)->Result<(),Error<anyhow::Error>>{
-        let(mut f,fresh)=self.locals(&body,3,&[(3,V::I64),(1,V::I32)])?;let(solver,skeleton,ped,first)=(fresh,fresh+1,fresh+2,fresh+3);
+        let(mut f,fresh)=self.locals(&body,3,&[(3,V::I64),(2,V::I32)])?;let(solver,skeleton,ped,first,observe)=(fresh,fresh+1,fresh+2,fresh+3,fresh+4);
         f.instruction(&I::LocalGet(0)).instruction(&I::LocalSet(solver)).instruction(&I::LocalGet(2)).instruction(&I::LocalSet(skeleton));
-        let mut reader=body.get_operators_reader()?;let mut n=0;let mut inserted=0;
-        while !reader.eof(){let op=reader.read()?;f.instruction(&self.instruction(op)?);if n==self.config.target_ordinal{
+        let mut reader=body.get_operators_reader()?;let mut n=0;let(mut inserted,mut resets,mut goals)=(0,0,0);
+        while !reader.eof(){let op=reader.read()?;
+        if n==self.config.reset_ordinal{
+            // Only a fresh local changes. Existing native call arguments on the
+            // operand stack are preserved, including the FALSE result branch.
+            f.instruction(&I::I32Const(0)).instruction(&I::LocalSet(observe));resets+=1;
+        }
+        f.instruction(&self.instruction(op)?);if n==self.config.target_ordinal{
             f.instruction(&I::LocalGet(solver)).instruction(&I::I64Load(mem(480))).instruction(&I::LocalSet(ped));self.local_ped_test(&mut f,ped);f.instruction(&I::If(B::Empty));
             self.predicate(&mut f,ped)?;f.instruction(&I::LocalSet(first));
             for local in [solver,skeleton,29,40,27,31]{f.instruction(&I::LocalGet(local));}
             f.instruction(&I::LocalGet(26)).instruction(&I::I64Const(96)).instruction(&I::I64Add).instruction(&I::GlobalGet(self.config.tls)).instruction(&I::LocalGet(first))
-                .instruction(&I::Call(self.imports+2)).instruction(&I::End);inserted+=1;
+                .instruction(&I::Call(self.imports+2)).instruction(&I::I32Const(1)).instruction(&I::LocalSet(observe)).instruction(&I::End);inserted+=1;
+        }
+        if n==self.config.goal_ordinal{
+            f.instruction(&I::LocalGet(observe)).instruction(&I::If(B::Empty)).instruction(&I::I32Const(0)).instruction(&I::LocalSet(observe));
+            for local in [solver,skeleton,29]{f.instruction(&I::LocalGet(local));}
+            // local40 has become orientation flags; local28 is still arm.
+            f.instruction(&I::LocalGet(28)).instruction(&I::I32WrapI64).instruction(&I::I32Const(crate::xr_motion_arms::POST_GOAL_ARM_FLAG as i32)).instruction(&I::I32Or);
+            for local in [27,31]{f.instruction(&I::LocalGet(local));}
+            f.instruction(&I::LocalGet(26)).instruction(&I::I64Const(96)).instruction(&I::I64Add).instruction(&I::GlobalGet(self.config.tls)).instruction(&I::LocalGet(first))
+                .instruction(&I::Call(self.imports+2)).instruction(&I::End);goals+=1;
         }n+=1;}
-        if inserted!=1{return Err(Error::UserError(anyhow::anyhow!("arm target seam count mismatch")));}out.function(&f);Ok(())
+        if inserted!=1||resets!=1||goals!=1{return Err(Error::UserError(anyhow::anyhow!("arm target/post-goal seam count mismatch")));}out.function(&f);Ok(())
     }
 }
 
@@ -167,29 +186,39 @@ impl Arms{
         for op in preops{pre.instruction(&op);}code.function(&pre);
         let mut iterate=Function::new([(37,V::I64),(1,V::I32)]);let mut ops=vec![
             I::GlobalGet(0),I::I64Const(288),I::I64Sub,I::LocalTee(26),I::GlobalSet(0),
-            I::LocalGet(2),I::LocalSet(29),I::LocalGet(0),I::I64Const(128),I::I64Add,I::LocalSet(27),
-            I::LocalGet(0),I::I64Const(352),I::I64Add,I::LocalSet(31),I::I32Const(1),I::LocalSet(40),
-            I::I64Const(999),I::LocalSet(0),I::I64Const(888),I::LocalSet(2),I::I64Const(1600),I::I32Load(MemArg{offset:0,align:2,memory_index:0})];
+            I::LocalGet(2),I::LocalSet(29),I::LocalGet(0),I::LocalSet(30),I::I64Const(1),I::LocalSet(28),I::Loop(B::Empty),
+            I::LocalGet(30),I::I64Const(32),I::I64Add,I::LocalGet(28),I::I64Const(96),I::I64Mul,I::I64Add,I::LocalSet(27),
+            I::LocalGet(30),I::I64Const(224),I::I64Add,I::LocalGet(28),I::I64Const(128),I::I64Mul,I::I64Add,I::LocalSet(31),
+            I::LocalGet(28),I::I32WrapI64,I::LocalSet(40),I::I64Const(999),I::LocalSet(0),I::I64Const(888),I::LocalSet(2)];
+        let reset_ordinal=ops.len();
+        ops.extend([I::I64Const(1600),I::I64Const(1),I::LocalGet(28),I::I64Sub,I::I64Const(4),I::I64Mul,I::I64Add,
+            I::I32Load(MemArg{offset:0,align:2,memory_index:0})]);
         let target_ordinal=ops.len();ops.push(I::If(B::Empty));
-        // Stand-in for the original native inverse/blend after the target seam.
-        // Its correction3 must survive rather than being overwritten afterward.
-        ops.extend([I::I64Const(1800),I::LocalGet(26),I::I64Load(mem(96)),I::I64Const(3),I::I64Add,I::I64Store(mem(0)),I::End,
+        // Native stand-in: input correction3 survives; FALSE keeps old output.
+        ops.extend([I::I64Const(1800),I::I64Const(1),I::LocalGet(28),I::I64Sub,I::I64Const(8),I::I64Mul,I::I64Add,
+            I::LocalGet(26),I::I64Load(mem(96)),I::I64Const(3),I::I64Add,I::I64Store(mem(0)),I::End,
+            // Native goal writes run even on FALSE. Reuse local40 for flags.
+            I::I32Const(3),I::LocalSet(40),I::LocalGet(27),I::LocalGet(40),I::I32Store16(MemArg{offset:90,align:1,memory_index:0}),
+            I::LocalGet(27),I::I32Const(1)]);
+        let goal_ordinal=ops.len();ops.push(I::I32Store8(MemArg{offset:64,align:0,memory_index:0}));
+        ops.extend([I::I32Const(3),I::Call(3),I::LocalGet(28),I::I64Const(1),I::I64Sub,I::LocalTee(28),I::I64Const(0),I::I64GeS,I::BrIf(0),I::End,
             I::LocalGet(26),I::I64Const(288),I::I64Add,I::GlobalSet(0),I::End]);
         for op in ops{iterate.instruction(&op);}code.function(&iterate);m.section(&code);
-        (m.finish(),Config{pre:4,iterate:5,predicate:0,request:1,convert:2,sp:0,tls:1,pre_ordinal:6,target_ordinal})
+        (m.finish(),Config{pre:4,iterate:5,predicate:0,request:1,convert:2,sp:0,tls:1,pre_ordinal:6,target_ordinal,reset_ordinal,goal_ordinal})
     }
+
     /// The real instrumented fixture for layered factory tests: imports
     /// predicate0 request1(native stand-in) convert2 event3, hooks4..6, pre7.
     pub(crate) fn instrumented_fixture()->Vec<u8>{let(bytes,config)=fixture();instrument(&bytes,config,None).unwrap()}
     #[test]fn executable_request_order_private_target_native_blend_and_false_fallback(){
         use std::sync::{Arc,Mutex,atomic::{AtomicBool,Ordering}};
         use wasmtime::{Config as EngineConfig,Engine,Linker,Store,SharedMemory,MemoryTypeBuilder};
-        let(bytes,config)=fixture();let bytes=instrument(&bytes,config,None).unwrap();
+        let(original,config)=fixture();let bytes=instrument(&original,config,None).unwrap();
         let mut ec=EngineConfig::new();ec.wasm_memory64(true).wasm_threads(true).shared_memory(true);let engine=Engine::new(&ec).unwrap();
         let module=wasmtime::Module::new(&engine,&bytes).unwrap();let mt=MemoryTypeBuilder::new().min(310).max(Some(310)).memory64(true).shared(true).build().unwrap();
         let memory=SharedMemory::new(&engine,mt).unwrap();let events=Arc::new(Mutex::new(Vec::<String>::new()));
         for(a,v)in[(20_159_720,1024),(1032,77),(1200+352,77),(1200+264,3000),(3000,4096),(2000+480,77)]{assert!(crate::write_u64(&memory,a,v));}
-        assert!(crate::write_u32(&memory,1600,1));let mut store=Store::new(&engine,());let mut linker=Linker::new(&engine);linker.define(&mut store,"env","memory",memory.clone()).unwrap();
+        for at in [1600,1604]{assert!(crate::write_u32(&memory,at,1));}let mut store=Store::new(&engine,());let mut linker=Linker::new(&engine);linker.define(&mut store,"env","memory",memory.clone()).unwrap();
         let sink=events.clone();linker.func_wrap("env","predicate",move|ped:i64,a:i32,b:i32,c:i32,d:i32,e:i32|{assert_eq!((ped,a,b,c,d,e),(77,0,0,0,1,0));sink.lock().unwrap().push("predicate".into());1i32}).unwrap();
         let mem=memory.clone();let sink=events.clone();linker.func_wrap("env","convert",move|data:i64,tag:i32,out:i64|{assert_eq!(data,4096);let value=match tag{57005=>10,28422=>11,18905=>20,60309=>21,_=>panic!("unknown bone")};assert!(crate::write_u32(&mem,out as u64,value));sink.lock().unwrap().push(format!("bone{tag}"));1i32}).unwrap();
         let mem=memory.clone();let sink=events.clone();linker.func_wrap("env","request",move|manager:i64,arm:i32,position:i64,flags:i32,a:f32,b:f32,c:f32,d:f32|{
@@ -201,8 +230,12 @@ impl Arms{
             assert!(crate::write_u64(&mem,position as u64,777));if denied.load(Ordering::Relaxed){0i64}else{42i64+arm as i64}}).unwrap();
         let sink=events.clone();linker.func_wrap(MODULE,"request_complete",move|token:i64,tls:i64|{assert!([42,43].contains(&token));assert_eq!(tls,123);sink.lock().unwrap().push("commit".into());}).unwrap();
         let mem=memory.clone();let sink=events.clone();linker.func_wrap(MODULE,"target",move|solver:i64,passed:i64,resolved:i64,arm:i32,goal:i64,request:i64,target:i64,tls:i64,first:i32|{
-            assert_eq!((solver,passed,resolved,arm,goal,request,target,tls,first),(2000,3000,3000,1,2128,2352,8000,123,1));
-            sink.lock().unwrap().push("target".into());assert!(crate::write_u64(&mem,target as u64,777));}).unwrap();
+            let raw=arm as u32;let index=raw&1;let post=raw&crate::xr_motion_arms::POST_GOAL_ARM_FLAG!=0;
+            assert_eq!(raw,index|if post{crate::xr_motion_arms::POST_GOAL_ARM_FLAG}else{0});
+            assert_eq!((solver,passed,resolved,goal,request,target,tls,first),(2000,3000,3000,2032+96*i64::from(index),2224+128*i64::from(index),8000,123,1));
+            sink.lock().unwrap().push(format!("{}{}",if post{"post"}else{"target"},index));
+            if post{assert_eq!(crate::read_u32(&mem,goal as u64+64),Some(1));assert_eq!(crate::read_u32(&mem,(goal as u64+90)&!3).map(|v|v>>16),Some(3));}
+            else{assert!(crate::write_u64(&mem,target as u64,777));}}).unwrap();
         let instance=linker.instantiate(&mut store,&module).unwrap();let pre=instance.get_typed_func::<(i64,f32),()>(&mut store,"pre").unwrap();
         pre.call(&mut store,(1200,0.016)).unwrap();assert_eq!(*events.lock().unwrap(),["stock1","predicate","bone57005","bone28422","input","native-request1","commit","bone18905","bone60309","input","native-request0","commit","stock2"]);
         assert_eq!(instance.get_global(&mut store,"sp").unwrap().get(&mut store).i64(),Some(8192));
@@ -210,10 +243,32 @@ impl Arms{
         assert_eq!(*events.lock().unwrap(),["stock1","predicate","bone57005","bone28422","input","bone18905","bone60309","input","stock2"]);
         assert_eq!(instance.get_global(&mut store,"sp").unwrap().get(&mut store).i64(),Some(8192));
         events.lock().unwrap().clear();let iterate=instance.get_typed_func::<(i64,f32,i64),()>(&mut store,"iterate").unwrap();
-        iterate.call(&mut store,(2000,0.016,3000)).unwrap();assert_eq!(crate::read_u64(&memory,1800),Some(780));assert_eq!(*events.lock().unwrap(),["predicate","target"]);
+        assert!(crate::write_u64(&memory,8000,777));let(base,len)=crate::mem_base_len(&memory);
+        // No guest thread is executing during these fixture snapshots.
+        let before=unsafe{std::slice::from_raw_parts(base,len)}.to_vec();
+        iterate.call(&mut store,(2000,0.016,3000)).unwrap();assert_eq!(crate::read_u64(&memory,1800),Some(780));assert_eq!(crate::read_u64(&memory,1808),Some(780));
+        assert_eq!(*events.lock().unwrap(),["predicate","target1","post1","stock3","predicate","target0","post0","stock3"]);
         assert_eq!(instance.get_global(&mut store,"sp").unwrap().get(&mut store).i64(),Some(8192));
-        events.lock().unwrap().clear();assert!(crate::write_u32(&memory,1600,0));assert!(crate::write_u64(&memory,1800,99));
-        iterate.call(&mut store,(2000,0.016,3000)).unwrap();assert!(events.lock().unwrap().is_empty());assert_eq!(crate::read_u64(&memory,1800),Some(99));
+        let observed=unsafe{std::slice::from_raw_parts(base,len)}.to_vec();
+        unsafe{std::ptr::copy_nonoverlapping(before.as_ptr(),base,len);}
+        let native_module=wasmtime::Module::new(&engine,&original).unwrap();let native=linker.instantiate(&mut store,&native_module).unwrap();
+        native.get_typed_func::<(i64,f32,i64),()>(&mut store,"iterate").unwrap().call(&mut store,(2000,0.016,3000)).unwrap();
+        assert_eq!(unsafe{std::slice::from_raw_parts(base,len)},observed.as_slice(),"all native fixture guest bytes must match without instrumentation");
+        assert_eq!(native.get_global(&mut store,"sp").unwrap().get(&mut store).i64(),Some(8192));
+        // Same invocation's FALSE arm cannot borrow the preceding TRUE marker;
+        // repeated invocations cannot borrow either previous arm's marker.
+        for(right,left,expected)in[(1,0,vec!["predicate","target1","post1","stock3","stock3"]),
+            (0,1,vec!["stock3","predicate","target0","post0","stock3"]),(0,0,vec!["stock3","stock3"])]{
+            events.lock().unwrap().clear();assert!(crate::write_u32(&memory,1600,right));assert!(crate::write_u32(&memory,1604,left));
+            for at in [1800,1808]{assert!(crate::write_u64(&memory,at,99));}
+            iterate.call(&mut store,(2000,0.016,3000)).unwrap();assert_eq!(*events.lock().unwrap(),expected);
+            assert_eq!(crate::read_u64(&memory,1800),Some(if right==1{780}else{99}));assert_eq!(crate::read_u64(&memory,1808),Some(if left==1{780}else{99}));
+            assert_eq!(instance.get_global(&mut store,"sp").unwrap().get(&mut store).i64(),Some(8192));
+        }
+    }
+    #[test]fn post_goal_factory_rejects_missing_reset_or_completed_goal_seam(){
+        let(bytes,config)=fixture();let mut wrong=config;wrong.goal_ordinal=usize::MAX;assert!(instrument(&bytes,wrong,None).is_err());
+        wrong=config;wrong.reset_ordinal=usize::MAX;assert!(instrument(&bytes,wrong,None).is_err());
     }
     #[test]#[ignore="exact private source parser/reencoder only; never instantiates game"]
     fn exact_original_six_bodies_preserve_every_other_body_and_native_data(){

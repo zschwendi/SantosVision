@@ -1,6 +1,7 @@
 //! Native arm INPUT bridge. The game still converts, blends and solves every
 //! goal, then updates the weapon through its original attachment machinery.
-//! Guest addresses are used only during a hook; retained leases contain values.
+//! Retained leases contain values. A bounded per-Store diagnostic pairs two
+//! hooks by guest identity, revalidating every address before its read-only use.
 use std::{collections::VecDeque, sync::{atomic::{AtomicU32, Ordering}, Mutex}, time::{Duration, Instant}};
 use crate::xr_motion_aim::{identity, multiply, rigid, CameraCandidate};
 #[path="xr_motion_cache.rs"]
@@ -15,6 +16,11 @@ mod left_wrist;
 pub const IMPORT_MODULE: &str = "muguet_motion_arms_v1";
 /// Opted-in left-wrist artifact: host-chosen native38506 flags for the left request.
 pub const LEFT_REQUEST_FLAGS_IMPORT: &str = "left_request_flags";
+/// target import protocol extension: ordinary arm0/1 still mutates only the
+/// private input; flagged arm0/1 observes the completed native goal read-only.
+pub(crate) const POST_GOAL_ARM_FLAG:u32=0x8000_0000;
+fn target_phase(arm:u64)->Option<(usize,bool)>{match arm{0|1=>Some((arm as usize,false)),
+    a if a==u64::from(POST_GOAL_ARM_FLAG)||a==u64::from(POST_GOAL_ARM_FLAG|1)=>Some(((a&1)as usize,true)),_=>None}}
 const MAX_AGE: Duration = Duration::from_millis(150);
 const MANAGER_VTABLE:u64=5_169_184;
 const SOLVER_VTABLE:u64=5_169_304;
@@ -131,13 +137,14 @@ struct Lease {token:u32,arm:u32,generation:(u64,u64,u64), tracking:u64, hand:[f3
     /// Native38506 request flags: right 256; left 0, or 256 only when calibrated.
     flags:u32}
 #[derive(Default)]
-pub struct StoreState {pending:Vec<(u32,u64)>,touched:Vec<(u64,u32,Instant)>,cache_touched:Vec<(u64,u64,Instant)>,sequence:u64,depth:u64,pub requests:u64,pub applied:u64,pub fallback:u64}
+pub struct StoreState {pending:Vec<(u32,u64)>,touched:Vec<(u64,u32,Instant)>,cache_touched:Vec<(u64,u64,Instant)>,
+    post_goal_pending:[Option<trace::PendingGoal>;2],sequence:u64,depth:u64,pub requests:u64,pub applied:u64,pub fallback:u64}
 pub struct BoundaryPrefix{floor:u64,depth:u64}
 impl StoreState {
     pub fn boundary_prefix(&mut self)->BoundaryPrefix{let prefix=BoundaryPrefix{floor:self.sequence,depth:self.depth};self.depth=self.depth.saturating_add(1);prefix}
     pub fn finish_boundary(&mut self,prefix:&BoundaryPrefix){
         if self.depth!=prefix.depth.saturating_add(1){self.recover_boundary(prefix);return;}
-        self.depth=prefix.depth;if self.depth==0{self.touched.clear();self.cache_touched.clear();}
+        self.depth=prefix.depth;if self.depth==0{self.touched.clear();self.cache_touched.clear();self.post_goal_pending=[None,None];}
     }
     fn touch(&mut self,token:u32)->bool{
         self.touched.retain(|x|x.2.elapsed()<=MAX_AGE);
@@ -151,7 +158,7 @@ impl StoreState {
         let cache_invalid:Vec<_>=self.cache_touched.iter().filter(|x|x.0>prefix.floor).map(|x|x.1).collect();
         self.cache_touched.retain(|x|x.0<=prefix.floor);cached::revoke(&cache_invalid);
         let invalid:Vec<_>=self.touched.iter().filter(|x|x.0>prefix.floor).map(|x|x.1).collect();
-        self.touched.retain(|x|x.0<=prefix.floor);self.depth=prefix.depth;self.pending.clear();
+        self.touched.retain(|x|x.0<=prefix.floor);self.depth=prefix.depth;self.pending.clear();self.post_goal_pending=[None,None];
         LEASES.lock().unwrap_or_else(|p|p.into_inner()).retain(|l|!invalid.contains(&l.token));
         let mut input=INPUT.lock().unwrap_or_else(|p|p.into_inner());if input.as_ref().is_some_and(|i|invalid.contains(&i.token)){*input=None;}
         let mut left=LEFT_INPUT.lock().unwrap_or_else(|p|p.into_inner());if left.as_ref().is_some_and(|i|invalid.contains(&i.0)){*left=None;}
@@ -398,7 +405,20 @@ pub(crate) fn host_hook(caller:&mut wasmtime::Caller<'_,crate::HostState>,name:&
         "target"=>{
             anyhow::ensure!(params.len()==9&&results.is_empty(),"native arm target ABI mismatch");
             let(solver,passed,resolved,arm,goal,request,target,tls,first)=(arg(0)?,arg(1)?,arg(2)?,arg(3)?,arg(4)?,arg(5)?,arg(6)?,arg(7)?,arg(8)?!=0);
-            if arm>1{return Ok(());}let guest=Guest(mem);let mut observation=Snapshot::new(&guest);
+            let Some((index,post_goal))=target_phase(arm)else{return Ok(());};let arm=index as u64;
+            let site=trace::GoalSite{solver,passed,resolved,arm,goal,request,scratch:target,tls};
+            let guest=Guest(mem);
+            if post_goal{
+                // Consume once before qualification, including rejected calls.
+                // This branch has no route to native input/goal/bone writes.
+                let pending=caller.data_mut().motion_arms.post_goal_pending[index].take();
+                let generation=current_arm(first,index as u32).map(|c|(c.generation(),c.tracking()));
+                let stack_matches=tls!=0&&active_stack(caller).and_then(|sp|sp.checked_add(96))==Some(target);
+                trace::post_goal(&guest,pending,site,generation,stack_matches);return Ok(());
+            }
+            // A rejected target attempt cannot reuse an older accepted one.
+            caller.data_mut().motion_arms.post_goal_pending[index]=None;
+            let mut observation=Snapshot::new(&guest);
             let local=observed_local_ped(&guest).is_some_and(|p|observation.u64(solver.saturating_add(480))==Some(p));
             let mut audit=HookObservation::new(arm as u32,false,local,first);audit.gate="camera_scope_or_exact_tracking";
             let Some(candidate)=current_arm(first,arm as u32)else{return Ok(())};
@@ -434,7 +454,7 @@ pub(crate) fn host_hook(caller:&mut wasmtime::Caller<'_,crate::HostState>,name:&
             if !read.unchanged()||current_arm(first,arm as u32).is_none_or(|c|c.generation()!=lease.generation){return Ok(());}
             audit.gate="boundary_journal_capacity";if !caller.data_mut().motion_arms.touch(token){return Ok(());}
             anyhow::ensure!(store_target(&guest,target,&lease.hand,lease.capability.full_pose()),"qualified private arm target range changed");
-            trace::target(&guest,ped,skel,goal,request,&lease,original,reference);
+            caller.data_mut().motion_arms.post_goal_pending[index]=trace::target(&guest,ped,site,&lease,original,reference);
             if arm==1{
             // In position-only mode the native38487 hand basis is preserved.
             // Record that applied value, never the identity request placeholder.
@@ -455,6 +475,11 @@ pub(crate) fn host_hook(caller:&mut wasmtime::Caller<'_,crate::HostState>,name:&
 #[cfg(test)]mod tests{
     use super::*;
     use std::{cell::RefCell,collections::BTreeMap};
+    #[test]fn target_phase_discriminator_preserves_ordinary_arms_and_rejects_unknown_bits(){
+        assert_eq!(target_phase(0),Some((0,false)));assert_eq!(target_phase(1),Some((1,false)));
+        assert_eq!(target_phase(u64::from(POST_GOAL_ARM_FLAG)),Some((0,true)));assert_eq!(target_phase(u64::from(POST_GOAL_ARM_FLAG|1)),Some((1,true)));
+        for invalid in [2,3,0x8000_0002,u64::MAX]{assert_eq!(target_phase(invalid),None);}
+    }
     #[derive(Default)]pub(super) struct TestMemory(pub(super) RefCell<BTreeMap<u64,u32>>);
     impl Memory for TestMemory{fn word(&self,a:u64)->Option<u32>{self.0.borrow().get(&a).copied()}fn put(&self,a:u64,v:u32)->bool{self.0.borrow_mut().insert(a,v);true}}
     impl TestMemory{pub(super) fn u64(&self,a:u64,v:u64){self.put(a,v as u32);self.put(a+4,(v>>32)as u32);}pub(super) fn matrix(&self,a:u64,m:&[f32;16]){for(i,v)in m.iter().enumerate(){self.put(a+i as u64*4,v.to_bits());}}}
