@@ -50,13 +50,18 @@ Executable SHA256:
 `cf3ab9f1db381c349ef426f2db8ae48fcc0cf21a208062ba7e58ca2d0bc426a1`.
 AOT SHA256:
 `9db6a260f6727f3b9935a0b95d172c06319531ba5ec7b2de4efc2632e7d381d6`.
-No physical tracking, barrel/shot agreement or performance acceptance is claimed.
+At deployment no physical tracking acceptance was claimed. The user's later
+build-26 test confirmed point-to-aim, binocular reticle tracking, shots landing
+where aimed, initial Wasted, and usable first-person ADS. Right-hand roll,
+Sense-driven gun movement during ADS and enlarged Wasted stereo remain broken.
+No performance or complete arm/unarmed-hand acceptance follows from that test.
 
-Next actual test: reopen Los Santos and enter immersive first person with a gun.
+The original deployment test recipe was: reopen Los Santos and enter immersive first person with a gun.
 Move right Sense while keeping the head still, then hold the controller still
 while turning the head. Check hands/arms, gun attachment, sights/reticle and shots.
 Collect a fresh own report using `gun-world26-device/collect_runtime26.py` with a
 new label. Require `equipped_gun_queued_world` for the gun's last-applied source
 and small `applied_vs_draw_world` deltas; otherwise inspect its precise fallback
 reason. A source counter alone does not establish visible success. Native firing
-and reticle authority were not changed by26 and remain separate acceptance.
+and reticle authority were not changed by26. Their successful observed behavior
+is now recorded in the acceptance audit; preserve it during the remaining polish.

@@ -5,15 +5,33 @@ headset feedback supersedes earlier passing source tests and target counters.
 The coordinator owns integration and the complete player experience. Parent:
 `w-14dea40fb6e248138ad507f85cf4384b`, topic `santosvision-immersive`.
 
-Build **26** is now installed in place and its bundle version was verified.
+## Latest physical acceptance — October 24 evening / October 25 UTC
+
+The user tested installed **build 26** and confirmed point-to-aim, one correctly
+registered reticle across both eyes, shots landing where aimed, the initial
+Wasted presentation, and usable first-person ADS. These are actual player
+observations; the absence of a fresh machine report does not erase them.
+The right hand appeared approximately 180 degrees upside down, the gun did not
+follow Sense movement while in ADS, and the enlarged Wasted presentation still
+misregistered between eyes. Immersive image fidelity remains below the accepted
+windowed view. Whether the gun itself shared the wrist roll is being clarified;
+do not reverse the accepted pointing/firing axis to fix a roll defect.
+
+Current work is scoped to those remaining defects and a source-to-display
+quality comparison. Unarmed hands, left-wrist calibration, sniper-specific
+acceptance, repeated startup stability and save recovery are not established by
+this feedback. Preserve accepted third-person behavior and the build-26 app.
+
+Build **26** is installed in place and its bundle version was verified.
 Source `eae9693`, tag `los-santos-gun-world-candidate26-20261024`. It changes
 only qualified local equipped first-person gun placement to use its queued
 native world matrix. Build25's one actual hardware snapshot found a172.766deg
 gun placement discrepancy while the paired arm placement agreed. Original
 source shows distinct regular/first-person attachment routes. Native build,
 signing/provisioning/cloud/full AOT embedding/RX checks and focused tests/review
-passed; the25 AOT and all prior frozen apps remain preserved. The new app was
-not activated after installation; **physical hand/gun/aim acceptance is pending**.
+passed; the25 AOT and all prior frozen apps remain preserved. The coordinator's
+launch observation was inconclusive; the user's subsequent test supplies the
+narrow physical acceptance recorded above.
 See [build26 notes](GUN-FIRST-PERSON-WORLD26-20261024.md).
 
 Previous diagnostic baseline: Build **25** was installed in place and its bundle version was verified.
@@ -46,8 +64,9 @@ and gun must follow the controllers, with barrel, reticle and native shots in
 agreement during independent head movement. Natural bare-hand interaction is
 deferred; unarmed Sense-driven avatar hands remain within the controller scope.
 
-Latest player feedback: **visible hand/arm tracking does not work**. Treat this
-as failed acceptance, not a completed implementation awaiting confirmation.
+Earlier build-24 player feedback was **visible hand/arm tracking does not work**.
+Build 26 now has the narrower positive acceptance above; the following capture
+findings remain historical evidence, not the latest acceptance verdict.
 The first actual capture now shows gun/arm depth surviving into the published
 image without the conditional foreground merge. The earlier general missing-
 depth explanation does not hold for this captured arrangement. Controller
@@ -56,7 +75,7 @@ foreground merge off instead of treating it as the hand-tracking fix.
 The user also withdrew the immersive Phone button: phone utilities now belong
 only to the windowed presentation, reached through the existing pause/window flow.
 
-Subsequent player feedback again fails first-person immersive acceptance:
+Earlier player feedback failed first-person immersive acceptance:
 orienting around the weapon feels wrong, and the world looks grainy and low
 detail. The interaction requirements have already been explained; further
 screenshots should identify particular visible defects without reopening those
@@ -76,10 +95,10 @@ session produced the validated capture described in
 | --- | --- | --- |
 | Startup succeeds consistently instead of going black roughly two times out of three | **Unfixed.** User reports repeated quit/restart needed. | Coordinator: trace native engine, surface, scene ownership and actual presented frame state. |
 | Start in immersive must not crash; our settings must remain usable | **Source repair integrated; device acceptance pending.** Matching device crash is SwiftUI Missing app graph. The old sequence also crashes an isolated scene-only app; serialized restoration passes three cycles. GTA pause currently uses an explicit window fallback, not an immersive front-end compositor. | Coordinator with menus specialist; see SCENE-RETURN-STABILITY-20261024.md. Test Start, GTA tabs/Apply/save and return to immersive after closing GTA menu. |
-| First-person ADS in flat and immersive | **Source repair integrated; visible ADS unaccepted.** Sense L2 + R3 now reaches GTA's separate native sights toggle in both first-person views. Original L2-to-RMB mapping was already correct. Tracked-arm/sights interaction and wheel sign need a device check. | Dedicated Opus 5.5 `ads` task; test both first-person views. |
+| First-person ADS in flat and immersive | **Build 26 player confirms ADS works.** Gun movement from Sense while ADS is still broken. Host review found a redundant stale private-mode dependency at already-qualified native arm callbacks; removal is under focused test, not physically accepted. | Interaction polish: preserve the sights toggle and accepted aiming; test independent controller motion while ADS. |
 | Sense can navigate GTA Settings and controls in every view | **Source repair integrated; hardware check pending.** GTA keeps the controller while its menu is open; L1/R1/Triangle send its actual Q/E/Tab bindings. Combined menu/ADS routing passes 39 tests. | Dedicated Opus 5.5 `menus` task; actual directions, tabs, confirm/cancel and Apply/save. |
-| Actual tracked gun, hands and arms | **Player acceptance failed; unfinished.** Actual build-24 capture proves the initial gun/arm draws precede world geometry and remain visible in published depth without merge. The earlier general missing-depth diagnosis is withdrawn for this arrangement. Build25 exact native goal positions match the last sampled controller targets; the separate FP candidate is close, but this is before Solve and not a movement-series or visible proof. Build26 corrects the qualified gun-only queued placement discrepancy; its physical selection and result remain unaccepted. Full arm/palette ownership, unarmed Sense hands and firing/reticle agreement remain unfinished; stale cache cookies do not prove a solve failure. | Dedicated Opus 5.5 `hands` task; actual skeleton, attachments and first-person draw transform must agree. |
-| Reticle always agrees with visible barrel and actual native aiming | **Incomplete.** Candidate 21 repairs an independent binocular-reference bug; it does not establish visible gun alignment. | Hands/ADS integration; near/far and independent head/hand movement. No fabricated center dot or desired-ray authority. |
+| Actual tracked gun, hands and arms | **Build 26 player confirms point-to-aim and correctly landing shots.** Right-hand roll is wrong and Sense motion freezes in ADS. Full arm/palette ownership, unarmed hands and independent calibrated left-wrist behavior are not accepted. The build-24 capture still disproves the old general missing-depth explanation for that arrangement. | Interaction polish: fix roll without changing forward aim; keep accepted gun placement and native shot authority. |
+| Reticle always agrees with visible barrel and actual native aiming | **Accepted in the user's build-26 test:** reticle tracks across both eyes and shots land where aimed. Retain broader near/far and ADS regression checks without relabeling that accepted result as failed. | Preserve accepted binocular/native aiming while fixing roll and ADS motion. |
 | Independent left wrist rotation | **Carried into installed 24; not physically accepted.** Explicit grip-to-native-hand calibration transports native flags256. Full artifact preservation, AOT generation and signed-app integration passed; 11 native state tests, 2 factory tests and 46 UI-flow checks pass after independent fixes. Uncalibrated play keeps native wrist orientation. | Hands task; proper calibrated frame and native orientation transport. |
 | First-person head looking, body turning and weapon aiming can be separated or chosen | **Partially implemented, choice unfinished.** Sense weapon aiming and headset view have separate source paths. There is no normal Settings choice for the requested first-person head-check/body-turn experiment. Preserve accepted third-person behavior. | Hands/aiming follow-up after actual barrel alignment is accepted. |
 | First-person immersive sniper is single and correctly zoomed | **Partial source repair; hardware pending.** Qualified scoped world now shares the graticule axis and uses a 1/m virtual baseline. Baked HUD fallback can still double when real HUD isolation is rejected; new counters identify it. | Dedicated Opus 5.5 `sniper` task. |
@@ -88,7 +107,7 @@ session produced the validated capture described in
 | Residual distant black sky squares | **Unresolved.** Earlier near holes improved; no complete physical acceptance. | Renderer follow-up; do not silently reopen accepted third-person camera behavior. |
 | Near geometry fades instead of fighting the player's body | **Source exists; physical comfort not accepted.** Current fade range is 5–10 cm. This does not establish that all first-person arms, sights or nearby walls behave correctly. | Check alongside actual tracked arms and ADS; do not restore the old broad 15–45 cm fade. |
 | Stronger or more convincing stereo | **Unaccepted.** Use calibrated physical eye transforms; alternate-eye timing and foreground/HUD errors remain. No artificial IPD-strength setting has been added. | Accept coherent aiming/scope geometry before experimenting with perceived depth strength. |
-| Weapon wheel and Wasted are not duplicated; HUD stays visible | **Not fully accepted.** Prior reticle improvement does not prove all HUD elements. | Explicit UI/stereo checks; minimap lower without moving farther left, right HUD lower and inward. |
+| Weapon wheel and Wasted are not duplicated; HUD stays visible | **Initial Wasted accepted in build 26; enlarged Wasted still wrong between eyes.** Other HUD/wheel states remain separately unaccepted. | Qualify the zoomed-state writer/admission path; preserve the working reticle and initial Wasted. |
 | Phone/view utilities are minimal and out of the way | **Installed 24 removes immersive Phone utilities entirely**, including their tracking hit areas. Phone/Close-phone and phone-only directions remain in the game window; View ornament was already removed in both presentations. Physical camera shortcuts remain. | Verify the requested removal and preserve working windowed phone access. |
 | Phone arrow pad only appears with phone, as an upright directional ornament; phone button closes phone | **Partial.** User previously accepted window behavior; immersive phone/open-transition failures remain. | Controls/lifecycle regression; preserve the working window path. |
 | Front of app feels concise and deliberate | **Trimmed in installed 24; player check pending.** Removed duplicate title/status and generic launcher decoration. Play, Settings, Quit and controller status remain. Footer includes the actual bundle build number. | Coordinator; no replacement wall of diagnostic controls. |
