@@ -392,6 +392,59 @@ fn settings_xml_with_values(xml: &str, wanted: std::collections::BTreeMap<(&str,
 }
 fn settings_xml_with_observed_values(xml: &str, wanted: std::collections::BTreeMap<(&str, &str), String>,
     observed: &mut std::collections::BTreeMap<String, String>) -> anyhow::Result<(String, Vec<String>)> {
+    settings_xml_with_value_policy(xml, wanted, observed, false)
+}
+
+/// Exact attribute qualification is confined to the opt-in taller source.
+/// Leave the existing wide-profile XML parser behavior unchanged.
+fn tall_aspect_xml(xml: &str) -> anyhow::Result<(String, Vec<String>)> {
+    settings_xml_with_value_policy(xml,
+        [(("video", "AspectRatio"), "0".to_string())].into_iter().collect(),
+        &mut std::collections::BTreeMap::new(), true)
+}
+
+fn exact_single_value_attribute(tag: &str) -> anyhow::Result<(usize, usize)> {
+    use anyhow::{ensure, Context};
+    let bytes = tag.as_bytes();
+    let name_character = |byte: u8| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b':' | b'-' | b'.');
+    let whitespace = |byte: u8| matches!(byte, b' ' | b'\t' | b'\r' | b'\n');
+    ensure!(bytes.first() == Some(&b'<'), "invalid tall-source aspect tag");
+    let mut cursor = 1;
+    while bytes.get(cursor).is_some_and(|byte| name_character(*byte)) { cursor += 1; }
+    let mut names = std::collections::BTreeSet::new();
+    let mut value = None;
+    loop {
+        let before_space = cursor;
+        while bytes.get(cursor).is_some_and(|byte| whitespace(*byte)) { cursor += 1; }
+        if bytes.get(cursor) == Some(&b'/') {
+            ensure!(bytes.get(cursor + 1) == Some(&b'>') && cursor + 2 == bytes.len(), "invalid tall-source aspect tag ending");
+            break;
+        }
+        ensure!(cursor > before_space, "tall-source aspect attributes must be separated by whitespace");
+        let start = cursor;
+        ensure!(bytes.get(cursor).is_some_and(|byte| byte.is_ascii_alphabetic() || matches!(byte, b'_' | b':')),
+            "invalid tall-source aspect attribute name");
+        while bytes.get(cursor).is_some_and(|byte| name_character(*byte)) { cursor += 1; }
+        let name = &tag[start..cursor];
+        ensure!(names.insert(name), "duplicate tall-source aspect attribute {name}");
+        while bytes.get(cursor).is_some_and(|byte| whitespace(*byte)) { cursor += 1; }
+        ensure!(bytes.get(cursor) == Some(&b'='), "tall-source aspect attribute has no equals sign");
+        cursor += 1;
+        while bytes.get(cursor).is_some_and(|byte| whitespace(*byte)) { cursor += 1; }
+        let quote = *bytes.get(cursor).context("missing tall-source aspect attribute value")?;
+        ensure!(matches!(quote, b'\'' | b'"'), "tall-source aspect attribute value must be quoted");
+        cursor += 1;
+        let value_start = cursor;
+        while bytes.get(cursor).is_some_and(|byte| *byte != quote) { cursor += 1; }
+        ensure!(bytes.get(cursor) == Some(&quote), "unterminated tall-source aspect attribute value");
+        if name == "value" { value = Some((value_start, cursor)); }
+        cursor += 1;
+    }
+    value.context("tall-source aspect requires one exact value attribute")
+}
+
+fn settings_xml_with_value_policy(xml: &str, wanted: std::collections::BTreeMap<(&str, &str), String>,
+    observed: &mut std::collections::BTreeMap<String, String>, strict_tall_aspect: bool) -> anyhow::Result<(String, Vec<String>)> {
     use anyhow::{ensure, Context};
     use std::collections::{BTreeMap, BTreeSet};
     let value_attribute = regex::Regex::new(r#"\bvalue\s*=\s*(?:"([^"]*)"|'([^']*)')"#)?;
@@ -447,11 +500,16 @@ fn settings_xml_with_observed_values(xml: &str, wanted: std::collections::BTreeM
                 }
                 if let Some(value) = wanted.get(&(stack[1], name)) {
                     ensure!(self_closing && seen.insert((stack[1], name)), "duplicate or non-value graphics tag {name}");
-                    let captures = value_attribute.captures(&xml[start..end + 1])
-                        .with_context(|| format!("settings tag {name} has no value attribute"))?;
-                    let field = captures.get(1).or_else(|| captures.get(2)).unwrap();
-                    if field.as_str() != value {
-                        edits.push((start + field.start(), start + field.end(), value.clone()));
+                    let (field_start, field_end) = if strict_tall_aspect && stack[1] == "video" && name == "AspectRatio" {
+                        exact_single_value_attribute(&xml[start..end + 1])?
+                    } else {
+                        let captures = value_attribute.captures(&xml[start..end + 1])
+                            .with_context(|| format!("settings tag {name} has no value attribute"))?;
+                        let field = captures.get(1).or_else(|| captures.get(2)).unwrap();
+                        (field.start(), field.end())
+                    };
+                    if &xml[start + field_start..start + field_end] != value {
+                        edits.push((start + field_start, start + field_end, value.clone()));
                         changed.push(name.into());
                     }
                 }
@@ -514,8 +572,7 @@ fn prepare_native_graphics(save_root: &Path) -> anyhow::Result<NativeGraphicsLau
         // Reuse the validated XML walker only as a read-only qualification.
         // A forced or unknown game aspect must not distort the taller source;
         // neither that setting nor the player's FOV is silently rewritten.
-        let (automatic, _) = settings_xml_with_values(&original,
-            [(("video", "AspectRatio"), "0".to_string())].into_iter().collect())
+        let (automatic, _) = tall_aspect_xml(&original)
             .context("validate Automatic aspect ratio for the taller source")?;
         ensure!(automatic == original,
             "Choose Automatic aspect ratio in GTA before using the 2560x2304 experimental resolution.");
@@ -737,6 +794,52 @@ mod native_graphics_tests {
             .replace("ScreenHeight value=\"1080\"", "ScreenHeight value=\"2304\"");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), wanted);
         assert_eq!(prepare_native_graphics(&fixture.0).unwrap().settings_action, "unchanged");
+    }
+
+    fn rejected_tall_aspect_keeps_files(tag: &str) {
+        let fixture = Fixture::new();
+        fixture.preset(2560, 2304, 60, "existing");
+        let path = fixture.settings();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let original = NATIVE_DEFAULT_SETTINGS.replace("<AspectRatio value=\"0\" />", tag);
+        std::fs::write(&path, &original).unwrap();
+        write_native_graphics_marker(&fixture.marker(), &NativeGraphics::default()).unwrap();
+        let marker = std::fs::read(fixture.marker()).unwrap();
+        assert!(prepare_native_graphics(&fixture.0).is_err(), "ambiguous or forced aspect was admitted: {tag}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        assert_eq!(std::fs::read(fixture.marker()).unwrap(), marker);
+        assert_eq!(std::fs::read_dir(path.parent().unwrap()).unwrap().count(), 1,
+                   "rejection must precede even backup creation");
+    }
+
+    #[test]
+    fn tall_source_rejects_suffix_attribute_alias_before_writes() {
+        rejected_tall_aspect_keeps_files("<AspectRatio note-value=\"0\" value=\"2\" />");
+    }
+
+    #[test]
+    fn tall_source_rejects_duplicate_value_attribute_before_writes() {
+        rejected_tall_aspect_keeps_files("<AspectRatio value=\"0\" value=\"2\" />");
+        rejected_tall_aspect_keeps_files("<AspectRatio value=\"0\" value='0' />");
+    }
+
+    #[test]
+    fn tall_source_accepts_exact_single_auto_attribute_in_ordinary_formats() {
+        for tag in ["<AspectRatio value='0' />", "<AspectRatio\n value = '0'/>",
+            "<AspectRatio note-value=\"2\" value=\"0\" />",
+            "<AspectRatio value=\"0\" note-value=\"2\" />",
+            "<AspectRatio note=\"1 &gt; 0\" value=\"0\" />"] {
+            let fixture = Fixture::new();
+            fixture.preset(2560, 2304, 60, "existing");
+            let path = fixture.settings();
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let original = NATIVE_DEFAULT_SETTINGS.replace("<AspectRatio value=\"0\" />", tag);
+            std::fs::write(&path, &original).unwrap();
+            let launch = prepare_native_graphics(&fixture.0).unwrap();
+            assert_eq!(std::fs::read_to_string(launch.backup_path.unwrap()).unwrap(), original);
+            assert!(std::fs::read_to_string(&path).unwrap().contains(tag), "valid aspect syntax was rewritten");
+            assert!(!launch.changed_tags.iter().any(|name| name == "AspectRatio"));
+        }
     }
 
     #[test]

@@ -73,7 +73,7 @@ final class WindowGameSurface: ObservableObject {
 }
 
 private struct GameCanvas: UIViewRepresentable {
-    let runtime: NativeRuntimeModel
+    @ObservedObject var runtime: NativeRuntimeModel
     let surface: WindowGameSurface
     func makeUIView(context: Context) -> UIView {
         surface.observeAttachment { runtime.setWindowAttached($0) }
