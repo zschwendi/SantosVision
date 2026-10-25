@@ -1186,6 +1186,7 @@ final class NativeRuntimeModel: ObservableObject {
             "rendering_quality_requested": ["depth_edge_fill": depthEdgeFillEnabled,
                                             "higher_display_resolution": higherImmersiveResolutionEnabled],
             "rendering_quality_effective": ["higher_display_resolution": GameWorldDisplayQuality.requested,
+                "smooth_surface_continuity": GameWorldSurfaceContinuityPolicy.requested,
                 "depth_edge_fill": GameWorldDepthEdgeFillPolicy.requested(
                 environment: ProcessInfo.processInfo.environment, arguments: ProcessInfo.processInfo.arguments,
                 stored: GameWorldDepthEdgeFillPolicy.stored)],

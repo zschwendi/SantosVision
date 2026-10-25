@@ -448,6 +448,9 @@ final class GameWorldRenderer: @unchecked Sendable {
     /// Opt-in owner-0 gap fill; needs the finite-sky ownership mask.
     private let depthEdgeFill: GameWorldDepthEdgeFill?
     private let imageQuality: GameWorldImageQualityTelemetry
+    /// Captured once for this renderer so both eyes, captures and optional
+    /// precomputed corners use the same surface reconstruction policy.
+    private let smoothSurfaceContinuity = GameWorldSurfaceContinuityPolicy.requested
     private let allowSyntheticAnchorCopy: Bool
     private let adaptiveMesh: GameWorldAdaptiveMesh?
     private let anchorProbe: GameWorldAnchorProbe?
@@ -1620,6 +1623,7 @@ final class GameWorldRenderer: @unchecked Sendable {
         var uniforms = GameWorldUniforms(sourceEyeFromClip: eye.sourceProjection.inverse,
             currentEyeFromSourceEye: worldFloatMatrix(relativeEye), currentClipFromEye: projection,
             sourceSize: SIMD2<UInt32>(eye.width, eye.height))
+        uniforms.reserved.x = smoothSurfaceContinuity ? 1 : 0
         uniforms.sourceDepthReversed = eye.sourceProjection.columns.2.z >= 0 ? 1 : 0
         let sourceSRGB = eye.color.pixelFormat == .rgba8Unorm_srgb || eye.color.pixelFormat == .bgra8Unorm_srgb
         let destinationEncoded = layer.configuration.colorFormat == .bgra8Unorm

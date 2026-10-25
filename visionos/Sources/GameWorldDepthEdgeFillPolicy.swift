@@ -13,6 +13,25 @@ enum GameWorldDisplayQuality {
         }
     }
 }
+
+/// Controlled reconstruction comparison. Normal play retains the affine
+/// surface policy until the curved-surface candidate has been checked in the
+/// actual headset. This changes geometry continuity, never the source image.
+enum GameWorldSurfaceContinuityPolicy {
+    static func requested(environment: [String: String], arguments: [String]) -> Bool {
+        if arguments.contains("--sv-world-disable-smooth-continuity") { return false }
+        switch environment["MUGUET_COMPOSITOR_SMOOTH_CONTINUITY"] {
+        case "1": return true
+        case "0": return false
+        default: return arguments.contains("--sv-world-smooth-continuity")
+        }
+    }
+
+    static var requested: Bool {
+        requested(environment: ProcessInfo.processInfo.environment,
+                  arguments: ProcessInfo.processInfo.arguments)
+    }
+}
 import simd
 
 /// Mirrors `GameWorldDepthEdgeFillUniforms` in GameWorld.metal (240 bytes).
