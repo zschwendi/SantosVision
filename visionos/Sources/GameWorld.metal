@@ -353,6 +353,131 @@ fragment GameWorldSkyOwnershipOut gameWorldSkyOwnershipFragment(GameWorldVertex 
     return out;
 }
 
+// Opt-in vertical reconstruction. Original fragment entry points above retain
+// their exact ABI and bilinear behavior. These new entries alone bind real
+// source depth at fragment texture 1; the renderer selects them explicitly.
+static bool gameWorldVerticalSupport(float2 uv, float2 texelDx, float2 texelDy,
+        uint background, constant GameWorldUniforms &u,
+        texture2d<float, access::read> depth, thread int2 &base, thread float &phase) {
+    if (background != 0 || !all(isfinite(uv)) || !all(isfinite(texelDx)) || !all(isfinite(texelDy))
+        || any(u.sourceSize < uint2(2, 4))) { return false; }
+    const float determinant = texelDx.x * texelDy.y - texelDx.y * texelDy.x;
+    // Only vertical source rows are reconstructed. Horizontal bilinear and its
+    // minification behavior stay unchanged, including ~1.04 horizontal source
+    // pixels per display pixel in the historical native-density case.
+    const float verticalFootprint = abs(texelDx.y) + abs(texelDy.y);
+    if (!isfinite(determinant) || abs(determinant) <= 1e-8
+        || verticalFootprint <= 1e-8 || verticalFootprint > 1) { return false; }
+    const float2 texel = uv * float2(u.sourceSize) - 0.5;
+    // All 2x4 color support plus one horizontal context column must be real
+    // source data. Three columns distinguish a vertical depth step from an
+    // arbitrary two-column slope; no clamped-border evidence is invented.
+    if (texel.x < 1 || texel.x >= float(u.sourceSize.x - 1)
+        || texel.y < 1 || texel.y >= float(u.sourceSize.y - 2)) { return false; }
+    base = int2(floor(texel));
+    phase = texel.y - float(base.y);
+    const float clearDepth = u.sourceDepthReversed != 0 ? 0.0 : 1.0;
+    float samples[12];
+    float magnitude = 0;
+    for (uint row = 0; row < 4; ++row) {
+        for (uint column = 0; column < 3; ++column) {
+            const float z = depth.read(uint2(base + int2(int(column) - 1, int(row) - 1))).r;
+            if (!isfinite(z) || z < 0 || z > 1 || z == clearDepth) { return false; }
+            samples[row * 3 + column] = z;
+            magnitude = max(magnitude, abs(z));
+        }
+    }
+    // Perspective planes have affine NDC depth. This sampling-only gate uses
+    // the same four-ULP precision budget as the original geometry classifier,
+    // without per-fragment matrix transforms or metric-depth divisions.
+    const float dx = (samples[2] - samples[0]) * 0.5;
+    const float dy = (samples[9] - samples[0]) / 3;
+    const float tolerance = 4 * (nextafter(magnitude, 2.0f) - magnitude);
+    for (uint row = 0; row < 4; ++row) {
+        for (uint column = 0; column < 3; ++column) {
+            if (abs(samples[row * 3 + column] - (samples[0] + dx * column + dy * row)) > tolerance) { return false; }
+        }
+    }
+    return true;
+}
+
+struct GameWorldVerticalSample { float3 rgb; uint eligible; };
+static GameWorldVerticalSample gameWorldVerticalSample(float2 uv, float2 texelDx, float2 texelDy,
+        uint background, constant GameWorldUniforms &u, texture2d<float> color,
+        texture2d<float, access::read> depth) {
+    constexpr sampler s(filter::linear, address::clamp_to_edge);
+    int2 base;
+    float t;
+    if (!gameWorldVerticalSupport(uv, texelDx, texelDy, background, u, depth, base, t)) {
+        return {color.sample(s, uv).rgb, 0};
+    }
+    const float3 a = color.sample(s, float2(uv.x, (float(base.y) - 0.5) / float(u.sourceSize.y))).rgb;
+    const float3 b = color.sample(s, float2(uv.x, (float(base.y) + 0.5) / float(u.sourceSize.y))).rgb;
+    const float3 c = color.sample(s, float2(uv.x, (float(base.y) + 1.5) / float(u.sourceSize.y))).rgb;
+    const float3 d = color.sample(s, float2(uv.x, (float(base.y) + 2.5) / float(u.sourceSize.y))).rgb;
+    // Catmull-Rom at tension 1/2; horizontal filtering remains the existing
+    // bilinear sample at each exact row center. The central-row range clamp
+    // forbids ringing past either endpoint on every RGB channel.
+    const float t2 = t * t, t3 = t2 * t;
+    const float4 weights = float4(-0.5 * t + t2 - 0.5 * t3,
+        1 - 2.5 * t2 + 1.5 * t3, 0.5 * t + 2 * t2 - 1.5 * t3,
+        -0.5 * t2 + 0.5 * t3);
+    return {clamp(a * weights.x + b * weights.y + c * weights.z + d * weights.w,
+                  min(b, c), max(b, c)), 1};
+}
+
+fragment float4 gameWorldVerticalReconstructionFragment(GameWorldVertex in [[stage_in]],
+        constant GameWorldUniforms &u [[buffer(0)]], texture2d<float> color [[texture(0)]],
+        texture2d<float, access::read> depth [[texture(1)]]) {
+    const float2 uv = in.sourceUVQ.xy / in.sourceUVQ.z;
+    // Unconditional derivatives precede varying sky/depth tests and discards.
+    const float2 texelDx = dfdx(uv) * float2(u.sourceSize);
+    const float2 texelDy = dfdy(uv) * float2(u.sourceSize);
+    if (!all(isfinite(in.sourceUVQ)) || in.sourceUVQ.z <= 1e-7) { discard_fragment(); }
+    const float visibility = in.background != 0 ? 1 : smoothstep(u.nearFadeDistances.x, u.nearFadeDistances.y,
+                                        length(in.currentEyePosition));
+    const uint bayer[16] = { 0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5 };
+    const uint2 pixel = uint2(in.position.xy);
+    const float threshold = (float(bayer[(pixel.y & 3) * 4 + (pixel.x & 3)]) + 0.5) / 16;
+    if (visibility <= threshold) { discard_fragment(); }
+    float3 rgb = gameWorldVerticalSample(uv, texelDx, texelDy, in.background, u, color, depth).rgb;
+    if (u.colorTransfer == 1) {
+        rgb = select(1.055 * pow(max(rgb, 0.0), float3(1.0 / 2.4)) - 0.055,
+                     12.92 * rgb, rgb <= 0.0031308);
+    } else if (u.colorTransfer == 2) {
+        rgb = select(pow((max(rgb, 0.0) + 0.055) / 1.055, float3(2.4)),
+                     rgb / 12.92, rgb <= 0.04045);
+    }
+    return float4(rgb, 1);
+}
+
+fragment GameWorldSkyOwnershipOut gameWorldSkyOwnershipVerticalReconstructionFragment(GameWorldVertex in [[stage_in]],
+        constant GameWorldUniforms &u [[buffer(0)]], texture2d<float> color [[texture(0)]],
+        texture2d<float, access::read> depth [[texture(1)]]) {
+    const float2 uv = in.sourceUVQ.xy / in.sourceUVQ.z;
+    const float2 texelDx = dfdx(uv) * float2(u.sourceSize);
+    const float2 texelDy = dfdy(uv) * float2(u.sourceSize);
+    if (!all(isfinite(in.sourceUVQ)) || in.sourceUVQ.z <= 1e-7) { discard_fragment(); }
+    const float visibility = in.background != 0 ? 1 : smoothstep(u.nearFadeDistances.x, u.nearFadeDistances.y,
+                                        length(in.currentEyePosition));
+    const uint bayer[16] = { 0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5 };
+    const uint2 pixel = uint2(in.position.xy);
+    const float threshold = (float(bayer[(pixel.y & 3) * 4 + (pixel.x & 3)]) + 0.5) / 16;
+    if (visibility <= threshold) { discard_fragment(); }
+    float3 rgb = gameWorldVerticalSample(uv, texelDx, texelDy, in.background, u, color, depth).rgb;
+    if (u.colorTransfer == 1) {
+        rgb = select(1.055 * pow(max(rgb, 0.0), float3(1.0 / 2.4)) - 0.055,
+                     12.92 * rgb, rgb <= 0.0031308);
+    } else if (u.colorTransfer == 2) {
+        rgb = select(pow((max(rgb, 0.0) + 0.055) / 1.055, float3(2.4)),
+                     rgb / 12.92, rgb <= 0.04045);
+    }
+    GameWorldSkyOwnershipOut out;
+    out.color = float4(rgb, 1);
+    out.owner = in.background != 0 ? 1u : 2u;
+    return out;
+}
+
 struct GameWorldSkyRepairUniforms {
     float4x4 eyeFromClip;
     float4x4 clipFromEye;
