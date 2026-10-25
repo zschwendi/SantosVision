@@ -71,14 +71,22 @@ struct GameWorldDepthEdgeFillUniforms {
 /// Registered reprojection captures show opaque black owner-0 gaps beside
 /// nearer geometry and between isolated texel footprints, absent from the
 /// source frame. The fill copies the adjacent background texel from the same
-/// source frame into those gaps only. It is opt-in until a physical A/B: the
-/// launcher toggle persists the choice, and explicit QA values override it.
+/// source frame into those gaps only. The restored27 visual profile enables
+/// this when there is no saved choice; explicit launcher/QA choices still win.
 enum GameWorldDepthEdgeFillPolicy {
     static let storedKey = "SantosVisionDepthEdgeFillEnabled"
     /// Longest searched gap, in source texels along the epipolar line.
     static let maximumSteps: UInt32 = 64
 
-    static var stored: Bool { UserDefaults.standard.bool(forKey: storedKey) }
+    static func savedChoice(in defaults: UserDefaults) -> Bool {
+        // The preferred27 session enabled repair through a launch override.
+        // Normal relaunches must not silently drop that visual profile, while
+        // an explicit saved false remains a deliberate opt-out.
+        guard defaults.object(forKey: storedKey) != nil else { return true }
+        return defaults.bool(forKey: storedKey)
+    }
+
+    static var stored: Bool { savedChoice(in: .standard) }
 
     static func requested(environment: [String: String], arguments: [String], stored: Bool) -> Bool {
         if arguments.contains("--sv-world-disable-depth-edge-fill") { return false }

@@ -193,9 +193,10 @@ check(MemoryLayout<GameWorldDepthEdgeFillUniforms>.offset(of: \.sourceSize) == 2
 check(MemoryLayout<GameWorldDepthEdgeFillUniforms>.offset(of: \.maximumInverseDistance) == 224, "distance offset")
 check(MemoryLayout<GameWorldDepthEdgeFillUniforms>.offset(of: \.maximumSteps) == 232, "steps offset")
 
-// Launch policy: off unless stored/selected; explicit QA values win.
+// Explicit saved choice and QA overrides; fresh-profile choice is tested in
+// DepthEdgeFillPreferenceValidation.swift.
 let policy = GameWorldDepthEdgeFillPolicy.self
-check(!policy.requested(environment: [:], arguments: [], stored: false), "default must stay off")
+check(!policy.requested(environment: [:], arguments: [], stored: false), "explicit saved off must remain off")
 check(policy.requested(environment: [:], arguments: [], stored: true), "stored launcher choice")
 check(policy.requested(environment: [:], arguments: ["--sv-world-depth-edge-fill"], stored: false), "QA enable argument")
 check(!policy.requested(environment: ["MUGUET_COMPOSITOR_DEPTH_EDGE_FILL": "0"], arguments: ["--sv-world-depth-edge-fill"], stored: true), "QA env disable")
