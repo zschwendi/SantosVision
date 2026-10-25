@@ -1023,6 +1023,8 @@ struct Gpu {
     mem: SharedMemory,
     base: *mut u8,
     ring: u64,
+    latency_ring_size: u64,
+    latency_last_camera: Option<(u64,u64,u64,u64,u32)>,
     device: Device,
     queue: Queue,
     adapter: Adapter,
@@ -1150,7 +1152,7 @@ pub fn max_msaa() -> u32 {
 }
 
 impl Gpu {
-    fn new(mem: SharedMemory, ring: u64, _size: u64, dbg: u64, handoff: Option<SurfaceHandoff>) -> anyhow::Result<Gpu> {
+    fn new(mem: SharedMemory, ring: u64, size: u64, dbg: u64, handoff: Option<SurfaceHandoff>) -> anyhow::Result<Gpu> {
         let (base, _) = mem_base_len(&mem);
         let (instance, surface) = match handoff {
             Some(h) => (h.instance, Some((h.surface, h.window))),
@@ -1238,7 +1240,7 @@ impl Gpu {
         log(&format!("op47 upload dedup: {}", upload_dedup.metrics(0.0)));
         Ok(Gpu {
             instance: instance.clone(), pending_clears: HashMap::new(), clears_folded: 0, pipe_jobs, pipe_results, pipe_pending: HashMap::new(), pending_skips: 0, pending_skips0: 0,
-            base, mem, ring, device, queue, adapter, surface, surface_format, surface_size: (0, 0),
+            base, mem, ring, latency_ring_size:size, latency_last_camera:None, device, queue, adapter, surface, surface_format, surface_size: (0, 0),
             objs: Vec::new(), enc: None, enc_epoch: 1, pass: None, pass_key: None, pass_info: None, pass_st: PassSt::default(),
             s: State::new(), world_view: None, world_depths: HashMap::new(), world_depth_before_ui: HashMap::new(), world_depth_snapshot_overflow: false, world_depth_snapshots_this_present: 0, world_depth_trace: HashMap::new(), world_depth_anomalies: Vec::new(),
             color_phase_trace: crate::world_ui::ColorPhaseTrace::from_env(), hud_capture:None, hud_draw:None, hud_pool:Vec::new(),
@@ -1809,7 +1811,23 @@ impl Gpu {
             let base = ring_w + (tail as u64 >> 2);
             let op = self.u(base);
             let n = self.u(base + 1) as u64;
-            if let Some(view) = crate::xr_view::take_command_view(base * 4) { self.world_view = view; }
+            if let Some(view) = crate::xr_view::take_command_view(base * 4) {
+                self.world_view = view;
+                if crate::world_latency_trace::enabled() {
+                    if let Some(view)=view.filter(|view|view.headset_applied) {
+                        let key=(view.provenance_epoch,view.camera_sequence,view.request_frame,view.head_pose_frame,view.eye_index);
+                        if self.latency_last_camera!=Some(key) {
+                        self.latency_last_camera=Some(key);
+                        let current_head=self.hdr(0).load(Ordering::SeqCst);
+                        crate::world_latency_trace::record("ring_camera_dequeued",crate::xr_view::latency_identity(view),
+                            crate::world_latency_trace::Metrics {
+                                ring_bytes:crate::world_latency_trace::ring_bytes(current_head,tail),
+                                ring_head:u64::try_from(current_head).ok(),ring_tail:u64::try_from(tail).ok(),
+                                ring_size:Some(self.latency_ring_size),..Default::default() });
+                        }
+                    }
+                }
+            }
             if let Some(mark) = crate::xr_view::take_command_foreground(base * 4) { self.foreground_set(mark); }
             if self.command_trace.wants_command(op) { self.trace_ring_command(op, base, n); }
             if op == 1 {

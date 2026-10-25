@@ -613,6 +613,12 @@ pub unsafe extern "C" fn sv_xr_submit_views(request: *const SVXRViewRequest) -> 
     let mut state = lock_world_state();
     if state.request.is_some_and(|(previous, _)| request.frame <= previous.frame) { return -4; }
     state.request = Some((request, Instant::now()));
+    if crate::world_latency_trace::enabled() {
+        crate::world_latency_trace::record("request_received",crate::world_latency_trace::Identity {
+            epoch:view_epoch(),request:Some(request.frame),views:Some(request.view_count),
+            presentation_time:Some(request.presentation_time_seconds),..Default::default()
+        },Default::default());
+    }
     0
 }
 
@@ -1016,7 +1022,19 @@ pub fn camera_post(caller: &mut Caller<'_, HostState>, source: u64, _frame: u64)
     state.last_main = Some(saved);
     state.history.push_back(saved);
     while state.history.len() > HISTORY { state.history.pop_front(); }
+    drop(state);
+    if crate::world_latency_trace::enabled() && view.headset_applied {
+        crate::world_latency_trace::record("camera_consumed",latency_identity(view),Default::default());
+    }
     Ok(())
+}
+
+/// Only called behind the diagnostic enabled branch. Unknown game/lease IDs
+/// remain absent until an actual completed source snapshot/lease exists.
+pub(crate) fn latency_identity(view:WorldView)->crate::world_latency_trace::Identity {
+    crate::world_latency_trace::Identity { epoch:view.provenance_epoch,request:Some(view.request_frame),
+        head:Some(view.head_pose_frame),camera:Some(view.camera_sequence),eye:Some(view.eye_index),
+        views:Some(view.view_count),presentation_time:Some(view.presentation_time_seconds),..Default::default() }
 }
 
 pub fn scene_post(_caller: &mut Caller<'_, HostState>, phase: u64) -> Result<()> {

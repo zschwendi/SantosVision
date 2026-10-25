@@ -224,6 +224,7 @@ fn start(game_root: &Path, save_root: &Path) -> Result<()> {
         status.graphics = None;
     }
     crate::raise_open_file_limit();
+    crate::world_latency_trace::initialize_from_env();
     let startup = crate::config::setup_native(game_root, save_root)?;
     let graphics = startup.native_graphics.as_ref().context("native startup has no graphics configuration")?;
     let (width, height) = (graphics.config.width, graphics.config.height);
@@ -304,6 +305,7 @@ pub extern "C" fn sv_runtime_status(out: *mut c_char, capacity: usize) -> i32 {
         "world_color_phase": crate::world_ui::status_json(),
         "world_hud": crate::xr_hud::status_json(),
         "world_command_trace": crate::world_command_trace::status_json(),
+        "world_latency_trace": crate::world_latency_trace::status_json(),
         "draw_setup": crate::draw_setup::status_json(),
         "diagnostic_scene": crate::host::benchmark::status_json(),
         "presents": crate::gpu::PRESENTS.load(Ordering::Relaxed),

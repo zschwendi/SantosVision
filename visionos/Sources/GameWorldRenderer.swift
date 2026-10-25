@@ -488,6 +488,9 @@ final class GameWorldRenderer: @unchecked Sendable {
     private var active = true
     private let sessionToken = UUID()
     private let inFlight = DispatchSemaphore(value: 3)
+    // A renderer may be constructed before native startup initializes tracing.
+    // Cache the cold request, not the native capture's current armed state.
+    private let latencyTraceRequested = ProcessInfo.processInfo.environment["MUGUET_XR_LATENCY_TRACE"] == "1"
     private var statusLimiter = GameWorldStatusLimiter()
     private var frameNumber: UInt64 = 0
     private var nextLifecycleSample: Double = 0
@@ -680,7 +683,7 @@ final class GameWorldRenderer: @unchecked Sendable {
         updateSenseUtilityTracking(false)
         motionTracking.stop()
         if retainsAnchors { XRHeadTracking.shared.invalidateRetainedAnchors(reason: "renderer stopped") }
-        WorldCameraOwnership.shared.release(sessionToken)
+        releaseCameraOwnership()
         session.stop()
     }
 
@@ -691,6 +694,11 @@ final class GameWorldRenderer: @unchecked Sendable {
         stopLock.unlock()
         motionTracking.setActive(active)
         if !active { updateSenseUtilityTracking(false) }
+    }
+
+    private func releaseCameraOwnership() {
+        let released = WorldCameraOwnership.shared.release(sessionToken)
+        if released, latencyTraceRequested { sv_world_latency_finish() }
     }
 
     func setSenseUtilitiesVisible(_ visible: Bool) { senseUtilities?.setVisible(visible) }
@@ -754,7 +762,7 @@ final class GameWorldRenderer: @unchecked Sendable {
             motionTracking.stop()
             session.stop()
             if retainsAnchors { XRHeadTracking.shared.invalidateRetainedAnchors(reason: "render loop ended") }
-            WorldCameraOwnership.shared.release(sessionToken)
+            releaseCameraOwnership()
             recordLifecycle("render_loop_ended", detail: endReason)
             report(.ended(endReason))
         }
@@ -1109,6 +1117,12 @@ final class GameWorldRenderer: @unchecked Sendable {
             }
         }
         ownsSlot = false
+        if latencyTraceRequested, !completedLeases.isEmpty {
+            let tokens = completedLeases.map { $0.native.lease }
+            tokens.withUnsafeBufferPointer {
+                _ = sv_world_latency_commit($0.baseAddress, UInt32(tokens.count))
+            }
+        }
         commands.commit()
     }
 
@@ -1734,14 +1748,16 @@ private final class WorldCameraOwnership: @unchecked Sendable {
         }
         return result
     }
-    func release(_ token: UUID) {
+    @discardableResult
+    func release(_ token: UUID) -> Bool {
         lock.lock()
         defer { lock.unlock() }
-        guard owner == token else { return }
+        guard owner == token else { return false }
         owner = nil
         _ = sv_xr_set_reticle_ready(0)
         _ = sv_xr_set_hud_ready(0)
         _ = sv_xr_world_camera_set_enabled(0)
+        return true
     }
     func refreshReady(_ token: UUID, reticleReady: Bool, hudReady: Bool) {
         lock.lock()

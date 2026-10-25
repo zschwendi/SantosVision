@@ -23,6 +23,7 @@ pub mod capture;
 pub mod world_frame;
 pub mod world_ui;
 pub mod world_command_trace;
+pub mod world_latency_trace;
 pub mod xr;
 pub mod xr_aim;
 pub mod xr_hud;

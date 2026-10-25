@@ -108,6 +108,17 @@ impl Ready {
 }
 #[derive(Clone)]
 struct ReadyPair { eyes: [Ready; 2], scene_epoch: u64, ready_at: Instant }
+
+fn latency_identity(frame:WorldFrame,epoch:u64,camera:Option<u64>)->crate::world_latency_trace::Identity {
+    crate::world_latency_trace::Identity { epoch,request:Some(frame.request_frame),head:Some(frame.head_frame),
+        camera,game:Some(frame.game_frame),eye:Some(frame.view_index),views:Some(frame.view_count),
+        lease:(frame.lease!=0).then_some(frame.lease),presentation_time:Some(frame.presentation_time) }
+}
+fn latency_metrics(frames:&Frames)->crate::world_latency_trace::Metrics {
+    crate::world_latency_trace::Metrics { pending_snapshots:Some(PENDING_SNAPSHOT_CALLBACKS.load(Ordering::Acquire)as u64),
+        dropped_snapshots:Some(frames.dropped),slots:Some(frames.pool.len()as u64),leases:Some(frames.leases.len()as u64),
+        ..Default::default() }
+}
 #[derive(Default)]
 struct Frames {
     pool: Vec<Arc<Slot>>,
@@ -433,8 +444,16 @@ pub(crate) fn publish_pair(device: &Device, queue: &Queue, sources: [PairSource<
         queue.submit([encoder.finish()]);
         let snapshot_submitted_at = Instant::now();
         let pending = PendingSnapshotCallback::new();
+        if crate::world_latency_trace::enabled() {
+            for frame in published { crate::world_latency_trace::record("snapshot_submitted",
+                latency_identity(frame,provenance_epoch,None),Default::default()); }
+        }
         queue.on_submitted_work_done(move || {
             let _pending = pending;
+            if crate::world_latency_trace::enabled() { for frame in published {
+                crate::world_latency_trace::record("snapshot_callback_observed",latency_identity(frame,provenance_epoch,None),
+                    crate::world_latency_trace::Metrics { pending_snapshots:Some(PENDING_SNAPSHOT_CALLBACKS.load(Ordering::Acquire)as u64),..Default::default() });
+            }}
             let snapshot_submit_to_gpu_completion_seconds = snapshot_completion_seconds(snapshot_submitted_at, Instant::now());
             if let Ok(mut frames) = FRAMES.lock() {
                 if generation != frames.generation || !crate::xr_view::view_epoch_is_active(provenance_epoch)
@@ -449,6 +468,10 @@ pub(crate) fn publish_pair(device: &Device, queue: &Queue, sources: [PairSource<
                 frames.pairs_published += 1;
                 frames.copied_depth_snapshots += 2;
                 frames.error = None;
+                if crate::world_latency_trace::enabled() {
+                    for frame in published { crate::world_latency_trace::record("snapshot_completed",
+                        latency_identity(frame,provenance_epoch,None),latency_metrics(&frames)); }
+                }
             }
         });
         let _ = device.poll(PollType::Poll);
@@ -531,7 +554,12 @@ pub(crate) fn publish_with_hud_and_optics(device:&Device, queue:&Queue, color:&T
             let slot = match reserve_snapshot_slot(&mut frames, device, color,
                 frozen_depth.map(|candidate| candidate.0)) {
                 Some(slot) => slot,
-                None => { frames.dropped += 1; return Ok(()); }
+                None => {
+                    frames.dropped += 1;
+                    if crate::world_latency_trace::enabled() { crate::world_latency_trace::record("snapshot_rejected_slot_limit",
+                        latency_identity(frame,provenance_epoch,Some(camera_sequence)),latency_metrics(&frames)); }
+                    return Ok(());
+                }
             };
             (slot, frames.generation)
         };
@@ -553,8 +581,13 @@ pub(crate) fn publish_with_hud_and_optics(device:&Device, queue:&Queue, color:&T
         let snapshot_submitted_at = Instant::now();
         // Separate compositor queues may read only after the producer's copy finishes.
         let pending = PendingSnapshotCallback::new();
+        if crate::world_latency_trace::enabled() { crate::world_latency_trace::record("snapshot_submitted",
+            latency_identity(frame,provenance_epoch,Some(camera_sequence)),Default::default()); }
         queue.on_submitted_work_done(move || {
             let _pending = pending;
+            if crate::world_latency_trace::enabled() { crate::world_latency_trace::record("snapshot_callback_observed",
+                latency_identity(frame,provenance_epoch,Some(camera_sequence)),crate::world_latency_trace::Metrics {
+                    pending_snapshots:Some(PENDING_SNAPSHOT_CALLBACKS.load(Ordering::Acquire)as u64),..Default::default() }); }
             let snapshot_submit_to_gpu_completion_seconds = snapshot_completion_seconds(snapshot_submitted_at, Instant::now());
             if let Ok(mut frames) = FRAMES.lock() {
                 if generation != frames.generation || !crate::xr_view::view_epoch_is_active(provenance_epoch) { return; }
@@ -566,6 +599,8 @@ pub(crate) fn publish_with_hud_and_optics(device:&Device, queue:&Queue, color:&T
                 if used_frozen_depth { frames.frozen_depth_handoffs += 1; }
                 else { frames.copied_depth_snapshots += 1; }
                 frames.error = None;
+                if crate::world_latency_trace::enabled() { crate::world_latency_trace::record("snapshot_completed",
+                    latency_identity(frame,provenance_epoch,Some(camera_sequence)),latency_metrics(&frames)); }
             }
         });
         let _ = device.poll(PollType::Poll);
@@ -650,6 +685,9 @@ pub extern "C" fn sv_world_acquire_frame(view_index: u32, output: *mut WorldFram
     frames.next_lease = token;
     ready.frame.lease = token;
     *output = ready.frame;
+    if crate::world_latency_trace::enabled() { crate::world_latency_trace::record("source_acquired",
+        latency_identity(ready.frame,ready.provenance_epoch,(ready.optics.camera_sequence!=0).then_some(ready.optics.camera_sequence)),
+        latency_metrics(&frames)); }
     frames.leases.insert(token, ready);
     frames.acquired += 1;
     0
@@ -682,6 +720,8 @@ pub extern "C" fn sv_world_acquire_pair(output: *mut WorldPair) -> i32 {
     for index in 0..2 {
         let token = last_token - (1 - index as u64);
         returned.eyes[index].lease = token;
+        if crate::world_latency_trace::enabled() { crate::world_latency_trace::record("source_acquired",
+            latency_identity(returned.eyes[index],pair.eyes[index].provenance_epoch,None),latency_metrics(&frames)); }
         frames.leases.insert(token, pair.eyes[index].clone());
     }
     frames.next_lease = last_token;
@@ -695,6 +735,27 @@ pub extern "C" fn sv_world_acquire_pair(output: *mut WorldPair) -> i32 {
 pub extern "C" fn sv_world_release_frame(lease: u64) -> i32 {
     let Ok(mut frames) = FRAMES.lock() else { return -1; };
     if frames.leases.remove(&lease).is_some() { 0 } else { -1 }
+}
+
+/// Diagnostic-only commit observation; does not modify world state or weaken
+/// the production completion validator. Trace code never acquires FRAMES.
+#[no_mangle]
+pub extern "C" fn sv_world_latency_commit(leases:*const u64,count:u32)->i32 {
+    if !crate::world_latency_trace::enabled(){return 0;}
+    if leases.is_null() || (leases as usize)%std::mem::align_of::<u64>()!=0 || !(1..=2).contains(&count){return -1;}
+    let tokens=unsafe{std::slice::from_raw_parts(leases,count as usize)};
+    let Ok(frames)=FRAMES.lock()else{return -1;};
+    for token in tokens {
+        let Some(ready)=frames.leases.get(token)else{return -1;};
+        if ready.generation!=frames.generation || !crate::xr_view::view_epoch_is_active(ready.provenance_epoch){return 1;}
+    }
+    for token in tokens {
+        let ready=&frames.leases[token];let mut frame=ready.frame;frame.lease=*token;
+        crate::world_latency_trace::record("compositor_commit",
+            latency_identity(frame,ready.provenance_epoch,(ready.optics.camera_sequence!=0).then_some(ready.optics.camera_sequence)),
+            latency_metrics(&frames));
+    }
+    0
 }
 
 #[no_mangle]
@@ -718,6 +779,12 @@ pub extern "C" fn sv_world_complete_frame(leases: *const u64, count: u32, metal_
         eyes |= 1 << ready.frame.view_index;
     }
     if eyes != (1 << count) - 1 { return -1; }
+    if crate::world_latency_trace::enabled() { for token in tokens {
+        let ready=&frames.leases[token];let mut frame=ready.frame;frame.lease=*token;
+        let mut metrics=latency_metrics(&frames);metrics.metal_status=Some(metal_status);
+        crate::world_latency_trace::record("compositor_completed",
+            latency_identity(frame,ready.provenance_epoch,(ready.optics.camera_sequence!=0).then_some(ready.optics.camera_sequence)),metrics);
+    }}
     if metal_status != 4 {
         frames.error = Some(format!("compositor Metal command ended with status {metal_status}"));
         frames.compositor_views = 0;

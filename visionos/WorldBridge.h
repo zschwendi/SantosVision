@@ -63,6 +63,12 @@ int32_t sv_world_release_frame(uint64_t lease);
  * status is MTLCommandBufferStatus (4 means completed). The native side verifies
  * every eye token before counting a world frame; release leases afterwards. */
 int32_t sv_world_complete_frame(const uint64_t *leases, uint32_t view_count, uint32_t metal_status);
+/* Default-off diagnostic only. All stages are timestamped by one native clock.
+ * Commit observes validated live leases; it does not certify same-epoch stereo.
+ * finish stops once and snapshots for bounded background create-new export. */
+uint32_t sv_world_latency_enabled(void);
+int32_t sv_world_latency_commit(const uint64_t *leases, uint32_t view_count);
+void sv_world_latency_finish(void);
 
 /* Optional HUD decomposition, borrowed for exactly the supplied world lease.
  * The original WorldFrame color is always the unmodified complete game image.
