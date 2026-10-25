@@ -451,6 +451,7 @@ final class GameWorldRenderer: @unchecked Sendable {
     /// Captured once for this renderer so both eyes, captures and optional
     /// precomputed corners use the same surface reconstruction policy.
     private let smoothSurfaceContinuity = GameWorldSurfaceContinuityPolicy.requested
+    private let verticalReconstruction: Bool
     private let allowSyntheticAnchorCopy: Bool
     private let adaptiveMesh: GameWorldAdaptiveMesh?
     private let anchorProbe: GameWorldAnchorProbe?
@@ -507,19 +508,27 @@ final class GameWorldRenderer: @unchecked Sendable {
         self.report = report
         guard let queue = layer.device.makeCommandQueue(), let library = layer.device.makeDefaultLibrary(),
               let vertex = library.makeFunction(name: "gameWorldVertex"),
-              let fragment = library.makeFunction(name: "gameWorldFragment") else { throw GameWorldError.missingMetal }
+              let baselineFragment = library.makeFunction(name: "gameWorldFragment") else { throw GameWorldError.missingMetal }
+        let environment = ProcessInfo.processInfo.environment
+        let copyRequested = environment["MUGUET_COMPOSITOR_SOURCE_ANCHOR_COPY"] == "1"
+        let probeRequested = environment["MUGUET_COMPOSITOR_ANCHOR_PROBE"] == "1"
+        let adaptiveRequested = RenderingOptimizations.adaptiveMeshEnabled
+        let reconstructionFragment = GameWorldVerticalReconstructionPolicy.requested
+            && !copyRequested && !probeRequested && !adaptiveRequested
+            && library.makeFunction(name: "gameWorldSkyOwnershipVerticalReconstructionFragment") != nil
+            ? library.makeFunction(name: "gameWorldVerticalReconstructionFragment") : nil
+        verticalReconstruction = reconstructionFragment != nil
         self.queue = queue
         let descriptor = MTLRenderPipelineDescriptor()
         descriptor.label = "Actual native GTA world depth reprojection"
         descriptor.vertexFunction = vertex
-        descriptor.fragmentFunction = fragment
+        descriptor.fragmentFunction = reconstructionFragment ?? baselineFragment
         descriptor.colorAttachments[0].pixelFormat = layer.configuration.colorFormat
         descriptor.depthAttachmentPixelFormat = layer.configuration.depthFormat
         pipeline = try layer.device.makeRenderPipelineState(descriptor: descriptor)
         reticle = GameWorldReticle(device: layer.device, library: library,
                                    colorFormat: layer.configuration.colorFormat,
                                    depthFormat: layer.configuration.depthFormat)
-        let environment = ProcessInfo.processInfo.environment
         let cornerRequested = environment["MUGUET_COMPOSITOR_CORNER_PRECOMPUTE"] == "1"
         var precompute: (kernel: any MTLComputePipelineState, pipeline: any MTLRenderPipelineState, scratch: CornerScratchPool)?
         if cornerRequested, let kernelFunction = library.makeFunction(name: "gameWorldCornerDepths"),
@@ -533,8 +542,6 @@ final class GameWorldRenderer: @unchecked Sendable {
             }
         }
         cornerPrecompute = precompute
-        let copyRequested = environment["MUGUET_COMPOSITOR_SOURCE_ANCHOR_COPY"] == "1"
-        let probeRequested = environment["MUGUET_COMPOSITOR_ANCHOR_PROBE"] == "1"
         hud = !copyRequested && !probeRequested
             && !ProcessInfo.processInfo.arguments.contains("--sv-world-single-source-stereo")
             ? GameWorldHUD(device: layer.device, library: library,
@@ -551,13 +558,13 @@ final class GameWorldRenderer: @unchecked Sendable {
                                   colorFormat: layer.configuration.colorFormat,
                                   depthFormat: layer.configuration.depthFormat) : nil
         allowSyntheticAnchorCopy = environment["MUGUET_COMPOSITOR_SOURCE_ANCHOR_COPY_ALLOW_SYNTHETIC"] == "1"
-        let adaptiveRequested = RenderingOptimizations.adaptiveMeshEnabled
         let skyFanRequested = RenderingOptimizations.skyFanEnabled
         let skyRequested = GameWorldFiniteSkySupport.requested
         let skyCompatible = !copyRequested && !probeRequested && !adaptiveRequested
         finiteSkySupport = skyRequested && skyCompatible
             ? GameWorldFiniteSkySupport(device: layer.device, library: library,
-                colorFormat: layer.configuration.colorFormat, depthFormat: layer.configuration.depthFormat) : nil
+                colorFormat: layer.configuration.colorFormat, depthFormat: layer.configuration.depthFormat,
+                verticalReconstruction: verticalReconstruction) : nil
         finiteSkySupportUnavailable = !skyRequested ? .qaDisabled
             : !skyCompatible ? .incompatibleConfiguration
             : finiteSkySupport == nil ? .pipelineUnavailable : nil
@@ -1567,6 +1574,7 @@ final class GameWorldRenderer: @unchecked Sendable {
                     encoder.setFragmentBytes(&uniforms, length: MemoryLayout<GameWorldUniforms>.stride, index: 0)
                     encoder.setVertexTexture(sourceEye.depth, index: 0)
                     encoder.setFragmentTexture(sourceEye.color, index: 0)
+                    if verticalReconstruction { encoder.setFragmentTexture(sourceEye.depth, index: 1) }
                     encoder.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4,
                         instanceCount: Int(sourceEye.width) * Int(sourceEye.height))
                 }
@@ -1595,7 +1603,16 @@ final class GameWorldRenderer: @unchecked Sendable {
     /// CPU encode outcomes are deliberately separate from GPU/pixel acceptance.
     func finiteSkySupportStatus() -> [String: Any] { finiteSkyTelemetry.reportValue }
 
-    func imageQualityStatus() -> [String: Any] { imageQuality.reportValue }
+    func imageQualityStatus() -> [String: Any] {
+        var value = imageQuality.reportValue
+        value["reconstruction_configuration"] = [
+            "smooth_continuity": smoothSurfaceContinuity,
+            "vertical_reconstruction_requested": GameWorldVerticalReconstructionPolicy.requested,
+            "vertical_reconstruction_pipeline_selected": verticalReconstruction,
+            "scope": "Pipeline configuration only; per-pixel support qualification and visible quality are not counted."
+        ] as [String: Any]
+        return value
+    }
 
     func hudCanvasStatus() -> [String: Any] {
         countersLock.lock()

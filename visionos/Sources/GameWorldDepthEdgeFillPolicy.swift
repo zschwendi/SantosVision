@@ -32,6 +32,24 @@ enum GameWorldSurfaceContinuityPolicy {
                   arguments: ProcessInfo.processInfo.arguments)
     }
 }
+
+/// A separate color-only experiment. Geometry, source pixels and all UI stay
+/// unchanged. The renderer can reject incompatible experimental paths.
+enum GameWorldVerticalReconstructionPolicy {
+    static func requested(environment: [String: String], arguments: [String]) -> Bool {
+        if arguments.contains("--sv-world-disable-vertical-reconstruction") { return false }
+        switch environment["MUGUET_COMPOSITOR_VERTICAL_RECONSTRUCTION"] {
+        case "1": return true
+        case "0": return false
+        default: return arguments.contains("--sv-world-vertical-reconstruction")
+        }
+    }
+
+    static var requested: Bool {
+        requested(environment: ProcessInfo.processInfo.environment,
+                  arguments: ProcessInfo.processInfo.arguments)
+    }
+}
 import simd
 
 /// Mirrors `GameWorldDepthEdgeFillUniforms` in GameWorld.metal (240 bytes).

@@ -1184,6 +1184,7 @@ final class NativeRuntimeModel: ObservableObject {
                 "metal_skip_empty_prepass": RenderingOptimizations.metalSkipEmptyPrepassEnabled
             ],
             "rendering_quality_requested": ["depth_edge_fill": depthEdgeFillEnabled,
+                                            "vertical_reconstruction": GameWorldVerticalReconstructionPolicy.requested,
                                             "higher_display_resolution": higherImmersiveResolutionEnabled],
             "rendering_quality_effective": ["higher_display_resolution": GameWorldDisplayQuality.requested,
                 "smooth_surface_continuity": GameWorldSurfaceContinuityPolicy.requested,

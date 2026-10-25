@@ -16,6 +16,7 @@ final class GameWorldFiniteSkySupport: @unchecked Sendable {
 
     private let worldPipeline: any MTLRenderPipelineState
     private let repairPipeline: any MTLRenderPipelineState
+    private let verticalReconstruction: Bool
     /// The exact existing nine-sample corner fit, evaluated once per geometric
     /// corner rather than once for each of its four source-texel owners.
     /// Diagnostic opt-in: the registered Mac source was slower after warming,
@@ -58,9 +59,11 @@ final class GameWorldFiniteSkySupport: @unchecked Sendable {
 
     init?(device: any MTLDevice, library: any MTLLibrary,
           colorFormat: MTLPixelFormat, depthFormat: MTLPixelFormat,
-          precomputeCorners: Bool = ProcessInfo.processInfo.environment["MUGUET_COMPOSITOR_CORNER_PRECOMPUTE"] == "1") {
+          precomputeCorners: Bool = ProcessInfo.processInfo.environment["MUGUET_COMPOSITOR_CORNER_PRECOMPUTE"] == "1",
+          verticalReconstruction: Bool = false) {
         guard let vertex = library.makeFunction(name: "gameWorldVertex"),
-              let ownerFragment = library.makeFunction(name: "gameWorldSkyOwnershipFragment"),
+              let ownerFragment = library.makeFunction(name: verticalReconstruction
+                ? "gameWorldSkyOwnershipVerticalReconstructionFragment" : "gameWorldSkyOwnershipFragment"),
               let repairVertex = library.makeFunction(name: "gameWorldSkyRepairVertex"),
               let repairFragment = library.makeFunction(name: "gameWorldSkyRepairFragment") else { return nil }
         let world = MTLRenderPipelineDescriptor()
@@ -85,6 +88,7 @@ final class GameWorldFiniteSkySupport: @unchecked Sendable {
               let rp = try? device.makeRenderPipelineState(descriptor: repair),
               let wd = device.makeDepthStencilState(descriptor: worldState),
               let rd = device.makeDepthStencilState(descriptor: repairState) else { return nil }
+        self.verticalReconstruction = verticalReconstruction
         worldPipeline = wp
         var precomputed: (kernel: any MTLComputePipelineState, world: any MTLRenderPipelineState)?
         if precomputeCorners,
@@ -177,6 +181,7 @@ final class GameWorldFiniteSkySupport: @unchecked Sendable {
         encoder.setVertexTexture(depth, index: 0)
         if let cornerDepths { encoder.setVertexTexture(cornerDepths, index: 1) }
         encoder.setFragmentTexture(color, index: 0)
+        if verticalReconstruction { encoder.setFragmentTexture(depth, index: 1) }
         encoder.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4,
                                instanceCount: Int(uniforms.sourceSize.x) * Int(uniforms.sourceSize.y))
         encoder.endEncoding()
