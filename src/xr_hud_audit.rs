@@ -11,9 +11,25 @@ const MAX_JSON:usize=8*1024;
 
 #[derive(Clone,Copy,Debug,PartialEq,Eq)]
 pub(crate) struct Owner{state:u32,manager:u64,context:u64,effect:u64,metadata_hash:u32}
+/// The shared readers use unaligned loads, so alignment is unrestricted. Guard
+/// their COMPLETE width and usize conversion before their unchecked addition.
+fn checked_address(address:u64,width:u64,length:usize)->Option<usize>{
+    if width==0{return None;}let start=usize::try_from(address).ok()?;
+    let end=usize::try_from(address.checked_add(width)?).ok()?;(end<=length).then_some(start)
+}
+fn checked_read<T>(address:u64,width:u64,length:usize,read:&impl Fn(u64)->Option<T>)->Option<T>{
+    checked_address(address,width,length)?;read(address)
+}
+fn checked_owner(length:usize,read32:impl Fn(u64)->Option<u32>,read64:impl Fn(u64)->Option<u64>)->Option<Owner>{
+    owner(|a|checked_read(a,4,length,&read32),|a|checked_read(a,8,length,&read64))
+}
+pub(crate) fn shared_owner(mem:&wasmtime::SharedMemory)->Option<Owner>{
+    let length=crate::mem_base_len(mem).1;
+    checked_owner(length,|a|crate::read_u32(mem,a),|a|crate::read_u64(mem,a))
+}
 /// Source26183 reads this manager/context/name before creating manager+976 and
 /// writes state1/2 at19235384. State alone does not establish a live effect.
-pub(crate) fn owner(read32:impl Fn(u64)->Option<u32>,read64:impl Fn(u64)->Option<u64>)->Option<Owner>{
+fn owner(read32:impl Fn(u64)->Option<u32>,read64:impl Fn(u64)->Option<u64>)->Option<Owner>{
     let state=read32(19_235_384)?;if !matches!(state,1|2){return None;}
     let manager=read64(19_235_320)?;if manager==0{return None;}
     let context=read64(manager.checked_add(752)?)?;let effect=read64(manager.checked_add(976)?)?;
@@ -129,11 +145,36 @@ pub(crate) fn status()->Value{
     #[test]fn native_death_owner_requires_live_chain_and_coherent_state(){
         let r32=|a|match a{19_235_384=>Some(1),2_140=>Some(123),_=>None};
         let r64=|a|match a{19_235_320=>Some(1_000),1_752=>Some(2_000),1_976=>Some(3_000),_=>None};
-        assert!(owner(r32,r64).is_some());assert!(owner(|_|Some(0),r64).is_none());assert!(owner(r32,|_|Some(0)).is_none());
-        assert!(owner(|_|Some(99),r64).is_none());
-        assert!(owner(r32,|a|if a==1_976{Some(0)}else{r64(a)}).is_none());
-        let second=owner(|a|match a{19_235_384=>Some(2),2_144=>Some(456),_=>None},r64).unwrap();assert_eq!(second.metadata_hash,456);
-        let reads=std::cell::Cell::new(0);assert!(owner(|a|{if a==19_235_384{let n=reads.get();reads.set(n+1);Some(if n==0{1}else{0})}else{r32(a)}},r64).is_none());
+        const LENGTH:usize=32*1024*1024;
+        assert!(checked_owner(LENGTH,r32,r64).is_some());assert!(checked_owner(LENGTH,|_|Some(0),r64).is_none());assert!(checked_owner(LENGTH,r32,|_|Some(0)).is_none());
+        assert!(checked_owner(LENGTH,|_|Some(99),r64).is_none());
+        assert!(checked_owner(LENGTH,r32,|a|if a==1_976{Some(0)}else{r64(a)}).is_none());
+        let second=checked_owner(LENGTH,|a|match a{19_235_384=>Some(2),2_144=>Some(456),_=>None},r64).unwrap();assert_eq!(second.metadata_hash,456);
+        let reads=std::cell::Cell::new(0);assert!(checked_owner(LENGTH,|a|{if a==19_235_384{let n=reads.get();reads.set(n+1);Some(if n==0{1}else{0})}else{r32(a)}},r64).is_none());
+    }
+    #[test]fn complete_read_width_is_checked_before_any_shared_reader_call(){
+        assert_eq!(checked_address(24,8,32),Some(24));assert_eq!(checked_address(28,4,32),Some(28));
+        assert_eq!(checked_address(25,8,32),None);assert_eq!(checked_address(29,4,32),None);
+        assert_eq!(checked_address(25,4,32),Some(25)); // existing load is unaligned
+        assert_eq!(checked_address(u64::MAX-3,8,usize::MAX),None);assert_eq!(checked_address(u64::MAX-1,4,usize::MAX),None);
+        assert_eq!(checked_address(0,0,32),None);
+        let calls=std::cell::Cell::new(0);let read=|_|{calls.set(calls.get()+1);Some(7)};
+        assert_eq!(checked_read(u64::MAX-3,8,usize::MAX,&read),None);assert_eq!(calls.get(),0);
+        assert_eq!(checked_read(24,8,32,&read),Some(7));assert_eq!(calls.get(),1);
+    }
+    #[test]fn malformed_owner_pointers_near_maximum_and_memory_end_fail_before_unsafe_readers(){
+        // Reproduces the review's manager+752 == MAX-3 case. The poisoned
+        // address must never reach the underlying read callback.
+        assert!(checked_owner(usize::MAX,|a|if a==19_235_384{Some(1)}else{panic!("unexpected read32")},
+            |a|if a==19_235_320{Some(u64::MAX-755)}else{panic!("overflowed read64 reached callback: {a}")}).is_none());
+        const LENGTH:usize=32*1024*1024;let end=LENGTH as u64;
+        // A valid field address whose full64-bit width crosses memory end.
+        let manager=end-980;
+        assert!(checked_owner(LENGTH,|a|if a==19_235_384{Some(1)}else{panic!("unexpected read32")},
+            |a|if a==19_235_320{Some(manager)}else if a==manager+752{Some(2_000)}else{panic!("near-end read64 reached callback: {a}")}).is_none());
+        // A valid context+140 address whose32-bit width crosses memory end.
+        assert!(checked_owner(LENGTH,|a|if a==19_235_384{Some(1)}else{panic!("near-end read32 reached callback: {a}")},
+            |a|match a{19_235_320=>Some(1_000),1_752=>Some(end-142),1_976=>Some(3_000),_=>None}).is_none());
     }
     #[test]fn admitted_success_does_not_clear_absent_or_rejected_death_evidence(){
         let _guard=TEST_RECORDS.lock().unwrap();

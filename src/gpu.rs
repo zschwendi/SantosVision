@@ -1345,7 +1345,7 @@ impl Gpu {
 
     fn hud_audit_owner(&self)->Option<crate::xr_hud::audit::Owner>{
         if !crate::xr_hud::enabled()||!crate::xr_motion_aim::diagnostic_enabled(){return None;}
-        crate::xr_hud::audit::owner(|a|crate::read_u32(&self.mem,a),|a|crate::read_u64(&self.mem,a))
+        crate::xr_hud::audit::shared_owner(&self.mem)
     }
     fn hud_audit_draw(&mut self,vs:&Program,ps:Option<&Program>){
         if self.hud_audit.needs_begin(self.presents+1){let owner=self.hud_audit_owner();self.hud_audit.begin(self.presents+1,owner);}
