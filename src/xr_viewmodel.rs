@@ -12,7 +12,11 @@
 //! times head-from-eye. Applying that same R gives M' = Bz*inverse(R)*inverse(Bz)*M
 //! and view*M' = inverse(R)*S*inverse(O): the native first-person model, exactly
 //! where the flat game places it relative to the game camera B0, seen from the
-//! physical eye. Only this invocation's own completed stack model changes; flat,
+//! physical eye. A narrowly owned local equipped gun instead uses its queued
+//! native world placement: M'=Bz*inverse(Beye)*Wdraw. The attachment producer can
+//! select a different FP skeleton for Wdraw than for O; a mutable current bone
+//! bank must not choose between those two queued placements each frame.
+//! Only this invocation's own completed stack model changes; flat,
 //! third person, unmatched views and every other draw family keep the original.
 //! This is no depth, coverage or displayed-pixel certificate.
 use super::*;
@@ -39,7 +43,8 @@ impl Family{
     fn slot(self)->usize{match self{Self::StreamPed=>0,Self::Skinned=>1}}
     /// O = entity_from_game_camera (44355 includes the composed attachment).
     fn camera_relative(self)->u64{match self{Self::StreamPed=>80,Self::Skinned=>64}}
-    /// The model the original NON-first-person branch draws. Observation only.
+    /// The model the original NON-first-person branch draws. Also the queued
+    /// placement source for an independently owned local equipped gun.
     fn draw_world(self)->u64{match self{Self::StreamPed=>16,Self::Skinned=>0}}
     /// Same draw-data predicate as the original branch (with context 7/19).
     fn first_person<M:Memory>(self,s:&mut Snapshot<'_,M>,draw:u64)->Option<bool>{match self{
@@ -85,10 +90,75 @@ pub(super) fn corrected_model(clone:&W,base_from_eye:&W,model:&W)->Option<[f32;1
     let bz=rotation_only(clone);let t=mul(&mul(&bz,&inverse64(base_from_eye)),&inverse64(&bz));
     let out=mul(&t,model).map(|v|v as f32);out.iter().all(|v|v.is_finite()).then_some(out)
 }
+fn world_model(clone:&W,eye:&W,world:&W)->Option<[f32;16]>{
+    let out=mul(&mul(&rotation_only(clone),&inverse64(eye)),world).map(|v|v as f32);
+    out.iter().all(|v|v.is_finite()).then_some(out)
+}
+fn delta(a:&W,b:&W)->(f64,f64){((0..3).map(|i|(a[12+i]-b[12+i]).powi(2)).sum::<f64>().sqrt(),rotation_deg(a,b))}
+
+/// Original46596 type3 branch: exact physical pointer in the entity registry's
+/// hash chain -> packed entity ID. Never invoke guest code or retain pointers.
+fn physical_entity_id<M:Memory>(s:&mut Snapshot<'_,M>,physical:u64)->Option<u64>{
+    let indirect=s.u64(26_005_240)?;if indirect==0{return None;}let reg=s.u64(indirect)?;if reg==0{return None;}
+    let count=s.u16(reg.checked_add(136)?)?;if count==0{return None;}
+    let buckets=s.u64(reg.checked_add(128)?)?;if buckets==0{return None;}
+    let mut node=s.u64(buckets.checked_add(u64::from((physical as u32)%u32::from(count))*8)?)?;
+    let mut visited=[0;64];
+    for i in 0..visited.len(){
+        if node==0||visited[..i].contains(&node){return None;}visited[i]=node;
+        if s.u64(node)?==physical{
+            let slot=s.u64(node.checked_add(8)?)?;let base=s.u64(reg)?;let stride=s.u64(reg.checked_add(24)?)?;
+            if base==0||stride==0{return None;}let distance=slot.checked_sub(base)?;
+            if distance%stride!=0{return None;}let index=distance/stride;if index>0x1ff_ffff{return None;}
+            return Some(0x3_fe00_0000|index);
+        }
+        node=s.u64(node.checked_add(24)?)?;
+    }None
+}
+
+/// Identity and standard attachment metadata qualify the QUEUED packet. No
+/// comparison with a current mutable FP bone bank, physical root or muzzle can
+/// choose the placement. This grants rendering authority only.
+fn equipped_gun_world<M:Memory>(s:&mut Snapshot<'_,M>,draw:u64,world:Option<W>)->Result<W,&'static str>{
+    macro_rules! need{($value:expr,$reason:literal)=>{$value.ok_or($reason)?};}
+    macro_rules! at{($address:expr,$offset:expr)=>{need!($address.checked_add($offset),"gun_address_range")};}
+    let factory=need!(s.u64(20_159_720),"gun_factory_unreadable");
+    if factory==0{return Err("gun_local_ped_absent");}let ped=need!(s.u64(need!(factory.checked_add(8),"gun_address_range")),"gun_local_ped_unreadable");
+    if ped==0{return Err("gun_local_ped_absent");}
+    let m=need!(ped.checked_add(3888),"gun_address_range");
+    if need!(s.u64(m),"gun_manager_unreadable")!=MANAGER_VTABLE||need!(s.u64(at!(m,352)),"gun_manager_unreadable")!=ped{return Err("gun_manager_owner_mismatch");}
+    if need!(s.u32(need!(ped.checked_add(5324),"gun_address_range")),"gun_ped_scope_unreadable")&4!=0{return Err("gun_ped_scope_unsupported");}
+    let solver=need!(s.u64(at!(m,272)),"gun_solver_unreadable");
+    if solver==0||need!(s.u64(solver),"gun_solver_unreadable")!=SOLVER_VTABLE||need!(s.u64(need!(solver.checked_add(480),"gun_address_range")),"gun_solver_unreadable")!=ped{return Err("gun_solver_owner_mismatch");}
+    let hand=need!(s.u16(at!(solver,128+72)),"gun_bone_unreadable");let bone=need!(s.u16(at!(solver,128+78)),"gun_bone_unreadable");
+    let skel=need!(s.u64(at!(m,264)),"gun_skeleton_unreadable");if skel==0{return Err("gun_skeleton_absent");}
+    let count=need!(s.u32(need!(skel.checked_add(32),"gun_address_range")),"gun_bone_count_unreadable");
+    if count==0||count>MAX_BONES||u32::from(hand)>=count||u32::from(bone)>=count||hand==bone{return Err("gun_auxiliary_bone_invalid");}
+    let wm=need!(s.u64(need!(ped.checked_add(4344),"gun_address_range")),"gun_weapon_manager_unreadable");if wm==0{return Err("gun_equipped_weapon_absent");}
+    let physical=need!(s.u64(need!(wm.checked_add(120),"gun_address_range")),"gun_equipped_weapon_unreadable");if physical==0{return Err("gun_equipped_weapon_absent");}
+    if need!(s.u32(need!(physical.checked_add(40),"gun_address_range")),"gun_entity_type_unreadable")&255!=3{return Err("gun_entity_type_not_three");}
+    let weapon=need!(s.u64(need!(physical.checked_add(864),"gun_address_range")),"gun_runtime_unreadable");
+    if weapon==0||need!(s.u64(need!(weapon.checked_add(88),"gun_address_range")),"gun_runtime_unreadable")!=physical{return Err("gun_runtime_physical_mismatch");}
+    if need!(s.u64(at!(physical,400)),"gun_transform_source_unreadable")!=at!(physical,96){return Err("gun_transform_source_not_embedded");}
+    let id=need!(physical_entity_id(s,physical),"gun_entity_registry_unqualified");
+    if need!(s.u64(need!(draw.checked_add(144),"gun_address_range")),"gun_draw_entity_id_unreadable")!=id{return Err("gun_draw_entity_id_mismatch");}
+    let archetype=need!(s.u64(at!(physical,32)),"gun_archetype_unreadable");if archetype==0{return Err("gun_archetype_absent");}
+    if need!(s.u16(need!(archetype.checked_add(106),"gun_address_range")),"gun_model_index_unreadable")!=need!(s.u16(need!(draw.checked_add(128),"gun_address_range")),"gun_draw_model_index_unreadable"){return Err("gun_draw_model_index_mismatch");}
+    let component=need!(s.u64(at!(physical,80)),"gun_attachment_component_unreadable");if component==0{return Err("gun_attachment_absent");}
+    let ext=need!(s.u64(need!(component.checked_add(72),"gun_address_range")),"gun_attachment_unreadable");if ext==0{return Err("gun_attachment_absent");}
+    if need!(s.u64(ext),"gun_attachment_parent_unreadable")!=ped{return Err("gun_attachment_not_local_ped");}
+    if need!(s.u16(need!(ext.checked_add(120),"gun_address_range")),"gun_attachment_bone_unreadable")!=bone{return Err("gun_attachment_auxiliary_bone_mismatch");}
+    let flags=need!(s.u32(at!(ext,124)),"gun_attachment_flags_unreadable");if flags&15!=2||flags&0x8000!=0{return Err("gun_attachment_state_unsupported");}
+    let mut q=[0.;4];for(i,v)in q.iter_mut().enumerate(){*v=f32::from_bits(need!(s.u32(at!(ext,96+i as u64*4)),"gun_attachment_rotation_unreadable"));}
+    let norm=q.iter().map(|v|v*v).sum::<f32>();if !norm.is_finite()||(norm-1.).abs()>0.001{return Err("gun_attachment_rotation_not_unit");}
+    for i in 0..3{if !f32::from_bits(need!(s.u32(at!(ext,64+i*4)),"gun_attachment_position_unreadable")).is_finite(){return Err("gun_attachment_position_nonfinite");}}
+    world.ok_or("gun_queued_world_not_rigid")
+}
 
 #[derive(Clone,Copy,Debug)]
 pub(super) struct Applied{pub family:Family,pub view:crate::xr_view::WorldView,pub head_translation_m:f64,pub head_rotation_deg:f64,
-    pub model_shift_m:f64,pub draw_world:Option<(f64,f64)>}
+    pub model_shift_m:f64,pub draw_world:Option<(f64,f64)>,pub placement_source:&'static str,pub placement_reason:&'static str,
+    pub applied_vs_camera_relative:(f64,f64),pub applied_vs_draw_world:Option<(f64,f64)>}
 fn words<M:Memory>(s:&mut Snapshot<'_,M>,address:u64)->Option<[u32;16]>{
     let mut out=[0;16];for(i,v)in out.iter_mut().enumerate(){*v=s.u32(address.checked_add(i as u64*4)?)?;}Some(out)
 }
@@ -96,7 +166,12 @@ fn floats(w:&[u32;16])->Option<[f32;16]>{let m=w.map(f32::from_bits);COORDINATES
 
 /// Read-only qualification, then one write of the invocation's own 12 model
 /// coordinates. Every rejection leaves the original native model untouched.
+#[cfg(test)]
 pub(super) fn qualify_and_correct<M:Memory>(mem:&M,family:Family,draw:u64,stack:u64,parent:u64,qualified:bool,
+    lookup:impl Fn(&[f32;16])->Option<(crate::xr_view::WorldView,[f32;16])>)->Result<Applied,&'static str>{
+    qualify_with_policy(mem,family,draw,stack,parent,qualified,false,lookup)
+}
+fn qualify_with_policy<M:Memory>(mem:&M,family:Family,draw:u64,stack:u64,parent:u64,qualified:bool,gun_world_policy:bool,
     lookup:impl Fn(&[f32;16])->Option<(crate::xr_view::WorldView,[f32;16])>)->Result<Applied,&'static str>{
     if !qualified||parent==0{return Err("original_first_person_branch_not_taken");}
     let mut s=Snapshot::new(mem);
@@ -115,15 +190,24 @@ pub(super) fn qualify_and_correct<M:Memory>(mem:&M,family:Family,draw:u64,stack:
     let bz=wide(&floats(&clone).ok_or("clone_nonfinite")?);if !rigid64(&rotation_only(&bz),1e-4){return Err("clone_basis_not_rigid");}
     let native=native_model(&bz,&o).ok_or("camera_relative_not_rigid")?;
     if max_error(&native,&model)>NATIVE_MODEL_TOLERANCE{return Err("model_is_not_original_camera_relative_result");}
-    let corrected=corrected_model(&bz,&relative,&model).ok_or("corrected_model_nonfinite")?;
-    // Observation only: compare the camera-relative world placement B0*S*inv(O)
-    // with the draw data's own world matrix. Never selects or alters a model.
-    let draw_world=words(&mut s,draw.saturating_add(family.draw_world())).and_then(|w|floats(&w)).map(|m|wide(&m)).filter(|m|rigid64(m,1e-3))
-        .map(|world|{let placed=mul(&mul(&wide(&base),&GAME_TO_RENDERER),&inverse64(&wide(&o)));
-            ((0..3).map(|i|(placed[12+i]-world[12+i]).powi(2)).sum::<f64>().sqrt(),rotation_deg(&placed,&world))});
-    if !s.unchanged(){return Err("snapshot_changed");}
+    let placed=mul(&mul(&wide(&base),&GAME_TO_RENDERER),&inverse64(&wide(&o)));
+    let world=draw.checked_add(family.draw_world()).and_then(|a|words(&mut s,a)).and_then(|w|floats(&w)).map(|m|wide(&m)).filter(|m|rigid64(m,1e-3));
+    // A failed candidate must not make another prop's legacy correction depend
+    // on mutable local-weapon state it never used. Validate both readsets only
+    // when queued gun placement is actually selected.
+    let mut gun_snapshot=Snapshot::new(mem);
+    let gun=if family==Family::StreamPed{Err("stream_ped_camera_relative")}
+        else if !gun_world_policy{Err("sense_gameplay_arms_scope_inactive")}else{equipped_gun_world(&mut gun_snapshot,draw,world)};
+    let uses_gun_world=gun.is_ok();
+    let(corrected,placement_source,placement_reason)=match gun{
+        Ok(world)=>(world_model(&bz,&wide(&view.game_from_eye),&world).ok_or("corrected_model_nonfinite")?,"equipped_gun_queued_world","local_equipped_standard_attachment"),
+        Err(reason)=>(corrected_model(&bz,&relative,&model).ok_or("corrected_model_nonfinite")?,"camera_relative",reason)};
+    let applied_world=mul(&mul(&wide(&view.game_from_eye),&inverse64(&rotation_only(&bz))),&wide(&corrected));
+    let draw_world=world.map(|world|delta(&placed,&world));
+    if !s.unchanged()||(uses_gun_world&&!gun_snapshot.unchanged()){return Err("snapshot_changed");}
     let applied=Applied{family,view,head_translation_m:translation_m(&relative),head_rotation_deg:rotation_deg(&relative,&[1.,0.,0.,0.,0.,1.,0.,0.,0.,0.,1.,0.,0.,0.,0.,1.]),
-        model_shift_m:(0..3).map(|i|(f64::from(corrected[12+i])-model[12+i]).powi(2)).sum::<f64>().sqrt(),draw_world};
+        model_shift_m:(0..3).map(|i|(f64::from(corrected[12+i])-model[12+i]).powi(2)).sum::<f64>().sqrt(),draw_world,placement_source,placement_reason,
+        applied_vs_camera_relative:delta(&applied_world,&placed),applied_vs_draw_world:world.map(|world|delta(&applied_world,&world))};
     if COORDINATES.iter().all(|&o|corrected[(o/4)as usize].to_bits()==raw[(o/4)as usize]){return Ok(applied);}
     for o in COORDINATES{if !mem.put(stack+MODEL+o,corrected[(o/4)as usize].to_bits()){return Err("model_write_failed");}}
     Ok(applied)
@@ -145,8 +229,12 @@ fn describe_applied(sample:Option<(Instant,Applied)>)->Option<serde_json::Value>
     sample.map(|(at,a)|serde_json::json!({"age_ms":at.elapsed().as_millis(),"family":a.family.index(),"view_epoch":a.view.provenance_epoch,
         "camera_sequence":a.view.camera_sequence,"request_frame":a.view.request_frame,"head_pose_frame":a.view.head_pose_frame,
         "eye_index":a.view.eye_index,"head_translation_m":a.head_translation_m,"head_rotation_degrees":a.head_rotation_deg,
-        "model_translation_shift_m":a.model_shift_m,"camera_relative_vs_draw_world":a.draw_world.map(|(t,r)|serde_json::json!({"translation_m":t,"rotation_degrees":r}))}))
+        "model_translation_shift_m":a.model_shift_m,"camera_relative_vs_draw_world":a.draw_world.map(describe_delta),
+        "placement_source":a.placement_source,"placement_qualification":a.placement_reason,
+        "applied_vs_camera_relative_world":describe_delta(a.applied_vs_camera_relative),"applied_vs_draw_world":a.applied_vs_draw_world.map(describe_delta)}))
 }
+fn describe_delta((t,r):(f64,f64))->serde_json::Value{serde_json::json!({"translation_m":t,"rotation_degrees":r})}
+fn gun_world_scope(arms:bool,gameplay:bool,spatial:bool,verified:bool,in_vehicle:bool)->bool{arms&&gameplay&&spatial&&verified&&!in_vehicle}
 
 pub(super) fn host_hook(caller:&mut wasmtime::Caller<'_,crate::HostState>,params:&[wasmtime::Val],results:&mut[wasmtime::Val],mem:&wasmtime::SharedMemory)->anyhow::Result<()>{
     use wasmtime::Val;
@@ -158,7 +246,9 @@ pub(super) fn host_hook(caller:&mut wasmtime::Caller<'_,crate::HostState>,params
     let gate=if !crate::xr_motion_aim::viewmodel_enabled(){"viewmodel_not_requested"}
         else if !crate::xr_view::world_camera_enabled(){"immersive_world_camera_inactive"}
         else if *tls==0||active_stack(caller)!=Some(*stack as u64){"frame_or_tls_identity"}
-        else{match qualify_and_correct(&Guest(mem),family,*draw as u64,*stack as u64,*parent as u64,*qualified!=0,crate::xr_view::installed_headset_eye){
+        else{let gun_policy=gun_world_scope(crate::xr_motion_aim::arms_enabled(),crate::xr_motion_aim::gameplay_enabled(),crate::pad::spatial_controls_selected(),
+                crate::pad::verified_guest_gameplay_context(),crate::pad::IN_VEHICLE.load(Ordering::Relaxed));
+            match qualify_with_policy(&Guest(mem),family,*draw as u64,*stack as u64,*parent as u64,*qualified!=0,gun_policy,crate::xr_view::installed_headset_eye){
             Ok(applied)=>{APPLIED[family.slot()].fetch_add(1,Ordering::Relaxed);LAST_APPLIED.lock().unwrap_or_else(|p|p.into_inner()).record(Instant::now(),applied);
                 // Only a corrected completed model may attribute this invocation's
                 // emissions to its displaced parent eye (default off; host reads only).
@@ -258,6 +348,114 @@ pub(super) fn status()->serde_json::Value{
         let view=crate::xr_view::WorldView{provenance_epoch:3,camera_sequence:9,request_frame:4,head_pose_frame:5,presentation_time_seconds:1.,eye_index:1,view_count:2,
             game_from_eye:narrow(&sc.beye),game_from_stage:identity(),projection_from_eye:identity(),depth_reverse_z:true,headset_applied:true,optics:crate::xr_view::ScopeOptics::default()};
         (m,sc,view)
+    }
+    const PED:u64=100_000;const WM:u64=120_000;const PHYSICAL:u64=130_000;const WEAPON:u64=140_000;
+    const COMPONENT:u64=150_000;const EXT:u64=160_000;const SKEL:u64=170_000;const SOLVER:u64=180_000;
+    const ARCH:u64=190_000;const REG:u64=200_000;const REG_PTR:u64=210_000;const BUCKETS:u64=220_000;const NODE:u64=230_000;
+    fn half(m:&TestMemory,a:u64,v:u16){let shift=(a&3)*8;let old=m.word(a&!3).unwrap_or(0);m.put(a&!3,(old&!(0xffff<<shift))|(u32::from(v)<<shift));}
+    fn owned_gun(m:&TestMemory){
+        m.u64(20_159_720,90_000);m.u64(90_008,PED);m.u64(PED+3888,MANAGER_VTABLE);m.u64(PED+3888+352,PED);m.put(PED+5324,0);
+        m.u64(PED+3888+272,SOLVER);m.u64(SOLVER,SOLVER_VTABLE);m.u64(SOLVER+480,PED);half(m,SOLVER+200,83);half(m,SOLVER+206,84);
+        m.u64(PED+3888+264,SKEL);m.put(SKEL+32,354);m.u64(PED+4344,WM);m.u64(WM+120,PHYSICAL);m.put(PHYSICAL+40,3);
+        m.u64(PHYSICAL+864,WEAPON);m.u64(WEAPON+88,PHYSICAL);m.u64(PHYSICAL+400,PHYSICAL+96);m.u64(PHYSICAL+32,ARCH);
+        half(m,ARCH+106,321);half(m,DRAW+128,321);m.u64(PHYSICAL+80,COMPONENT);m.u64(COMPONENT+72,EXT);m.u64(EXT,PED);
+        half(m,EXT+120,84);m.put(EXT+124,2);for i in 0..4{m.put(EXT+96+i*4,if i==3{1f32.to_bits()}else{0});}for i in 0..3{m.put(EXT+64+i*4,0);}
+        m.u64(26_005_240,REG_PTR);m.u64(REG_PTR,REG);half(m,REG+136,1);m.u64(REG+128,BUCKETS);m.u64(BUCKETS,NODE);
+        m.u64(NODE,PHYSICAL);m.u64(NODE+8,240_000+3*32);m.u64(REG,240_000);m.u64(REG+24,32);m.u64(DRAW+144,0x3_fe00_0003);
+    }
+    fn mismatched_gun(head:f64,eye:usize)->(TestMemory,Scene,crate::xr_view::WorldView,W){
+        let(m,mut sc,mut view)=fixture(Family::Skinned,head);
+        let mut relative=sc.r;relative[12]+=if eye==0{-0.032}else{0.032};
+        sc.beye=mul(&sc.b0,&relative);sc.r=relative;view.eye_index=eye as u32;view.game_from_eye=narrow(&sc.beye);
+        put_words(&m,PARENT+VIEWPORT_CAMERA,&view.game_from_eye);put_words(&m,STACK+CLONE_CAMERA,&narrow(&rotation_only(&sc.beye)));
+        let mut native=narrow(&native_model(&rotation_only(&sc.beye),&narrow(&sc.o)).unwrap());
+        for i in [3,7,11,15]{native[i]=f32::from_bits(0xdead_0000+i as u32);}put_words(&m,STACK+MODEL,&native);
+        let world=at(mul(&rot([0.,0.,1.],172.77),&rotation_only(&sc.e)),[sc.e[12]+0.26,sc.e[13]-0.05,sc.e[14]+0.03]);
+        put_words(&m,DRAW,&narrow(&world));owned_gun(&m);(m,sc,view,world)
+    }
+    fn read_model(m:&TestMemory)->W{wide(&std::array::from_fn(|i|f32::from_bits(m.word(STACK+MODEL+i as u64*4).unwrap())))}
+    #[test]fn owned_gun_uses_queued_world_for_both_eyes_and_head_motion_without_double_correction(){
+        for head in [-48.,0.,31.]{for eye in 0..2{
+            let(m,sc,view,world)=mismatched_gun(head,eye);let before=m.0.borrow().clone();
+            let a=qualify_with_policy(&m,Family::Skinned,DRAW,STACK,PARENT,true,true,|_|Some((view,narrow(&sc.b0)))).unwrap();
+            assert_eq!(a.placement_source,"equipped_gun_queued_world");assert_eq!(a.placement_reason,"local_equipped_standard_attachment");
+            let(t,r)=a.draw_world.unwrap();assert!(t>0.25&&r>170.);let(t,r)=a.applied_vs_draw_world.unwrap();assert!(t<5e-4&&r<0.05,"{t} {r}");
+            let actual=mul(&inverse64(&rotation_only(&sc.beye)),&read_model(&m));let expected=mul(&inverse64(&sc.beye),&world);
+            assert!(max_error(&actual,&expected)<5e-4,"head{head} eye{eye}");
+            assert!(max_error(&actual,&mul(&inverse64(&sc.r),&mul(&GAME_TO_RENDERER,&inverse64(&sc.o))))>0.1);
+            for(address,value)in m.0.borrow().iter(){if !COORDINATES.iter().any(|o|*address==STACK+MODEL+o){assert_eq!(before.get(address),Some(value),"changed non-model coordinate {address}");}}
+            let telemetry=describe_applied(Some((Instant::now(),a))).unwrap();assert_eq!(telemetry["placement_source"],"equipped_gun_queued_world");
+            assert!(telemetry["camera_relative_vs_draw_world"]["rotation_degrees"].as_f64().unwrap()>170.);
+        }}
+    }
+    #[test]fn gun_identity_attachment_and_registry_rejections_exactly_preserve_legacy_behavior(){
+        let cases:[(&str,fn(&TestMemory));15]=[
+            ("gun_draw_entity_id_mismatch",|m|{m.u64(DRAW+144,0x3_fe00_0004);}),
+            ("gun_draw_model_index_mismatch",|m|{half(m,DRAW+128,322);}),
+            ("gun_entity_type_not_three",|m|{m.put(PHYSICAL+40,4);}),
+            ("gun_runtime_physical_mismatch",|m|{m.u64(WEAPON+88,PHYSICAL+8);}),
+            ("gun_manager_owner_mismatch",|m|{m.u64(PED+3888+352,PED+8);}),
+            ("gun_solver_owner_mismatch",|m|{m.u64(SOLVER+480,PED+8);}),
+            ("gun_attachment_not_local_ped",|m|{m.u64(EXT,PED+8);}),
+            ("gun_attachment_auxiliary_bone_mismatch",|m|{half(m,EXT+120,85);}),
+            ("gun_auxiliary_bone_invalid",|m|{half(m,SOLVER+206,65535);}),
+            ("gun_attachment_state_unsupported",|m|{m.put(EXT+124,0x8002);}),
+            ("gun_attachment_rotation_not_unit",|m|{m.put(EXT+108,2f32.to_bits());}),
+            ("gun_entity_registry_unqualified",|m|{half(m,REG+136,0);}),
+            ("gun_entity_registry_unqualified",|m|{m.u64(NODE,PHYSICAL+8);m.u64(NODE+24,NODE);}),
+            ("gun_entity_registry_unqualified",|m|{m.u64(REG+24,0);}),
+            ("gun_queued_world_not_rigid",|m|{m.put(DRAW,2f32.to_bits());})];
+        for(reason,mutate)in cases{
+            let(m,sc,view,_)=mismatched_gun(27.,0);mutate(&m);let initial=m.0.borrow().clone();
+            let legacy=TestMemory(std::cell::RefCell::new(initial));
+            qualify_and_correct(&legacy,Family::Skinned,DRAW,STACK,PARENT,true,|_|Some((view,narrow(&sc.b0)))).unwrap();
+            let a=qualify_with_policy(&m,Family::Skinned,DRAW,STACK,PARENT,true,true,|_|Some((view,narrow(&sc.b0)))).unwrap();
+            assert_eq!(a.placement_source,"camera_relative");assert_eq!(a.placement_reason,reason);
+            assert_eq!(*m.0.borrow(),*legacy.0.borrow(),"{reason} changed legacy bytes");
+        }
+    }
+    #[test]fn registry_bound_and_address_overflow_fail_closed(){
+        let(m,_,_,_)=mismatched_gun(20.,0);
+        for i in 0..65{let n=NODE+i*32;m.u64(n,PHYSICAL+8);m.u64(n+24,n+32);}m.u64(NODE+64*32,PHYSICAL);
+        assert!(physical_entity_id(&mut Snapshot::new(&m),PHYSICAL).is_none());
+        m.u64(REG_PTR,u64::MAX-8);assert!(physical_entity_id(&mut Snapshot::new(&m),PHYSICAL).is_none());
+    }
+    #[test]fn gun_scope_and_stream_ped_keep_camera_relative_path(){
+        assert!(gun_world_scope(true,true,true,true,false));
+        for scope in [(false,true,true,true,false),(true,false,true,true,false),(true,true,false,true,false),(true,true,true,false,false),(true,true,true,true,true)]{
+            assert!(!gun_world_scope(scope.0,scope.1,scope.2,scope.3,scope.4));
+        }
+        for(family,reason)in [(Family::Skinned,"sense_gameplay_arms_scope_inactive"),(Family::StreamPed,"stream_ped_camera_relative")]{
+            let(m,sc,view)=fixture(family,24.);let a=qualify_with_policy(&m,family,DRAW,STACK,PARENT,true,family==Family::StreamPed,|_|Some((view,narrow(&sc.b0)))).unwrap();
+            assert_eq!(a.placement_source,"camera_relative");assert_eq!(a.placement_reason,reason);
+            let expected=mul(&inverse64(&sc.r),&mul(&GAME_TO_RENDERER,&inverse64(&sc.o)));
+            assert!(max_error(&mul(&inverse64(&rotation_only(&sc.beye)),&read_model(&m)),&expected)<5e-4);
+        }
+    }
+    #[test]fn mutable_owned_gun_snapshot_rejects_without_any_write(){
+        use std::cell::Cell;
+        struct Changing{m:TestMemory,reads:Cell<u32>}
+        impl Memory for Changing{
+            fn word(&self,a:u64)->Option<u32>{let v=self.m.word(a)?;if a==DRAW+144{let n=self.reads.get();self.reads.set(n+1);Some(if n==0{v}else{v^1})}else{Some(v)}}
+            fn put(&self,_:u64,_:u32)->bool{panic!("incoherent snapshot wrote memory")}
+        }
+        let(m,sc,view,_)=mismatched_gun(20.,1);let before=m.0.borrow().clone();let changing=Changing{m,reads:Cell::new(0)};
+        assert_eq!(qualify_with_policy(&changing,Family::Skinned,DRAW,STACK,PARENT,true,true,|_|Some((view,narrow(&sc.b0)))).err(),Some("snapshot_changed"));
+        assert_eq!(*changing.m.0.borrow(),before);
+    }
+    #[test]fn rejected_nonlocal_prop_does_not_borrow_mutable_weapon_readset(){
+        use std::cell::Cell;
+        struct Changing{m:TestMemory,reads:Cell<u32>}
+        impl Memory for Changing{
+            fn word(&self,a:u64)->Option<u32>{let v=self.m.word(a)?;if a==PED+3888+352{let n=self.reads.get();self.reads.set(n+1);Some(if n==0{v}else{v^1})}else{Some(v)}}
+            fn put(&self,a:u64,v:u32)->bool{self.m.put(a,v)}
+        }
+        let(m,sc,view,_)=mismatched_gun(20.,1);m.u64(DRAW+144,0x3_fe00_0004);let legacy=TestMemory(std::cell::RefCell::new(m.0.borrow().clone()));
+        qualify_and_correct(&legacy,Family::Skinned,DRAW,STACK,PARENT,true,|_|Some((view,narrow(&sc.b0)))).unwrap();
+        let changing=Changing{m,reads:Cell::new(0)};
+        let a=qualify_with_policy(&changing,Family::Skinned,DRAW,STACK,PARENT,true,true,|_|Some((view,narrow(&sc.b0)))).unwrap();
+        assert_eq!(a.placement_reason,"gun_draw_entity_id_mismatch");assert_eq!(changing.reads.get(),1);
+        assert_eq!(*changing.m.0.borrow(),*legacy.0.borrow());
     }
     #[test]fn arm_report_does_not_replace_gun_observation_or_its_view_identity(){
         let mut samples=AppliedObservations::default();
