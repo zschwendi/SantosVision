@@ -1,5 +1,17 @@
 # Overnight physical immersive correctness
 
+## Current state — October 25 UTC
+
+This file retains the October 13 investigation. Its candidate6/7 deployment
+notes below are historical, not the current headset build. Installed build26
+is preserved at `los-santos-point-aim-accepted26-20261025` (`eae9693`). The user
+confirms point-to-aim, binocular reticle tracking, correctly landing shots,
+initial Wasted and usable first-person ADS. Remaining: right-hand roll,
+controller-driven gun motion during ADS, enlarged Wasted stereo and immersive
+image quality. See [the current acceptance audit](USER-REQUEST-AUDIT-20261024.md)
+and [build26](GUN-FIRST-PERSON-WORLD26-20261024.md). Do not resume an obsolete
+candidate6 capture recipe or relabel the successful player test as failed.
+
 Working checkpoint: `los-santos-immersive-checkpoint-20261013` (`d4b78b8`). User reports immersive game visible. Preserve this tag and its signed build5 in `target/verification/render-hotpath-20261011/los-santos-calibration-device-v5`.
 
 Current physical candidate: `los-santos-aim-capture-candidate-v6-r6-20261013` (`1a2810b`). Signed build6-r6 is in `target/verification/render-hotpath-20261011/los-santos-aim-capture-device-v6-r6`, with `integration-receipt.json` binding its unchanged compiled source, executable and original AOT. Executable SHA256: `22afe28e5c96aef5304129135a223ed396d4a9ce7b6cc0c7caa642b167ae0fa4`. It was installed in place on the physical AVP on 2026-10-20; visual acceptance remains pending. At the October 13 cutoff, the physical AVP remained unavailable on both scheduled bounded checks at13:04 and13:34UTC; neither caused an install or capture. The original r1 install failed with CoreDevice4016. Former r5/tag `7e12233`, r4/tag `626d0b1`, r3/tag `04ebfd9` and r2/tag `7951aa8` remain preserved. No simulator use, AOT regeneration, assets changes, banked resets or push.
