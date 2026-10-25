@@ -63,8 +63,23 @@ fn left_packet_valid(head:u64,presentation:f64,flags:u32,times:[f64;3],ids:[u64;
 #[derive(Clone,Debug)]
 pub(crate) struct LeftArmCandidate{pub view_epoch:u64,pub camera_sequence:u64,pub head_frame:u64,pub tracking_epoch:u64,pub hand_sequence:u64,pub game_from_stage:[f32;16],pub stage_from_grip:[f32;16],pub recorded_at:Instant,pub source_age:Duration}
 impl LeftArmCandidate{fn valid(&self,now:Instant,epoch:u64)->bool{self.view_epoch==epoch&&epoch!=0&&self.camera_sequence!=0&&self.head_frame!=0&&self.tracking_epoch!=0&&self.hand_sequence!=0&&rigid(&self.game_from_stage)&&rigid(&self.stage_from_grip)&&now.checked_duration_since(self.recorded_at).and_then(|age|age.checked_add(self.source_age)).is_some_and(|age|age<=MAX_AGE)}}
-pub(crate) fn native_left_arm_candidate(first:bool)->Option<LeftArmCandidate>{
-    if !arms_enabled()||!current_supported_scope(first)||!NATIVE_MODE.lock().unwrap_or_else(|p|p.into_inner()).is_some_and(|(first,at,_,e)|first&&e==crate::xr_view::view_epoch()&&at.elapsed()<=MAX_AGE){return None;}
+#[derive(Clone,Copy)]
+enum ArmModeAuthority{RecentAimRead,CurrentNativePredicate}
+fn arm_mode_matches(first:bool,authority:ArmModeAuthority,history:Option<(bool,Instant,u64,u64)>,now:Instant,epoch:u64)->bool{
+    first&&match authority{ArmModeAuthority::CurrentNativePredicate=>true,
+        ArmModeAuthority::RecentAimRead=>history.is_some_and(|(first,at,_,e)|first&&e==epoch&&now.checked_duration_since(at).is_some_and(|age|age<=MAX_AGE))}
+}
+fn arm_mode_authorized(first:bool,authority:ArmModeAuthority)->bool{
+    let history=match authority{ArmModeAuthority::RecentAimRead=>*NATIVE_MODE.lock().unwrap_or_else(|p|p.into_inner()),ArmModeAuthority::CurrentNativePredicate=>None};
+    arm_mode_matches(first,authority,history,Instant::now(),crate::xr_view::view_epoch())
+}
+pub(crate) fn native_left_arm_candidate(first:bool)->Option<LeftArmCandidate>{native_left_arm_candidate_with_authority(first,ArmModeAuthority::RecentAimRead)}
+/// Only the certified native arm request/target hooks may use their current
+/// original45913(ped,0,0,0,1,0) result instead of another hook's mode history.
+/// The caller still qualifies local owner, native stack and request identity.
+pub(crate) fn native_left_arm_candidate_at_native_site(first:bool)->Option<LeftArmCandidate>{native_left_arm_candidate_with_authority(first,ArmModeAuthority::CurrentNativePredicate)}
+fn native_left_arm_candidate_with_authority(first:bool,authority:ArmModeAuthority)->Option<LeftArmCandidate>{
+    if !arms_enabled()||!current_supported_scope(first)||!arm_mode_authorized(first,authority){return None;}
     let c=LEFT_CANDIDATE.lock().unwrap_or_else(|p|p.into_inner()).clone()?;if !c.valid(Instant::now(),crate::xr_view::view_epoch())||LATEST_CAMERA_SEQUENCE.load(Ordering::Acquire)!=c.camera_sequence{return None;}
     #[cfg(target_os="visionos")]{
         extern "C"{fn sv_xr_motion_read_v1(frame:u64,f:*mut f32,fn_:u32,t:*mut f64,tn:u32,id:*mut u64,idn:u32)->u32;}
@@ -101,9 +116,17 @@ fn current_supported_scope(first_person:bool)->bool {
 /// Same accepted camera packet for native arm requests and targets. A later
 /// callback cannot borrow a replacement tracking generation or extend its age.
 pub(crate) fn native_arm_candidate(first_person:bool)->Option<CameraCandidate>{
+    native_arm_candidate_with_authority(first_person,ArmModeAuthority::RecentAimRead)
+}
+/// Invocation-local mode authority, exclusively for the certified native arm
+/// hooks. This does not publish NATIVE_MODE or grant firing/reticle authority.
+pub(crate) fn native_arm_candidate_at_native_site(first_person:bool)->Option<CameraCandidate>{
+    if !arms_enabled(){return None;}native_arm_candidate_with_authority(first_person,ArmModeAuthority::CurrentNativePredicate)
+}
+fn native_arm_candidate_with_authority(first_person:bool,authority:ArmModeAuthority)->Option<CameraCandidate>{
     let fail=|gate|{ARM_CANDIDATE_GATE.store(gate,Ordering::Relaxed);None};
     if !gameplay_enabled(){return fail(1);}if !current_supported_scope(first_person){return fail(2);}
-    if !NATIVE_MODE.lock().unwrap_or_else(|p|p.into_inner()).is_some_and(|(first,at,_,e)|first&&e==crate::xr_view::view_epoch()&&at.elapsed()<=MAX_AGE){return fail(3);}
+    if !arm_mode_authorized(first_person,authority){return fail(3);}
     let Some(candidate)=CANDIDATE.lock().unwrap_or_else(|p|p.into_inner()).clone()else{return fail(4);};
     if !candidate.valid(Instant::now(),crate::xr_view::view_epoch()){return fail(5);}
     if !tracking_still_live(&candidate){return fail(6);}ARM_CANDIDATE_GATE.store(7,Ordering::Relaxed);Some(candidate)
@@ -809,6 +832,31 @@ mod tests {
             (true,true,false,false,true),(true,true,true,true,true),(true,true,true,false,false)]{
             assert!(!supported_motion_scope(route.0,route.1,route.2,route.3,route.4));
         }
+    }
+    #[test]
+    fn native_arm_site_uses_its_current_predicate_without_restamping_tracking_or_aim_history(){
+        let now=Instant::now();let epoch=7;
+        // A current native arm predicate remains authoritative if a different
+        // camera-reading task has not run, has expired, or last saw another mode.
+        for history in [None,Some((true,now-Duration::from_millis(151),10,epoch)),
+            Some((false,now,10,epoch)),Some((true,now,10,epoch-1))]{
+            assert!(!arm_mode_matches(true,ArmModeAuthority::RecentAimRead,history,now,epoch));
+            assert!(arm_mode_matches(true,ArmModeAuthority::CurrentNativePredicate,history,now,epoch));
+            assert!(!arm_mode_matches(false,ArmModeAuthority::CurrentNativePredicate,history,now,epoch));
+        }
+        let fresh=Some((true,now,10,epoch));
+        assert!(arm_mode_matches(true,ArmModeAuthority::RecentAimRead,fresh,now,epoch));
+        assert!(!arm_mode_matches(false,ArmModeAuthority::RecentAimRead,fresh,now,epoch));
+        // Mode authority does not replace the independent packet-age, epoch or
+        // head/hand identity checks used by both production candidate paths.
+        let c=candidate(now);assert!(c.valid(now,epoch));
+        assert!(!c.valid(now+Duration::from_millis(151),epoch));
+        assert!(!c.valid(now,epoch+1));
+        for field in 0..3{let mut missing=c.clone();match field{0=>missing.head_frame=0,1=>missing.tracking_epoch=0,_=>missing.hand_sequence=0};assert!(!missing.valid(now,epoch));}
+        let mut old_source=c.clone();old_source.source_age_at_capture=Duration::from_millis(151);assert!(!old_source.valid(now,epoch));
+        let left=LeftArmCandidate{view_epoch:epoch,camera_sequence:11,head_frame:12,tracking_epoch:4,hand_sequence:13,
+            game_from_stage:identity(),stage_from_grip:identity(),recorded_at:now,source_age:Duration::ZERO};
+        assert!(left.valid(now,epoch));assert!(!left.valid(now+Duration::from_millis(151),epoch));assert!(!left.valid(now,epoch+1));
     }
     #[test]fn left_packet_and_position_candidate_remain_valid_when_right_accessory_is_lost(){
         let times=[10.,9.98,1.];let ids=[1,4,12,13];assert!(left_packet_valid(12,10.,1,times,ids));assert_eq!(packet_rejection(12,10.,1,times,ids),Some("no_fresh_right_accessory"));

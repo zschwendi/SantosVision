@@ -332,7 +332,12 @@ impl ArmSource{
     fn generation(&self)->(u64,u64,u64){match self{Self::Right(c)=>generation(c),Self::Left(c)=>(c.view_epoch,c.camera_sequence,c.hand_sequence)}}
     fn tracking(&self)->u64{match self{Self::Right(c)=>c.tracking_epoch,Self::Left(c)=>c.tracking_epoch}}
 }
-fn current_arm(first:bool,arm:u32)->Option<ArmSource>{match arm{1=>current(first).map(ArmSource::Right),0=>crate::xr_motion_aim::native_left_arm_candidate(first).map(ArmSource::Left),_=>None}}
+// Every caller is a certified request/target callback carrying the current
+// original45913 predicate. ADS must not depend on the separate GunIk read site
+// continuing to execute; all local owner/stack/request checks still follow.
+fn current_arm(first:bool,arm:u32)->Option<ArmSource>{match arm{
+    1=>crate::xr_motion_aim::native_arm_candidate_at_native_site(first).map(ArmSource::Right),
+    0=>crate::xr_motion_aim::native_left_arm_candidate_at_native_site(first).map(ArmSource::Left),_=>None}}
 fn active_stack(caller:&mut wasmtime::Caller<'_,crate::HostState>)->Option<u64>{caller.get_export("__muguet_motion_stack_pointer")?.into_global()?.get(caller).i64().map(|v|v as u64)}
 fn observed_local_ped<M:Memory>(guest:&M)->Option<u64>{let mut s=Snapshot::new(guest);let factory=s.u64(20_159_720)?;if factory==0{return None;}s.u64(factory.checked_add(8)?).filter(|ped|*ped!=0)}
 
