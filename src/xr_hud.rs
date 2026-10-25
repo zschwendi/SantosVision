@@ -3,6 +3,8 @@
 //! samples; it is not the final target alpha and never a difference of colors.
 use std::sync::{atomic::{AtomicBool, Ordering}, LazyLock, Mutex};
 use wgpu::*;
+#[path="xr_hud_audit.rs"]
+pub(crate) mod audit;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
@@ -23,7 +25,8 @@ pub extern "C" fn sv_xr_set_hud_ready(value:u32)->i32 {
 pub(crate) fn enabled()->bool { READY.load(Ordering::Acquire) && crate::xr_view::world_camera_enabled() }
 pub fn status_json()->serde_json::Value { let s=STATUS.lock().unwrap_or_else(|p|p.into_inner());
     serde_json::json!({"abi_version":1,"ready":READY.load(Ordering::Acquire),"published":s.0,"rejected":s.1,"last_rejection":s.2,
-      "coverage":"same raster, original shader alpha, over-composition; never color subtraction","angular_width_degrees":60,"distance_metres":2}) }
+      "coverage":"same raster, original shader alpha, over-composition; never color subtraction","angular_width_degrees":60,"distance_metres":2,
+      "death_admission":audit::status()}) }
 pub(crate) fn record_result(success:bool,reason:Option<&str>){let mut s=STATUS.lock().unwrap_or_else(|p|p.into_inner());if success{s.0+=1;s.2=None;}else{s.1+=1;s.2=reason.map(str::to_owned);}}
 
 /// Immutable for the entire published world lease; the producer pool reuses an

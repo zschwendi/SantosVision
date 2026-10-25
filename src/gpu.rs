@@ -1046,6 +1046,7 @@ struct Gpu {
     world_depth_anomalies: Vec<serde_json::Value>,
     color_phase_trace: crate::world_ui::ColorPhaseTrace,
     hud_capture:Option<HudCapture>, hud_draw:Option<crate::xr_hud::HudBlend>, hud_pool:Vec<Arc<crate::xr_hud::HudImages>>,
+    hud_audit:crate::xr_hud::audit::PresentAudit,
     // Producer-attributed first-person foreground (default off; see fg).
     foreground: Option<fg::ForegroundMark>,
     fp_sessions: fg::logic::Sessions,
@@ -1241,6 +1242,7 @@ impl Gpu {
             objs: Vec::new(), enc: None, enc_epoch: 1, pass: None, pass_key: None, pass_info: None, pass_st: PassSt::default(),
             s: State::new(), world_view: None, world_depths: HashMap::new(), world_depth_before_ui: HashMap::new(), world_depth_snapshot_overflow: false, world_depth_snapshots_this_present: 0, world_depth_trace: HashMap::new(), world_depth_anomalies: Vec::new(),
             color_phase_trace: crate::world_ui::ColorPhaseTrace::from_env(), hud_capture:None, hud_draw:None, hud_pool:Vec::new(),
+            hud_audit:crate::xr_hud::audit::PresentAudit::default(),
             foreground: None, fp_sessions: Default::default(), fp_images: HashMap::new(), fp_pool: Vec::new(), fp_merge: None,
             foreground_capture: ForegroundCapture::from_env(),
             command_trace: crate::world_command_trace::CommandTrace::from_env(), pdirty: true, last_pl: None, last_program_uids: None,
@@ -1337,7 +1339,53 @@ impl Gpu {
     }
 
     fn hud_reject(&mut self,reason:&str) {
+        self.hud_audit.reject(reason);
         if let Some(h)=&mut self.hud_capture { h.rejected.get_or_insert_with(||reason.to_owned()); }
+    }
+
+    fn hud_audit_owner(&self)->Option<crate::xr_hud::audit::Owner>{
+        if !crate::xr_hud::enabled()||!crate::xr_motion_aim::diagnostic_enabled(){return None;}
+        crate::xr_hud::audit::owner(|a|crate::read_u32(&self.mem,a),|a|crate::read_u64(&self.mem,a))
+    }
+    fn hud_audit_draw(&mut self,vs:&Program,ps:Option<&Program>){
+        if self.hud_audit.needs_begin(self.presents+1){let owner=self.hud_audit_owner();self.hud_audit.begin(self.presents+1,owner);}
+        if !self.hud_audit.active(){return;}
+        use crate::xr_hud::audit::{Draw,Text};
+        let r=&self.s.rt[0];let texture=self.tex(r.tex);
+        let layout=texture.map(|t|[t.desc.w,t.desc.h,t.desc.samples,t.desc.d,r.mip,r.slice]).unwrap_or([0,0,0,0,r.mip,r.slice]);
+        let expected=[0.,0.,layout[0]as f32,layout[1]as f32,0.,1.];
+        let blend=self.state(self.s.blend.0);let mut blend_words=[0;12];let blend_len=blend.as_ref().map_or(0,|b|b.words.len());
+        if let Some(b)=&blend{for(to,from)in blend_words.iter_mut().zip(&b.words){*to=*from;}}
+        let mut reads=[0;8];let mut reads_count=0;let mut certified=0;
+        for(stage,program)in[(0,Some(vs)),(1,ps)]{if let Some(program)=program{for binding in &program.info.bindings{
+            if binding.kind!=Kind::Texture{continue;}
+            let resource=self.s.srv[stage].get(binding.binding.wrapping_sub(32)as usize).and_then(|id|self.view_obj(*id)).map_or(0,|v|v.res);
+            if reads_count<8{reads[reads_count]=resource;
+                if self.hud_capture.as_ref().is_some_and(|h|self.tex(resource).is_some_and(|t|h.scratch.get(&resource)==Some(&t.tex))){certified|=1<<reads_count;}}
+            reads_count+=1;
+        }}}
+        let hashes=std::array::from_fn(|stage|match self.obj(self.s.shader[stage]){Some(Obj::Shader(s))=>u64::from_str_radix(&s.hash,16).ok(),_=>None});
+        let packet=Draw{ordinal:self.draws+1,target:r.tex,hashes,labels:[Text::new(&vs.label),Text::new(ps.map_or("",|p|p.label.as_str()))],
+            kinds:[vs.hud_kind,ps.and_then(|p|p.hud_kind)],targets:std::array::from_fn(|i|self.s.rt.get(i).map_or(0,|r|r.tex)),
+            other_targets:self.s.rt.iter().skip(4).any(|r|r.tex!=0),depth:self.s.ds.tex,depth_flags:self.s.ds.flags,
+            writes_depth:self.s.ds.flags&1==0&&self.state(self.s.dss.0).is_some_and(|d|d.words.first()==Some(&1)&&d.words.get(1)==Some(&1)),
+            target_layout:layout,target_format:texture.map(|t|t.format),blend_words,blend_len,color_mask:blend_for(blend.as_deref(),0).1.bits(),
+            viewport:self.s.viewports.first().copied().unwrap_or(expected),scissor:self.s.scissors.first().copied().unwrap_or([0,0,layout[0],layout[1]]),
+            texture_reads:reads,reads_count,reads_omitted:reads_count.saturating_sub(8),certified_scratch_bits:certified};
+        self.hud_audit.attempted(packet);
+    }
+    fn finish_hud_audit(&mut self,color_id:u32,view:Option<&crate::xr_view::WorldView>,capture:Option<&HudCapture>){
+        if !self.hud_audit.active(){return;}
+        let(outcome,reason)=match capture{
+            None=>("absent_candidate","no_qualified_pinned_lens_candidate"),
+            Some(h)if h.rejected.is_some()=>("rejected_candidate",h.rejected.as_deref().unwrap()),
+            Some(h)if h.final_id!=color_id||self.tex(color_id).is_none_or(|t|t.tex!=h.final_texture)=>("rejected_candidate","final_texture_identity_mismatch"),
+            Some(h)if h.draws==0||h.images.is_none()=>("rejected_candidate","no_captured_hud_raster_draws"),
+            Some(h)if !view.is_some_and(|v|v.headset_applied&&crate::world_frame::shares_screen_rays(v,&h.view))=>("rejected_candidate","final_hud_screen_rays_mismatch"),
+            Some(_)=>("admitted_candidate","hud_admitted_pending_world_depth_and_gpu_completion")};
+        let candidate=capture.map(|h|serde_json::json!({"view":crate::world_ui::marker(&h.view),"final_target":h.final_id,
+            "hud_draws":h.draws,"images_reserved":h.images.is_some(),"scratch_count":h.scratch.len()})).unwrap_or(serde_json::Value::Null);
+        let owner=self.hud_audit_owner();self.hud_audit.finish(color_id,view,outcome,reason,owner,candidate);
     }
 
     /// Execute before every mutation opcode, irrespective of tracing flags.
@@ -1359,6 +1407,9 @@ impl Gpu {
             0..=47=>{},
             _=>self.hud_reject("unknown GPU opcode after final postFX"),
         }
+        if self.hud_capture.as_ref().is_some_and(|h|writes.contains(&h.final_id)||(h.images.is_some()&&reads.contains(&h.final_id))){
+            self.hud_audit.resource_command(op,&writes,&reads);
+        }
         if let Some(h)=&mut self.hud_capture {
             for id in writes { h.scratch.remove(&id);if id==h.final_id {h.rejected.get_or_insert_with(||format!("opcode{op} mutates final HUD target"));} }
             if h.images.is_some() && reads.contains(&h.final_id){h.rejected.get_or_insert_with(||format!("opcode{op} reads HUD-bearing final target"));}
@@ -1378,6 +1429,7 @@ impl Gpu {
     }
 
     fn prepare_hud_draw(&mut self,vs:&Program,ps:Option<&Program>)->Option<crate::xr_hud::HudBlend> {
+        self.hud_audit_draw(vs,ps);
         use crate::xr_hud::ShaderKind as K;
         let Some(capture)=self.hud_capture.as_ref()else{return None;};
         if capture.rejected.is_some(){return None;}
@@ -1462,21 +1514,26 @@ impl Gpu {
     }
 
     fn finish_hud_draw(&mut self,vs:&Program,ps:Option<&Program>) {
+        self.hud_audit.completed();
         use crate::xr_hud::ShaderKind as K;
         if self.hud_draw.is_some(){if let Some(c)=&mut self.hud_capture{c.draws+=1;}return;}
         if !crate::xr_hud::enabled() || self.hud_capture.is_some()
             || (vs.hud_kind,ps.and_then(|p|p.hud_kind))!=(Some(K::LensVertex),Some(K::LensPixel)) {return;}
-        let Some(view)=self.world_view.filter(|v|v.headset_applied&&crate::xr_view::view_epoch_is_active(v.provenance_epoch))else{return;};
+        let Some(view)=self.world_view.filter(|v|v.headset_applied&&crate::xr_view::view_epoch_is_active(v.provenance_epoch))else{
+            self.hud_audit.lens("pinned_lens_has_no_active_headset_world_view");return;};
         let r=&self.s.rt[0];
-        let Some(t)=self.tex(r.tex)else{return;};
+        let Some(t)=self.tex(r.tex)else{self.hud_audit.lens("pinned_lens_target_unavailable");return;};
         let (blend,mask)=blend_for(self.state(self.s.blend.0).as_deref(),0);
         let expected=[0.,0.,t.desc.w as f32,t.desc.h as f32,0.,1.];
         if r.mip!=0 || r.slice!=0 || self.s.rt.iter().skip(1).any(|r|r.tex!=0)
             || t.desc.samples!=1 || t.desc.d!=1 || !matches!(t.format,TextureFormat::Bgra8Unorm|TextureFormat::Rgba8Unorm)
             || blend.is_some() || mask!=ColorWrites::ALL
             || self.s.viewports.first().copied().unwrap_or(expected)!=expected
-            || self.s.scissors.first().copied().unwrap_or([0,0,t.desc.w,t.desc.h])!=[0,0,t.desc.w,t.desc.h] {return;}
-        self.hud_capture=Some(HudCapture{final_id:r.tex,final_texture:t.tex.clone(),view,images:None,draws:0,scratch:HashMap::new(),rejected:None});
+            || self.s.scissors.first().copied().unwrap_or([0,0,t.desc.w,t.desc.h])!=[0,0,t.desc.w,t.desc.h] {
+            self.hud_audit.lens("pinned_lens_layout_viewport_scissor_or_blend_rejected");return;}
+        let capture=HudCapture{final_id:r.tex,final_texture:t.tex.clone(),view,images:None,draws:0,scratch:HashMap::new(),rejected:None};
+        self.hud_audit.lens("pinned_lens_candidate_started");
+        self.hud_capture=Some(capture);
     }
 
     fn color_phase_target(&self, id: u32) -> serde_json::Value {
@@ -4651,6 +4708,7 @@ impl Gpu {
         self.end_pass();
         self.hud_draw=None;
         let hud_capture=self.hud_capture.take();
+        self.finish_hud_audit(color_id,present_view.as_ref(),hud_capture.as_ref());
         if self.command_trace.wants_command(7) {
             self.command_trace.present(self.presents+1, present_view.as_ref(),
                 crate::xr_view::world_camera_enabled() && present_view.as_ref().is_some_and(|view|
