@@ -114,6 +114,52 @@ struct GameWorldVertex {
 // qualified NDC depth of one geometric corner, in [0, 1], or -1 when the
 // neighborhood is not one continuous plane. The neighborhood always contains
 // every texel that owns the corner, so an invalid or clear owner yields -1.
+//
+// Opt-in experiment: reserved.x == 1 enables a separately bounded smooth
+// surface fallback. The normal zero value preserves the original affine test.
+// It does not join arbitrary nearby depths: metric changes must stay within
+// source-ray footprint bounds, and border/sky/invalid neighborhoods stay isolated.
+static float boundedSmoothCornerDepth(uint2 corner, int2 base,
+        thread const float *samples, constant GameWorldUniforms &u) {
+    if (any(corner == 0) || any(corner >= u.sourceSize)) { return -1; }
+    float linearDepth[9];
+    float minimumDepth = INFINITY;
+    for (uint i = 0; i < 9; ++i) {
+        const float4 eye = u.sourceEyeFromClip * float4(0, 0, samples[i], 1);
+        if (!all(isfinite(eye)) || eye.w <= 1e-7 || eye.z >= 0) { return -1; }
+        linearDepth[i] = -eye.z / eye.w;
+        minimumDepth = min(minimumDepth, linearDepth[i]);
+    }
+    // A source pixel's X/Y ray interval at the nearest neighborhood depth.
+    // Native source projections are certified pinholes; asymmetric offsets
+    // change ray origins in NDC, not these neighboring-ray differences.
+    const float footprint = minimumDepth * min(
+        2 * abs(u.sourceEyeFromClip[0][0]) / float(u.sourceSize.x),
+        2 * abs(u.sourceEyeFromClip[1][1]) / float(u.sourceSize.y));
+    if (!isfinite(footprint) || footprint <= 0) { return -1; }
+    const float jumpLimit = 2 * footprint;
+    const float curvatureLimit = 0.25 * footprint;
+    for (uint y = 0; y < 3; ++y) {
+        for (uint x = 0; x < 2; ++x) {
+            if (abs(linearDepth[y * 3 + x + 1] - linearDepth[y * 3 + x]) > jumpLimit
+                || abs(linearDepth[(x + 1) * 3 + y] - linearDepth[x * 3 + y]) > jumpLimit) { return -1; }
+        }
+        if (abs(linearDepth[y * 3] - 2 * linearDepth[y * 3 + 1] + linearDepth[y * 3 + 2]) > curvatureLimit
+            || abs(linearDepth[y] - 2 * linearDepth[3 + y] + linearDepth[6 + y]) > curvatureLimit) { return -1; }
+    }
+    for (uint y = 0; y < 2; ++y) {
+        for (uint x = 0; x < 2; ++x) {
+            if (abs(linearDepth[y * 3 + x] - linearDepth[y * 3 + x + 1]
+                    - linearDepth[(y + 1) * 3 + x] + linearDepth[(y + 1) * 3 + x + 1]) > curvatureLimit) { return -1; }
+        }
+    }
+    // Four surrounding centers, selected from the same owner-independent 3x3
+    // neighborhood. Every owner therefore emits the same shared corner.
+    const int2 low = int2(corner) - base - 1;
+    const uint index = uint(low.y * 3 + low.x);
+    return (samples[index] + samples[index + 1] + samples[index + 3] + samples[index + 4]) * 0.25;
+}
+
 static float qualifiedCornerDepth(uint2 corner, constant GameWorldUniforms &u,
                                   texture2d<float, access::read> depth) {
     const float clearDepth = u.sourceDepthReversed != 0 ? 0.0 : 1.0;
@@ -132,17 +178,20 @@ static float qualifiedCornerDepth(uint2 corner, constant GameWorldUniforms &u,
     const float dx = (samples[2] - samples[0]) * 0.5;
     const float dy = (samples[6] - samples[0]) * 0.5;
     const float tolerance = 4 * (nextafter(magnitude, 2.0f) - magnitude);
+    bool affine = true;
     for (uint y = 0; y < 3; ++y) {
         for (uint x = 0; x < 3; ++x) {
             if (abs(samples[y * 3 + x] - (samples[0] + dx * x + dy * y)) > tolerance) {
-                return -1;
+                if (u.reserved.x != 1) { return -1; }
+                affine = false;
             }
         }
     }
     // At the image edge the nearest three centers give a consistent one-sided
     // half-texel extrapolation, rather than flattening the plane at the border.
     const float2 offset = float2(corner) - float2(base) - 0.5;
-    const float result = samples[0] + dx * offset.x + dy * offset.y;
+    const float result = affine ? samples[0] + dx * offset.x + dy * offset.y
+        : boundedSmoothCornerDepth(corner, base, samples, u);
     const float4 source = u.sourceEyeFromClip * float4(0, 0, result, 1);
     if (!isfinite(result) || result < 0 || result > 1 || !all(isfinite(source))
         || source.w <= 1e-7 || source.z >= 0) { return -1; }
