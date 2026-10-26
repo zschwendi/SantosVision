@@ -987,6 +987,76 @@ static bool gameWorldDepthEdgeSearch(float3 ray, constant GameWorldDepthEdgeFill
     return found;
 }
 
+// The search-entry texel identifies the visible surface beside a gap. It is
+// not generally the point where this display ray meets that surface. When a
+// complete local plane is certified, keep color and filled depth on that same
+// ray/plane intersection. Otherwise retain the original adjacent-texel repair.
+static bool gameWorldDepthEdgePlanarSample(float3 ray,
+        constant GameWorldDepthEdgeFillUniforms &u,
+        texture2d<float, access::read> depth, GameWorldDepthEdgeHit hit,
+        thread float2 &uv, thread float4 &point) {
+    if (hit.sky || any(u.sourceSize < 3)) { return false; }
+    const int2 base = clamp(int2(hit.texel) - 1, int2(0), int2(u.sourceSize) - 3);
+    float values[9];
+    float magnitude = 0;
+    const float clear = u.sourceDepthReversed != 0 ? 0 : 1;
+    for (uint y = 0; y < 3; ++y) {
+        for (uint x = 0; x < 3; ++x) {
+            const float z = depth.read(uint2(base + int2(x, y))).r;
+            if (!isfinite(z) || z < 0 || z > 1 || z == clear) { return false; }
+            values[y * 3 + x] = z;
+            magnitude = max(magnitude, abs(z));
+        }
+    }
+    const float dx = (values[2] - values[0]) * 0.5;
+    const float dy = (values[6] - values[0]) * 0.5;
+    // Same four-ULP affine certificate as continuous world corners. A nearby
+    // depth or a two-column step alone is not evidence of a continuous plane.
+    const float tolerance = 4 * (nextafter(magnitude, 2.0f) - magnitude);
+    for (uint y = 0; y < 3; ++y) {
+        for (uint x = 0; x < 3; ++x) {
+            if (abs(values[y * 3 + x] - (values[0] + dx * x + dy * y)) > tolerance) { return false; }
+        }
+    }
+    const float a = dx * float(u.sourceSize.x) * 0.5;
+    const float b = -dy * float(u.sourceSize.y) * 0.5;
+    const float c = values[0] - dx * (float(base.x) + 0.5 - float(u.sourceSize.x) * 0.5)
+        - dy * (float(base.y) + 0.5 - float(u.sourceSize.y) * 0.5);
+    const float4 plane = float4(-a, -b, 1, -c);
+    const float4 h0 = u.sourceClipFromCurrentEye * float4(ray, 0);
+    const float4 h1 = u.sourceClipFromCurrentEye[3];
+    const float previousS = (h0.z - hit.sourceDepth * h0.w) / (hit.sourceDepth * h1.w - h1.z);
+    const float4 previousPoint = float4(ray,
+        isfinite(previousS) && previousS > 0 ? previousS : hit.inverseDistance);
+    const float4 previousClip = u.currentClipFromEye * previousPoint;
+    const float previousDepth = previousClip.z / previousClip.w;
+    // Do not promote a previous out-of-range/far-depth repair into new finite
+    // coverage. This correction only refines an already finite filled pixel.
+    if (!all(isfinite(previousClip)) || previousClip.w <= 1e-7
+        || previousDepth <= 0 || previousDepth > 1) { return false; }
+    const float s = -dot(plane, h0) / dot(plane, h1);
+    if (!isfinite(s) || s <= 0 || s > u.maximumInverseDistance) { return false; }
+    const float4 h = h0 + s * h1;
+    if (!all(isfinite(h)) || h.w <= 1e-6) { return false; }
+    const float2 p = gameWorldDepthEdgeTexel(h, float2(u.sourceSize)) - 0.5;
+    // All four bilinear taps must be real centers inside this exact 3x3
+    // certificate. Never filter across an occluder, invalid depth or sky.
+    if (!all(isfinite(p)) || any(p < float2(base)) || any(p >= float2(base + 2))) { return false; }
+    const float4 candidate = float4(ray, s);
+    const float4 clip = u.currentClipFromEye * candidate;
+    const float z = clip.z / clip.w;
+    if (!all(isfinite(clip)) || clip.w <= 1e-7 || z <= 0 || z > 1) { return false; }
+    const float2 sampleUV = (p + 0.5) / float2(u.sourceSize);
+    // Normalizing and reconstructing texture coordinates can move an exact
+    // boundary a few ULPs. Certify the coordinates the sampler actually uses,
+    // too, so even a tiny nonzero tap cannot leave this depth neighborhood.
+    const float2 sampleP = clamp(sampleUV, 0.0, 1.0) * float2(u.sourceSize) - 0.5;
+    if (!all(isfinite(sampleP)) || any(sampleP < float2(base)) || any(sampleP >= float2(base + 2))) { return false; }
+    uv = sampleUV;
+    point = candidate;
+    return true;
+}
+
 fragment GameWorldDepthEdgeFillOut gameWorldDepthEdgeFillFragment(GameWorldSkyRepairVertex in [[stage_in]],
         constant GameWorldDepthEdgeFillUniforms &u [[buffer(0)]],
         device atomic_uint *counts [[buffer(1), function_constant(gameWorldDepthEdgeFillCounts)]],
@@ -1011,7 +1081,6 @@ fragment GameWorldDepthEdgeFillOut gameWorldDepthEdgeFillFragment(GameWorldSkyRe
     }
     ray /= rayLength;
     float3 rgb = gameWorldReadLinearSRGB(color, hit.texel, u.colorTransfer);
-    rgb = gameWorldLinearSRGBToP3(rgb);
     float4 point;
     if (hit.sky) {
         // The same finite support sphere the sky repair gives surviving sky.
@@ -1023,7 +1092,14 @@ fragment GameWorldDepthEdgeFillOut gameWorldDepthEdgeFillFragment(GameWorldSkyRe
         const float4 h1 = u.sourceClipFromCurrentEye[3];
         const float s = (h0.z - hit.sourceDepth * h0.w) / (hit.sourceDepth * h1.w - h1.z);
         point = float4(ray, isfinite(s) && s > 0 ? s : hit.inverseDistance);
+        float2 sampleUV;
+        float4 planarPoint;
+        if (gameWorldDepthEdgePlanarSample(ray, u, depth, hit, sampleUV, planarPoint)) {
+            point = planarPoint;
+            rgb = gameWorldSampleLinearSRGB(color, sampleUV, u.colorTransfer);
+        }
     }
+    rgb = gameWorldLinearSRGBToP3(rgb);
     const float4 clip = u.currentClipFromEye * point;
     const float z = clip.z / clip.w;
     GameWorldDepthEdgeFillOut out;

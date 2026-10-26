@@ -405,7 +405,21 @@ struct ColorPipelineMetalValidation {
             let old=autoreleasepool{render(oldPipelines,eye,head,before:true,view:false)}
             let manual=autoreleasepool{render(newPipelines,eye,head,before:false,view:false)}
             let hardware=autoreleasepool{render(newPipelines,eye,head,before:false,view:true)}
-            require(old.depth==manual.depth && old.owner==manual.owner,"Color correction preserves all depth and ownership bytes")
+            require(old.owner==manual.owner,"Finished-image corrections preserve all ownership bytes")
+            // The planar gap repair intentionally corrects depth only at an
+            // already uncovered pixel. ReprojectionFillPlaneValidation holds
+            // the independent surface/color oracle; SamplingValidation checks
+            // registered images, gates and fallback. Retain strict covered-depth
+            // and coverage checks here against the historical color baseline.
+            var filledDepthChanges = 0, coveredDepthChanges = 0, finiteCoverageChanges = 0
+            for i in 0..<width*height {
+                if old.depth[i] != manual.depth[i] {
+                    if old.owner[i] == 0 { filledDepthChanges += 1 } else { coveredDepthChanges += 1 }
+                }
+                if (old.depth[i] == 0) != (manual.depth[i] == 0) { finiteCoverageChanges += 1 }
+            }
+            require(coveredDepthChanges == 0,"Finished-image corrections preserve every covered depth bit")
+            require(finiteCoverageChanges == 0,"Gap repair preserves finite-depth coverage")
             require(manual.depth==hardware.depth && manual.owner==hardware.owner,"Hardware and fallback preserve depth/ownership")
             var changed=0,maximum=0,total=0,viewMaximum=0,viewTotal=0
             for i in 0..<width*height {var different=false;for c in 0..<3 {
@@ -428,8 +442,10 @@ struct ColorPipelineMetalValidation {
                 "original_readiness_at_snapshot":sources[eye].metadata["readiness_at_snapshot"]!,"original_deadline_fallback":sources[eye].metadata["diagnostic_deadline_fallback"]!,
                 "changed_world_pixels":changed,"maximum_world_code_delta":maximum,"mean_world_code_delta":Double(total)/Double(width*height*3),
                 "manual_hardware_maximum_code_delta":viewMaximum,"manual_hardware_mean_code_delta":Double(viewTotal)/Double(width*height*3),
-                "depth_owner_byte_identical":true,"depth_sha256":old.depth.withUnsafeBytes{hash(Data($0))},"owner_sha256":hash(Data(old.owner))])
-            print("PASS \(name): depth/owner exact; color changes \(changed)/\(width*height), hardware/fallback max \(viewMaximum) bytes")
+                "covered_depth_and_all_ownership_byte_identical":true,"filled_depth_changed_pixels":filledDepthChanges,
+                "before_depth_sha256":old.depth.withUnsafeBytes{hash(Data($0))},
+                "after_depth_sha256":hardware.depth.withUnsafeBytes{hash(Data($0))},"owner_sha256":hash(Data(old.owner))])
+            print("PASS \(name): covered depth/owner exact; \(filledDepthChanges) planar fill depth corrections; color changes \(changed)/\(width*height), hardware/fallback max \(viewMaximum) bytes")
         }}
         let report:[String:Any]=["schema":1,"device":device.name,"checks":checks,"completed_metal_renders":renders,"pass":true,
             "source_hashes":inputHashes,"oracle_samples":oracleRows,"maximum_before_oracle_error":maxBefore,"maximum_after_manual_oracle_error":maxAfter,
@@ -442,8 +458,8 @@ struct ColorPipelineMetalValidation {
             "export_color_space":"Display P3 (sRGB transfer)","source_export_color_space":"sRGB","target_format":"rgba8Unorm_srgb",
             "before_contract":"Frozen177acd5 rawBGRA→encoded-filter→manualdecode→sRGBtarget; output interpreted per CompositorServices P3 contract",
             "after_contract":"linear-light sampling→sRGBprimaries-to-P3→sRGBtarget; encoded-domain HUD source-over through destination fetch",
-            "no_resolution_guard_geometry_or_graphics_setting_change":true,"physical_quality_acceptance":false,"live_game_run":false,"simulator":false,
-            "limits":"Existing independently captured eye leases and their registered source matrices. Prescribed neutral and turned display poses. Original failed capture-readiness streak retained. Offline color/geometry verification; no new headset frame, flicker, latency or FPS acceptance."]
+            "no_resolution_guard_covered_geometry_or_graphics_setting_change":true,"physical_quality_acceptance":false,"live_game_run":false,"simulator":false,
+            "limits":"Existing independently captured eye leases and their registered source matrices. Prescribed neutral and turned display poses. Original failed capture-readiness streak retained. Filled depth can change under the separately tested planar gap-repair certificate; covered depth and all ownership remain exact. Offline color/geometry verification; no new headset frame, flicker, latency or FPS acceptance."]
         try JSONSerialization.data(withJSONObject:report,options:[.prettyPrinted,.sortedKeys]).write(to:output.appendingPathComponent("report.json"),options:.withoutOverwriting)
         print("PASS color pipeline: \(checks) checks, \(renders) completed Metal renders")
     }
