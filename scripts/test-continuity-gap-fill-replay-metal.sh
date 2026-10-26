@@ -19,7 +19,7 @@ Path(sys.argv[1]).write_text('import simd\nimport Foundation\nimport Metal\n' + 
 PY
 cp visionos/Tests/ContinuityGapFillReplayMetalValidation.swift "$out/build/main.swift"
 xcrun swiftc -O -D SV_GAME_RUNTIME "$out/build/GameWorldUniforms.swift" \
-    visionos/Sources/GameWorldFiniteSkyPolicy.swift visionos/Sources/GameWorldFiniteSkySupport.swift \
+    visionos/Sources/GameWorldOrderedCorners.swift visionos/Sources/GameWorldFiniteSkyPolicy.swift visionos/Sources/GameWorldFiniteSkySupport.swift \
     visionos/Sources/GameWorldDepthEdgeFillPolicy.swift visionos/Sources/GameWorldDepthEdgeFill.swift \
     "$out/build/main.swift" -o "$out/build/continuity-gap-fill-replay"
 "$out/build/continuity-gap-fill-replay" "$PWD" "$out" "$baseline"

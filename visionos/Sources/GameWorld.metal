@@ -1024,3 +1024,46 @@ fragment GameWorldDepthEdgeFillOut gameWorldDepthEdgeFillFragment(GameWorldSkyRe
     }
     return out;
 }
+
+// ---- Default-off exact source-order indexed corner sharing ----
+// Experimental entry points appended to the unchanged production source.
+// Keep the reference's two triangles for every pixel in row-major order.
+kernel void orderedCornerIndices(uint2 pixel [[thread_position_in_grid]],
+        constant GameWorldUniforms &u [[buffer(0)]],
+        device uint *indices [[buffer(1)]],
+        texture2d<float, access::read> corners [[texture(0)]]) {
+    if (any(pixel >= u.sourceSize)) { return; }
+    const uint own = pixel.y * u.sourceSize.x + pixel.x;
+    const uint sharedCount = (u.sourceSize.x + 1) * (u.sourceSize.y + 1);
+    uint v[4];
+    for (uint i = 0; i < 4; ++i) {
+        const uint2 corner = gameWorldCorner(i, pixel);
+        const float q = corners.read(corner).r;
+        v[i] = q >= 0 ? corner.y * (u.sourceSize.x + 1) + corner.x
+                     : sharedCount + own * 4 + i;
+    }
+    const uint order[6] = {0, 1, 2, 2, 1, 3};
+    for (uint i = 0; i < 6; ++i) { indices[own * 6 + i] = v[order[i]]; }
+}
+
+vertex GameWorldVertex orderedCornerVertex(uint id [[vertex_id]],
+        constant GameWorldUniforms &u [[buffer(0)]],
+        texture2d<float, access::read> depth [[texture(0)]],
+        texture2d<float, access::read> corners [[texture(1)]]) {
+    const uint sharedCount = (u.sourceSize.x + 1) * (u.sourceSize.y + 1);
+    if (id < sharedCount) {
+        const uint2 corner(id % (u.sourceSize.x + 1), id / (u.sourceSize.x + 1));
+        // This is an owner in the exact qualification neighborhood, including
+        // at the one-sided image borders. A qualified corner implies a valid
+        // finite (non-clear) owner. Keep that real owner's background semantics.
+        const uint2 owner = min(corner, u.sourceSize - 1);
+        const float z = depth.read(owner).r;
+        return gameWorldCornerVertex(corner, z, corners.read(corner).r, u);
+    }
+    const uint fallback = id - sharedCount;
+    const uint own = fallback / 4;
+    const uint2 pixel(own % u.sourceSize.x, own / u.sourceSize.x);
+    const uint2 corner = gameWorldCorner(fallback % 4, pixel);
+    const float z = depth.read(pixel).r;
+    return gameWorldCornerVertex(corner, z, z, u);
+}

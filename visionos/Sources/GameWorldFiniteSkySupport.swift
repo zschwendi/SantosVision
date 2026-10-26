@@ -17,6 +17,8 @@ final class GameWorldFiniteSkySupport: @unchecked Sendable {
     private let worldPipeline: any MTLRenderPipelineState
     private let repairPipeline: any MTLRenderPipelineState
     private let verticalPipeline: (any MTLRenderPipelineState)?
+    private let ordered: (helper: GameWorldOrderedCorners, world: any MTLRenderPipelineState)?
+    private let orderedRequested: Bool
     /// The exact existing nine-sample corner fit, evaluated once per geometric
     /// corner rather than once for each of its four source-texel owners.
     /// Diagnostic opt-in: the registered Mac source was slower after warming,
@@ -41,6 +43,7 @@ final class GameWorldFiniteSkySupport: @unchecked Sendable {
         let radius: Float
         let cornersPrecomputed: Bool
         let verticalReconstruction: Bool
+        let orderedCorners: Bool
     }
 
     private struct CornerCompletionLease: @unchecked Sendable {
@@ -62,7 +65,9 @@ final class GameWorldFiniteSkySupport: @unchecked Sendable {
     init?(device: any MTLDevice, library: any MTLLibrary,
           colorFormat: MTLPixelFormat, depthFormat: MTLPixelFormat,
           precomputeCorners: Bool = ProcessInfo.processInfo.environment["MUGUET_COMPOSITOR_CORNER_PRECOMPUTE"] == "1",
+          orderedCorners: Bool = ProcessInfo.processInfo.environment["MUGUET_COMPOSITOR_ORDERED_CORNERS"] == "1",
           verticalReconstruction: Bool = false) {
+        orderedRequested = orderedCorners
         guard let vertex = library.makeFunction(name: "gameWorldVertex"),
               let ownerFragment = library.makeFunction(name: "gameWorldSkyOwnershipFragment"),
               let repairVertex = library.makeFunction(name: "gameWorldSkyRepairVertex"),
@@ -118,6 +123,21 @@ final class GameWorldFiniteSkySupport: @unchecked Sendable {
             }
         }
         corners = precomputed
+        // A separate opt-in path shares only the already-qualified geometric
+        // corners. Its index stream retains both original triangles for every
+        // source pixel, in the original source order. Allocation/encode failure
+        // retains the complete original path below; no source samples are culled.
+        var orderedPipeline: (GameWorldOrderedCorners, any MTLRenderPipelineState)?
+        if orderedCorners, let vertex = library.makeFunction(name: "orderedCornerVertex"),
+           let helper = GameWorldOrderedCorners(device: device, library: library) {
+            let descriptor = world.copy() as! MTLRenderPipelineDescriptor
+            descriptor.label = "Finite sky: exact source-order indexed corner sharing"
+            descriptor.vertexFunction = vertex
+            if let pipeline = try? device.makeRenderPipelineState(descriptor: descriptor) {
+                orderedPipeline = (helper, pipeline)
+            }
+        }
+        ordered = orderedPipeline
         repairPipeline = rp
         worldDepth = wd
         repairDepth = rd
@@ -155,7 +175,12 @@ final class GameWorldFiniteSkySupport: @unchecked Sendable {
         // the original vertex path. Acquired textures stay exclusively leased
         // until this command completes even when precompute cannot be encoded.
         var cornerDepths: (any MTLTexture)?
-        if let corners,
+        // Qualification is source-only. The first integration is restricted
+        // to the normal bilinear/affine route verified independently; other
+        // reconstruction experiments retain their original pipelines.
+        let orderedResources = !(allowVerticalReconstruction && verticalPipeline != nil) && uniforms.reserved == .zero
+            ? ordered?.helper.prepare(commands: commands, uniforms: uniforms, depth: depth) : nil
+        if orderedResources == nil, let corners,
            let texture = cornerPool.acquire(device: target.device, width: color.width, height: color.height) {
             let completion = CornerCompletionLease(pool: cornerPool, lease: CornerScratchLease(textures: [texture]))
             commands.addCompletedHandler { _ in completion.release() }
@@ -186,7 +211,9 @@ final class GameWorldFiniteSkySupport: @unchecked Sendable {
         encoder.label = "EXPERIMENT final sky ownership (0 uncovered, 1 sky, 2 finite)"
         encoder.setViewport(viewport)
         var reconstructed = false
-        if cornerDepths != nil, let corners {
+        if orderedResources != nil, let ordered {
+            encoder.setRenderPipelineState(ordered.world)
+        } else if cornerDepths != nil, let corners {
             if allowVerticalReconstruction, let vertical = corners.verticalWorld {
                 encoder.setRenderPipelineState(vertical)
                 reconstructed = true
@@ -202,18 +229,48 @@ final class GameWorldFiniteSkySupport: @unchecked Sendable {
         encoder.setFragmentBytes(&uniforms, length: MemoryLayout<GameWorldUniforms>.stride, index: 0)
         encoder.setVertexTexture(depth, index: 0)
         if let cornerDepths { encoder.setVertexTexture(cornerDepths, index: 1) }
+        if let orderedResources { encoder.setVertexTexture(orderedResources.corners, index: 1) }
         encoder.setFragmentTexture(color, index: 0)
         if reconstructed { encoder.setFragmentTexture(depth, index: 1) }
-        encoder.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4,
-                               instanceCount: Int(uniforms.sourceSize.x) * Int(uniforms.sourceSize.y))
+        if let orderedResources {
+            encoder.drawIndexedPrimitives(type: .triangle,
+                indexCount: Int(uniforms.sourceSize.x) * Int(uniforms.sourceSize.y) * 6,
+                indexType: .uint32, indexBuffer: orderedResources.indices, indexBufferOffset: 0)
+        } else {
+            encoder.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4,
+                                   instanceCount: Int(uniforms.sourceSize.x) * Int(uniforms.sourceSize.y))
+        }
         encoder.endEncoding()
 
         let radius = far * 0.8
         guard encodeRepair(commands: commands, depth: targetDepth, slice: pass.depthAttachment.slice,
             ownership: ownership, viewport: viewport, projection: projection, radius: radius) else { return nil }
         return Result(ownership: ownership, radius: radius, cornersPrecomputed: cornerDepths != nil,
-                      verticalReconstruction: reconstructed)
+                      verticalReconstruction: reconstructed, orderedCorners: orderedResources != nil)
     }
+
+    func orderedCornerStatus() -> [String: Any] {
+        var status: [String: Any] = ["requested": orderedRequested, "pipeline_available": ordered != nil,
+            "maximum_scratch_bytes": GameWorldOrderedCornersBudget.maximumBytes,
+            "maximum_sets": GameWorldOrderedCornersBudget.maximumSets,
+            "scope": "CPU configuration/resource lifetime only; exact source order retained, bounded resources fall back to original draw. No physical performance acceptance."]
+        if let ordered {
+            let statistics = ordered.helper.statistics
+            status["sets"] = statistics.sets
+            status["busy_sets"] = statistics.busy
+            status["scratch_bytes"] = statistics.bytes
+            status["released_leases"] = statistics.releasedLeases
+        }
+        return status
+    }
+
+    #if SV_ORDERED_CORNERS_VALIDATION
+    // Inject refusal at the real optional encoder boundary in offscreen tests.
+    // The shipping build has neither this entry point nor the helper switch.
+    func validationRejectOrderedEncoderOrdinal(_ ordinal: Int?) {
+        ordered?.helper.validationRejectEncoderOrdinal = ordinal
+    }
+    #endif
 
     /// A separate ordered pass is essential: a support sphere may be nearer
     /// than legitimate world geometry. Final MRT ownership, rather than support

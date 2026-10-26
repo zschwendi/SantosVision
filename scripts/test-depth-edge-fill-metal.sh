@@ -18,7 +18,7 @@ pathlib.Path(sys.argv[1]).write_text('import simd\nimport Foundation\nimport Met
 PY
 cp visionos/Tests/DepthEdgeFillMetalValidation.swift "$out/build/main.swift"
 xcrun swiftc -O -D SV_GAME_RUNTIME "$out/build/GameWorldUniforms.swift" \
-    visionos/Sources/GameWorldFiniteSkyPolicy.swift visionos/Sources/GameWorldFiniteSkySupport.swift \
+    visionos/Sources/GameWorldOrderedCorners.swift visionos/Sources/GameWorldFiniteSkyPolicy.swift visionos/Sources/GameWorldFiniteSkySupport.swift \
     visionos/Sources/GameWorldDepthEdgeFillPolicy.swift visionos/Sources/GameWorldDepthEdgeFill.swift \
     visionos/Tests/DepthEdgeFillMirror.swift "$out/build/main.swift" \
     -o "$out/build/depth-edge-fill-metal-validation"

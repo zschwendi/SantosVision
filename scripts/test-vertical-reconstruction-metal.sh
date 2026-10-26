@@ -15,6 +15,6 @@ Path(sys.argv[1]).write_text('import simd\nimport Foundation\nimport Metal\n'+s[
 PY
 cp visionos/Tests/VerticalReconstructionMetalValidation.swift "$out/build/main.swift"
 xcrun swiftc -O -D SV_GAME_RUNTIME "$out/build/GameWorldUniforms.swift" \
-    visionos/Sources/GameWorldFiniteSkyPolicy.swift visionos/Sources/GameWorldFiniteSkySupport.swift \
+    visionos/Sources/GameWorldOrderedCorners.swift visionos/Sources/GameWorldFiniteSkyPolicy.swift visionos/Sources/GameWorldFiniteSkySupport.swift \
     "$out/build/main.swift" -o "$out/build/vertical-reconstruction-validation"
 "$out/build/vertical-reconstruction-validation" "$PWD" "$out" "$baseline" "${3:-}"

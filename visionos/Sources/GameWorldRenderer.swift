@@ -1015,7 +1015,8 @@ final class GameWorldRenderer: @unchecked Sendable {
                             currentClipFromEye: uniforms.currentClipFromEye,
                             nearFadeDistances: uniforms.nearFadeDistances, timestamp: timestamp,
                             outputViewIndex: 0, renderingMethod: (singleSource == nil
-                                ? (encoded.finiteSkyFirstEye ? "finite_sky_support_experiment_depth_mesh"
+                                ? (encoded.finiteSkyFirstEye ? (encoded.orderedCornersFirstEye
+                                    ? "finite_sky_support_ordered_corners_depth_mesh" : "finite_sky_support_experiment_depth_mesh")
                                     : (encoded.copy ? "source_anchor_copy" : "independent_eye_depth_mesh"))
                                 : "single_source_depth_stereo") + (encoded.hudIsolated ? "_single_hud_canvas" : ""))
                         didDebugCapture = true
@@ -1331,11 +1332,12 @@ final class GameWorldRenderer: @unchecked Sendable {
                         sources: [GameWorldSourceEye], pairQualified: Bool, timestamp: Double,
                         commands: any MTLCommandBuffer, cornerScratch: inout CornerScratchLease,
                         adaptiveScratch: inout AdaptiveScratchLease,
-                        singleSource: GameWorldSourceEye? = nil) -> (views: Int, copy: Bool, finiteSkyFirstEye: Bool, hudIsolated: Bool,
+                        singleSource: GameWorldSourceEye? = nil) -> (views: Int, copy: Bool, finiteSkyFirstEye: Bool, orderedCornersFirstEye: Bool, hudIsolated: Bool,
                             displayOptics: GameWorldScopeOptics.Optics) {
         var clearedTextures = Set<String>()
         var encodedViews = 0
         var finiteSkyFirstEye = false
+        var orderedCornersFirstEye = false
         // Both eyes use one original-game aim sample, even if the script thread
         // publishes another sample between the two encoding calls.
         let gameplayAim = reticle == nil ? nil : GameWorldReticle.snapshot()
@@ -1488,6 +1490,7 @@ final class GameWorldRenderer: @unchecked Sendable {
             if skyOutcome == .encoded, let source {
                 encodedViews += 1
                 if eye == 0 { finiteSkyFirstEye = true }
+                if eye == 0 { orderedCornersFirstEye = skyResult?.orderedCorners == true }
                 // The fill reconstructs the exact frame the world pass drew.
                 var fill: GameWorldDepthEdgeFillUniforms?
                 if imageQuality.fillRequested {
@@ -1635,7 +1638,7 @@ final class GameWorldRenderer: @unchecked Sendable {
             encoder.endEncoding()
             if let adaptiveSet, let adaptiveMesh { adaptiveMesh.encodeCounterCopy(commands: commands, set: adaptiveSet) }
         }
-        return (encodedViews, copyDecision != nil, finiteSkyFirstEye, hudSnapshot != nil, displayOptics)
+        return (encodedViews, copyDecision != nil, finiteSkyFirstEye, orderedCornersFirstEye, hudSnapshot != nil, displayOptics)
     }
 
     /// Synchronized compact snapshot read by the existing lifecycle report.
@@ -1651,6 +1654,7 @@ final class GameWorldRenderer: @unchecked Sendable {
             "vertical_reconstruction_requires_qualified_hud": true,
             "scope": "Pipeline availability only; each drawable also needs qualified HUD isolation. Per-pixel support qualification and visible quality are not counted."
         ] as [String: Any]
+        value["ordered_corners"] = finiteSkySupport?.orderedCornerStatus()
         return value
     }
 
