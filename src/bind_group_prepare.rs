@@ -2,6 +2,10 @@
 //! The resource walk and fresh uniform snapshot remain in gpu.rs on every call.
 use std::time::Duration;
 
+fn key_first_requested(existing_prepare:bool,value:Option<&str>)->bool {
+    existing_prepare && value==Some("1")
+}
+
 pub(super) const KEY_INLINE: usize = 32;
 pub(super) const ENTRIES_INLINE: usize = 12;
 
@@ -102,6 +106,14 @@ impl<T> EntryScratch<T> {
 
 pub(super) struct BindGroupPrepare {
     pub(super) enabled: bool,
+    pub(super) key_first: bool,
+    key_first_publisher:u64,
+    key_first_calls: u64,
+    key_first_hits: u64,
+    key_first_fallbacks: u64,
+    key_first_owned_items_avoided: u64,
+    key_first_binding_items: [u64;4],
+    key_first_hit_binding_items: [u64;4],
     calls: u64,
     lookups: u64,
     hits: u64,
@@ -122,16 +134,38 @@ pub(super) struct BindGroupPrepare {
 
 impl BindGroupPrepare {
     pub(super) fn from_environment() -> Self {
-        Self::new(crate::draw_setup::bind_group_prepare_enabled())
+        let mut result=Self::new(crate::draw_setup::bind_group_prepare_enabled());
+        result.key_first=key_first_requested(result.enabled,std::env::var("MUGUET_BIND_GROUP_KEY_FIRST").ok().as_deref());
+        result.key_first_publisher=super::bind_group_key_first_status::begin(result.key_first);
+        result
     }
 
     pub(super) fn new(enabled: bool) -> Self {
-        Self { enabled, calls: 0, lookups: 0, hits: 0, misses: 0,
+        Self { enabled, key_first:false,key_first_publisher:0, key_first_calls:0,key_first_hits:0,key_first_fallbacks:0,
+            key_first_owned_items_avoided:0,key_first_binding_items:[0;4],key_first_hit_binding_items:[0;4],
+            calls: 0, lookups: 0, hits: 0, misses: 0,
             inline_key_lookups: 0, key_spills: 0, entry_spills: 0,
             owned_key_materializations: 0, owned_entry_materializations: 0,
             entry_items_on_miss: 0, cache_invalidations: 0,
             skipped_set_obj_invalidations: [0; 4], skipped_destroy_invalidations: [0; 4],
             sampled_calls: 0, sampled_wall_ns: 0, sampled_max_ns: 0 }
+    }
+
+    pub(super) fn publish_key_first_status(&self) {
+        super::bind_group_key_first_status::publish(self.key_first_publisher,super::bind_group_key_first_status::Counters{
+            calls:self.calls,lookups:self.key_first_calls,hits:self.key_first_hits,fallbacks:self.key_first_fallbacks,
+            avoided:self.key_first_owned_items_avoided,mix:self.key_first_binding_items,hit_mix:self.key_first_hit_binding_items});
+    }
+
+    pub(super) fn key_first_fallback(&mut self) { self.key_first_fallbacks=self.key_first_fallbacks.saturating_add(1); }
+    pub(super) fn key_first_lookup(&mut self,hit:bool,items:usize,mix:[u64;4]) {
+        self.key_first_calls=self.key_first_calls.saturating_add(1);
+        for (total,count) in self.key_first_binding_items.iter_mut().zip(mix) {*total=total.saturating_add(count);}
+        if hit {
+            self.key_first_hits=self.key_first_hits.saturating_add(1);
+            self.key_first_owned_items_avoided=self.key_first_owned_items_avoided.saturating_add(items as u64);
+            for (total,count) in self.key_first_hit_binding_items.iter_mut().zip(mix) {*total=total.saturating_add(count);}
+        }
     }
 
     // One sample in 64 calls keeps timing overhead out of most draw calls.
@@ -185,6 +219,13 @@ impl BindGroupPrepare {
 
     pub(super) fn metrics(&self) -> serde_json::Value {
         serde_json::json!({"schema":1,"enabled":self.enabled,
+            "key_first_enabled":self.key_first,"key_first_eligible_lookups":self.key_first_calls,
+            "key_first_hits":self.key_first_hits,"key_first_fallbacks":self.key_first_fallbacks,
+            "key_first_owned_resource_items_avoided":self.key_first_owned_items_avoided,
+            "key_first_binding_items":{"uniform":self.key_first_binding_items[0],"sampler":self.key_first_binding_items[1],
+                "texture":self.key_first_binding_items[2],"storage_buffer":self.key_first_binding_items[3]},
+            "key_first_hit_binding_items":{"uniform":self.key_first_hit_binding_items[0],"sampler":self.key_first_hit_binding_items[1],
+                "texture":self.key_first_hit_binding_items[2],"storage_buffer":self.key_first_hit_binding_items[3]},
             "calls":self.calls,"lookups":self.lookups,"hits":self.hits,"misses":self.misses,
             "inline_key_lookups":self.inline_key_lookups,"key_spills":self.key_spills,
             "entry_spills":self.entry_spills,
@@ -210,6 +251,17 @@ impl BindGroupPrepare {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    #[test]
+    fn key_first_is_separately_opt_in_and_requires_existing_prepare() {
+        for existing in [false,true] {
+            for value in [None,Some(""),Some("0"),Some("true"),Some("2"),Some("1"),Some(" 1"),Some("1 ")] {
+                assert_eq!(key_first_requested(existing,value),existing &&value==Some("1"));
+            }
+        }
+        assert!(!BindGroupPrepare::new(true).key_first);
+        assert!(!BindGroupPrepare::new(false).key_first);
+    }
 
     #[test]
     fn pure_invalidation_relevance_covers_nonbinding_replacements_and_missing_resources() {

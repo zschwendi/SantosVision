@@ -67,6 +67,7 @@ pub(crate) fn status_json() -> serde_json::Value {
         "render_prepare": render_prepare_enabled(),
         "uniform_stage_pack": uniform_stage_pack_enabled(),
         "bind_group_prepare": bind_group_prepare_enabled(),
+        "bind_group_key_first": crate::gpu::bind_group_key_first_status_json(),
         "uniform_snapshot": uniform_snapshot_enabled(),
         "metal_skip_empty_transit": wgpu::wgc::rendering_overhead::metal_transit_requested(),
         "metal_skip_empty_prepass": wgpu::wgc::rendering_overhead::metal_prepass_requested(),

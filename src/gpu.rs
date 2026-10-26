@@ -30,6 +30,12 @@ use uniform_snapshot::UniformSnapshot;
 mod bind_group_prepare;
 use bind_group_prepare::{BindGroupPrepare, EntryScratch, KeyScratch, NonBindingKind};
 
+#[path = "bind_group_key_first.rs"]
+mod bind_group_key_first;
+#[path = "bind_group_key_first_status.rs"]
+mod bind_group_key_first_status;
+pub(crate) use bind_group_key_first_status::status_json as bind_group_key_first_status_json;
+
 #[cfg(all(test, target_os = "macos"))]
 #[path = "guest_write_tests.rs"]
 mod guest_write_tests;
@@ -3127,6 +3133,13 @@ impl Gpu {
     }
 
     fn stage_bind_group_inner(&mut self, stage: usize, prog: &Program, group: u32, bgl: &(BindGroupLayout, u64)) -> Option<BgResult> {
+        if self.bind_group_prepare.enabled && self.bind_group_prepare.key_first {
+            let bindings = prog.group_bindings.get(&group).map(Vec::as_slice).unwrap_or(&[]);
+            if self.key_first_bindings_eligible(stage, prog, bindings) {
+                return self.stage_bind_group_key_first(stage, prog, bindings, bgl);
+            }
+            self.bind_group_prepare.key_first_fallback();
+        }
         enum Res { Buf(Buffer, u64, Option<u64>), View(TextureView), Smp(Sampler) }
         let bindings = self.render_prepare.bindings(prog.group_bindings.get(&group).map(Vec::as_slice).unwrap_or(&[]));
         let fast = self.bind_group_prepare.enabled;
@@ -4866,6 +4879,7 @@ impl Gpu {
             log(&format!("render prepare: {}", self.render_prepare.metrics(self.presents, self.draws, self.passes, self.submits, self.errors.load(Ordering::Relaxed))));
             log(&format!("uniform stage pack: {}", self.uniform_pack.metrics(self.presents, self.draws, self.submits, self.errors.load(Ordering::Relaxed))));
             log(&format!("uniform snapshot cache: {}", self.uniform_snapshot.metrics()));
+            self.bind_group_prepare.publish_key_first_status();
             log(&format!("bind group prepare: {}", self.bind_group_prepare.metrics()));
             if let Some(r) = self.instance.generate_report() {
                 let h = &r.hub;
