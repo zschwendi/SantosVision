@@ -1,6 +1,10 @@
 # Third-person immersive fidelity on the27 baseline
 
-## Latest local candidate — V27.7, October26
+## Latest local candidate — V27.8, October26
+
+V27.8 retains the V27.7 color correction and adds elapsed-time/pair-max source coverage plus depth-qualified planar gap sampling. A separate standalone same-eye density fixture implements the first native-raster step toward a high-density center, with no app integration or runtime publication. See [V27.8 image stability, evidence and acceptance](THIRD-PERSON-IMAGE-STABILITY-20261026.md). The package is local only; hardware quality remains unaccepted. This section and its linked test supersede the historical V27.6 acceptance plans below.
+
+## Preserved V27.7 color candidate — October26
 
 The new agent implemented and locally verified a production color-path correction: decode-before-filter source sampling, explicit sRGB-to-linear-Display-P3 output, original encoded-domain HUD composition and color-tagged captures. Registered actual-game Metal before/after comparisons preserve depth and ownership. V27.6 remains frozen and uninstalled; V27.7 is a separate local candidate. No device, iPad or simulator action occurred. See [V27.7 color fidelity and acceptance](THIRD-PERSON-COLOR-FIDELITY-20261026.md) for evidence, remaining overscan/performance limits and the next single headset test. The older candidate and performance-experiment sections below remain historical evidence, not instructions to install V27.6 or enable its experiments.
 
@@ -59,7 +63,7 @@ Sixteen assembled offscreen replays of those actual registered sources cover bot
 
 The taller producer itself costs more: last native Mac log samples are roughly63 presents/s at1440 and51 at2304, without a concurrent live compositor. They do not predict headset FPS. Faster reconstruction does not guarantee a60FPS game or4K stereo60. The separate adaptive mesh failed4/42 ownership/depth cases and remains excluded.
 
-## Next actual headset check
+## Historical V27.6 headset plan — superseded
 
 Use V27.6 after its complete package checks. Measure the ordered source cache and native key-first path at the same1440-line scene and graphics settings, with actual per-eye preparations, periodic binding counters, command timing and matched source-pose age. Use the normal live window→expand route;300 presents can still be loading and must not trigger an unqualified automatic jump. Preserve independently rendered eyes, guard/freshness defaults and no single-source diagnostic. Resolve the current own-app Documents path and set a unique absolute latency trace path before native startup. A recent ready timestamp alone does not remove old source-pose lag. Capture-enabled shader-read usage may change storage/performance, so label readback separately. Common-target QA and lower submission depth are independent later comparisons. The prior bounded device query still found27.3 installed; copying its last report yielded an inactive05:19Z window session, not fresh runtime or current wearer readiness.
 
@@ -72,6 +76,6 @@ Use V27.6 after its complete package checks. Measure the ordered source cache an
 - Queue-pressure QA can select1/2/3 compositor commands in flight; unset/invalid preserves3. CPU bound checks and integrated Swift6 typecheck pass. No latency or FPS benefit is established. Compare separately from cache changes.
 - Safe-math GPU source compaction remains **isolated and excluded from this app candidate**.83 compacted-vs-safe cases,114 pool checks and98 integration checks pass, but safe-vs-original pixels differ and registered-scene timings are mixed/regressions. A declared guard3 matrix stress saves24.45% on M4, not a registered game/AVP image. Resource fallback could expose arithmetic differences as flicker. Its frozen branch `73490d2` and qualification report are retained; do not enable it for normal play or treat synthetic stress as headset evidence.
 
-The next live package after its full build/signature/AOT checks is V27.6. Keep the first normal1440-line profile on unchanged graphics/guard settings, with the original distinct sources and no debug readback. The source cache and key-first binding flags can be measured with completed telemetry and a unique absolute latency export path. Common-target QA, submission-depth changes and source readback are separate comparisons. Never use the single-source diagnostic as a stereo fix. The existing physical27.3 screenshots and M2 report remain the last genuine headset visual evidence until a fresh session is obtained.
+The earlier V27.6 plan below is historical; use the latest candidate acceptance document above. That plan retained the first normal1440-line profile on unchanged graphics/guard settings, with the original distinct sources and no debug readback. The source cache and key-first binding flags can be measured with completed telemetry and a unique absolute latency export path. Common-target QA, submission-depth changes and source readback are separate comparisons. Never use the single-source diagnostic as a stereo fix. The existing physical27.3 screenshots and M2 report remain the last genuine headset visual evidence until a fresh session is obtained.
 
 All evidence is private under the canonical checkout's `target/verification/device-session-20261025/third-person27/`, especially `device-quality27-3-20261025/`, `quality27-3-device/`, `ordered-corners-experiment/`, `ordered-corners-pool/`, `scene-fixture-repair/` and `registered-optical-comparison/`. No simulator, banked reset, unrelated media or public game-asset publication was used.
