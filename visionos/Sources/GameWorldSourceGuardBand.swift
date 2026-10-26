@@ -49,16 +49,31 @@ enum GameWorldSourceGuardBand {
 /// The cap is explicit: turns beyond it and translation disocclusions remain
 /// unsupported, rather than stretching edge pixels or delaying the display pose.
 struct GameWorldSourceCoverage {
+    // Share the native lease admission bound. An admitted stalled source must
+    // raise the horizon to its cap rather than silently losing its age signal.
+    static let maximumSourceAge: Double = 1
     private var previous: (time: Double, pose: simd_float4x4)?
     private var speed: Double = 0
     private var horizon: Double = 0.18 // actual build18 source lag was 100–160ms
+    private var horizonObservedAt: Double?
     private(set) var scale = GameWorldSourceGuardBand.configuredScale
     private(set) var saturated = false
 
-    mutating func observeSourceAge(_ age: Double) {
-        guard age.isFinite, age >= 0, age <= 0.5 else { return }
-        // Keep a conservative rolling peak; old stalls do not hold blur forever.
-        horizon = min(0.3, max(0.1, max(horizon * 0.98, age + 0.03)))
+    mutating func observeSourceAges(_ ages: [Double], timestamp: Double) {
+        guard timestamp.isFinite,
+              let age = ages.filter({ $0.isFinite && $0 >= 0 && $0 <= Self.maximumSourceAge }).max() else { return }
+        let elapsed = timestamp - (horizonObservedAt ?? timestamp)
+        guard elapsed >= 0 else { return }
+        // One conservative rolling peak for the whole display pair. The old
+        // 0.98 decay ran once per eye: swapping eyes or repeating a callback
+        // changed the next source projection without any new motion evidence.
+        // Preserve that decay at one observation per nominal 60 Hz frame
+        // (time constant ~0.825 s), slower than the former stereo cadence.
+        // Equal timestamps may raise the peak but never decay it; stale
+        // timestamps cannot change the budget or its observation clock.
+        let decay = exp(log(0.98) * 60 * elapsed)
+        horizon = min(0.3, max(0.1, max(horizon * decay, age + 0.03)))
+        horizonObservedAt = timestamp
     }
 
     mutating func sample(timestamp: Double, pose: simd_float4x4,

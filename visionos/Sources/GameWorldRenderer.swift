@@ -184,7 +184,7 @@ private final class GameWorldLease: @unchecked Sendable {
               native.view_count == UInt32(viewCount), native.reserved == 0,
               native.depth_convention == 0, native.width > 1, native.height > 1,
               native.presentation_time.isFinite,
-              abs(timestamp - native.presentation_time) <= 1,
+              abs(timestamp - native.presentation_time) <= GameWorldSourceCoverage.maximumSourceAge,
               validWorldMatrix(projection), validWorldMatrix(eyeTransform), validWorldMatrix(stageTransform),
               let colorPointer = UnsafeRawPointer(bitPattern: UInt(native.color_texture)),
               let depthPointer = UnsafeRawPointer(bitPattern: UInt(native.depth_texture)),
@@ -1014,9 +1014,8 @@ final class GameWorldRenderer: @unchecked Sendable {
             } else if sampleCompletedPair { imageQuality.completedPairs.discardUnqualifiedSample() }
             if builtIn {
                 sourceCoverageMagnification = encoded.displayOptics.magnification
-                for source in sources where source.kind == .actual {
-                    sourceCoverage.observeSourceAge(timestamp - source.presentationTime)
-                }
+                sourceCoverage.observeSourceAges(sources.filter { $0.kind == .actual }
+                    .map { timestamp - $0.presentationTime }, timestamp: timestamp)
             }
             if builtIn, encoded.views == drawable.views.count, !sources.isEmpty {
                 if let first = sources.first, first.kind != .actual {
