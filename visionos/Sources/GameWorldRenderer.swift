@@ -11,11 +11,8 @@ struct GameWorldConfiguration: CompositorLayerConfiguration {
     func makeConfiguration(capabilities: LayerRenderer.Capabilities,
                            configuration: inout LayerRenderer.Configuration) {
         let colorFormats = capabilities.supportedColorFormats(options: [])
-        // Some compositor/simulator configurations expose only sRGB targets.
-        // Negotiate first; the shader matches the destination's transfer function.
-        configuration.colorFormat = colorFormats.contains(.bgra8Unorm) ? .bgra8Unorm
-            : colorFormats.contains(.bgra8Unorm_srgb) ? .bgra8Unorm_srgb
-            : colorFormats.first ?? configuration.colorFormat
+        configuration.colorFormat = GameWorldColor.compositorFormat(supported: colorFormats,
+            fallback: configuration.colorFormat)
         if capabilities.supportedDepthFormats.contains(.depth32Float) {
             configuration.depthFormat = .depth32Float
         }
@@ -232,7 +229,7 @@ private final class GameWorldLease: @unchecked Sendable {
                       guardScale: retained.eyes[eye].sourceGuardBandScale, optics: optics).passed else { return nil }
         }
         self.native = native
-        self.color = color
+        self.color = GameWorldColor.samplingTexture(color)
         self.depth = depth
         self.opticalFrame = opticalFrame
         sourceProjection = projection
@@ -1783,7 +1780,7 @@ final class GameWorldRenderer: @unchecked Sendable {
                     completionEyes.append(completionEye)
                 }
                 if !loggedFrame {
-                    log.info("Actual GTA source eye \(eye): kind=\(sourceEye.kind.rawValue, privacy: .public) size=\(sourceEye.width)x\(sourceEye.height) format=\(sourceEye.color.pixelFormat.rawValue) color_device=\(sourceEye.color.device.registryID) compositor_device=\(self.layer.device.registryID) eye_x=\(view.transform.columns.3.x) projection_x=\(uniforms.currentClipFromEye.columns.2.x) source_near=\(sourceEye.depthNear) source_far=\(sourceEye.depthFar) corner_precompute=\(corners != nil) adaptive=\(adaptiveSet != nil) copy=\(copyDecision != nil)")
+                    log.info("Actual GTA source eye \(eye): kind=\(sourceEye.kind.rawValue, privacy: .public) size=\(sourceEye.width)x\(sourceEye.height) sampling_format=\(sourceEye.color.pixelFormat.rawValue) color_device=\(sourceEye.color.device.registryID) compositor_device=\(self.layer.device.registryID) eye_x=\(view.transform.columns.3.x) projection_x=\(uniforms.currentClipFromEye.columns.2.x) source_near=\(sourceEye.depthNear) source_far=\(sourceEye.depthFar) corner_precompute=\(corners != nil) adaptive=\(adaptiveSet != nil) copy=\(copyDecision != nil)")
                 }
             }
             if source?.eye.kind == .actual, let hudSnapshot {
@@ -1855,11 +1852,7 @@ final class GameWorldRenderer: @unchecked Sendable {
             sourceSize: SIMD2<UInt32>(eye.width, eye.height))
         uniforms.reserved.x = smoothSurfaceContinuity ? 1 : 0
         uniforms.sourceDepthReversed = eye.sourceProjection.columns.2.z >= 0 ? 1 : 0
-        let sourceSRGB = eye.color.pixelFormat == .rgba8Unorm_srgb || eye.color.pixelFormat == .bgra8Unorm_srgb
-        let destinationEncoded = layer.configuration.colorFormat == .bgra8Unorm
-            || layer.configuration.colorFormat == .rgba8Unorm
-        if sourceSRGB && destinationEncoded { uniforms.colorTransfer = 1 }
-        else if !sourceSRGB && !destinationEncoded { uniforms.colorTransfer = 2 }
+        uniforms.colorTransfer = GameWorldColor.sourceTransfer(eye.color.pixelFormat)
         return uniforms
     }
 

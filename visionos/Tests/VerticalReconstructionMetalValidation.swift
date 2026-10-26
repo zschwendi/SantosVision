@@ -27,13 +27,9 @@ fragment float4 auditSample(float4 p [[position]], constant GameWorldUniforms &u
     const float2 texel = m.origin + (p.x-.5)*m.dx + (p.y-.5)*m.dy;
     const float2 uv = (texel+.5)/float2(u.sourceSize);
     const float2 dx = dfdx(uv)*float2(u.sourceSize), dy = dfdy(uv)*float2(u.sourceSize);
-    constexpr sampler s(filter::linear,address::clamp_to_edge);
     GameWorldVerticalSample v = m.enabled != 0 ? gameWorldVerticalSample(uv,dx,dy,m.background,u,color,depth)
-        : GameWorldVerticalSample{color.sample(s,uv).rgb,0};
-    float3 rgb = v.rgb;
-    if(u.colorTransfer==1) rgb=select(1.055*pow(max(rgb,0.0),float3(1.0/2.4))-.055,12.92*rgb,rgb<=.0031308);
-    else if(u.colorTransfer==2) rgb=select(pow((max(rgb,0.0)+.055)/1.055,float3(2.4)),rgb/12.92,rgb<=.04045);
-    return float4(rgb,float(v.eligible));
+        : GameWorldVerticalSample{gameWorldSampleLinearSRGB(color,uv,u.colorTransfer),0};
+    return float4(gameWorldLinearSRGBToP3(v.rgb),float(v.eligible));
 }
 fragment GameWorldSkyOwnershipOut auditWorldEligibility(GameWorldVertex in [[stage_in]],
         constant GameWorldUniforms &u [[buffer(0)]],texture2d<float> color [[texture(0)]],
@@ -47,6 +43,10 @@ fragment GameWorldSkyOwnershipOut auditWorldEligibility(GameWorldVertex in [[sta
 """
 let library = try device.makeLibrary(source: production + diagnostic, options: nil)
 let oldLibrary = try device.makeLibrary(source: original, options: nil)
+// Exercise missing-optional-function fallback using current color semantics.
+// The frozen historical library remains an independent geometry oracle only.
+let missingOptionalLibrary = try device.makeLibrary(source: production
+    .replacingOccurrences(of: "gameWorldSkyOwnershipVerticalReconstructionFragment", with: "qaUnavailableVerticalFragment"), options: nil)
 require(MemoryLayout<GameWorldUniforms>.stride == 224, "Production world uniform ABI changed")
 
 func texture(_ format: MTLPixelFormat, _ w: Int, _ h: Int, _ usage: MTLTextureUsage) -> any MTLTexture {
@@ -57,8 +57,12 @@ func texture(_ format: MTLPixelFormat, _ w: Int, _ h: Int, _ usage: MTLTextureUs
 func sRGB(_ f: MTLPixelFormat) -> Bool { f == .rgba8Unorm_srgb || f == .bgra8Unorm_srgb }
 func bgra(_ f: MTLPixelFormat) -> Bool { f == .bgra8Unorm || f == .bgra8Unorm_srgb }
 func transfer(_ source: MTLPixelFormat, _ destination: MTLPixelFormat) -> UInt32 {
-    sRGB(source) && !sRGB(destination) ? 1 : (!sRGB(source) && sRGB(destination) ? 2 : 0)
+    // Source-only contract: sampling supplies linear sRGB; all targets receive
+    // linear Display P3, and an sRGB attachment encodes only the stored values.
+    sRGB(source) ? 0 : 2
 }
+func decode(_ v:Double)->Double { v<=0.04045 ? v/12.92:pow((v+0.055)/1.055,2.4) }
+func encode(_ v:Double)->Double { v<=0.0031308 ? 12.92*v:1.055*pow(max(v,0),1/2.4)-0.055 }
 func projection(focal: SIMD2<Float> = SIMD2(0.5341740847,0.665856123), reversed: Bool = true) -> simd_float4x4 {
     let n: Float = 0.05, f: Float = 10000
     return simd_float4x4(columns: (SIMD4(focal.x,0,0,0),SIMD4(0,focal.y,0,0),
@@ -92,7 +96,8 @@ func makeSource(_ name: String, width: Int = 256, height: Int = 256,
         case "impulse": value=y == height/2 ? 0.9:0.1
         default: value=Float((x*7+y*13)&255)/255
         }
-        let v=UInt8(min(255,max(0,(value*255).rounded())))
+        // Analytic fixtures describe linear light; real guest storage is sRGB.
+        let v=UInt8(min(255,max(0,(encode(Double(value))*255).rounded())))
         bytes[i*4]=v;bytes[i*4+1]=v;bytes[i*4+2]=v
         if depthName == "step" { depths[i]=z(y < height/2 ? 0.2:8,reversed: reversed) }
         if depthName == "vertical_shallow" { depths[i]=z(y < height/2 ? 1:1.005,reversed: reversed) }
@@ -127,8 +132,7 @@ func audit(_ source: Source, destination: MTLPixelFormat = .rgba32Float, mapping
     var uniforms=GameWorldUniforms(sourceEyeFromClip:projection(reversed:reversed).inverse,
         currentEyeFromSourceEye:matrix_identity_float4x4,currentClipFromEye:projection(),sourceSize:SIMD2(UInt32(source.width),UInt32(source.height)))
     uniforms.sourceDepthReversed=reversed ? 1:0
-    // Float target deliberately retains sampled domain for analytic metrics.
-    uniforms.colorTransfer=destination == .rgba32Float ? 0:transfer(source.color.pixelFormat,destination)
+    uniforms.colorTransfer=transfer(source.color.pixelFormat,destination)
     var m=mapping
     encoder.setRenderPipelineState(pipeline);encoder.setFragmentBytes(&uniforms,length:MemoryLayout<GameWorldUniforms>.stride,index:0)
     encoder.setFragmentBytes(&m,length:MemoryLayout<Mapping>.stride,index:1)
@@ -169,8 +173,8 @@ for name in ["constant","ramp","horizontal","edge","alternating","sine","impulse
     for y in 0..<128 {
         let p=64+Float(y)*0.617+0.375,low=Int(floor(p))
         if name != "horizontal" {
-            let lo=Float(min(source.rgba[low*256*4],source.rgba[(low+1)*256*4]))/255
-            let hi=Float(max(source.rgba[low*256*4],source.rgba[(low+1)*256*4]))/255
+            let lo=Float(decode(Double(min(source.rgba[low*256*4],source.rgba[(low+1)*256*4]))/255))
+            let hi=Float(decode(Double(max(source.rgba[low*256*4],source.rgba[(low+1)*256*4]))/255))
             for x in 0..<64 { let v=b[(y*64+x)*4];require(v>=lo-2e-6 && v<=hi+2e-6,"\(name): local central-row range exceeded") }
         }
     }
@@ -213,8 +217,6 @@ for kind in ["vertical_minification","border","background","degenerate"] {
     checks.append(["name":kind,"baseline_rgb_exact":true])
 }
 let formats:[MTLPixelFormat]=[.rgba8Unorm,.rgba8Unorm_srgb,.bgra8Unorm,.bgra8Unorm_srgb]
-func decode(_ v:Double)->Double { v<=0.04045 ? v/12.92:pow((v+0.055)/1.055,2.4) }
-func encode(_ v:Double)->Double { v<=0.0031308 ? 12.92*v:1.055*pow(max(v,0),1/2.4)-0.055 }
 for sf in formats { for df in formats {
     let source=makeSource("constant",format:sf)
     let a=try audit(source,destination:df,mapping:mapping(0.375,enabled:false))
@@ -230,11 +232,10 @@ for sf in formats { for df in formats {
         let position=64+Float(y)*0.617+0.375,base=Int(floor(position)),t=Double(position-Float(base))
         let t2=t*t,t3=t2*t
         let weights=[-0.5*t+t2-0.5*t3,1-2.5*t2+1.5*t3,0.5*t+2*t2-1.5*t3,-0.5*t2+0.5*t3]
-        let samples=(0..<4).map { i->Double in let v=Double(sine.rgba[(base+i-1)*256*4])/255;return sRGB(sf) ? decode(v):v }
+        let samples=(0..<4).map { i->Double in decode(Double(sine.rgba[(base+i-1)*256*4])/255) }
         var expected=zip(samples,weights).reduce(0.0) { $0+$1.0*$1.1 }
         expected=min(max(expected,min(samples[1],samples[2])),max(samples[1],samples[2]))
-        if transfer(sf,df)==1 { expected=encode(expected) }
-        if transfer(sf,df)==2 { expected=decode(expected) }
+        // Neutral RGB is invariant under the sRGB-to-P3 primary conversion.
         if sRGB(df) { expected=encode(expected) }
         for x in 0..<64 { maximumReferenceError=max(maximumReferenceError,abs(Double(fractional[(y*64+x)*4])-expected)) }
     }
@@ -333,10 +334,12 @@ for reversed in [false,true] {
     let baseline=try geometry(source,uniforms:u,width:256,height:256,kind:"baseline")
     let sharp=try geometry(source,uniforms:u,width:256,height:256,kind:"vertical")
     let normal=try geometry(source,uniforms:u,width:256,height:256,kind:"vertical",ownership:false)
-    require(old.color==baseline.color && sameGeometry(old,baseline),"Original fragment entry point changed")
+    require(sameGeometry(old,baseline),"Historical geometry/depth/owner changed")
     require(sameGeometry(baseline,sharp),"Vertical reconstruction changed geometry/depth/owner")
     require(normal.color==sharp.color && zip(normal.depth,sharp.depth).allSatisfy { $0.bitPattern==$1.bitPattern },"Normal/MRT vertical fragments disagree")
-    geometryChecks.append(["source_reversed":reversed,"frozen_original_entry_exact":true,"geometry_depth_owner_exact":true,"normal_and_ownership_fragments_exact":true])
+    geometryChecks.append(["source_reversed":reversed,"frozen_original_geometry_exact":true,
+        "historical_color_equality_required":false,"historical_color_note":"Color intentionally changed to before-filter linear sampling and Display P3; historical shader remains geometry oracle.",
+        "geometry_depth_owner_exact":true,"normal_and_ownership_fragments_exact":true])
 }
 
 // Compile and call the production Swift encoder too. Its private ownership
@@ -380,7 +383,7 @@ for precompute in [false,true] {
         depthFormat:.depth32Float,precomputeCorners:precompute,verticalReconstruction:true)!
     let disabled=GameWorldFiniteSkySupport(device:device,library:library,colorFormat:.rgba8Unorm_srgb,
         depthFormat:.depth32Float,precomputeCorners:precompute,verticalReconstruction:false)!
-    let missing=GameWorldFiniteSkySupport(device:device,library:oldLibrary,colorFormat:.rgba8Unorm_srgb,
+    let missing=GameWorldFiniteSkySupport(device:device,library:missingOptionalLibrary,colorFormat:.rgba8Unorm_srgb,
         depthFormat:.depth32Float,precomputeCorners:precompute,verticalReconstruction:true)!
     for reversed in [false,true] {
         let source=makeSource("sine",width:192,height:160,reversed:reversed)
@@ -440,10 +443,10 @@ if mode == "--timing" {
 }
 try JSONSerialization.data(withJSONObject:["passed":true,"device":device.name,"checks":geometryChecks],options:[.prettyPrinted,.sortedKeys])
     .write(to:output.appendingPathComponent("geometry-result.json"))
-print("PASS actual production normal/MRT fragments: frozen baseline unchanged, depth and ownership exact, both Z conventions.")
+print("PASS actual production normal/MRT fragments: historical geometry, depth and ownership exact; current-color optional fallback exact, both Z conventions.")
 
 if mode == "--replay" {
-    let prefix=root.appendingPathComponent("target/verification/device-session-20261020/candidate7/world-normal7-a6e1eec5a70a4ec084e39db09a8fcde5").path
+    let prefix=ProcessInfo.processInfo.environment["SV_REGISTERED_CAPTURE_PREFIX"] ?? root.appendingPathComponent("target/verification/device-session-20261020/candidate7/world-normal7-a6e1eec5a70a4ec084e39db09a8fcde5").path
     let metadata=try JSONSerialization.jsonObject(with:Data(contentsOf:URL(fileURLWithPath:prefix+"-report.json"))) as! [String:Any]
     func matrix(_ key:String)->simd_float4x4 {
         let v=(metadata[key] as! [NSNumber]).map(\.floatValue)
@@ -474,7 +477,7 @@ if mode == "--replay" {
     let base=try geometry(source,uniforms:u,width:w,height:h,kind:"baseline")
     let sharp=try geometry(source,uniforms:u,width:w,height:h,kind:"vertical")
     let mask=try geometry(source,uniforms:u,width:w,height:h,kind:"eligibility")
-    require(base.color==old.color && sameGeometry(base,old),"Registered frozen original entry changed")
+    require(sameGeometry(base,old),"Registered historical geometry/depth/owner changed")
     require(sameGeometry(base,sharp),"Registered sampling changed geometry/depth/ownership")
     var eligible=0,changed=0,fallbackChanged=0,maxChannel=0
     var sumDifference=0
@@ -512,7 +515,9 @@ if mode == "--replay" {
         "registered_prefix":prefix,"source_size":[sw,sh],"output_size":[w,h],"eligible_pixels":eligible,"covered_pixels":covered,
         "eligible_fraction":Double(eligible)/Double(covered),"color_changed_pixels":changed,"fallback_changed_pixels":fallbackChanged,
         "maximum_channel_delta_8bit":maxChannel,"mean_absolute_channel_delta_over_covered":Double(sumDifference)/Double(covered*3),
-        "geometry_depth_owner_bit_identical":true,"frozen_original_entry_exact":true,"baseline_gpu_ms":timesOld,"candidate_gpu_ms":timesNew,
+        "geometry_depth_owner_bit_identical":true,"frozen_original_geometry_exact":true,
+        "historical_color_equality_required":false,"output_ppm_color_space":"Stored sRGB transfer, Display P3 primaries, untagged raw PPM",
+        "baseline_gpu_ms":timesOld,"candidate_gpu_ms":timesNew,
         "baseline_median_ms":median(timesOld),"candidate_median_ms":median(timesNew),"median_paired_delta_ms":median(zip(timesOld,timesNew).map { $1-$0 })]
     try JSONSerialization.data(withJSONObject:result,options:[.prettyPrinted,.sortedKeys]).write(to:output.appendingPathComponent("replay-result.json"))
     print("REPLAY eligible=\(eligible)/\(covered), changedRGB=\(changed), maxchannel=\(maxChannel), fallbackchanges=\(fallbackChanged); paired delta=\(result["median_paired_delta_ms"]!)ms")

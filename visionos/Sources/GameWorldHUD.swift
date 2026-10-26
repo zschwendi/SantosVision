@@ -106,7 +106,7 @@ final class GameWorldHUD: @unchecked Sendable {
                   worldColor.width == color.width, worldColor.height == color.height else { return nil }
             native = value
             self.color = color
-            self.worldColor = worldColor
+            self.worldColor = GameWorldColor.samplingTexture(worldColor)
             halfSize = half
         }
 
@@ -118,11 +118,11 @@ final class GameWorldHUD: @unchecked Sendable {
 
     private let pipeline: any MTLRenderPipelineState
     private let depth: any MTLDepthStencilState
-    private let decodeForLinearTarget: UInt32
     private struct Uniforms {
         var clipFromHead: simd_float4x4
         var halfSize: SIMD2<Float>
         var distance: Float
+        // Reserved ABI word. Output is always linear P3; retained for older QA layouts.
         var decodeForLinearTarget: UInt32
     }
 
@@ -135,11 +135,9 @@ final class GameWorldHUD: @unchecked Sendable {
         descriptor.vertexFunction = vertex
         descriptor.fragmentFunction = fragment
         descriptor.colorAttachments[0].pixelFormat = colorFormat
-        descriptor.colorAttachments[0].isBlendingEnabled = true
-        descriptor.colorAttachments[0].sourceRGBBlendFactor = .one
-        descriptor.colorAttachments[0].destinationRGBBlendFactor = .oneMinusSourceAlpha
-        descriptor.colorAttachments[0].sourceAlphaBlendFactor = .one
-        descriptor.colorAttachments[0].destinationAlphaBlendFactor = .oneMinusSourceAlpha
+        // The shader fetches the actual destination and reproduces the game's
+        // encoded-domain blend before converting the finished result to P3.
+        descriptor.colorAttachments[0].isBlendingEnabled = false
         descriptor.depthAttachmentPixelFormat = depthFormat
         let d = MTLDepthStencilDescriptor()
         d.depthCompareFunction = .always
@@ -148,7 +146,6 @@ final class GameWorldHUD: @unchecked Sendable {
               let depth = device.makeDepthStencilState(descriptor: d) else { return nil }
         self.pipeline = pipeline
         self.depth = depth
-        decodeForLinearTarget = colorFormat == .bgra8Unorm || colorFormat == .rgba8Unorm ? 0 : 1
     }
 
     func encode(_ encoder: any MTLRenderCommandEncoder, snapshot: Snapshot,
@@ -158,7 +155,7 @@ final class GameWorldHUD: @unchecked Sendable {
         var uniforms = Uniforms(clipFromHead: GameWorldHUDPolicy.clipFromHead(
                 headFromEye: headFromEye, projection: projection, placementY: layout.y, nativeScope: nativeScope),
             halfSize: layout.halfSize, distance: snapshot.native.distance_metres,
-            decodeForLinearTarget: decodeForLinearTarget)
+            decodeForLinearTarget: 0)
         encoder.setRenderPipelineState(pipeline)
         encoder.setDepthStencilState(depth)
         encoder.setCullMode(.none)

@@ -1,6 +1,48 @@
 #include <metal_stdlib>
 using namespace metal;
 
+// The finished guest is SDR sRGB. Compositor Services requires linear Display
+// P3 shader values for every target format (sRGB attachments encode storage).
+static float3 gameWorldDecodeSRGB(float3 rgb) {
+    return select(pow((max(rgb, 0.0) + 0.055) / 1.055, float3(2.4)),
+                  rgb / 12.92, rgb <= 0.04045);
+}
+static float3 gameWorldEncodeSRGB(float3 rgb) {
+    return select(1.055 * pow(max(rgb, 0.0), float3(1.0 / 2.4)) - 0.055,
+                  12.92 * rgb, rgb <= 0.0031308);
+}
+// D65 sRGB -> XYZ -> Display P3; columns of the matrix, no white adaptation.
+static float3 gameWorldLinearSRGBToP3(float3 rgb) {
+    return float3x3(float3(0.822461969, 0.033194199, 0.017082631),
+                    float3(0.177538031, 0.966805801, 0.072397441),
+                    float3(0.0, 0.0, 0.910519929)) * rgb;
+}
+static float3 gameWorldLinearP3ToSRGB(float3 rgb) {
+    return float3x3(float3(1.224940176, -0.042056955, -0.019637555),
+                    float3(-0.224940176, 1.042056955, -0.078636046),
+                    float3(0.0, 0.0, 1.098273600)) * rgb;
+}
+static float3 gameWorldReadLinearSRGB(texture2d<float> color, uint2 texel, uint transfer) {
+    const float3 rgb = color.read(texel).rgb;
+    return transfer == 2 ? gameWorldDecodeSRGB(rgb) : rgb;
+}
+static float3 gameWorldSampleLinearSRGB(texture2d<float> color, float2 uv, uint transfer) {
+    constexpr sampler s(filter::linear, address::clamp_to_edge);
+    if (transfer != 2) { return color.sample(s, uv).rgb; }
+    // Fallback when a zero-copy sRGB view is unavailable: decode each source
+    // texel BEFORE filtering. Decoding a filtered UNORM value darkens edges.
+    const int2 size = int2(color.get_width(), color.get_height());
+    const float2 p = clamp(uv, 0.0, 1.0) * float2(size) - 0.5;
+    const int2 base = int2(floor(p));
+    const float2 t = fract(p);
+    const uint2 a = uint2(clamp(base, int2(0), size - 1));
+    const uint2 b = uint2(clamp(base + int2(1, 0), int2(0), size - 1));
+    const uint2 c = uint2(clamp(base + int2(0, 1), int2(0), size - 1));
+    const uint2 d = uint2(clamp(base + int2(1, 1), int2(0), size - 1));
+    return mix(mix(gameWorldReadLinearSRGB(color, a, transfer), gameWorldReadLinearSRGB(color, b, transfer), t.x),
+               mix(gameWorldReadLinearSRGB(color, c, transfer), gameWorldReadLinearSRGB(color, d, transfer), t.x), t.y);
+}
+
 struct GameWorldSenseUtilityUniforms {
     float4x4 clipFromHead;
     float2 center;
@@ -45,6 +87,7 @@ struct GameWorldHUDUniforms {
     float4x4 clipFromHead;
     float2 halfSize;
     float distance;
+    // Reserved ABI word; the attachment's storage never changes the color contract.
     uint decodeForLinearTarget;
 };
 struct GameWorldHUDVertex { float4 position [[position]]; float2 uv; };
@@ -58,17 +101,27 @@ vertex GameWorldHUDVertex gameWorldHUDVertex(uint id [[vertex_id]],
     return out;
 }
 fragment float4 gameWorldHUDFragment(GameWorldHUDVertex in [[stage_in]],
-        constant GameWorldHUDUniforms &u [[buffer(0)]], texture2d<float> hud [[texture(0)]]) {
+        constant GameWorldHUDUniforms &u [[buffer(0)]], texture2d<float> hud [[texture(0)]],
+        float4 destination [[color(0)]]) {
     constexpr sampler s(filter::linear, address::clamp_to_edge);
     float4 pixel = hud.sample(s, in.uv);
     const float coverage = clamp(pixel.a, 0.0, 1.0);
-    if (!all(isfinite(pixel)) || coverage <= 0) { discard_fragment(); }
-    if (u.decodeForLinearTarget != 0) {
-        float3 rgb = max(pixel.rgb / max(coverage, 1e-8), 0.0);
-        rgb = select(pow((rgb + .055) / 1.055, float3(2.4)), rgb / 12.92, rgb <= .04045);
-        pixel.rgb = rgb * coverage;
-    }
-    return float4(pixel.rgb, coverage);
+    if (!all(isfinite(pixel)) || (coverage <= 0 && all(pixel.rgb == 0))) { discard_fragment(); }
+    // H is an accumulated premultiplied contribution in the game's ENCODED
+    // blend domain. Decode(H/A)*A followed by linear source-over is a different
+    // image. Fetch the displayed background and reproduce that original blend.
+    // sRGB attachments provide decoded linear values here, just as on sampling.
+    const float backgroundAlpha = clamp(destination.a, 0.0, 1.0);
+    const float alpha = coverage + backgroundAlpha * (1 - coverage);
+    // Native premultiplied-over also permits RGB-only (alpha-zero) additive
+    // contributions. Keep them, including over a transparent destination.
+    const float scale = alpha > 0 ? alpha : 1;
+    const float3 background = backgroundAlpha > 0
+        ? gameWorldEncodeSRGB(gameWorldLinearP3ToSRGB(destination.rgb / backgroundAlpha)) * backgroundAlpha
+        : float3(0);
+    // Match the guest final UNORM saturation in its own primaries, before P3.
+    const float3 encoded = clamp((pixel.rgb + background * (1 - coverage)) / scale, 0.0, 1.0);
+    return float4(gameWorldLinearSRGBToP3(gameWorldDecodeSRGB(encoded)) * scale, alpha);
 }
 
 struct GameWorldReticleUniforms { float4 clipPosition; float2 halfSizeNDC; float2 padding; };
@@ -290,7 +343,6 @@ vertex GameWorldVertex gameWorldPrecomputedVertex(uint id [[vertex_id]],
 fragment float4 gameWorldFragment(GameWorldVertex in [[stage_in]],
                                   constant GameWorldUniforms &u [[buffer(0)]],
                                   texture2d<float> color [[texture(0)]]) {
-    constexpr sampler s(filter::linear, address::clamp_to_edge);
     if (!all(isfinite(in.sourceUVQ)) || in.sourceUVQ.z <= 1e-7) { discard_fragment(); }
     // Stable ordered coverage removes geometry near the current camera while
     // leaving every surviving fragment's real reverse-Z depth unchanged.
@@ -300,16 +352,8 @@ fragment float4 gameWorldFragment(GameWorldVertex in [[stage_in]],
     const uint2 pixel = uint2(in.position.xy);
     const float threshold = (float(bayer[(pixel.y & 3) * 4 + (pixel.x & 3)]) + 0.5) / 16;
     if (visibility <= threshold) { discard_fragment(); }
-    float3 rgb = color.sample(s, in.sourceUVQ.xy / in.sourceUVQ.z).rgb;
-    // Match sampled source RGB to the negotiated compositor target. Native sRGB
-    // formats decode during sampling; sRGB destinations encode during storage.
-    if (u.colorTransfer == 1) {
-        rgb = select(1.055 * pow(max(rgb, 0.0), float3(1.0 / 2.4)) - 0.055,
-                     12.92 * rgb, rgb <= 0.0031308);
-    } else if (u.colorTransfer == 2) {
-        rgb = select(pow((max(rgb, 0.0) + 0.055) / 1.055, float3(2.4)),
-                     rgb / 12.92, rgb <= 0.04045);
-    }
+    float3 rgb = gameWorldSampleLinearSRGB(color, in.sourceUVQ.xy / in.sourceUVQ.z, u.colorTransfer);
+    rgb = gameWorldLinearSRGBToP3(rgb);
     return float4(rgb, 1);
 }
 
@@ -331,7 +375,6 @@ struct GameWorldSkyOwnershipOut {
 fragment GameWorldSkyOwnershipOut gameWorldSkyOwnershipFragment(GameWorldVertex in [[stage_in]],
                                   constant GameWorldUniforms &u [[buffer(0)]],
                                   texture2d<float> color [[texture(0)]]) {
-    constexpr sampler s(filter::linear, address::clamp_to_edge);
     if (!all(isfinite(in.sourceUVQ)) || in.sourceUVQ.z <= 1e-7) { discard_fragment(); }
     const float visibility = in.background != 0 ? 1 : smoothstep(u.nearFadeDistances.x, u.nearFadeDistances.y,
                                         length(in.currentEyePosition));
@@ -339,14 +382,8 @@ fragment GameWorldSkyOwnershipOut gameWorldSkyOwnershipFragment(GameWorldVertex 
     const uint2 pixel = uint2(in.position.xy);
     const float threshold = (float(bayer[(pixel.y & 3) * 4 + (pixel.x & 3)]) + 0.5) / 16;
     if (visibility <= threshold) { discard_fragment(); }
-    float3 rgb = color.sample(s, in.sourceUVQ.xy / in.sourceUVQ.z).rgb;
-    if (u.colorTransfer == 1) {
-        rgb = select(1.055 * pow(max(rgb, 0.0), float3(1.0 / 2.4)) - 0.055,
-                     12.92 * rgb, rgb <= 0.0031308);
-    } else if (u.colorTransfer == 2) {
-        rgb = select(pow((max(rgb, 0.0) + 0.055) / 1.055, float3(2.4)),
-                     rgb / 12.92, rgb <= 0.04045);
-    }
+    float3 rgb = gameWorldSampleLinearSRGB(color, in.sourceUVQ.xy / in.sourceUVQ.z, u.colorTransfer);
+    rgb = gameWorldLinearSRGBToP3(rgb);
     GameWorldSkyOwnershipOut out;
     out.color = float4(rgb, 1);
     out.owner = in.background != 0 ? 1u : 2u;
@@ -405,16 +442,15 @@ struct GameWorldVerticalSample { float3 rgb; uint eligible; };
 static GameWorldVerticalSample gameWorldVerticalSample(float2 uv, float2 texelDx, float2 texelDy,
         uint background, constant GameWorldUniforms &u, texture2d<float> color,
         texture2d<float, access::read> depth) {
-    constexpr sampler s(filter::linear, address::clamp_to_edge);
     int2 base;
     float t;
     if (!gameWorldVerticalSupport(uv, texelDx, texelDy, background, u, depth, base, t)) {
-        return {color.sample(s, uv).rgb, 0};
+        return {gameWorldSampleLinearSRGB(color, uv, u.colorTransfer), 0};
     }
-    const float3 a = color.sample(s, float2(uv.x, (float(base.y) - 0.5) / float(u.sourceSize.y))).rgb;
-    const float3 b = color.sample(s, float2(uv.x, (float(base.y) + 0.5) / float(u.sourceSize.y))).rgb;
-    const float3 c = color.sample(s, float2(uv.x, (float(base.y) + 1.5) / float(u.sourceSize.y))).rgb;
-    const float3 d = color.sample(s, float2(uv.x, (float(base.y) + 2.5) / float(u.sourceSize.y))).rgb;
+    const float3 a = gameWorldSampleLinearSRGB(color, float2(uv.x, (float(base.y) - 0.5) / float(u.sourceSize.y)), u.colorTransfer);
+    const float3 b = gameWorldSampleLinearSRGB(color, float2(uv.x, (float(base.y) + 0.5) / float(u.sourceSize.y)), u.colorTransfer);
+    const float3 c = gameWorldSampleLinearSRGB(color, float2(uv.x, (float(base.y) + 1.5) / float(u.sourceSize.y)), u.colorTransfer);
+    const float3 d = gameWorldSampleLinearSRGB(color, float2(uv.x, (float(base.y) + 2.5) / float(u.sourceSize.y)), u.colorTransfer);
     // Catmull-Rom at tension 1/2; horizontal filtering remains the existing
     // bilinear sample at each exact row center. The central-row range clamp
     // forbids ringing past either endpoint on every RGB channel.
@@ -441,13 +477,7 @@ fragment float4 gameWorldVerticalReconstructionFragment(GameWorldVertex in [[sta
     const float threshold = (float(bayer[(pixel.y & 3) * 4 + (pixel.x & 3)]) + 0.5) / 16;
     if (visibility <= threshold) { discard_fragment(); }
     float3 rgb = gameWorldVerticalSample(uv, texelDx, texelDy, in.background, u, color, depth).rgb;
-    if (u.colorTransfer == 1) {
-        rgb = select(1.055 * pow(max(rgb, 0.0), float3(1.0 / 2.4)) - 0.055,
-                     12.92 * rgb, rgb <= 0.0031308);
-    } else if (u.colorTransfer == 2) {
-        rgb = select(pow((max(rgb, 0.0) + 0.055) / 1.055, float3(2.4)),
-                     rgb / 12.92, rgb <= 0.04045);
-    }
+    rgb = gameWorldLinearSRGBToP3(rgb);
     return float4(rgb, 1);
 }
 
@@ -465,13 +495,7 @@ fragment GameWorldSkyOwnershipOut gameWorldSkyOwnershipVerticalReconstructionFra
     const float threshold = (float(bayer[(pixel.y & 3) * 4 + (pixel.x & 3)]) + 0.5) / 16;
     if (visibility <= threshold) { discard_fragment(); }
     float3 rgb = gameWorldVerticalSample(uv, texelDx, texelDy, in.background, u, color, depth).rgb;
-    if (u.colorTransfer == 1) {
-        rgb = select(1.055 * pow(max(rgb, 0.0), float3(1.0 / 2.4)) - 0.055,
-                     12.92 * rgb, rgb <= 0.0031308);
-    } else if (u.colorTransfer == 2) {
-        rgb = select(pow((max(rgb, 0.0) + 0.055) / 1.055, float3(2.4)),
-                     rgb / 12.92, rgb <= 0.04045);
-    }
+    rgb = gameWorldLinearSRGBToP3(rgb);
     GameWorldSkyOwnershipOut out;
     out.color = float4(rgb, 1);
     out.owner = in.background != 0 ? 1u : 2u;
@@ -562,7 +586,6 @@ fragment GameWorldCopyFragmentOut gameWorldSourceCopyFragment(GameWorldCopyVerte
                                                              constant GameWorldCopyUniforms &u [[buffer(0)]],
                                                              texture2d<float> color [[texture(0)]],
                                                              texture2d<float, access::read> depth [[texture(1)]]) {
-    constexpr sampler s(filter::linear, address::clamp_to_edge);
     // A point on this pixel's viewing ray in eye space, then that ray in source clip space.
     float4 eyePoint = u.currentEyeFromClip * float4(in.ndc, 0.5, 1);
     if (!all(isfinite(eyePoint)) || abs(eyePoint.w) <= 1e-7) { discard_fragment(); }
@@ -598,14 +621,8 @@ fragment GameWorldCopyFragmentOut gameWorldSourceCopyFragment(GameWorldCopyVerte
     const uint2 pixel = uint2(in.position.xy);
     const float threshold = (float(bayer[(pixel.y & 3) * 4 + (pixel.x & 3)]) + 0.5) / 16;
     if (visibility <= threshold) { discard_fragment(); }
-    float3 rgb = color.sample(s, uv).rgb;
-    if (u.colorTransfer == 1) {
-        rgb = select(1.055 * pow(max(rgb, 0.0), float3(1.0 / 2.4)) - 0.055,
-                     12.92 * rgb, rgb <= 0.0031308);
-    } else if (u.colorTransfer == 2) {
-        rgb = select(pow((max(rgb, 0.0) + 0.055) / 1.055, float3(2.4)),
-                     rgb / 12.92, rgb <= 0.04045);
-    }
+    float3 rgb = gameWorldSampleLinearSRGB(color, uv, u.colorTransfer);
+    rgb = gameWorldLinearSRGBToP3(rgb);
     GameWorldCopyFragmentOut out;
     out.color = float4(rgb, 1);
     out.depth = outDepth;
@@ -993,14 +1010,8 @@ fragment GameWorldDepthEdgeFillOut gameWorldDepthEdgeFillFragment(GameWorldSkyRe
         discard_fragment();
     }
     ray /= rayLength;
-    float3 rgb = color.read(hit.texel).rgb;
-    if (u.colorTransfer == 1) {
-        rgb = select(1.055 * pow(max(rgb, 0.0), float3(1.0 / 2.4)) - 0.055,
-                     12.92 * rgb, rgb <= 0.0031308);
-    } else if (u.colorTransfer == 2) {
-        rgb = select(pow((max(rgb, 0.0) + 0.055) / 1.055, float3(2.4)),
-                     rgb / 12.92, rgb <= 0.04045);
-    }
+    float3 rgb = gameWorldReadLinearSRGB(color, hit.texel, u.colorTransfer);
+    rgb = gameWorldLinearSRGBToP3(rgb);
     float4 point;
     if (hit.sky) {
         // The same finite support sphere the sky repair gives surviving sky.

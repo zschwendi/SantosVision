@@ -11,7 +11,7 @@ func require(_ condition: @autoclosure () -> Bool, _ message: @autoclosure () ->
 }
 let root = URL(fileURLWithPath: CommandLine.arguments[1])
 let destination = URL(fileURLWithPath: CommandLine.arguments[2])
-let prefix = root.appendingPathComponent(
+let prefix = ProcessInfo.processInfo.environment["SV_REGISTERED_CAPTURE_PREFIX"] ?? root.appendingPathComponent(
     "target/verification/device-session-20261020/candidate7/world-normal7-a6e1eec5a70a4ec084e39db09a8fcde5").path
 let metadata = try JSONSerialization.jsonObject(with: Data(contentsOf: URL(fileURLWithPath: prefix + "-report.json"))) as! [String: Any]
 func matrix(_ key: String) -> simd_float4x4 {
@@ -70,9 +70,25 @@ sourceDepth.withUnsafeBytes { sourceDepthTexture.replace(region: MTLRegionMake2D
 let width = 1888, height = 1792
 let viewport = MTLViewport(originX: 0, originY: 0, width: Double(width), height: Double(height), znear: 0, zfar: 1)
 // Production defaults, including the current 5-10cm near fade.
-let world = GameWorldUniforms(sourceEyeFromClip: matrix("source_eye_from_clip"),
+var world = GameWorldUniforms(sourceEyeFromClip: matrix("source_eye_from_clip"),
     currentEyeFromSourceEye: matrix("current_eye_from_source_eye"), currentClipFromEye: matrix("current_clip_from_eye"),
     sourceSize: SIMD2(UInt32(sw), UInt32(sh)))
+// Raw capture RGB is encoded sRGB even though this fixture's texture is UNORM.
+world.colorTransfer = 2
+
+// Independent Double reference: finished sRGB bytes -> linear Display P3 ->
+// linear UNORM storage. The fill uses a real texel read, without interpolation.
+func expectedP3Bytes(_ sourceOffset: Int) -> [UInt8] {
+    func decode(_ channel: UInt8) -> Double {
+        let value = Double(channel) / 255
+        return value <= 0.04045 ? value / 12.92 : pow((value + 0.055) / 1.055, 2.4)
+    }
+    let r = decode(sourceRGB[sourceOffset]), g = decode(sourceRGB[sourceOffset + 1]), b = decode(sourceRGB[sourceOffset + 2])
+    let p3 = [0.822461969 * r + 0.177538031 * g,
+              0.033194199 * r + 0.966805801 * g,
+              0.017082631 * r + 0.072397441 * g + 0.910519929 * b]
+    return p3.map { UInt8(min(255, max(0, ($0 * 255).rounded()))) }
+}
 
 struct Rendered { var color: [UInt8]; var depth: [Float]; var owner: [UInt8]; var gpuMilliseconds: Double }
 func render(fill: Bool, telemetry: GameWorldImageQualityTelemetry) -> Rendered {
@@ -160,7 +176,8 @@ for y in 0..<height { for x in 0..<width {
     if mirror != nil { mirrorFilled += 1 }
     if let mirror, changed {
         let s = (Int(mirror.texel.y) * sw + Int(mirror.texel.x)) * 3
-        let same = (0..<3).allSatisfy { filled.color[i * 4 + $0] == sourceRGB[s + $0] }
+        let expected = expectedP3Bytes(s)
+        let same = (0..<3).allSatisfy { abs(Int(filled.color[i * 4 + $0]) - Int(expected[$0])) <= 1 }
         if same { agreement += 1 } else { mismatches += 1 }
         maximumDepthDifference = max(maximumDepthDifference, abs(filled.depth[i] - mirror.depth))
     } else if (mirror != nil) != changed {
@@ -199,6 +216,8 @@ let result: [String: Any] = ["passed": true, "device": device.name,
     "scope": "Actual offscreen Mac Metal of production finite-sky ownership plus production depth-edge fill on the registered candidate7 capture; not Vision Pro composition, headset performance or visual acceptance.",
     "uncovered_pixels": uncovered, "gpu_filled": gpuFilled, "cpu_mirror_filled": mirrorFilled,
     "gpu_cpu_same_texel_colour": agreement, "gpu_cpu_mismatches": mismatches,
+    "color_reference": "Independent Double sRGB decode and D65 sRGB-to-P3 matrix, linear UNORM target, maximum one-byte rounding tolerance",
+    "output_ppm_note": "Raw linear Display P3 bytes without ICC tag; use numeric comparison, not an assumed sRGB preview",
     "max_gpu_cpu_depth_difference": maximumDepthDifference,
     "audited_body_roi_uncovered": bodyUncovered, "audited_body_roi_filled": bodyFilled,
     "gpu_counter_sample": ["uncovered": counted.0, "finite": counted.1, "sky": counted.2, "left": counted.3],
