@@ -92,7 +92,8 @@ final class GameWorldDebugCapture: @unchecked Sendable {
           slice: Int, viewport: MTLViewport, native: SVWorldFrame,
           sourceEyeFromClip: simd_float4x4, currentEyeFromSourceEye: simd_float4x4,
           currentClipFromEye: simd_float4x4, nearFadeDistances: SIMD2<Float>, timestamp: Double,
-          outputViewIndex: Int = 0, renderingMethod: String = "unspecified") {
+          outputViewIndex: Int = 0, renderingMethod: String = "unspecified",
+          targetStage: GameWorldCompletedPair.TargetStage? = nil) {
         let formats: Set<MTLPixelFormat> = [.rgba8Unorm, .bgra8Unorm, .rgba8Unorm_srgb, .bgra8Unorm_srgb]
         let width = Int(viewport.width), height = Int(viewport.height)
         let x = Int(viewport.originX), y = Int(viewport.originY)
@@ -131,7 +132,7 @@ final class GameWorldDebugCapture: @unchecked Sendable {
         self.currentEyeFromSourceEye = currentEyeFromSourceEye
         self.currentClipFromEye = currentClipFromEye
         self.nearFadeDistances = nearFadeDistances
-        metadata = ["schema": 2, "scope": "Readback of actual leased textures and the normal compositor shader output before presentation; no substitute render.",
+        var details: [String: Any] = ["schema": 2, "scope": "Readback of actual leased textures and the normal compositor shader output before presentation; no substitute render.",
                     "game_frame": native.game_frame, "request_frame": native.request_frame,
                     "head_frame": native.head_frame, "view_count": native.view_count,
                     "view_index": native.view_index, "presentation_time": timestamp,
@@ -177,6 +178,8 @@ final class GameWorldDebugCapture: @unchecked Sendable {
         }
         blit.endEncoding()
         Self.log.info("Queued actual world shader diagnostic: \(prefix.path, privacy: .public)")
+        if let targetStage { details["target_stage"] = targetStage.reportValue }
+        metadata = details
     }
 
     func write(compositorAcknowledged: Bool) {

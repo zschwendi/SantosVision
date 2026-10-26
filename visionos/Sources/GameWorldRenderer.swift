@@ -484,6 +484,7 @@ final class GameWorldRenderer: @unchecked Sendable {
     /// Diagnostic only: one immutable native eye image reprojected into both
     /// physical eyes. Never a certified pair or a source-anchor copy.
     private let singleSourceStereo = ProcessInfo.processInfo.arguments.contains("--sv-world-single-source-stereo")
+    private let commonTargetStageQA = GameWorldCommonTargetStage.requested(environment: ProcessInfo.processInfo.environment)
     /// Per-lease optics also needs the exact physical/request projection pair.
     /// The existing count/age bounds apply to normal world rendering too.
     private var retainsAnchors: Bool { true }
@@ -1005,11 +1006,12 @@ final class GameWorldRenderer: @unchecked Sendable {
                                  timestamp: timestamp, commands: commands, cornerScratch: &cornerScratch, adaptiveScratch: &adaptiveScratch,
                                  singleSource: singleSource, sampleCompletedPair: sampleCompletedPair)
             if sampleCompletedPair, encoded.views == 2, let stageFromHead {
-                let sample = GameWorldCompletedPair(compositorFrame: frameNumber, predictedDisplayTime: timestamp,
+                var sample = GameWorldCompletedPair(compositorFrame: frameNumber, predictedDisplayTime: timestamp,
                     displayRequest: displayRequestFrame, displayHead: displayHeadFrame,
                     displayStageFromHead: GameWorldCompletedPair.bits(stageFromHead),
                     pairAcquiredAtomically: pairQualified, eyes: encoded.completionEyes,
                     predictedDisplayClock: GameWorldCompletedPair.Clock.compositorPresentationEpoch.rawValue)
+                sample.targetStage = encoded.targetStage.telemetry
                 if sample.qualified { completedPairSample = sample }
                 else { imageQuality.completedPairs.discardUnqualifiedSample() }
             } else if sampleCompletedPair { imageQuality.completedPairs.discardUnqualifiedSample() }
@@ -1051,7 +1053,7 @@ final class GameWorldRenderer: @unchecked Sendable {
                             ?? view.transform
                         let uniforms = worldUniforms(eye: captureSource, stageFromHead: stageFromHead,
                             headFromEye: worldEye,
-                            projection: displayProjection)
+                            projection: displayProjection, targetGameFromStage: encoded.targetStage.gameFromStage)
                         if debugMotionPolicy?.allows(uniforms.currentEyeFromSourceEye) == true {
                         debugCapture = GameWorldDebugCapture(prefix: debugPrefix, device: layer.device, commands: commands,
                             color: encoded.hudIsolated ? (lease.hud?.worldColor ?? lease.color) : lease.color,
@@ -1067,7 +1069,9 @@ final class GameWorldRenderer: @unchecked Sendable {
                                 ? (encoded.finiteSkyFirstEye ? (encoded.orderedCornersFirstEye
                                     ? "finite_sky_support_ordered_corners_depth_mesh" : "finite_sky_support_experiment_depth_mesh")
                                     : (encoded.copy ? "source_anchor_copy" : "independent_eye_depth_mesh"))
-                                : "single_source_depth_stereo") + (encoded.hudIsolated ? "_single_hud_canvas" : ""))
+                                : "single_source_depth_stereo") + (encoded.hudIsolated ? "_single_hud_canvas" : "")
+                                + (encoded.targetStage.telemetry.applied ? "_common_target_stage_qa" : ""),
+                            targetStage: encoded.targetStage.telemetry)
                         didDebugCapture = true
                         if debugCapture == nil { log.error("Live world capture unsupported or exceeded its 96 MiB bound.") }
                         }
@@ -1395,7 +1399,8 @@ final class GameWorldRenderer: @unchecked Sendable {
                         commands: any MTLCommandBuffer, cornerScratch: inout CornerScratchLease,
                         adaptiveScratch: inout AdaptiveScratchLease,
                         singleSource: GameWorldSourceEye? = nil, sampleCompletedPair: Bool = false) -> (views: Int, copy: Bool, finiteSkyFirstEye: Bool, orderedCornersFirstEye: Bool, hudIsolated: Bool,
-                            displayOptics: GameWorldScopeOptics.Optics, completionEyes: [GameWorldCompletedPair.Eye]) {
+                            displayOptics: GameWorldScopeOptics.Optics, completionEyes: [GameWorldCompletedPair.Eye],
+                            targetStage: GameWorldCommonTargetStage.Decision) {
         var clearedTextures = Set<String>()
         var encodedViews = 0
         var finiteSkyFirstEye = false
@@ -1501,6 +1506,48 @@ final class GameWorldRenderer: @unchecked Sendable {
             if let anchor = copyDecision.retained.anchor { drawable.deviceAnchor = anchor }
             pathCounters.copyDrawables &+= 1
         }
+        let targetStage: GameWorldCommonTargetStage.Decision
+        if commonTargetStageQA {
+            let blocked = singleSource != nil ? "single_source_diagnostic"
+                : anchorProbe != nil ? "analytic_or_synthetic_probe"
+                : copyDecision != nil ? "source_anchor_copy_active"
+                : nativeScope ? "native_scope_active" : nil
+            var candidates: [GameWorldCommonTargetStage.Candidate] = []
+            if blocked == nil {
+                for source in orderedSources {
+                    guard let lease = source.lease else { continue }
+                    let retained = XRHeadTracking.shared.retainedPose(headFrame: source.headFrame, now: timestamp)
+                    let check = retained.map { pose in
+                        GameWorldSourcePoseCheck.verify(retainedStageFromHead: pose.stageFromHead, retainedEyes: pose.eyes,
+                            retainedRequestFrame: pose.requestFrame, eyeIndex: source.viewIndex, requestFrame: source.requestFrame,
+                            leaseGameFromStage: source.gameFromStage, leaseGameFromEye: source.gameFromEye,
+                            leaseProjection: source.sourceProjection, leaseDepthReversed: source.sourceProjection.columns.2.z >= 0)
+                    }
+                    let optics = lease.opticalFrame
+                    let eye = source.viewIndex
+                    guard drawable.views.indices.contains(eye), worldEyes.indices.contains(eye) else { continue }
+                    candidates.append(.init(identity: .init(eye: eye, lease: lease.native.lease, game: source.gameFrame,
+                        request: source.requestFrame, head: source.headFrame, camera: optics.cameraSequence,
+                        epoch: optics.epoch, trackingEpoch: retained?.epoch ?? 0), actual: source.kind == .actual,
+                        sourcePoseQualified: check?.passed == true
+                            && retained?.timestampClock == GameWorldCompletedPair.Clock.compositorPresentationEpoch.rawValue,
+                        ordinaryOptics: optics.optics == .identity, gameFromStage: source.gameFromStage,
+                        gameFromEye: source.gameFromEye, sourceProjection: source.sourceProjection,
+                        // Identity optics below makes this exactly encode's display projection.
+                        displayProjection: drawable.computeProjection(convention: .rightUpBack, viewIndex: eye),
+                        displayHeadFromEye: worldEyes[eye]))
+                }
+            }
+            let reticlePolicy: GameWorldCommonTargetStage.Reticle
+            if let gameplayAim {
+                if gameplayAim.aim.flags & 16 != 0 { reticlePolicy = .knownFirstPerson }
+                else if gameplayAim.aim.view_epoch != candidates.first?.identity.epoch { reticlePolicy = .epochMismatch }
+                else if let reference = gameplayAim.reference { reticlePolicy = .reference(reference.gameFromStage) }
+                else { reticlePolicy = .perSource }
+            } else { reticlePolicy = .absent }
+            targetStage = GameWorldCommonTargetStage.select(requested: true, candidates: candidates,
+                selectedOpticalIndex: opticalIndex, stageFromHead: stageFromHead, blockedReason: blocked, reticle: reticlePolicy)
+        } else { targetStage = GameWorldCommonTargetStage.reject(requested: false, reason: "not_requested") }
         for (eye, view) in drawable.views.enumerated() {
             let map = view.textureMap
             let firstPass = clearedTextures.insert("\(map.textureIndex):\(map.sliceIndex)").inserted
@@ -1522,7 +1569,7 @@ final class GameWorldRenderer: @unchecked Sendable {
             let worldEye = worldEyes.indices.contains(eye) ? worldEyes[eye] : view.transform
             if let stageFromHead, let sourceEye = singleSource ?? displaySources.first(where: { $0.viewIndex == eye }) {
                 source = (sourceEye, worldUniforms(eye: sourceEye, stageFromHead: stageFromHead, headFromEye: worldEye,
-                                                   projection: projection))
+                                                   projection: projection, targetGameFromStage: targetStage.gameFromStage))
             }
             var completionEye: GameWorldCompletedPair.Eye?
             if let source, source.eye.kind == .actual,
@@ -1752,7 +1799,7 @@ final class GameWorldRenderer: @unchecked Sendable {
             encoder.endEncoding()
             if let adaptiveSet, let adaptiveMesh { adaptiveMesh.encodeCounterCopy(commands: commands, set: adaptiveSet) }
         }
-        return (encodedViews, copyDecision != nil, finiteSkyFirstEye, orderedCornersFirstEye, hudSnapshot != nil, displayOptics, completionEyes)
+        return (encodedViews, copyDecision != nil, finiteSkyFirstEye, orderedCornersFirstEye, hudSnapshot != nil, displayOptics, completionEyes, targetStage)
     }
 
     /// Synchronized compact snapshot read by the existing lifecycle report.
@@ -1769,6 +1816,12 @@ final class GameWorldRenderer: @unchecked Sendable {
             "vertical_reconstruction_requires_qualified_hud": true,
             "scope": "Pipeline availability only; each drawable also needs qualified HUD isolation. Per-pixel support qualification and visible quality are not counted."
         ] as [String: Any]
+        value["common_target_stage_qa"] = ["requested": commonTargetStageQA,
+            "manual_third_person_only": true, "maximum_stage_origin_translation_metres": GameWorldCommonTargetStage.maximumStageOriginTranslation,
+            "maximum_camera_rotation_degrees": GameWorldCommonTargetStage.maximumRotationDegrees,
+            "coverage_minimum_target_eye_depth_metres": GameWorldCommonTargetStage.minimumCoverageDepth,
+            "coverage_clip_limit": GameWorldCommonTargetStage.coverageClipLimit,
+            "scope": "Default off. Per-drawable decision/provenance in completed display pairs and debug capture. No same-update stereo or physical quality acceptance."] as [String: Any]
         value["ordered_corners"] = finiteSkySupport?.orderedCornerStatus()
         return value
     }
@@ -1787,10 +1840,11 @@ final class GameWorldRenderer: @unchecked Sendable {
     }
 
     private func worldUniforms(eye: GameWorldSourceEye, stageFromHead: simd_float4x4,
-                               headFromEye: simd_float4x4, projection: simd_float4x4) -> GameWorldUniforms {
+                               headFromEye: simd_float4x4, projection: simd_float4x4,
+                               targetGameFromStage: simd_float4x4? = nil) -> GameWorldUniforms {
         // Subtract large GTA world origins in Double on the CPU, then send the
         // small relative eye matrix to both the shader and its live diagnostic.
-        let gameFromStage = worldDoubleMatrix(eye.gameFromStage)
+        let gameFromStage = worldDoubleMatrix(targetGameFromStage ?? eye.gameFromStage)
         let stageFromHead = worldDoubleMatrix(stageFromHead)
         let headFromCurrentEye = worldDoubleMatrix(headFromEye)
         let gameFromCurrentEye = gameFromStage * stageFromHead * headFromCurrentEye

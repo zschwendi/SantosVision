@@ -199,6 +199,41 @@ struct GameWorldCompletedPair: Sendable {
         let interval = end - start
         return interval.isFinite && interval > 0 ? interval : nil
     }
+    struct TargetStage: Sendable {
+        struct SourceIdentity: Sendable {
+            let eye: Int
+            let lease: UInt64
+            let game: UInt64
+            let request: UInt64
+            let head: UInt64
+            let camera: UInt64
+            let epoch: UInt64
+            let trackingEpoch: UInt64
+            var reportValue: [String: Any] {
+                ["eye": eye, "lease": lease, "game_frame": game, "request_frame": request,
+                 "head_frame": head, "camera_sequence": camera, "view_epoch": epoch, "tracking_epoch": trackingEpoch]
+            }
+        }
+        let requested: Bool
+        let applied: Bool
+        let reason: String
+        let reticlePolicy: String
+        var selectedSource: SourceIdentity?
+        var gameFromStageBits: [UInt32]?
+        var maximumStageOriginTranslationMetres: Double?
+        var maximumCameraRotationDegrees: Double?
+        var reportValue: [String: Any] {
+            var value: [String: Any] = ["requested": requested, "applied": applied, "reason": reason,
+                "reticle_policy": reticlePolicy,
+                "scope": "Manual third-person QA only. One newest qualified acquired source mapping for BOTH target eyes; source cameras/projections/IDs unchanged. Not same-update stereo; dynamic actors and disocclusions remain. No extrapolation to display time."]
+            if let selectedSource { value["selected_source"] = selectedSource.reportValue }
+            if let gameFromStageBits { value["target_game_from_stage_float_bits"] = gameFromStageBits }
+            if let maximumStageOriginTranslationMetres { value["maximum_source_to_target_stage_origin_translation_metres"] = maximumStageOriginTranslationMetres }
+            if let maximumCameraRotationDegrees { value["maximum_source_to_target_camera_rotation_degrees"] = maximumCameraRotationDegrees }
+            return value
+        }
+    }
+
     struct Eye: Sendable {
         let displayEye: Int
         let sourceEye: Int
@@ -256,6 +291,7 @@ struct GameWorldCompletedPair: Sendable {
     let pairAcquiredAtomically: Bool
     let eyes: [Eye]
     var predictedDisplayClock = Clock.unknown.rawValue
+    var targetStage: TargetStage?
 
     var qualified: Bool {
         eyes.count == 2 && eyes.map(\.displayEye) == [0, 1] && eyes.map(\.sourceEye) == [0, 1]
@@ -288,6 +324,7 @@ struct GameWorldCompletedPair: Sendable {
             row["command_gpu_interval_seconds"] = gpuInterval
             row["command_gpu_interval_scope"] = "Successful compositor command gpuEndTime minus gpuStartTime only; overlapping GPU scheduling interval, not isolated busy time or FPS."
         }
+        if let targetStage { row["target_stage"] = targetStage.reportValue }
         if let displayRequest { row["display_request_frame"] = displayRequest }
         if let displayHead { row["display_head_frame"] = displayHead }
         return row
