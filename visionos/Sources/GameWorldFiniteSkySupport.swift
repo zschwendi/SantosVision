@@ -44,6 +44,7 @@ final class GameWorldFiniteSkySupport: @unchecked Sendable {
         let cornersPrecomputed: Bool
         let verticalReconstruction: Bool
         let orderedCorners: Bool
+        let orderedPreparation: String
     }
 
     private struct CornerCompletionLease: @unchecked Sendable {
@@ -180,8 +181,12 @@ final class GameWorldFiniteSkySupport: @unchecked Sendable {
         // Qualification is source-only. The first integration is restricted
         // to the normal bilinear/affine route verified independently; other
         // reconstruction experiments retain their original pipelines.
-        let orderedResources = !(allowVerticalReconstruction && verticalPipeline != nil) && uniforms.reserved == .zero
+        let orderedEligible = !(allowVerticalReconstruction && verticalPipeline != nil) && uniforms.reserved == .zero
+        let orderedResources = orderedEligible
             ? ordered?.helper.prepare(commands: commands, uniforms: uniforms, depth: depth, source: orderedSource) : nil
+        let orderedPreparation = orderedResources.map { $0.reusedCompletedSource ? "completed_source_cache_hit" : "fresh_preparation" }
+            ?? (!orderedRequested ? "not_requested" : ordered == nil ? "pipeline_unavailable"
+                : !orderedEligible ? "reconstruction_ineligible" : "preparation_unavailable")
         if orderedResources == nil, let corners,
            let texture = cornerPool.acquire(device: target.device, width: color.width, height: color.height) {
             let completion = CornerCompletionLease(pool: cornerPool, lease: CornerScratchLease(textures: [texture]))
@@ -248,7 +253,8 @@ final class GameWorldFiniteSkySupport: @unchecked Sendable {
         guard encodeRepair(commands: commands, depth: targetDepth, slice: pass.depthAttachment.slice,
             ownership: ownership, viewport: viewport, projection: projection, radius: radius) else { return nil }
         return Result(ownership: ownership, radius: radius, cornersPrecomputed: cornerDepths != nil,
-                      verticalReconstruction: reconstructed, orderedCorners: orderedResources != nil)
+                      verticalReconstruction: reconstructed, orderedCorners: orderedResources != nil,
+                      orderedPreparation: orderedPreparation)
     }
 
     func orderedCornerStatus() -> [String: Any] {

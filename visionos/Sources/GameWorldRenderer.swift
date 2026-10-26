@@ -844,6 +844,7 @@ final class GameWorldRenderer: @unchecked Sendable {
         var singleSourcePresentation: GameWorldSingleSourcePresentation?
         var probePresentation: (kind: GameWorldSourceKind, copy: Bool)?
         var debugCapture: GameWorldDebugCapture?
+        var completedPairSample: GameWorldCompletedPair?
         for drawable in drawables {
             let duration = LayerRenderer.Clock.Instant.epoch.duration(to: drawable.frameTiming.presentationTime)
             let timestamp = Double(duration.components.seconds) + Double(duration.components.attoseconds) / 1e18
@@ -870,6 +871,8 @@ final class GameWorldRenderer: @unchecked Sendable {
             var acquisitionFailed = false
             var singleSource: GameWorldSourceEye?
             var singleSourceEpoch: UInt64?
+            var displayRequestFrame: UInt64?
+            var displayHeadFrame: UInt64?
             if builtIn, let stageFromHead, (1...2).contains(drawable.views.count) {
                 let physicalProjections = drawable.views.indices.map {
                     drawable.computeProjection(convention: .rightUpBack, viewIndex: $0)
@@ -896,6 +899,7 @@ final class GameWorldRenderer: @unchecked Sendable {
                 // The request frame names the eye geometry; the head frame names the pose. Both are
                 // retained together so a lease can be checked against the exact pair it claims.
                 let requestFrame = WorldRequestCounter.shared.next()
+                displayRequestFrame = requestFrame
                 var headFrame: UInt64?
                 if retainsAnchors {
                     headFrame = XRHeadTracking.shared.submit(timestamp: timestamp, stageFromHead: stageFromHead, tracked: true,
@@ -904,6 +908,7 @@ final class GameWorldRenderer: @unchecked Sendable {
                     headFrame = XRHeadTracking.shared.submit(timestamp: timestamp, stageFromHead: stageFromHead, tracked: true,
                                                               anchor: trackedAnchor, requestFrame: requestFrame, eyes: eyes, retain: false)
                 }
+                displayHeadFrame = headFrame
                 if let headFrame {
                     motionTracking.sample(timestamp: timestamp, stageFromHead: stageFromHead, headFrame: headFrame)
                 } else {
@@ -986,9 +991,22 @@ final class GameWorldRenderer: @unchecked Sendable {
             } else if builtIn {
                 reportStatus("The compositor supplied an unsupported game view count (\(drawable.views.count)); this bridge supports one or two views.")
             }
+            // Capture only a bounded immutable diagnostic value. The existing
+            // command completion handler is the sole publisher of these rows.
+            let sampleCompletedPair = builtIn && completedPairSample == nil && singleSource == nil
+                && drawable.views.count == 2 && sources.count == 2 && sources.allSatisfy { $0.kind == .actual }
+                && imageQuality.completedPairs.shouldSample(now: ProcessInfo.processInfo.systemUptime)
             let encoded = encode(drawable: drawable, stageFromHead: stageFromHead, sources: sources, pairQualified: pairQualified,
                                  timestamp: timestamp, commands: commands, cornerScratch: &cornerScratch, adaptiveScratch: &adaptiveScratch,
-                                 singleSource: singleSource)
+                                 singleSource: singleSource, sampleCompletedPair: sampleCompletedPair)
+            if sampleCompletedPair, encoded.views == 2, let stageFromHead {
+                let sample = GameWorldCompletedPair(compositorFrame: frameNumber, predictedDisplayTime: timestamp,
+                    displayRequest: displayRequestFrame, displayHead: displayHeadFrame,
+                    displayStageFromHead: GameWorldCompletedPair.bits(stageFromHead),
+                    pairAcquiredAtomically: pairQualified, eyes: encoded.completionEyes)
+                if sample.qualified { completedPairSample = sample }
+                else { imageQuality.completedPairs.discardUnqualifiedSample() }
+            } else if sampleCompletedPair { imageQuality.completedPairs.discardUnqualifiedSample() }
             if builtIn {
                 sourceCoverageMagnification = encoded.displayOptics.magnification
                 for source in sources where source.kind == .actual {
@@ -1070,6 +1088,8 @@ final class GameWorldRenderer: @unchecked Sendable {
         let completedSingleSourcePresentation = singleSourcePresentation
         let completedProbe = probePresentation
         let completedDebugCapture = debugCapture
+        let completedPair = completedPairSample
+        let pairTelemetry = imageQuality.completedPairs
         let reportThisFrame = !loggedFrame || frameNumber % 120 == 0
         if presentation != nil || probePresentation != nil || singleSourcePresentation != nil { loggedFrame = true }
         frameNumber &+= 1
@@ -1101,6 +1121,15 @@ final class GameWorldRenderer: @unchecked Sendable {
                 if acknowledged, buffer.status == .completed {
                     report(.gameFrameCompleted(uptime: ProcessInfo.processInfo.systemUptime))
                 }
+            }
+            if let completedPair {
+                let pairAcknowledged = acknowledged && completedPresentation?.viewCount == 2
+                    && completedPresentation?.gameFrames == completedPair.eyes.map(\.game)
+                    && completedPresentation?.requestFrames == completedPair.eyes.map(\.request)
+                    && completedPresentation?.headFrames == completedPair.eyes.map(\.head)
+                    && Array(completedLeases.prefix(2)).map { $0.native.lease } == completedPair.eyes.map(\.lease)
+                pairTelemetry.complete(completedPair, successful: buffer.status == .completed,
+                    acknowledged: pairAcknowledged, at: ProcessInfo.processInfo.systemUptime)
             }
             if let gpuTiming,
                let summary = gpuTiming.record(completed: buffer.status == .completed, error: buffer.status == .error,
@@ -1357,12 +1386,13 @@ final class GameWorldRenderer: @unchecked Sendable {
                         sources: [GameWorldSourceEye], pairQualified: Bool, timestamp: Double,
                         commands: any MTLCommandBuffer, cornerScratch: inout CornerScratchLease,
                         adaptiveScratch: inout AdaptiveScratchLease,
-                        singleSource: GameWorldSourceEye? = nil) -> (views: Int, copy: Bool, finiteSkyFirstEye: Bool, orderedCornersFirstEye: Bool, hudIsolated: Bool,
-                            displayOptics: GameWorldScopeOptics.Optics) {
+                        singleSource: GameWorldSourceEye? = nil, sampleCompletedPair: Bool = false) -> (views: Int, copy: Bool, finiteSkyFirstEye: Bool, orderedCornersFirstEye: Bool, hudIsolated: Bool,
+                            displayOptics: GameWorldScopeOptics.Optics, completionEyes: [GameWorldCompletedPair.Eye]) {
         var clearedTextures = Set<String>()
         var encodedViews = 0
         var finiteSkyFirstEye = false
         var orderedCornersFirstEye = false
+        var completionEyes: [GameWorldCompletedPair.Eye] = []
         // Both eyes use one original-game aim sample, even if the script thread
         // publishes another sample between the two encoding calls.
         let gameplayAim = reticle == nil ? nil : GameWorldReticle.snapshot()
@@ -1486,12 +1516,46 @@ final class GameWorldRenderer: @unchecked Sendable {
                 source = (sourceEye, worldUniforms(eye: sourceEye, stageFromHead: stageFromHead, headFromEye: worldEye,
                                                    projection: projection))
             }
+            var completionEye: GameWorldCompletedPair.Eye?
             if let source, source.eye.kind == .actual,
                let density = GameWorldSamplingDensity.measure(eye: eye, displayProjection: projection,
                    displayPixels: SIMD2(Int(map.viewport.width), Int(map.viewport.height)),
                    sourceProjection: source.eye.sourceProjection,
                    sourcePixels: SIMD2(Int(source.eye.width), Int(source.eye.height))) {
                 imageQuality.record(density: density)
+                if sampleCompletedPair, let lease = source.eye.lease {
+                    let retained = XRHeadTracking.shared.retainedPose(headFrame: source.eye.headFrame, now: timestamp)
+                    let check = retained.map { pose in
+                        GameWorldSourcePoseCheck.verify(retainedStageFromHead: pose.stageFromHead, retainedEyes: pose.eyes,
+                            retainedRequestFrame: pose.requestFrame, eyeIndex: source.eye.viewIndex,
+                            requestFrame: source.eye.requestFrame, leaseGameFromStage: source.eye.gameFromStage,
+                            leaseGameFromEye: source.eye.gameFromEye, leaseProjection: source.eye.sourceProjection,
+                            leaseDepthReversed: source.uniforms.sourceDepthReversed != 0)
+                    }
+                    let matched = check?.passed == true
+                    let guardScale = matched && retained?.eyes.indices.contains(source.eye.viewIndex) == true
+                        ? retained?.eyes[source.eye.viewIndex].sourceGuardBandScale : nil
+                    completionEye = GameWorldCompletedPair.Eye(displayEye: eye, sourceEye: source.eye.viewIndex,
+                        lease: lease.native.lease, game: source.eye.gameFrame, request: source.eye.requestFrame,
+                        head: source.eye.headFrame, sourcePresentationTime: source.eye.presentationTime,
+                        retainedPoseTime: retained.flatMap { matched && $0.timestamp.isFinite ? $0.timestamp : nil },
+                        requestedGuard: guardScale.flatMap { $0.isFinite && $0 > 0 ? $0 : nil },
+                        guardProvenance: matched ? "retained_request_verified_against_source_pose_and_projection"
+                            : "unavailable_" + (check?.reason ?? "retained_pose_missing"),
+                        inferredFocalGuard: GameWorldCompletedPair.focalRatio(display: projection, source: source.eye.sourceProjection),
+                        sourceProjection: GameWorldCompletedPair.bits(source.eye.sourceProjection),
+                        sourceGameFromEye: GameWorldCompletedPair.bits(source.eye.gameFromEye),
+                        sourceGameFromStage: GameWorldCompletedPair.bits(source.eye.gameFromStage),
+                        displayProjection: GameWorldCompletedPair.bits(projection),
+                        displayHeadFromEye: GameWorldCompletedPair.bits(view.transform),
+                        displayWorldHeadFromEye: GameWorldCompletedPair.bits(worldEye),
+                        currentEyeFromSourceEye: GameWorldCompletedPair.bits(source.uniforms.currentEyeFromSourceEye),
+                        viewport: [map.viewport.originX, map.viewport.originY, map.viewport.width, map.viewport.height], density: density)
+                    // Source-anchor copy relabels the drawable; preserve that
+                    // actual retained anchor separately from the current pose.
+                    completionEye?.sourceAnchorStageFromHead = copyDecision.map { GameWorldCompletedPair.bits($0.retained.stageFromHead) }
+                    completionEye?.sourceAnchorPoseTime = copyDecision?.retained.timestamp
+                }
             }
             let skyOutcome: GameWorldFiniteSkyTelemetry.Outcome
             var skyResult: GameWorldFiniteSkySupport.Result?
@@ -1569,6 +1633,13 @@ final class GameWorldRenderer: @unchecked Sendable {
                             reportStatus("The immersive HUD overlay could not be encoded; waiting for the next complete frame.")
                         }
                     }
+                }
+                if var completionEye, let skyResult {
+                    completionEye.path = skyResult.orderedCorners ? "finite_sky_ordered_corners"
+                        : skyResult.cornersPrecomputed ? "finite_sky_precomputed_corners" : "finite_sky_original_mesh"
+                    if skyResult.verticalReconstruction { completionEye.path += "_vertical_reconstruction" }
+                    completionEye.orderedPreparation = skyResult.orderedPreparation
+                    completionEyes.append(completionEye)
                 }
                 continue
             }
@@ -1648,6 +1719,12 @@ final class GameWorldRenderer: @unchecked Sendable {
                         instanceCount: Int(sourceEye.width) * Int(sourceEye.height))
                 }
                 encodedViews += 1
+                if var completionEye {
+                    completionEye.path = copyDecision != nil ? "source_anchor_copy" : adaptiveSet != nil ? "adaptive_mesh"
+                        : corners != nil ? "precomputed_corners_mesh" : "original_mesh"
+                    completionEye.orderedPreparation = "finite_sky_not_encoded_" + skyOutcome.rawValue
+                    completionEyes.append(completionEye)
+                }
                 if !loggedFrame {
                     log.info("Actual GTA source eye \(eye): kind=\(sourceEye.kind.rawValue, privacy: .public) size=\(sourceEye.width)x\(sourceEye.height) format=\(sourceEye.color.pixelFormat.rawValue) color_device=\(sourceEye.color.device.registryID) compositor_device=\(self.layer.device.registryID) eye_x=\(view.transform.columns.3.x) projection_x=\(uniforms.currentClipFromEye.columns.2.x) source_near=\(sourceEye.depthNear) source_far=\(sourceEye.depthFar) corner_precompute=\(corners != nil) adaptive=\(adaptiveSet != nil) copy=\(copyDecision != nil)")
                 }
@@ -1665,7 +1742,7 @@ final class GameWorldRenderer: @unchecked Sendable {
             encoder.endEncoding()
             if let adaptiveSet, let adaptiveMesh { adaptiveMesh.encodeCounterCopy(commands: commands, set: adaptiveSet) }
         }
-        return (encodedViews, copyDecision != nil, finiteSkyFirstEye, orderedCornersFirstEye, hudSnapshot != nil, displayOptics)
+        return (encodedViews, copyDecision != nil, finiteSkyFirstEye, orderedCornersFirstEye, hudSnapshot != nil, displayOptics, completionEyes)
     }
 
     /// Synchronized compact snapshot read by the existing lifecycle report.

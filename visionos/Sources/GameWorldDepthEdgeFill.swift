@@ -96,6 +96,7 @@ final class GameWorldImageQualityTelemetry: @unchecked Sendable {
 
     let fillRequested: Bool
     let fillAvailable: Bool
+    let completedPairs = GameWorldCompletedPairTelemetry()
     private let lock = NSLock()
     private var outcomes = [[UInt64]](repeating: [UInt64](repeating: 0, count: Outcome.allCases.count), count: 2)
     private var nextSample = [Double](repeating: 0, count: 2)
@@ -145,19 +146,25 @@ final class GameWorldImageQualityTelemetry: @unchecked Sendable {
 
     var reportValue: [String: Any] {
         lock.lock()
-        defer { lock.unlock() }
+        let observedOutcomes = outcomes, observedSamples = samples, observedDensity = density
+        let completedCount = completedSamples, failedCount = failedSamples
+        lock.unlock()
+        // Report dictionary construction, including the bounded completed-pair
+        // payload, must not hold the lock used by per-eye render observations.
         let views: [[String: Any]] = (0..<2).map { view in
             var counts: [String: UInt64] = [:]
-            for (outcome, count) in zip(Outcome.allCases, outcomes[view]) where count > 0 { counts[outcome.rawValue] = count }
+            for (outcome, count) in zip(Outcome.allCases, observedOutcomes[view]) where count > 0 { counts[outcome.rawValue] = count }
             var row: [String: Any] = ["view_index": view, "encode_outcomes": counts]
-            if let sample = samples[view] { row["last_gpu_sample"] = sample }
+            if let sample = observedSamples[view] { row["last_gpu_sample"] = sample }
             return row
         }
         return ["schema": 1,
                 "depth_edge_fill": ["requested": fillRequested, "available": fillAvailable,
-                    "completed_gpu_samples": completedSamples, "failed_gpu_samples": failedSamples, "views": views,
+                    "completed_gpu_samples": completedCount, "failed_gpu_samples": failedCount, "views": views,
                     "scope": "Counters come from sampled, successfully completed compositor command buffers. A filled pixel copies one adjacent source texel from the same game frame: an estimate of hidden background, not newly rendered geometry, and not visual acceptance."] as [String: Any],
-                "sampling_density": density.compactMap { $0?.reportValue },
+                "sampling_density": observedDensity.compactMap { $0?.reportValue },
+                "sampling_density_stage": "latest independent per-eye CPU observations, before encoding and without completion qualification",
+                "completed_display_pairs": completedPairs.reportValue,
                 "sampling_density_scope": "Straight ahead of each eye, from the actual display projection/viewport and the displayed source lease projection/size. Above 1 display pixel per source texel is enlargement; this is not perceived sharpness."]
     }
 }

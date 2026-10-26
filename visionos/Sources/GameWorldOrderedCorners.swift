@@ -93,6 +93,7 @@ final class GameWorldOrderedCorners: @unchecked Sendable {
     struct Resources: @unchecked Sendable {
         let corners: any MTLTexture
         let indices: any MTLBuffer
+        var reusedCompletedSource = false
     }
 
     struct Statistics: Sendable {
@@ -332,7 +333,9 @@ final class GameWorldOrderedCorners: @unchecked Sendable {
             key: key, queue: commands.commandQueue) else { return nil }
         if hit {
             commands.addCompletedHandler { [lease] command in lease.release(success: command.status == .completed) }
-            return resources
+            var result = resources
+            result.reusedCompletedSource = true
+            return result
         }
         func encoder(_ ordinal: Int) -> (any MTLComputeCommandEncoder)? {
             #if SV_ORDERED_CORNERS_VALIDATION
