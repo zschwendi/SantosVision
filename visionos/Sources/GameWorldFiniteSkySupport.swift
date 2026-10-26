@@ -66,6 +66,7 @@ final class GameWorldFiniteSkySupport: @unchecked Sendable {
           colorFormat: MTLPixelFormat, depthFormat: MTLPixelFormat,
           precomputeCorners: Bool = ProcessInfo.processInfo.environment["MUGUET_COMPOSITOR_CORNER_PRECOMPUTE"] == "1",
           orderedCorners: Bool = ProcessInfo.processInfo.environment["MUGUET_COMPOSITOR_ORDERED_CORNERS"] == "1",
+          reuseOrderedSources: Bool = ProcessInfo.processInfo.environment["MUGUET_COMPOSITOR_ORDERED_SOURCE_REUSE"] == "1",
           verticalReconstruction: Bool = false) {
         orderedRequested = orderedCorners
         guard let vertex = library.makeFunction(name: "gameWorldVertex"),
@@ -129,7 +130,7 @@ final class GameWorldFiniteSkySupport: @unchecked Sendable {
         // retains the complete original path below; no source samples are culled.
         var orderedPipeline: (GameWorldOrderedCorners, any MTLRenderPipelineState)?
         if orderedCorners, let vertex = library.makeFunction(name: "orderedCornerVertex"),
-           let helper = GameWorldOrderedCorners(device: device, library: library) {
+           let helper = GameWorldOrderedCorners(device: device, library: library, reuseSources: reuseOrderedSources) {
             let descriptor = world.copy() as! MTLRenderPipelineDescriptor
             descriptor.label = "Finite sky: exact source-order indexed corner sharing"
             descriptor.vertexFunction = vertex
@@ -149,7 +150,8 @@ final class GameWorldFiniteSkySupport: @unchecked Sendable {
     func encode(commands: any MTLCommandBuffer, pass: MTLRenderPassDescriptor,
                 viewport: MTLViewport, projection: simd_float4x4, far: Float,
                 uniforms: GameWorldUniforms, color: any MTLTexture,
-                depth: any MTLTexture, allowVerticalReconstruction: Bool = false) -> Result? {
+                depth: any MTLTexture, allowVerticalReconstruction: Bool = false,
+                orderedSource: GameWorldOrderedSourceIdentity? = nil) -> Result? {
         guard let target = pass.colorAttachments[0].texture,
               let targetDepth = pass.depthAttachment.texture,
               target.sampleCount == 1, targetDepth.sampleCount == 1,
@@ -179,7 +181,7 @@ final class GameWorldFiniteSkySupport: @unchecked Sendable {
         // to the normal bilinear/affine route verified independently; other
         // reconstruction experiments retain their original pipelines.
         let orderedResources = !(allowVerticalReconstruction && verticalPipeline != nil) && uniforms.reserved == .zero
-            ? ordered?.helper.prepare(commands: commands, uniforms: uniforms, depth: depth) : nil
+            ? ordered?.helper.prepare(commands: commands, uniforms: uniforms, depth: depth, source: orderedSource) : nil
         if orderedResources == nil, let corners,
            let texture = cornerPool.acquire(device: target.device, width: color.width, height: color.height) {
             let completion = CornerCompletionLease(pool: cornerPool, lease: CornerScratchLease(textures: [texture]))
@@ -260,9 +262,17 @@ final class GameWorldFiniteSkySupport: @unchecked Sendable {
             status["busy_sets"] = statistics.busy
             status["scratch_bytes"] = statistics.bytes
             status["released_leases"] = statistics.releasedLeases
+            status["source_reuse_enabled"] = ordered.helper.reuseSources
+            status["source_cache_hits"] = statistics.cacheHits
+            status["source_cache_misses"] = statistics.cacheMisses
+            status["ready_cached_sets"] = statistics.readyCached
+            status["cache_reader_leases"] = statistics.readerLeases
         }
         return status
     }
+
+    var wantsOrderedSourceIdentity: Bool { ordered?.helper.reuseSources == true }
+    func retireOrderedSourceCache() { ordered?.helper.retireSourceCache() }
 
     #if SV_ORDERED_CORNERS_VALIDATION
     // Inject refusal at the real optional encoder boundary in offscreen tests.

@@ -47,6 +47,15 @@ pub struct SVWorldOpticsFrame {
     pub magnification:f32, pub reference_fov_degrees:f32, pub actual_fov_degrees:f32,
     pub source_eye:u32, pub view_count:u32, pub flags:u32, pub reserved:[u32;4],
 }
+/// Additive exact immutable publication identity, checked against a live lease.
+/// Unlike a native texture address, source_id changes on every slot overwrite.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SVWorldSourceFrame {
+    pub abi_version:u32, pub byte_size:u32,
+    pub lease:u64, pub source_id:u64, pub generation:u64, pub provenance_epoch:u64,
+}
+const _:()=assert!(std::mem::size_of::<SVWorldSourceFrame>()==40);
 const _:()=assert!(std::mem::size_of::<SVWorldOpticsFrame>()==112);
 const _:()=assert!(std::mem::offset_of!(SVWorldOpticsFrame,presentation_time)==64);
 const _:()=assert!(std::mem::offset_of!(SVWorldOpticsFrame,magnification)==72);
@@ -99,7 +108,7 @@ impl FrozenPreUiDepth {
 /// Native handle for diagnostics manifests only; never dereferenced by callers.
 pub(crate) fn native_texture_handle(texture: &Texture) -> Option<u64> { metal_pointer(texture) }
 #[derive(Clone)]
-struct Ready { slot: Arc<Slot>, frame: WorldFrame, generation: u64, provenance_epoch: u64,
+struct Ready { slot: Arc<Slot>, frame: WorldFrame, source_id:u64, generation: u64, provenance_epoch: u64,
     pair_epoch: u64, ready_at: Instant, snapshot_submit_to_gpu_completion_seconds: Option<f64>,
     hud: Option<Arc<crate::xr_hud::HudImages>>, optics:FrameOptics }
 impl Ready {
@@ -126,6 +135,7 @@ struct Frames {
     latest_pair: Option<ReadyPair>,
     leases: HashMap<u64, Ready>,
     next_lease: u64,
+    next_source_id: u64,
     published: u64,
     dropped: u64,
     acquired: u64,
@@ -142,6 +152,13 @@ struct Frames {
 }
 static FRAMES: LazyLock<Mutex<Frames>> = LazyLock::new(|| Mutex::new(Frames::default()));
 static PENDING_SNAPSHOT_CALLBACKS: AtomicUsize = AtomicUsize::new(0);
+
+fn reserve_source_ids(next:&mut u64,count:u64)->Option<u64> {
+    if count==0{return None;}
+    let last=next.checked_add(count)?;
+    let first=next.checked_add(1)?;
+    *next=last;Some(first)
+}
 
 // Metal completion updates wgpu's fence, but publication still requires a
 // submit/device poll to dispatch this callback. Keep the producer polling even
@@ -410,13 +427,15 @@ pub(crate) fn publish_pair(device: &Device, queue: &Queue, sources: [PairSource<
             "paired eyes must have distinct native depth targets");
         anyhow::ensure!(crate::xr_view::view_epoch_is_active(provenance_epoch),
             "paired source provenance expired");
-        let (slots, generation) = {
+        let (slots, generation, first_source_id) = {
             let mut frames = FRAMES.lock().map_err(|_| anyhow::anyhow!("world frame lock poisoned"))?;
             let left = reserve_snapshot_slot(&mut frames, device, sources[0].color, None)
                 .context("no left-eye snapshot slot")?;
             let right = reserve_snapshot_slot(&mut frames, device, sources[1].color, None)
                 .context("no right-eye snapshot slot")?;
-            ([left, right], frames.generation)
+            let first=reserve_source_ids(&mut frames.next_source_id,2)
+                .context("immutable paired source identity exhausted")?;
+            ([left, right], frames.generation, first)
         };
         let mut published = source_frames;
         for index in 0..2 {
@@ -460,7 +479,8 @@ pub(crate) fn publish_pair(device: &Device, queue: &Queue, sources: [PairSource<
                     || frames.latest_pair.as_ref().is_some_and(|pair| pair.scene_epoch >= scene_epoch) { return; }
                 let ready_at = Instant::now();
                 let eyes = std::array::from_fn(|index| Ready { slot: slots[index].clone(),
-                    frame: published[index], generation, provenance_epoch, pair_epoch: scene_epoch,
+                    frame: published[index], source_id:first_source_id+index as u64,
+                    generation, provenance_epoch, pair_epoch: scene_epoch,
                     ready_at, snapshot_submit_to_gpu_completion_seconds, hud:None, optics:FrameOptics::default() });
                 frames.latest = [Some(eyes[0].clone()), Some(eyes[1].clone())];
                 frames.latest_pair = Some(ReadyPair { eyes, scene_epoch, ready_at });
@@ -546,7 +566,7 @@ pub(crate) fn publish_with_hud_and_optics(device:&Device, queue:&Queue, color:&T
                 && native_device.is_some() && native_device == metal_device_pointer(color)
         });
         let used_frozen_depth = frozen_depth.is_some();
-        let (slot, generation) = {
+        let (slot, generation, source_id) = {
             let mut frames = FRAMES.lock().map_err(|_| anyhow::anyhow!("world frame lock poisoned"))?;
             // A GPU command dequeued before close/recenter must not capture the
             // reopened generation after those operations reset its provenance.
@@ -561,7 +581,9 @@ pub(crate) fn publish_with_hud_and_optics(device:&Device, queue:&Queue, color:&T
                     return Ok(());
                 }
             };
-            (slot, frames.generation)
+            let source_id=reserve_source_ids(&mut frames.next_source_id,1)
+                .context("immutable source identity exhausted")?;
+            (slot, frames.generation, source_id)
         };
         frame.abi_version = 1;
         frame.byte_size = std::mem::size_of::<WorldFrame>() as u32;
@@ -593,7 +615,7 @@ pub(crate) fn publish_with_hud_and_optics(device:&Device, queue:&Queue, color:&T
                 if generation != frames.generation || !crate::xr_view::view_epoch_is_active(provenance_epoch) { return; }
                 let index = frame.view_index as usize;
                 if hud.is_some(){crate::xr_hud::record_result(true,None);}
-                frames.latest[index] = Some(Ready { slot, frame, generation, provenance_epoch,
+                frames.latest[index] = Some(Ready { slot, frame, source_id, generation, provenance_epoch,
                     pair_epoch: 0, ready_at: Instant::now(), snapshot_submit_to_gpu_completion_seconds, hud, optics });
                 frames.published += 1;
                 if used_frozen_depth { frames.frozen_depth_handoffs += 1; }
@@ -669,6 +691,23 @@ pub extern "C" fn sv_world_frame_optics_v1(world_lease:u64,output:*mut SVWorldOp
     let Some(ready)=frames.leases.get(&world_lease)else{return -1;};
     if ready.generation!=frames.generation || !crate::xr_view::view_epoch_is_active(ready.provenance_epoch){return 1;}
     *out=ready.optics.describe(world_lease,ready.provenance_epoch,ready.frame);0
+}
+
+/// Cold opt-in source-derived cache admission. Does not mint/retain a lease or
+/// extend native snapshot lifetime; the caller must keep its current lease live
+/// until every GPU read completes, exactly as for the original frame ABI.
+#[no_mangle]
+pub extern "C" fn sv_world_frame_source_v1(world_lease:u64,output:*mut SVWorldSourceFrame)->i32 {
+    if output.is_null() || (output as usize)%std::mem::align_of::<SVWorldSourceFrame>()!=0{return -1;}
+    let out=unsafe{&mut *output};
+    if out.abi_version!=1 || out.byte_size!=40{return -1;}
+    *out=SVWorldSourceFrame{abi_version:1,byte_size:40,..Default::default()};
+    let Ok(frames)=FRAMES.lock()else{return -1;};
+    let Some(ready)=frames.leases.get(&world_lease)else{return -1;};
+    if ready.source_id==0 || ready.generation!=frames.generation
+        || !crate::xr_view::view_epoch_is_active(ready.provenance_epoch){return 1;}
+    *out=SVWorldSourceFrame{abi_version:1,byte_size:40,lease:world_lease,
+        source_id:ready.source_id,generation:ready.generation,provenance_epoch:ready.provenance_epoch};0
 }
 
 #[no_mangle]
@@ -810,6 +849,107 @@ pub(crate) fn lock_test_publication() -> std::sync::MutexGuard<'static, ()> {
 mod tests {
     use super::*;
     pub(super) static TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn immutable_source_ids_are_nonzero_monotonic_and_fail_closed_without_wrap() {
+        let mut next=0;
+        assert_eq!(reserve_source_ids(&mut next,1),Some(1));
+        assert_eq!(reserve_source_ids(&mut next,2),Some(2));
+        assert_eq!(next,3);
+        assert_eq!(reserve_source_ids(&mut next,0),None);
+        assert_eq!(next,3);
+        next=u64::MAX-1;
+        assert_eq!(reserve_source_ids(&mut next,2),None);
+        assert_eq!(next,u64::MAX-1);
+        assert_eq!(reserve_source_ids(&mut next,1),Some(u64::MAX));
+        assert_eq!(reserve_source_ids(&mut next,1),None);
+        assert_eq!(next,u64::MAX);
+    }
+
+    #[test]
+    fn immutable_source_sidecar_rejects_and_clears_unknown_or_released_lease() {
+        let _serial=TEST_LOCK.lock().unwrap();
+        let mut out=SVWorldSourceFrame{abi_version:1,byte_size:40,lease:u64::MAX,
+            source_id:u64::MAX,generation:u64::MAX,provenance_epoch:u64::MAX};
+        assert_eq!(sv_world_frame_source_v1(u64::MAX,&mut out),-1);
+        assert_eq!(out,SVWorldSourceFrame{abi_version:1,byte_size:40,..Default::default()});
+        assert_eq!(sv_world_frame_source_v1(0,std::ptr::null_mut()),-1);
+        out.abi_version=2;
+        assert_eq!(sv_world_frame_source_v1(0,&mut out),-1);
+    }
+
+    #[test]
+    #[cfg(target_os="macos")]
+    #[ignore="explicit Metal immutable publication ID and slot-reuse proof"]
+    fn immutable_source_id_survives_reacquire_and_changes_on_identical_metadata_slot_reuse() {
+        let _serial=TEST_LOCK.lock().unwrap();
+        *FRAMES.lock().unwrap()=Frames::default();
+        assert_eq!(crate::xr_view::sv_xr_world_camera_set_enabled(1),0);
+        let epoch=crate::xr_view::view_epoch();
+        let mut descriptor=InstanceDescriptor::new_without_display_handle();descriptor.backends=Backends::METAL;
+        let instance=Instance::new(descriptor);
+        let adapter=pollster::block_on(instance.request_adapter(&RequestAdapterOptions::default())).unwrap();
+        let (device,queue)=pollster::block_on(adapter.request_device(&DeviceDescriptor::default())).unwrap();
+        let make=|format|device.create_texture(&TextureDescriptor {label:Some("Source ID slot-reuse proof"),
+            size:Extent3d{width:1,height:1,depth_or_array_layers:1},mip_level_count:1,sample_count:1,
+            dimension:TextureDimension::D2,format,usage:TextureUsages::COPY_SRC|TextureUsages::COPY_DST|TextureUsages::TEXTURE_BINDING,
+            view_formats:&[]});
+        let color=make(TextureFormat::Rgba8Unorm);let depth=make(TextureFormat::R32Float);
+        let identity_matrix=[1.,0.,0.,0.,0.,1.,0.,0.,0.,0.,1.,0.,0.,0.,0.,1.];
+        let projection=[1.,0.,0.,0.,0.,1.,0.,0.,0.,0.,0.0001,-1.,0.,0.,0.1,0.];
+        let frame=WorldFrame{view_count:1,game_frame:7,request_frame:8,head_frame:9,presentation_time:10.,
+            projection_from_eye:projection,game_from_eye:identity_matrix,game_from_stage:identity_matrix,..Default::default()};
+        let publish_value=|value:f32| {
+            queue.write_texture(TexelCopyTextureInfo{texture:&depth,mip_level:0,origin:Origin3d::ZERO,aspect:TextureAspect::All},
+                &value.to_le_bytes(),TexelCopyBufferLayout{offset:0,bytes_per_row:Some(4),rows_per_image:Some(1)},
+                Extent3d{width:1,height:1,depth_or_array_layers:1});
+            publish(&device,&queue,&color,&depth,frame,epoch);
+            device.poll(PollType::Wait{submission_index:None,timeout:Some(Duration::from_secs(10))}).unwrap();
+        };
+        let acquire=|| {
+            let mut returned=WorldFrame{abi_version:1,byte_size:288,..Default::default()};
+            assert_eq!(sv_world_acquire_frame(0,&mut returned),0);returned
+        };
+        let identity=|lease| {
+            let mut value=SVWorldSourceFrame{abi_version:1,byte_size:40,..Default::default()};
+            assert_eq!(sv_world_frame_source_v1(lease,&mut value),0);value
+        };
+        publish_value(0.25);
+        let first=acquire();let first_id=identity(first.lease);
+        let again=acquire();let again_id=identity(again.lease);
+        assert_ne!(first.lease,again.lease);assert_eq!(first_id.source_id,again_id.source_id);
+        assert_eq!(FRAMES.lock().unwrap().leases.len(),2); // Sidecars never mint leases.
+        let retained_texture_only=FRAMES.lock().unwrap().leases[&first.lease].slot.depth.clone();
+        assert_eq!(sv_world_release_frame(first.lease),0);assert_eq!(sv_world_release_frame(again.lease),0);
+        let mut stale=first_id;assert_eq!(sv_world_frame_source_v1(first.lease,&mut stale),-1);assert_eq!(stale.source_id,0);
+        publish_value(0.5); // Latest A protects its slot; B uses another.
+        publish_value(0.75); // Only the pool owns A now, so C overwrites A.
+        let current=acquire();let current_id=identity(current.lease);
+        assert_eq!(current.depth_texture,first.depth_texture);
+        assert_eq!((current.game_frame,current.request_frame,current.head_frame,current.presentation_time),
+            (first.game_frame,first.request_frame,first.head_frame,first.presentation_time));
+        assert!(current_id.source_id>first_id.source_id);assert_eq!(current_id.provenance_epoch,epoch);
+        let output=device.create_buffer(&BufferDescriptor{label:Some("Retained texture is not native slot ownership"),
+            size:256,usage:BufferUsages::COPY_DST|BufferUsages::MAP_READ,mapped_at_creation:false});
+        let mut copy=device.create_command_encoder(&CommandEncoderDescriptor::default());
+        copy.copy_texture_to_buffer(TexelCopyTextureInfo{texture:&retained_texture_only,mip_level:0,origin:Origin3d::ZERO,aspect:TextureAspect::All},
+            TexelCopyBufferInfo{buffer:&output,layout:TexelCopyBufferLayout{offset:0,bytes_per_row:Some(256),rows_per_image:Some(1)}},
+            Extent3d{width:1,height:1,depth_or_array_layers:1});
+        let index=queue.submit([copy.finish()]);let (send,receive)=std::sync::mpsc::channel();
+        output.slice(..).map_async(MapMode::Read,move|result|{send.send(result).unwrap();});
+        device.poll(PollType::Wait{submission_index:Some(index),timeout:Some(Duration::from_secs(10))}).unwrap();
+        receive.recv_timeout(Duration::from_secs(1)).unwrap().unwrap();
+        let mapped=output.slice(..).get_mapped_range().unwrap();
+        assert_eq!(f32::from_le_bytes(mapped[..4].try_into().unwrap()),0.75);
+        drop(mapped);output.unmap();
+        let next=FRAMES.lock().unwrap().next_source_id;reset();
+        assert_eq!(FRAMES.lock().unwrap().next_source_id,next);
+        let mut expired=current_id;assert_eq!(sv_world_frame_source_v1(current.lease,&mut expired),1);
+        assert_eq!((expired.lease,expired.source_id,expired.provenance_epoch),(0,0,0));
+        assert_eq!(sv_world_release_frame(current.lease),0);
+        assert_eq!(crate::xr_view::sv_xr_world_camera_set_enabled(0),0);
+        *FRAMES.lock().unwrap()=Frames::default();
+    }
 
     #[test]
     fn world_callback_accounting_drives_production_poll_and_idle_policy_until_every_guard_retires() {

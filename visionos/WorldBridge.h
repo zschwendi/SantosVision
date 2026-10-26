@@ -59,6 +59,16 @@ int32_t sv_world_acquire_pair(SVWorldPair *pair);
 /* Release ONLY after the compositor command buffer finishes reading textures.
  * Duplicate/unknown lease tokens return -1 and never release another frame. */
 int32_t sv_world_release_frame(uint64_t lease);
+/* Exact immutable snapshot publication identity. Requires a current live
+ * lease; does not retain/pin native resources. source_id is nonzero and changes
+ * on every publication, even when the slot address and frame metadata repeat.
+ * Caller still releases its existing lease only after command completion. */
+typedef struct {
+    uint32_t abi_version, byte_size;
+    uint64_t lease, source_id, generation, provenance_epoch;
+} SVWorldSourceFrame;
+_Static_assert(sizeof(SVWorldSourceFrame) == 40, "SVWorldSourceFrame ABI must match Rust");
+int32_t sv_world_frame_source_v1(uint64_t world_lease, SVWorldSourceFrame *source);
 /* Report a completed Metal compositor command while all leases are still live.
  * status is MTLCommandBufferStatus (4 means completed). The native side verifies
  * every eye token before counting a world frame; release leases afterwards. */

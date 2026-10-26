@@ -248,6 +248,30 @@ private final class GameWorldLease: @unchecked Sendable {
         released = true
         _ = sv_world_release_frame(native.lease)
     }
+
+    /// Read only for the separately enabled derived-source cache. The sidecar
+    /// verifies this exact lease is still current; the normal command handler
+    /// remains responsible for releasing it after GPU completion.
+    func orderedSourceIdentity() -> GameWorldOrderedSourceIdentity? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !released else { return nil }
+        var identity = SVWorldSourceFrame()
+        identity.abi_version = 1; identity.byte_size = 40
+        guard MemoryLayout<SVWorldSourceFrame>.size == 40,
+              sv_world_frame_source_v1(native.lease, &identity) == 0,
+              identity.abi_version == 1, identity.byte_size == 40,
+              identity.lease == native.lease, identity.source_id != 0,
+              identity.provenance_epoch == opticalFrame.epoch else { return nil }
+        let columns = [sourceProjection.columns.0, sourceProjection.columns.1,
+            sourceProjection.columns.2, sourceProjection.columns.3]
+        return GameWorldOrderedSourceIdentity(sourceID: identity.source_id, generation: identity.generation,
+            epoch: identity.provenance_epoch, gameFrame: native.game_frame,
+            requestFrame: native.request_frame, headFrame: native.head_frame,
+            eye: native.view_index, viewCount: native.view_count, depthHandle: native.depth_texture,
+            width: native.width, height: native.height, presentationBits: native.presentation_time.bitPattern,
+            projectionBits: columns.flatMap { [$0.x.bitPattern, $0.y.bitPattern, $0.z.bitPattern, $0.w.bitPattern] })
+    }
     deinit { release() }
 }
 
@@ -697,6 +721,7 @@ final class GameWorldRenderer: @unchecked Sendable {
     }
 
     private func releaseCameraOwnership() {
+        finiteSkySupport?.retireOrderedSourceCache()
         let released = WorldCameraOwnership.shared.release(sessionToken)
         if released, latencyTraceRequested { sv_world_latency_finish() }
     }
@@ -1477,7 +1502,9 @@ final class GameWorldRenderer: @unchecked Sendable {
                 skyResult = finiteSkySupport.encode(commands: commands, pass: pass, viewport: map.viewport,
                     projection: projection, far: drawable.depthRange.x, uniforms: source.uniforms,
                     color: source.eye.color, depth: source.eye.depth,
-                    allowVerticalReconstruction: hudSnapshot != nil)
+                    allowVerticalReconstruction: hudSnapshot != nil,
+                    orderedSource: finiteSkySupport.wantsOrderedSourceIdentity
+                        ? source.eye.lease?.orderedSourceIdentity() : nil)
                 skyOutcome = skyResult != nil ? .encoded : .encodeUnavailable
             } else { skyOutcome = .noQualifiedActualSource }
             finiteSkyTelemetry.record(view: eye, outcome: skyOutcome, source: source.map {
