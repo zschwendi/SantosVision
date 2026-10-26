@@ -1,0 +1,41 @@
+{
+  "schema": 1,
+  "baseline": "private exact27 source-aspect readiness fixture r4 (not production checkout)",
+  "files": {
+    "src/lib.rs": {
+      "before_sha256": "ab6778c0aa0e7513644364ba152c689a145a5301e6cff03c010d32bb0a1b169b",
+      "after_sha256": "b136e5f0fce34abab99c2ac683f1549f8f12b0aa554f2caa8e0cc99f7b63856f"
+    },
+    "src/mp.rs": {
+      "before_sha256": "5fe152b40192f92ca636f7b8d1da371f2085789c949a8ff89d84aef9ba767b23",
+      "after_sha256": "cd2ae0e8001e73ed73d57c5f1e545031a9dc8ff3d8959d337a88b731b94c780f"
+    },
+    "src/gpu.rs": {
+      "before_sha256": "e923ffd67ec03a41dda197ffe0011f631376b322133806d183d3df6c095776e7",
+      "after_sha256": "e5ea41594a1960e3f0b3d05b3d35c4518991a46c7d6ff1b9b1579a5d44213977"
+    },
+    "src/world_frame.rs": {
+      "before_sha256": "68fe132cd97ebce7de3a29ebc5b1fe265feadf3792cc178a9e141176e894d5dd",
+      "after_sha256": "3c5ae1e76c80f91808c8f943b8ef259dd6fd1aebb2f834aacbca3be160dd13e1"
+    },
+    "src/third_person_source_qa.rs": {
+      "before_sha256": "112d2f0f8e70395b9dea376adc30f7fe90e557656f19c2ef1179c8821294af2f",
+      "after_sha256": "dfad8a5dc4d78cb410d7417500d00b252a29c1cd7d86878b76a040526108a77d"
+    },
+    "src/qa_readiness_observer.rs": {
+      "before_sha256": "d413b072f456f3c7a5e64de94bf9fa747b2caeaaeefef8fdf239bc23c5d5f6d7",
+      "after_sha256": "b67e94d0fd1f81e7dc5dade262a1a1db45f2379feb30d1c73530b804fa583840"
+    },
+    "src/qa_scene_setup.rs": {
+      "before_sha256": null,
+      "after_sha256": "35b2550f048923d31af9f8f84ce69f8f4002f9c0d52de79268793020a045d559"
+    },
+    "src/qa_idle_camera.rs": {
+      "before_sha256": null,
+      "after_sha256": "e1126cede57f068b3db302a030858cf3526921daabdbb8acbb044fc7114581d9"
+    }
+  },
+  "original_game_and_AOT_assets_included": false,
+  "compiled_executable_sha256": "7cd5a746066b89cd0115baa54c265a1960d15973a9b1197430c32d0f1b9e78d6",
+  "source_manifest_sha256": "eec087182c874e5a09e96e9f0b41405661fc9b50f98ffe5406c03ae72e5be29e"
+}

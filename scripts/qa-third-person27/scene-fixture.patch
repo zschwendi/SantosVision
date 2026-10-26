@@ -1,0 +1,380 @@
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -668,3 +668,7 @@
+ mod third_person_source_qa;
+ #[cfg(all(test,target_os="macos"))]
+ mod qa_readiness_observer;
++#[cfg(all(test,target_os="macos"))]
++mod qa_scene_setup;
++#[cfg(all(test,target_os="macos"))]
++mod qa_idle_camera;
+--- a/src/mp.rs
++++ b/src/mp.rs
+@@ -894,6 +894,7 @@
+         let mut c = Cmd { caller, scratch };
+         #[cfg(all(test,target_os="macos"))]
+         if crate::third_person_source_qa::active() {
++            qa_fixed_third_person_scene(&mut c);
+             let qa_ped=c.i("PlayerPedId",&[]);
+             let qa_player=qa_ped!=0&&c.exists(qa_ped);
+             let qa_gameplay=c.i("IsGameplayCamRendering",&[])!=0;
+@@ -930,6 +931,63 @@
+     }
+     write_u64(mem, active, saved);
+     Ok(())
++}
++
++#[cfg(all(test,target_os="macos"))]
++fn qa_fixed_third_person_scene(c:&mut Cmd<'_, '_>){
++    use crate::qa_scene_setup::{Action,Sample};
++    fn typed(c:&mut Cmd<'_, '_>,name:&str,args:&[Val])->Option<i32>{match call(c.caller,&format!("mp:{name}"),args){Some(Val::I32(v))=>Some(v),_=>None}}
++    fn typed_vec(c:&mut Cmd<'_, '_>,name:&str,args:&[Val])->Option<[f32;3]>{
++        for off in [0u64,8,16]{crate::write_u32(c.mem(),c.scratch+off,f32::NAN.to_bits());}
++        let mut full=vec![Val::I64(c.scratch as i64)];full.extend_from_slice(args);
++        if !matches!(call(c.caller,&format!("mp:{name}"),&full),Some(Val::I32(0))){return None;}
++        let v=[c.read_f32(0),c.read_f32(8),c.read_f32(16)];v.iter().all(|v|v.is_finite()).then_some(v)
++    }
++    let ped=typed(c,"PlayerPedId",&[]);
++    let exists=ped.and_then(|p|typed(c,"DoesEntityExist",&[i(p)])).map(|x|x!=0);
++    let health=ped.and_then(|p|typed(c,"GetEntityHealth",&[i(p)]));
++    let in_vehicle=ped.and_then(|p|typed(c,"IsPedInAnyVehicle",&[i(p),b(false)])).map(|x|x!=0);
++    let gameplay=typed(c,"IsGameplayCamRendering",&[]).map(|x|x!=0);
++    let on_screen=ped.and_then(|p|typed(c,"IsEntityOnScreen",&[i(p)])).map(|x|x!=0);
++    let m=c.mem();
++    let directors=||{[19_235_320u64,19_275_168,19_235_336,19_235_296].map(|a|crate::read_u64(m,a))};
++    let d=directors();let stable=d==directors();
++    let scripted_dominant=if stable{match(d[1],d[2]){(Some(d),Some(s))if d!=0&&s!=0=>Some(d==s),_=>None}}else{None};
++    let player_position=ped.and_then(|p|typed_vec(c,"GetEntityCoords",&[i(p),b(false)]));
++    let position_at_target=player_position.map(|p|dist(p,crate::qa_scene_setup::POSITION)<=0.25);
++    let sample=Sample{ped,exists,health,in_vehicle,gameplay,on_screen,scripted_dominant,position_at_target};
++    let mut commands=serde_json::Map::new();
++    let mut idle_error=None;
++    // Prevent/recover ONLY original idle-camera state before the Setup gate.
++    // Gameplay may already be non-dominant due to idle; no generic input or
++    // script/cinematic director override is substituted here.
++    if crate::qa_idle_camera::may_invalidate(sample,crate::qa_scene_setup::elapsed_ms(),d[3],crate::qa_scene_setup::rejected()){
++        let table=c.caller.get_export("__indirect_function_table").and_then(|e|e.into_table());
++        let result=crate::qa_idle_camera::invoke(c.caller,table,crate::qa_idle_camera::certified());
++        let code=if let Err(error)=result{idle_error=Some(error);None}else{Some(0)};
++        commands.insert("InvalidateIdleCam_original_table45348".into(),serde_json::json!(code));
++    }
++    let action=crate::qa_scene_setup::decide(sample);
++    if matches!(action,Action::Setup|Action::ResetScriptCamera)&&scripted_dominant==Some(true){commands.insert("RenderScriptCams_force_stop".into(),serde_json::json!(typed(c,"RenderScriptCams",&[b(false),b(false),i(0),b(true),b(true),i(0)])));}
++    if action==Action::Setup{
++        if let Some(p)=ped{
++            let pos=c.vec_arg(1,crate::qa_scene_setup::POSITION);
++            commands.insert("SetEntityCoordsNoOffset".into(),serde_json::json!(typed(c,"SetEntityCoordsNoOffset",&[i(p),pos,b(false),b(false),b(false)])));
++            commands.insert("SetEntityHeading".into(),serde_json::json!(typed(c,"SetEntityHeading",&[i(p),f(crate::qa_scene_setup::HEADING)])));
++            commands.insert("FreezeEntityPosition".into(),serde_json::json!(typed(c,"FreezeEntityPosition",&[i(p),b(true)])));
++            commands.insert("SetFollowPedCamViewMode".into(),serde_json::json!(typed(c,"SetFollowPedCamViewMode",&[i(1)])));
++            commands.insert("SetGameplayCamRelativeHeading".into(),serde_json::json!(typed(c,"SetGameplayCamRelativeHeading",&[f(0.)])));
++            commands.insert("SetGameplayCamRelativePitch".into(),serde_json::json!(typed(c,"SetGameplayCamRelativePitch",&[f(-3.),f(1.)])));
++            c.c_str(S_NAME,"EXTRASUNNY");let weather=c.ptr(S_NAME);
++            commands.insert("SetWeatherTypeNowPersist".into(),serde_json::json!(typed(c,"SetWeatherTypeNowPersist",&[weather])));
++        }
++    }
++    if matches!(action,Action::Setup|Action::ResetScriptCamera|Action::HoldClock){
++        commands.insert("SetClockTime".into(),serde_json::json!(typed(c,"SetClockTime",&[i(12),i(0),i(0)])));
++    }
++    let after=directors();let after_stable=after==directors();
++    let raw=serde_json::json!({"director_globals_double_read_stable":stable,"gameplay_director":d[0],"dominant_director":d[1],"scripted_director":d[2],"cinematic_director":d[3],"dominant_vtable":d[1].filter(|a|*a!=0).and_then(|a|crate::read_u64(m,a)),"player_position":player_position,"player_model":ped.and_then(|p|typed(c,"GetEntityModel",&[i(p)])),"gameplay_camera_position":typed_vec(c,"GetGameplayCamCoord",&[]),"follow_camera":read_native_camera(c).map(|r|[r.ped_view_mode,r.vehicle_view_mode]),"selected_script_scope_only":true,"idle_command_error":idle_error,"director_globals_post_idle_double_read_stable":after_stable,"post_idle_gameplay_director":after[0],"post_idle_dominant_director":after[1],"post_idle_scripted_director":after[2],"post_idle_cinematic_director":after[3]});
++    crate::qa_scene_setup::record(sample,raw,action,serde_json::Value::Object(commands));
+ }
+ 
+ /// Optional native camera diagnostics. Pose consumption and rigid offsets run
+--- a/src/gpu.rs
++++ b/src/gpu.rs
+@@ -3386,7 +3386,13 @@
+         match self.obj(self.s.shader[0]) { Some(Obj::Shader(s)) => Some(s.sig.clone()), _ => None }
+     }
+ 
++    #[track_caller]
+     fn skip(&mut self) {
++        #[cfg(all(test,target_os="macos"))]
++        if crate::third_person_source_qa::active(){
++            let hash=|id|match self.obj(id){Some(Obj::Shader(s))=>s.hash.as_str(),_=>"missing"};
++            crate::qa_scene_setup::record_skip(std::panic::Location::caller().line(),hash(self.s.shader[0]),hash(self.s.shader[1]));
++        }
+         if let Some(hud)=&mut self.hud_capture { hud.rejected.get_or_insert_with(||"draw skipped after final postFX".into()); }
+         self.skipped += 1;
+     }
+--- a/src/world_frame.rs
++++ b/src/world_frame.rs
+@@ -103,7 +103,9 @@
+     pair_epoch: u64, ready_at: Instant, snapshot_submit_to_gpu_completion_seconds: Option<f64>,
+     hud: Option<Arc<crate::xr_hud::HudImages>>, optics:FrameOptics,
+     #[cfg(all(test,target_os="macos"))]
+-    qa_readiness:Option<crate::qa_readiness_observer::Stamp> }
++    qa_readiness:Option<crate::qa_readiness_observer::Stamp>,
++    #[cfg(all(test,target_os="macos"))]
++    qa_scene:serde_json::Value }
+ impl Ready {
+     #[cfg(test)]
+     fn depth_texture(&self) -> &Texture { &self.slot.depth }
+@@ -445,7 +447,8 @@
+                 let eyes = std::array::from_fn(|index| Ready { slot: slots[index].clone(),
+                     frame: published[index], generation, provenance_epoch, pair_epoch: scene_epoch,
+                     ready_at, snapshot_submit_to_gpu_completion_seconds, hud:None, optics:FrameOptics::default(),
+-                    #[cfg(all(test,target_os="macos"))] qa_readiness:None });
++                    #[cfg(all(test,target_os="macos"))] qa_readiness:None,
++                    #[cfg(all(test,target_os="macos"))] qa_scene:serde_json::Value::Null });
+                 frames.latest = [Some(eyes[0].clone()), Some(eyes[1].clone())];
+                 frames.latest_pair = Some(ReadyPair { eyes, scene_epoch, ready_at });
+                 frames.published += 2;
+@@ -490,6 +493,8 @@
+     let optics=FrameOptics{camera_sequence,optics};
+     #[cfg(all(test,target_os="macos"))]
+     let qa_readiness=crate::qa_readiness_observer::stamp_for_snapshot(&frame,provenance_epoch);
++    #[cfg(all(test,target_os="macos"))]
++    let qa_scene=crate::qa_readiness_observer::scene_for_snapshot(&frame,provenance_epoch);
+     let result = (|| -> anyhow::Result<()> {
+         anyhow::ensure!(optics.optics.valid(),"invalid immutable optical frame metadata");
+         if let Some(images)=&hud { let hud=&images.contribution; anyhow::ensure!(hud.format()==TextureFormat::Rgba16Float
+@@ -567,7 +572,8 @@
+                 if hud.is_some(){crate::xr_hud::record_result(true,None);}
+                 frames.latest[index] = Some(Ready { slot, frame, generation, provenance_epoch,
+                     pair_epoch: 0, ready_at: Instant::now(), snapshot_submit_to_gpu_completion_seconds, hud, optics,
+-                    #[cfg(all(test,target_os="macos"))] qa_readiness });
++                    #[cfg(all(test,target_os="macos"))] qa_readiness,
++                    #[cfg(all(test,target_os="macos"))] qa_scene });
+                 frames.published += 1;
+                 if used_frozen_depth { frames.frozen_depth_handoffs += 1; }
+                 else { frames.copied_depth_snapshots += 1; }
+@@ -1447,7 +1453,7 @@
+         let Some(ready)=ready else{let _=sv_world_release_frame(frame.lease);continue;};
+         // Immutable eligibility selects a candidate; explicit deadline fallback
+         // still exports failed/unknown diagnostics without upgrading readiness.
+-        if !crate::qa_readiness_observer::export_allowed(ready.qa_readiness)
++        if !crate::qa_readiness_observer::export_allowed(ready.qa_readiness,&ready.qa_scene)
+             || !crate::third_person_source_qa::claim_eye(eye) {
+             let _=sv_world_release_frame(frame.lease);continue;
+         }
+@@ -1489,6 +1495,7 @@
+                 "hud_api_result":hud_api_result,"hud_api_header":[hud_api.abi_version,hud_api.byte_size],"optics_api_result":optics_result,"optics_api_header":[optics_api.abi_version,optics_api.byte_size],"diagnostic_camera_eligible":crate::third_person_source_qa::diagnostic_camera_eligible(),"compatibility_accepted":false,"classification":"diagnostic evidence only; camera/HUD/shape acceptance evaluated after bytes are preserved",
+                 "warmup_policy":"No diagnostic export gate on dimensions, camera eligibility, HUD availability or present count",
+                 "readiness_at_snapshot":crate::qa_readiness_observer::stamp_json(ready.qa_readiness),
++                "scene_at_snapshot":ready.qa_scene,
+                 "diagnostic_deadline_fallback":crate::qa_readiness_observer::force_world(),
+                 "camera_getter_at_readback":crate::third_person_source_qa::camera_json(),"world_frame_status":status_json(),"hud_status":crate::xr_hud::status_json(),
+                 "registration":"All source images are the exact same immutable leased raster, tightly packed top-left texel rows. Independent eyes retain their actual separate frame IDs."}))
+--- a/src/third_person_source_qa.rs
++++ b/src/third_person_source_qa.rs
+@@ -61,6 +61,7 @@
+     let engine=wasmtime::Engine::new(&crate::engine_config_for(false))?;
+     let module=unsafe{wasmtime::Module::deserialize(&engine,&code)}.map_err(anyhow::Error::from).context("exact27 Mac AOT is not compatible; forbid fallback")?;
+     let startup=crate::config::setup_native(game,save)?;
++    crate::qa_idle_camera::certify(&std::fs::read(&startup.wasm_path)?,&sha)?;
+     let meta=std::fs::metadata(&startup.wasm_path)?;
+     let stamp=meta.modified()?.duration_since(std::time::UNIX_EPOCH)?.as_secs();
+     use std::hash::{Hash,Hasher};
+@@ -89,6 +90,7 @@
+     let eyes=[crate::xr_view::SVXREyeView{head_from_eye:fixed16(&request["head_from_eyes"][0])?,projection_from_eye:fixed16(&request["projection_from_eyes"][0])?},crate::xr_view::SVXREyeView{head_from_eye:fixed16(&request["head_from_eyes"][1])?,projection_from_eye:fixed16(&request["projection_from_eyes"][1])?}];
+     ensure!(crate::native::sv_world_set_frozen_depth_transfer(1)==0,"app frozen-depth prestart setter");ensure!(crate::native::sv_runtime_set_draw_setup_overhead(1)==0,"app overhead prestart setter");
+     ensure!(!crate::xr_view::world_camera_enabled(),"flat starts without camera override");crate::xr_view::qa_observe_native_without_camera_override();ensure!(!crate::xr_view::world_camera_enabled(),"trace must not enable camera override");
++    crate::qa_scene_setup::initialize();
+     let start=Instant::now();setup_aot(&game,&save,&PathBuf::from(std::env::var("SV_3P_QA_AOT")?))?;
+     let game_c=CString::new(game.to_str().unwrap())?;let save_c=CString::new(save.to_str().unwrap())?;let mut error=vec![0i8;65536];
+     ensure!(crate::native::sv_runtime_start(game_c.as_ptr(),save_c.as_ptr(),error.as_mut_ptr(),error.len())==0,"native start {}",unsafe{CStr::from_ptr(error.as_ptr())}.to_string_lossy());ensure!(crate::native::sv_runtime_set_active(1)==0,"active runtime");
+@@ -104,14 +106,14 @@
+             for (key,value)in[("TextureQuality","2"),("ShaderQuality","1"),("ShadowQuality","2"),("ReflectionQuality","1"),("SSAO","1"),("AnisotropicFiltering","16"),("FXAA_Enabled","true"),("MSAA","0")]{ensure!(s["graphics"]["actual_graphics_values"][key]==value,"actual XML{key} differs from immutable device seed");}
+             write_json("effective-app-parity.json",&s)?;parity_checked=true;
+         }
+-        let now=start.elapsed().as_secs();if now>=tick{write_json(&format!("readiness-{now:03}.json"),&crate::qa_readiness_observer::status_json())?;tick=now+1;}
++        let now=start.elapsed().as_secs();if now>=tick{write_json(&format!("readiness-{now:03}.json"),&crate::qa_readiness_observer::status_json())?;write_json(&format!("scene-{now:03}.json"),&crate::qa_scene_setup::status())?;tick=now+1;}
+         // Reserve time for actual world/depth diagnostics even if Flat never qualifies.
+         // These are deadline budgets, never readiness or acceptance signals.
+         if !world&&now>=125{crate::qa_readiness_observer::force_flat_diagnostic();}
+         let capture=crate::capture::status_json();
+         if !world&&capture["state"]=="written"{
+             ensure!(capture["width"].as_u64()==Some(width)&&capture["height"].as_u64()==Some(height),"actual normal final dimensions");
+-            write_json("normal-final-capture.json",&capture)?;write_json("normal-window-native-status.json",&s)?;write_json("normal-window-camera.json",&camera_json())?;
++            write_json("normal-final-scene.json",&crate::qa_scene_setup::status())?;write_json("normal-final-capture.json",&capture)?;write_json("normal-window-native-status.json",&s)?;write_json("normal-window-camera.json",&camera_json())?;
+             ensure!(crate::xr_view::sv_xr_world_camera_set_enabled(1)==0,"world enable");ensure!(crate::xr_hud::sv_xr_set_hud_ready(1)==0,"qualified HUD pipeline availability request");
+             ARMED.store(true,Ordering::Release);world=true;
+         }
+@@ -120,8 +122,8 @@
+             ensure!(unsafe{crate::xr::sv_xr_submit_pose(&pose)}==0,"head request");ensure!(unsafe{crate::xr_view::sv_xr_submit_views(&views)}==0,"view request");
+             if now>=170{crate::qa_readiness_observer::force_world_diagnostic();}
+             if exports_completed_without_error()?{
+-                write_json("final-native-status.json",&s)?;write_json("final-camera.json",&camera_json())?;write_json("final-readiness.json",&crate::qa_readiness_observer::status_json())?;
+-                write_json("runtime-completion.json",&json!({"schema":1,"profile":[width,height],"diagnostic_images_written":true,"compatibility_accepted":false,"physical_acceptance":false,"same_epoch_stereo_certified":false,"elapsed_seconds":start.elapsed().as_secs_f64(),"readiness_is_eligibility_only":true,"app_parity_checked":parity_checked}))?;return Ok(());
++                write_json("final-scene.json",&crate::qa_scene_setup::status())?;write_json("final-native-status.json",&s)?;write_json("final-camera.json",&camera_json())?;write_json("final-readiness.json",&crate::qa_readiness_observer::status_json())?;
++                write_json("runtime-completion.json",&json!({"schema":1,"profile":[width,height],"diagnostic_images_written":true,"compatibility_accepted":false,"physical_acceptance":false,"same_epoch_stereo_certified":false,"elapsed_seconds":start.elapsed().as_secs_f64(),"readiness_is_eligibility_only":true,"app_parity_checked":parity_checked,"test_only_scene_setup_qualified":crate::qa_scene_setup::qualified()}))?;return Ok(());
+             }
+         }
+         std::thread::sleep(Duration::from_millis(16));
+@@ -171,6 +173,7 @@
+ pub(crate) fn request_flat_capture(stamp:crate::qa_readiness_observer::Stamp){
+     if FLAT_CAPTURE_ARMED.compare_exchange(false,true,Ordering::AcqRel,Ordering::Acquire).is_err(){return;}
+     let result=(||->Result<()>{
++        write_json("normal-final-scene-at-present.json",&crate::qa_readiness_observer::scene_for_key(stamp.key))?;
+         write_json("normal-final-readiness.json",&crate::qa_readiness_observer::stamp_json(Some(stamp)))?;
+         let output=OUTPUT.get().context("diagnostic output not initialized")?.join("normal-final.ppm");let path=CString::new(output.to_str().context("outputUTF8")?)?;
+         ensure!(crate::capture::sv_gpu_capture_next(path.as_ptr())==0,"normal final readback request failed");Ok(())
+--- a/src/qa_readiness_observer.rs
++++ b/src/qa_readiness_observer.rs
+@@ -5,6 +5,7 @@
+ use serde_json::{json,Value};
+ use std::sync::{atomic::{AtomicBool,AtomicU64,Ordering},LazyLock,Mutex};
+ use std::time::Instant;
++use std::collections::VecDeque;
+ 
+ #[derive(Clone,Copy,Default)]
+ pub(crate) struct Counters {pub pending_jobs:u64,pub pending_drops:u64,pub skipped:u64,pub encoded:u64}
+@@ -14,8 +15,8 @@
+ static DEPTH:[AtomicU64;2]=[AtomicU64::new(0),AtomicU64::new(0)];
+ static FORCE_FLAT:AtomicBool=AtomicBool::new(false);
+ static FORCE_WORLD:AtomicBool=AtomicBool::new(false);
+-struct State {gate:gate::Gate,previous:Counters,latest:Option<Stamp>}
+-static STATE:LazyLock<Mutex<State>>=LazyLock::new(||Mutex::new(State{gate:gate::Gate::new(),previous:Counters::default(),latest:None}));
++struct State {gate:gate::Gate,previous:Counters,latest:Option<Stamp>,scenes:VecDeque<(FrameKey,Value)>}
++static STATE:LazyLock<Mutex<State>>=LazyLock::new(||Mutex::new(State{gate:gate::Gate::new(),previous:Counters::default(),latest:None,scenes:VecDeque::new()}));
+ 
+ pub(crate) fn record_camera(value:Option<crate::xr::CameraReadback>,player:bool,gameplay:bool){
+     *CAMERA.lock().unwrap()=Some(CameraEvent{value,player,gameplay,at:Instant::now()});
+@@ -38,8 +39,10 @@
+     let depth=[DEPTH[0].swap(0,Ordering::AcqRel),DEPTH[1].swap(0,Ordering::AcqRel)];
+     let stamp={let mut state=STATE.lock().unwrap();let prev=state.previous;state.previous=c;
+         let stats=Stats{pending_jobs:c.pending_jobs,pending_draw_drops:c.pending_drops.saturating_sub(prev.pending_drops),skipped_draws:c.skipped.saturating_sub(prev.skipped),encoded_draws:c.encoded.saturating_sub(prev.encoded),encoded_scene_depth_draws:if view.is_some(){depth[match stage{Stage::Flat=>0,Stage::World=>1}]}else{0},camera:camera()};
+-        let stamp=state.gate.observe(key,stats);state.latest=Some(stamp);stamp};
+-    if stage==Stage::Flat&&(stamp.capture_eligible||FORCE_FLAT.load(Ordering::Acquire)){
++        let stamp=state.gate.observe(key,stats);
++        insert_scene(&mut state.scenes,key,crate::qa_scene_setup::snapshot());
++        state.latest=Some(stamp);stamp};
++    if stage==Stage::Flat&&((stamp.capture_eligible&&scene_qualified(&scene_for_key(stamp.key)))||FORCE_FLAT.load(Ordering::Acquire)){
+         crate::third_person_source_qa::request_flat_capture(stamp);
+     }
+ }
+@@ -48,7 +51,16 @@
+ pub(crate) fn stamp_for_snapshot(frame:&crate::world_frame::WorldFrame,epoch:u64)->Option<Stamp>{
+     STATE.lock().unwrap().gate.lookup(FrameKey{epoch,game_frame:frame.game_frame,request_frame:frame.request_frame,head_frame:frame.head_frame,eye:frame.view_index,stage:Stage::World})
+ }
+-pub(crate) fn export_allowed(stamp:Option<Stamp>)->bool{force_world()||stamp.is_some_and(|s|s.capture_eligible)}
++fn insert_scene(scenes:&mut VecDeque<(FrameKey,Value)>,key:FrameKey,value:Value){
++    if scenes.iter().any(|(k,_)|*k==key){scenes.retain(|(k,_)|*k!=key);scenes.push_back((key,Value::Null));}
++    else{scenes.push_back((key,value));}
++    while scenes.len()>gate::MAX_RECORDS{scenes.pop_front();}
++}
++fn lookup_scene(scenes:&VecDeque<(FrameKey,Value)>,key:FrameKey)->Value{scenes.iter().find(|(k,_)|*k==key).map(|(_,v)|v.clone()).unwrap_or(Value::Null)}
++pub(crate) fn scene_for_key(key:FrameKey)->Value{lookup_scene(&STATE.lock().unwrap().scenes,key)}
++pub(crate) fn scene_for_snapshot(frame:&crate::world_frame::WorldFrame,epoch:u64)->Value{scene_for_key(FrameKey{epoch,game_frame:frame.game_frame,request_frame:frame.request_frame,head_frame:frame.head_frame,eye:frame.view_index,stage:Stage::World})}
++fn scene_qualified(scene:&Value)->bool{scene["latest"]["scene_settled"]==true}
++pub(crate) fn export_allowed(stamp:Option<Stamp>,scene:&Value)->bool{force_world()||(stamp.is_some_and(|s|s.capture_eligible)&&scene_qualified(scene))}
+ pub(crate) fn stamp_json(stamp:Option<Stamp>)->Value{
+     let Some(s)=stamp else{return json!({"record_present":false,"capture_eligible":false,"failure":"missing_exact_snapshot_readiness"});};
+     let camera=s.stats.camera.map(|c|json!({"player_exists":c.player_exists,"gameplay_rendering":c.gameplay_rendering,"mode":c.mode,"age_ms":c.age_ms}));
+@@ -66,8 +78,17 @@
+ 
+ #[cfg(test)]mod tests{
+     use super::*;
++    #[test]fn exact_scene_copy_stays_immutable_and_duplicate_or_eviction_fails_unknown(){
++        let mut scenes=VecDeque::new();let key=FrameKey{epoch:4,game_frame:1,request_frame:9,head_frame:9,eye:0,stage:Stage::World};
++        insert_scene(&mut scenes,key,json!({"latest":{"scene_settled":false}}));let old=lookup_scene(&scenes,key);
++        insert_scene(&mut scenes,FrameKey{game_frame:2,..key},json!({"latest":{"scene_settled":true}}));
++        assert!(!scene_qualified(&old));assert!(!scene_qualified(&lookup_scene(&scenes,FrameKey{eye:1,..key})));
++        insert_scene(&mut scenes,key,json!({"latest":{"scene_settled":true}}));assert!(lookup_scene(&scenes,key).is_null());assert!(!scene_qualified(&old));
++        for frame in 3..300{insert_scene(&mut scenes,FrameKey{game_frame:frame,..key},json!({"latest":{"scene_settled":true}}));}
++        assert_eq!(scenes.len(),gate::MAX_RECORDS);assert!(lookup_scene(&scenes,key).is_null());
++    }
+     #[test]fn missing_stamp_is_unknown_and_only_explicit_fallback_allows_diagnostics(){
+-        assert!(!FORCE_WORLD.load(Ordering::Acquire));assert!(!export_allowed(None));
++        assert!(!FORCE_WORLD.load(Ordering::Acquire));assert!(!export_allowed(None,&Value::Null));
+         let value=stamp_json(None);assert_eq!(value["capture_eligible"],false);assert_eq!(value["record_present"],false);
+     }
+     #[test]fn immutable_stamp_json_never_looks_up_current_state(){
+--- /dev/null
++++ b/src/qa_scene_setup.rs
+@@ -0,0 +1,49 @@
++//! Private test-only deterministic third-person scene setup. Never production.
++use serde_json::{json,Value};
++use std::sync::{Mutex,OnceLock};
++use std::time::Instant;
++
++pub(crate) const POSITION:[f32;3]=[-1037.0,-2737.0,20.1693];
++pub(crate) const HEADING:f32=180.;
++#[derive(Clone,Copy,Debug,PartialEq,Eq)]
++pub(crate) enum Action{Wait,Setup,ResetScriptCamera,HoldClock,Reject}
++#[derive(Clone,Copy,Debug)]
++pub(crate) struct Sample{pub ped:Option<i32>,pub exists:Option<bool>,pub health:Option<i32>,pub in_vehicle:Option<bool>,pub gameplay:Option<bool>,pub on_screen:Option<bool>,pub scripted_dominant:Option<bool>,pub position_at_target:Option<bool>}
++#[derive(Default)]
++pub(crate) struct Policy{ped:Option<i32>,stable_ticks:u32,setup_ms:Option<u64>,resets:u8,last_reset_ms:u64,rejected:bool}
++impl Policy{
++ pub(crate) fn step(&mut self,ms:u64,s:Sample)->Action{
++  if self.rejected{return Action::Reject;}
++  if let Some(bound)=self.ped{if self.setup_ms.is_some()&&s.ped!=Some(bound){self.rejected=true;return Action::Reject;}}
++  let valid=s.ped.is_some_and(|p|p>0)&&s.exists==Some(true)&&s.health.is_some_and(|h|h>0)&&s.in_vehicle==Some(false);
++  if !valid{self.stable_ticks=0;return Action::Wait;}
++  if self.ped!=s.ped{self.ped=s.ped;self.stable_ticks=0;}
++  self.stable_ticks=self.stable_ticks.saturating_add(1);
++  if self.setup_ms.is_none(){if s.gameplay!=Some(true)&&s.scripted_dominant!=Some(true){return Action::Wait;}if ms>=45_000&&self.stable_ticks>=30{self.setup_ms=Some(ms);self.last_reset_ms=ms;return Action::Setup;}return Action::Wait;}
++  if s.gameplay!=Some(true)&&s.scripted_dominant==Some(true)&&ms.saturating_sub(self.last_reset_ms)>=1000&&self.resets<3{self.resets+=1;self.last_reset_ms=ms;return Action::ResetScriptCamera;}
++  Action::HoldClock
++ }
++ pub(crate) fn settled(&self,ms:u64,s:Sample)->bool{!self.rejected&&self.setup_ms.is_some_and(|t|ms.saturating_sub(t)>=20_000)&&s.ped==self.ped&&s.exists==Some(true)&&s.health.is_some_and(|h|h>0)&&s.in_vehicle==Some(false)&&s.gameplay==Some(true)&&s.on_screen==Some(true)&&s.position_at_target==Some(true)}
++}
++struct State{policy:Policy,samples:Vec<Value>,last_sample_ms:u64,latest:Value}
++static SKIPS:Mutex<std::collections::BTreeMap<String,u64>>=Mutex::new(std::collections::BTreeMap::new());
++pub(crate) fn record_skip(line:u32,vertex:&str,pixel:&str){let key=format!("draw_skip_line{line}:{vertex}:{pixel}");let mut m=SKIPS.lock().unwrap();if let Some(n)=m.get_mut(&key){*n=n.saturating_add(1);}else if m.len()<256{m.insert(key,1);}}
++static START:OnceLock<Instant>=OnceLock::new();
++static STATE:Mutex<Option<State>>=Mutex::new(None);
++pub(crate) fn initialize(){START.set(Instant::now()).expect("one scene fixture/process");*STATE.lock().unwrap()=Some(State{policy:Policy::default(),samples:Vec::new(),last_sample_ms:0,latest:Value::Null});}
++pub(crate) fn elapsed_ms()->u64{START.get().map(|t|t.elapsed().as_millis().min(u128::from(u64::MAX))as u64).unwrap_or(0)}
++pub(crate) fn decide(s:Sample)->Action{let ms=elapsed_ms();STATE.lock().unwrap().as_mut().map(|s0|s0.policy.step(ms,s)).unwrap_or(Action::Wait)}
++pub(crate) fn record(sample:Sample,raw:Value,action:Action,commands:Value){let ms=elapsed_ms();let mut lock=STATE.lock().unwrap();let Some(s)=lock.as_mut()else{return;};if commands.as_object().is_some_and(|m|m.values().any(Value::is_null)){s.policy.rejected=true;}let settled=s.policy.settled(ms,sample);let event=json!({"elapsed_ms":ms,"action":format!("{action:?}"),"ped":sample.ped,"exists":sample.exists,"health":sample.health,"in_vehicle":sample.in_vehicle,"gameplay_rendering":sample.gameplay,"entity_on_screen":sample.on_screen,"scripted_dominant":sample.scripted_dominant,"actual_position_at_target":sample.position_at_target,"scene_settled":settled,"raw":raw,"command_results":commands});s.latest=event.clone();if s.samples.len()<256&&(ms.saturating_sub(s.last_sample_ms)>=1000||matches!(action,Action::Setup|Action::ResetScriptCamera|Action::Reject)){s.last_sample_ms=ms;s.samples.push(event);}}
++pub(crate) fn rejected()->bool{STATE.lock().unwrap().as_ref().is_some_and(|s|s.policy.rejected)}
++pub(crate) fn qualified()->bool{STATE.lock().unwrap().as_ref().is_some_and(|s|s.latest["scene_settled"]==true)}
++pub(crate) fn snapshot()->Value{STATE.lock().unwrap().as_ref().map(|s|json!({"schema":1,"scene":"airport-fixed-tp-v1","position":POSITION,"heading":HEADING,"clock":[12,0,0],"weather":"EXTRASUNNY","latest":s.latest,"test_only_scene_mutation":true})).unwrap_or(Value::Null)}
++pub(crate) fn status()->Value{let lock=STATE.lock().unwrap();lock.as_ref().map(|s|json!({"schema":1,"scene":"airport-fixed-tp-v1","position":POSITION,"heading":HEADING,"clock":[12,0,0],"weather":"EXTRASUNNY","latest":s.latest,"bounded_samples":s.samples,"max_samples":256,"test_only_scene_mutation":true,"draw_skips_by_site_and_shader_cumulative":*SKIPS.lock().unwrap(),"skip_telemetry_scope":"draw skip helper only; direct compute skip branches remain counted by unchanged original gate but unclassified here","physical_acceptance":false})).unwrap_or(Value::Null)}
++#[cfg(test)]mod tests{use super::*;fn good()->Sample{Sample{ped:Some(258),exists:Some(true),health:Some(200),in_vehicle:Some(false),gameplay:Some(true),on_screen:Some(true),scripted_dominant:Some(false),position_at_target:Some(true)}}fn ready()->Policy{let mut p=Policy::default();for _ in 0..29{assert_eq!(p.step(45_000,good()),Action::Wait);}assert_eq!(p.step(45_000,good()),Action::Setup);p}
++#[test]fn setup_waits_for_time_and_stable_real_live_onfoot_ped(){let mut p=Policy::default();for ms in 0..45_000{assert_eq!(p.step(ms,good()),Action::Wait);}assert_eq!(p.step(45_000,good()),Action::Setup);}
++#[test]fn missing_typed_getters_never_qualify(){for field in 0..7{let mut s=good();match field{0=>s.ped=None,1=>s.exists=None,2=>s.health=None,3=>s.in_vehicle=None,4=>s.gameplay=None,5=>s.on_screen=None,_=>s.position_at_target=None};let mut p=ready();p.step(80_000,s);assert!(!p.settled(80_000,s));}}
++#[test]fn switching_raw_ped_after_setup_rejects_without_reapplying(){let mut p=ready();let mut s=good();s.ped=Some(259);assert_eq!(p.step(46_000,s),Action::Reject);assert_eq!(p.step(47_000,good()),Action::Reject);assert!(!p.settled(80_000,good()));}
++#[test]fn resets_bounded_three_spaced_attempts(){let mut p=ready();let mut s=good();s.gameplay=Some(false);s.scripted_dominant=Some(true);for t in [46_000,47_000,48_000]{assert_eq!(p.step(t,s),Action::ResetScriptCamera);}assert_eq!(p.step(49_000,s),Action::HoldClock);assert!(!p.settled(80_000,s));}
++#[test]fn wrong_or_unknown_actual_position_never_settles(){let p=ready();let mut s=good();s.position_at_target=Some(false);assert!(!p.settled(80_000,s));s.position_at_target=None;assert!(!p.settled(80_000,s));}
++#[test]fn unknown_or_other_director_never_starts_or_resets(){let mut p=Policy::default();let mut s=good();s.gameplay=Some(false);for _ in 0..60{assert_eq!(p.step(90_000,s),Action::Wait);}s.scripted_dominant=None;assert_eq!(p.step(90_000,s),Action::Wait);}
++#[test]fn actual_gameplay_and_on_screen_and_settle_required(){let p=ready();assert!(!p.settled(64_999,good()));assert!(p.settled(65_000,good()));let mut s=good();s.on_screen=Some(false);assert!(!p.settled(80_000,s));s.on_screen=Some(true);s.gameplay=Some(false);assert!(!p.settled(80_000,s));}
++}
+--- /dev/null
++++ b/src/qa_idle_camera.rs
+@@ -0,0 +1,41 @@
++//! Test-only original idle-camera command, from an existing immutable table slot.
++//! Original11ca8d... element table0 slot45348 -> func49111 [] -> []. Patch5
++//! reencodes function indices and retains element order; certified AOTdc4806...
++//! is patch2a5d56... . No exports/imports/AOT are generated by this helper.
++use std::sync::OnceLock;
++use wasmtime::{AsContextMut,Table};
++static CERTIFIED:OnceLock<bool>=OnceLock::new();
++pub(crate) const TABLE_SLOT:u64=45348;
++pub(crate) fn certify(original:&[u8],aot_sha:&str)->anyhow::Result<()>{
++    anyhow::ensure!(crate::xr_motion_patch::sha256(original)?=="11ca8d2c04c5e843d18ff4aea4899d72c86973c6b031df334e67c446b2ae83e0","idle original mapping unqualified");
++    anyhow::ensure!(aot_sha=="dc4806cba7b44366fd039dc5212a20fbfcc96139d3208047b5e52e41db2fdfff","idle AOT mapping unqualified");
++    CERTIFIED.set(true).map_err(|_|anyhow::anyhow!("one idle certificate/process"))?;Ok(())
++}
++pub(crate) fn certified()->bool{CERTIFIED.get()==Some(&true)}
++pub(crate) fn may_invalidate(s:crate::qa_scene_setup::Sample,ms:u64,cinematic:Option<u64>,rejected:bool)->bool{
++    !rejected&&ms>=5000&&cinematic.is_some_and(|v|v!=0)&&s.ped.is_some_and(|p|p>0)&&s.exists==Some(true)&&s.health.is_some_and(|h|h>0)&&s.in_vehicle==Some(false)
++}
++pub(crate) fn invoke<S:AsContextMut<Data=crate::HostState>>(store:&mut S,table:Option<Table>,certified:bool)->Result<(),String>{
++    if !certified{return Err("exact original/patch5/AOT mapping not certified".into());}
++    let table=table.ok_or("existing exported indirect table unavailable")?;
++    let func=table.get(&mut *store,TABLE_SLOT).and_then(|r|r.as_func().flatten().cloned()).ok_or("certified idle table slot missing/null")?;
++    let typed=func.typed::<(),()>(&*store).map_err(|e|format!("idle table signature mismatch: {e}"))?;
++    crate::guest_call_scope::call(store,crate::guest_call_scope::Kind::Ordinary,|s|typed.call(s,())).map_err(|e|format!("original InvalidateIdleCam failed: {e}"))
++}
++#[cfg(all(test,feature="jit"))]mod tests{
++ use super::*;use std::sync::{Arc,atomic::{AtomicU64,Ordering}};use wasmtime::{Engine,Store,TableType,RefType,Ref,Func};
++ #[test]fn idle_prevention_does_not_depend_on_setup_or_gameplay_dominance(){
++   use crate::qa_scene_setup::Sample;let base=Sample{ped:Some(258),exists:Some(true),health:Some(200),in_vehicle:Some(false),gameplay:Some(false),on_screen:Some(false),scripted_dominant:Some(false),position_at_target:Some(false)};
++   assert!(may_invalidate(base,5000,Some(4096),false));assert!(!may_invalidate(base,4999,Some(4096),false));assert!(!may_invalidate(base,5000,Some(0),false));assert!(!may_invalidate(base,5000,None,false));assert!(!may_invalidate(base,5000,Some(4096),true));
++   for n in 0..4{let mut s=base;match n{0=>s.ped=None,1=>s.exists=None,2=>s.health=None,_=>s.in_vehicle=None};assert!(!may_invalidate(s,5000,Some(4096),false));}
++ }
++ #[test]fn real_wasmtime_table_call_is_exact_typed_and_fail_closed(){
++  let e=Engine::default();let mut s=Store::new(&e,crate::HostState::new(0));let count=Arc::new(AtomicU64::new(0));let c=count.clone();
++  let valid=Func::wrap(&mut s,move||{c.fetch_add(1,Ordering::Relaxed);});
++  let table=Table::new(&mut s,TableType::new64(RefType::FUNCREF,TABLE_SLOT+1,Some(TABLE_SLOT+1)),Ref::Func(None)).unwrap();
++  assert!(invoke(&mut s,Some(table),false).is_err());assert!(invoke(&mut s,None,true).is_err());assert!(invoke(&mut s,Some(table),true).is_err());assert_eq!(count.load(Ordering::Relaxed),0);
++  let wrong=Func::wrap(&mut s,|_:i32|{});table.set(&mut s,TABLE_SLOT,Ref::Func(Some(wrong))).unwrap();assert!(invoke(&mut s,Some(table),true).is_err());assert_eq!(count.load(Ordering::Relaxed),0);
++  table.set(&mut s,TABLE_SLOT,Ref::Func(Some(valid))).unwrap();assert!(invoke(&mut s,Some(table),true).is_ok());assert_eq!(count.load(Ordering::Relaxed),1);
++  let trap=Func::wrap(&mut s,||->wasmtime::Result<()>{Err(wasmtime::Error::msg("injected idle command failure"))});table.set(&mut s,TABLE_SLOT,Ref::Func(Some(trap))).unwrap();assert!(invoke(&mut s,Some(table),true).is_err());assert_eq!(count.load(Ordering::Relaxed),1);
++ }
++}

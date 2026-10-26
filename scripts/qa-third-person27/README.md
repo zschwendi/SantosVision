@@ -1,0 +1,11 @@
+# Private third-person scene fixture repair
+
+This patch applies only to the previously frozen exact27 native-game readiness fixture. It does not compile in the normal app, change production graphics or controls, or include game/AOT/save assets. `source-hashes.json` pins every input and resulting source file; preserve existing fixture outputs and apply only to a new private clone.
+
+The old late capture was using GTA's automatic cinematic idle director, despite the follow-camera mode getter reporting third person. Exact original WASM proves the gameplay-camera getter compares gameplay and dominant-rendered director pointers. The actual repaired fixture records typed getter success, stable director globals, actual hero position, model and camera coordinates, then qualifies a fixed airport scene, noon and clear weather.
+
+The existing original `InvalidateIdleCam` command is invoked through source-certified slot45348 of the already-exported function table. It is typed `[] -> []`, requires exact original11ca8d... and Mac AOTdc4806... certification, and uses the ordinary guest-call cleanup wrapper inside the selected script/TLS scope. Unknown mapping, missing/null table, wrong signature or failed call rejects the scene. No new import, export, AOT or generic input is generated. Idle prevention runs for a valid live on-foot player before the setup decision, so an earlier idle-camera takeover cannot deadlock setup. Unknown cinematic directors are never forced through a script-camera reset.
+
+A successful void teleport is insufficient: actual position must be within0.25m of the specified point, a live on-foot player must exist and be on screen, gameplay must render, and the20s settle must complete. The original readiness gate remains byte-identical. A bounded exact-frame scene sidecar is copied into the immutable snapshot; newer readiness cannot upgrade older leases. Deadline exports remain explicitly failed/unknown diagnostics.
+
+Validation before the final native run:31 compiled CPU checks passed, including actual Wasmtime table64 lookup/type/failure calls and the idle-before-setup regression. Native full-game results are recorded separately in the private `third-person27/scene-fixture-repair` evidence directory. This is a test fixture and provides no physical quality, stereo or FPS acceptance.
