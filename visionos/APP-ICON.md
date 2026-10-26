@@ -1,4 +1,4 @@
-# Los Santos icon
+# V icon
 
 The current catalog selects **santos-five-visor.png**: an original neon Vision
 Pro visor with palm/sunset reflections and FIVE lettering. It was introduced

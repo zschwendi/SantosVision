@@ -2,13 +2,13 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-    <key>CFBundleDisplayName</key><string>Los Santos</string>
-    <key>CFBundleName</key><string>Los Santos</string>
+    <key>CFBundleDisplayName</key><string>V</string>
+    <key>CFBundleName</key><string>V</string>
     <key>CFBundleIdentifier</key><string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
     <key>CFBundleExecutable</key><string>$(EXECUTABLE_NAME)</string>
     <key>CFBundlePackageType</key><string>APPL</string>
     <key>CFBundleShortVersionString</key><string>0.1</string>
-    <key>CFBundleVersion</key><string>27.4</string>
+    <key>CFBundleVersion</key><string>27.5</string>
     <key>GCSupportsControllerUserInteraction</key><true/>
     <key>GCSupportedGameControllers</key>
     <array>
@@ -21,10 +21,10 @@
         <key>UISceneConfigurations</key><dict/>
     </dict>
     <key>NSWorldSensingUsageDescription</key>
-    <string>Los Santos uses your headset position and movement to render the immersive game world around you.</string>
+    <string>V uses your headset position and movement to render the immersive game world around you.</string>
     <key>NSAccessoryTrackingUsageDescription</key>
-    <string>Los Santos can use the position and orientation of your paired spatial controllers for immersive hand and aiming controls.</string>
+    <string>V can use the position and orientation of your paired spatial controllers for immersive hand and aiming controls.</string>
     <key>NSHandsTrackingUsageDescription</key>
-    <string>Los Santos can use your hand movements for immersive hand controls.</string>
+    <string>V can use your hand movements for immersive hand controls.</string>
 </dict>
 </plist>

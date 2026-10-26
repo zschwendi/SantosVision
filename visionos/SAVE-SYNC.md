@@ -1,4 +1,4 @@
-# GTA save history for SantosVision
+# GTA save history for V
 
 `SantosSaveSync` mirrors only `pc_settings.bin` and files under `Profiles/`
 within `Documents/saves/userdata/Documents/Rockstar Games/GTA V/`. The native

@@ -57,7 +57,7 @@ struct ImmersiveGameControls: View {
                 // calibration card; no new scene is created for it.
                 LeftWristCalibrationCard(model: runtime.leftWrist)
             } else {
-                Text("Los Santos").font(.title3.bold())
+                Text("V").font(.title3.bold())
                 SantosPauseControls(runtime: runtime,
                     windowAction: {
                         gameScenes.requestReturn(generation: world.sceneGeneration, reason: "player_requested_window")

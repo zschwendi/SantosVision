@@ -133,7 +133,7 @@ struct WindowGameView: View {
             } else if !runtime.hasStarted || runtime.engineFailed {
                 VStack(spacing: 16) {
                     if runtime.isBusy { ProgressView() }
-                    Text(runtime.engineFailed ? "Game stopped" : (runtime.isBusy ? "Starting Los Santos…" : "Game could not start"))
+                    Text(runtime.engineFailed ? "Game stopped" : (runtime.isBusy ? "Starting V…" : "Game could not start"))
                         .font(.title2)
                     Text(runtime.status).font(.caption).foregroundStyle(.secondary)
                     if !runtime.isBusy {
@@ -244,7 +244,7 @@ struct WindowGameView: View {
                 }
             }
             VStack(spacing: 18) {
-                Text("Los Santos").font(.largeTitle.weight(.semibold))
+                Text("V").font(.largeTitle.weight(.semibold))
                 Text("GTA V").font(.headline).foregroundStyle(.secondary)
                 if runtime.isBusy {
                     ProgressView()
@@ -275,7 +275,7 @@ struct WindowGameView: View {
             world.isOpening = false
             return
         }
-        world.status = "Opening immersive Los Santos…"
+        world.status = "Opening immersive V…"
         switch await openImmersiveSpace(id: GameWorldModel.spaceID) {
         case .opened:
             world.isImmersiveActive = true
@@ -412,7 +412,7 @@ struct SantosSettingsView: View {
                     Text("Adjusts the right stick's look speed. GTA's own mouse sensitivity also applies.")
                         .font(.caption).foregroundStyle(.secondary)
                     LeftWristCalibrationSettingsRow(model: runtime.leftWrist) { dismiss() }
-                    Text("DualSense: click the touchpad to change camera. Sense: click both sticks together to change camera; in first person, hold L2 and click R3 to toggle sights. Left stick always moves; its click is normal L3. Use the Phone button and its arrow pad for the phone. Look at a native button and press either Sense trigger to select it. Start opens GTA's own pause menu in the game window, with Los Santos settings and Quit beside it. In GTA Settings: stick moves, Cross selects, Circle goes back, L1/R1 change tabs, Square applies and Triangle is GTA's Tab. GTA keys: Enter ✕, Backspace ○, Space □, Tab △, Q/E L1/R1.")
+                    Text("DualSense: click the touchpad to change camera. Sense: click both sticks together to change camera; in first person, hold L2 and click R3 to toggle sights. Left stick always moves; its click is normal L3. Use the Phone button and its arrow pad for the phone. Look at a native button and press either Sense trigger to select it. Start opens GTA's own pause menu in the game window, with V settings and Quit beside it. In GTA Settings: stick moves, Cross selects, Circle goes back, L1/R1 change tabs, Square applies and Triangle is GTA's Tab. GTA keys: Enter ✕, Backspace ○, Space □, Tab △, Q/E L1/R1.")
                         .font(.caption).foregroundStyle(.secondary)
                 }
                 Section {
@@ -421,7 +421,7 @@ struct SantosSettingsView: View {
                         set: { runtime.setDrawSetupOverhead($0) }))
                         .disabled(!runtime.canChangeRenderingOptimizations)
                     if runtime.hasStarted {
-                        Text("Graphics, sound and look sensitivity apply at the next launch. Quit the game, reopen Los Santos, change them before Play, then launch again. In GTA’s Settings menu, use Square to apply GTA settings.").font(.caption).foregroundStyle(.secondary)
+                        Text("Graphics, sound and look sensitivity apply at the next launch. Quit the game, reopen V, change them before Play, then launch again. In GTA’s Settings menu, use Square to apply GTA settings.").font(.caption).foregroundStyle(.secondary)
                     }
                     if !runtime.playSettingsStatus.isEmpty {
                         Text(runtime.playSettingsStatus).font(.caption).foregroundStyle(.secondary)

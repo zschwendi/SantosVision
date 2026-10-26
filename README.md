@@ -1,7 +1,12 @@
-# Muguet
-A native Mach-O iOS/macOS port of GTA V, with multiplayer
+# spatial-V
 
-## SantosVision fork — visionOS work in progress
+**V** is the app name for this native GTA V runtime for Apple Vision Pro.
+The project builds on [Muguet](https://github.com/c22dev/muguet); upstream attribution and licensing are retained.
+
+Current third-person rendering work and verified build/device limits are tracked in
+[the fidelity report](docs/THIRD-PERSON-FIDELITY-20261025.md).
+
+## visionOS work in progress
 
 The requested goal for this fork is GTA V surrounding the player with head tracking
 and distinct views for each eye on Apple Vision Pro. The fork now has a native

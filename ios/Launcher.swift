@@ -100,7 +100,7 @@ struct LauncherView: View {
     var body: some View {
         HStack(spacing: 0) {
             VStack(spacing: 16) {
-                Text("Los Santos").font(.largeTitle.weight(.bold))
+                Text("V").font(.largeTitle.weight(.bold))
                 if !muguet_has_game_code() {
                     Text("This build has no game code: build it with ./make-ios.sh <game.zip>.")
                         .foregroundStyle(.red).font(.callout).multilineTextAlignment(.center)
