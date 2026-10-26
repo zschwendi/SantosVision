@@ -32,3 +32,9 @@ With tracing off, hot hooks take only an atomic/boolean branch: no trace clock, 
 Run `python3 scripts/analyze_world_latency.py <trace.ndjson> --output <new-analysis.json>`. The parser bounds the input, rejects incomplete exports, mixed capture sessions and nonmonotonic records, and joins only exact per-eye session/epoch/request/head/camera/game/lease identities. Missing stages produce null intervals. Source reuse produces separate lease observations; it is never turned into a same-update stereo pair. Stage intervals include scheduling/queue/callback overhead. A still-camera observation or a fresh ready timestamp alone cannot locate head-turn source lag.
 
 The next actual test is one bounded normal third-person session with moderate and fast head turns, no single-source diagnostic and no guard/default changes. Require the new complete export and its exact candidate/source/config provenance. Compare camera-to-ring, ring-to-submit, callback-to-publication and compositor intervals before selecting a latency fix. Source, CPU and typecheck results do not establish installed behavior or physical improvement.
+
+## Separate queue-pressure comparison
+
+`MUGUET_COMPOSITOR_MAX_IN_FLIGHT` accepts1,2 or3 at renderer construction. Unset or invalid values preserve the original limit3. It bounds the same existing completion-signaled semaphore; it changes no camera, source resolution, guard, graphics or source-slot policy. The resolved value is recorded as `maximum_compositor_commands_in_flight` in the image-quality report.
+
+This is a QA control, not an established optimization. Reducing it may change GPU overlap and throughput as well as queue pressure. Compare it separately after the cache off/on test at an otherwise unchanged scene/configuration, using actual completed-pair pose age and command timing. Keep3 for normal use until physical evidence supports a change. CPU bound checks and a build do not establish a latency or frame-rate improvement.

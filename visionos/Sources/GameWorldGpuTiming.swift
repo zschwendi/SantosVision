@@ -1,5 +1,17 @@
 import Foundation
 
+/// Cold QA setting for a matched queue-pressure comparison. The ordinary
+/// three-command limit is unchanged; this is not a frame-rate or quality knob.
+enum GameWorldSubmissionBudget {
+    static let defaultMaximum = 3
+
+    static func maximum(environment: [String: String]) -> Int {
+        guard let raw = environment["MUGUET_COMPOSITOR_MAX_IN_FLIGHT"],
+              let value = Int(raw), (1...defaultMaximum).contains(value) else { return defaultMaximum }
+        return value
+    }
+}
+
 /// Measures only the existing compositor command buffer. Guest rendering has
 /// its own queue and is deliberately excluded from this timing interval.
 struct GameWorldGpuTimingSummary: Sendable {
@@ -21,7 +33,7 @@ struct GameWorldGpuTimingSummary: Sendable {
 
     var reportValue: [String: Any] {
         ["schema": 1,
-         "scope": "compositor command buffer: depth reprojection, optional debug blit, encodePresent; excludes guest/wgpu rendering and system display",
+         "scope": "elapsed GPU interval of the compositor command buffer: depth reprojection, optional debug blit, encodePresent. Guest/wgpu commands and system display are not encoded here; cross-queue GPU scheduling may overlap this interval. Not isolated busy time or reciprocal FPS.",
          "window_kind": "nonoverlapping completion-callback windows; counters reset after each report",
          "clock": "ProcessInfo.systemUptime",
          "window_index": windowIndex,

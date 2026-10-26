@@ -511,7 +511,8 @@ final class GameWorldRenderer: @unchecked Sendable {
     private var stopped = false
     private var active = true
     private let sessionToken = UUID()
-    private let inFlight = DispatchSemaphore(value: 3)
+    private let maximumFramesInFlight: Int
+    private let inFlight: DispatchSemaphore
     // A renderer may be constructed before native startup initializes tracing.
     // Cache the cold request, not the native capture's current armed state.
     private let latencyTraceRequested = ProcessInfo.processInfo.environment["MUGUET_XR_LATENCY_TRACE"] == "1"
@@ -531,13 +532,15 @@ final class GameWorldRenderer: @unchecked Sendable {
 
     init(layer: LayerRenderer, utilityAtlas: (any MTLTexture)? = nil,
          report: @escaping @Sendable (GameWorldEvent) -> Void) throws {
+        let environment = ProcessInfo.processInfo.environment
+        maximumFramesInFlight = GameWorldSubmissionBudget.maximum(environment: environment)
+        inFlight = DispatchSemaphore(value: maximumFramesInFlight)
         self.layer = layer
         if GameWorldDisplayQuality.requested { layer.renderQuality = .init(rawValue: 1) }
         self.report = report
         guard let queue = layer.device.makeCommandQueue(), let library = layer.device.makeDefaultLibrary(),
               let vertex = library.makeFunction(name: "gameWorldVertex"),
               let baselineFragment = library.makeFunction(name: "gameWorldFragment") else { throw GameWorldError.missingMetal }
-        let environment = ProcessInfo.processInfo.environment
         let copyRequested = environment["MUGUET_COMPOSITOR_SOURCE_ANCHOR_COPY"] == "1"
         let probeRequested = environment["MUGUET_COMPOSITOR_ANCHOR_PROBE"] == "1"
         let adaptiveRequested = RenderingOptimizations.adaptiveMeshEnabled
@@ -1751,6 +1754,7 @@ final class GameWorldRenderer: @unchecked Sendable {
 
     func imageQualityStatus() -> [String: Any] {
         var value = imageQuality.reportValue
+        value["maximum_compositor_commands_in_flight"] = maximumFramesInFlight
         value["reconstruction_configuration"] = [
             "smooth_continuity": smoothSurfaceContinuity,
             "vertical_reconstruction_requested": GameWorldVerticalReconstructionPolicy.requested,
