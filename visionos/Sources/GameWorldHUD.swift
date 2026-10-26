@@ -36,8 +36,18 @@ enum GameWorldHUDPolicy {
     // Flat-window rendering keeps the original game coordinates.
     static let immersiveScale: Float = 0.94
     static let immersiveVerticalFraction: Float = -0.17
-    static func placement(halfSize: SIMD2<Float>, nativeScope: Bool) -> (halfSize: SIMD2<Float>, y: Float) {
-        nativeScope ? (halfSize, 0) : (halfSize * immersiveScale, halfSize.y * immersiveVerticalFraction)
+    static func placement(halfSize: SIMD2<Float>, nativeScope: Bool,
+                          sourceSize: SIMD2<UInt32> = .zero) -> (halfSize: SIMD2<Float>, y: Float) {
+        // This explicit experimental format adds vertical world samples at the
+        // same width. GTA also enlarges its HUD pixels by 2304/1440. Keeping
+        // the old 60-degree canvas width would enlarge those UI elements by
+        // the same amount. Scale the *complete* ordinary canvas isotropically
+        // back to its 1440-line reading size; retain every source UV and alpha.
+        // Existing 16:9 formats and angular scope graticules remain unchanged.
+        if nativeScope { return (halfSize, 0) }
+        let scale: Float = sourceSize == SIMD2(2560, 2304) ? 1440.0 / 2304.0 : 1
+        let ordinary = halfSize * scale
+        return (ordinary * immersiveScale, ordinary.y * immersiveVerticalFraction)
     }
 
     /// Ordinary HUD belongs to its finite, comfortable reading plane. A scope
@@ -143,7 +153,8 @@ final class GameWorldHUD: @unchecked Sendable {
 
     func encode(_ encoder: any MTLRenderCommandEncoder, snapshot: Snapshot,
                 headFromEye: simd_float4x4, projection: simd_float4x4, nativeScope: Bool) {
-        let layout = GameWorldHUDPolicy.placement(halfSize: snapshot.halfSize, nativeScope: nativeScope)
+        let layout = GameWorldHUDPolicy.placement(halfSize: snapshot.halfSize, nativeScope: nativeScope,
+            sourceSize: SIMD2(snapshot.native.width, snapshot.native.height))
         var uniforms = Uniforms(clipFromHead: GameWorldHUDPolicy.clipFromHead(
                 headFromEye: headFromEye, projection: projection, placementY: layout.y, nativeScope: nativeScope),
             halfSize: layout.halfSize, distance: snapshot.native.distance_metres,

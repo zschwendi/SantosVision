@@ -71,6 +71,40 @@ struct HUDPolicyValidation {
         require(abs(half.y / half.x - 9.0 / 16.0) < 1e-6, "HUD preserves actual source aspect ratio")
         let scaled = GameWorldHUDPolicy.halfSize(width: 3840, height: 2160, angularWidth: 60, distance: 4)!
         require(simd_length(scaled - half * 2) < 1e-6, "Angular safe area must not depend on texture resolution or distance")
+        for size in [SIMD2<UInt32>(640, 360), SIMD2(960, 540), SIMD2(1280, 720),
+                     SIMD2(1920, 1080), SIMD2(2560, 1440), SIMD2(3840, 2160)] {
+            let sourceHalf = GameWorldHUDPolicy.halfSize(width: Int(size.x), height: Int(size.y),
+                angularWidth: 60, distance: 2)!
+            let unchanged = GameWorldHUDPolicy.placement(halfSize: sourceHalf, nativeScope: false, sourceSize: size)
+            require(unchanged.halfSize == sourceHalf * GameWorldHUDPolicy.immersiveScale
+                && unchanged.y == sourceHalf.y * GameWorldHUDPolicy.immersiveVerticalFraction,
+                "Every existing 16:9 source retains bit-identical ordinary HUD geometry")
+        }
+        let tallSize = SIMD2<UInt32>(2560, 2304)
+        let tallHalf = GameWorldHUDPolicy.halfSize(width: 2560, height: 2304, angularWidth: 60, distance: 2)!
+        let tall = GameWorldHUDPolicy.placement(halfSize: tallHalf, nativeScope: false, sourceSize: tallSize)
+        require(abs(tall.halfSize.y - ordinary.halfSize.y) < 1e-6 && abs(tall.y - ordinary.y) < 1e-6,
+                "Tall experiment retains the ordinary HUD's vertical reading frame and lower safe area")
+        require(abs(tall.halfSize.x / ordinary.halfSize.x - 0.625) < 1e-6,
+                "Tall experiment moves outside anchors inward rather than enlarging the UI")
+        let baselinePitch = ordinary.halfSize / SIMD2<Float>(2560, 1440)
+        let tallPitch = tall.halfSize / SIMD2<Float>(2560, 2304)
+        require(simd_length(tallPitch / baselinePitch - SIMD2<Float>(repeating: 0.625)) < 1e-6,
+                "Tall normalization is isotropic in pixel space; circular HUD elements cannot be stretched")
+        // These are measured alpha bounds from the real producer captures, not
+        // a generated UI model. Their scenes differ; this checks size only.
+        let baselineExtent = SIMD2<Float>(360, 260) * baselinePitch
+        let tallExtent = SIMD2<Float>(576, 417) * tallPitch
+        require(abs(tallExtent.x / baselineExtent.x - 1) < 1e-6
+            && abs(tallExtent.y / baselineExtent.y - 1) < 0.003,
+            "Observed tall minimap coverage retains the baseline reading size within measured raster rounding")
+        let tallScope = GameWorldHUDPolicy.placement(halfSize: tallHalf, nativeScope: true, sourceSize: tallSize)
+        require(tallScope.halfSize == tallHalf && tallScope.y == 0,
+                "Tall experiment never normalizes a scope's angular graticule")
+        let unknown = GameWorldHUDPolicy.placement(halfSize: tallHalf, nativeScope: false, sourceSize: SIMD2(2560, 2303))
+        require(unknown.halfSize == tallHalf * GameWorldHUDPolicy.immersiveScale
+            && unknown.y == tallHalf.y * GameWorldHUDPolicy.immersiveVerticalFraction,
+            "Only the explicitly admitted tall experiment receives normalization")
         let invalid: [(Int, Int, Float, Float)] = [
             (0, 1080, 60, 2), (1, 1080, 60, 2), (1920, 1, 60, 2),
             (16385, 1080, 60, 2), (1920, 16385, 60, 2),
@@ -116,6 +150,15 @@ struct HUDPolicyValidation {
         var scopeRecovered = [[SIMD3<Float>]](repeating: [], count: 2)
         var oldScopeRecovered = [[SIMD3<Float>]](repeating: [], count: 2)
         for eye in 0..<2 {
+            let tallClip = GameWorldHUDPolicy.clipFromHead(headFromEye: heads[eye], projection: projections[eye],
+                placementY: tall.y, nativeScope: false)
+            for uv: SIMD2<Float> in [SIMD2(0, 0), SIMD2(1, 0), SIMD2(0, 1), SIMD2(1, 1)] {
+                let point = SIMD4<Float>((uv.x * 2 - 1) * tall.halfSize.x,
+                    (1 - uv.y * 2) * tall.halfSize.y, -2, 1)
+                let clip = tallClip * point, ndc = clip / clip.w
+                require(clip.w.isFinite && clip.w > 0 && abs(ndc.x) < 1 && abs(ndc.y) < 1,
+                    "The complete tall HUD texture, including its corners, remains in both measured eye frusta")
+            }
             let ordinaryClip = GameWorldHUDPolicy.clipFromHead(headFromEye: heads[eye],
                 projection: projections[eye], placementY: safeY, nativeScope: false)
             var ordinaryPlacement = matrix_identity_float4x4
