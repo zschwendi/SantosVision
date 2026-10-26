@@ -92,6 +92,44 @@ import simd
         check(legacyReport["depth_edge_fill"] is [String: Any], "legacy fill counters retained")
         check(legacyReport["sampling_density_stage"] is String && legacyReport["completed_display_pairs"] is [String: Any],
               "new additive qualification fields exported")
+        let compositorClock = GameWorldCompletedPair.Clock.compositorPresentationEpoch.rawValue
+        func age(_ display: Double, _ retained: Double?, displayClock: String? = nil,
+                 retainedClock: String? = nil, qualified: Bool = true) -> Double? {
+            GameWorldCompletedPair.sourcePoseAge(display: display, displayClock: displayClock ?? compositorClock,
+                retained: retained, retainedClock: retainedClock ?? compositorClock, sourcePoseQualified: qualified)
+        }
+        check(age(10, 9) == 1, "same audited clock permits matched pose age")
+        check(age(10, 11) == -1, "future source pose remains negative, never clamped")
+        check(age(10, 10) == 0, "zero pose age retained")
+        check(age(10, 9, displayClock: "unknown") == nil, "unknown display clock suppresses age")
+        check(age(10, 9, retainedClock: "unknown") == nil, "unknown source clock suppresses age")
+        check(age(10, 9, retainedClock: GameWorldCompletedPair.Clock.systemUptime.rawValue) == nil,
+              "mismatched clock suppresses age")
+        check(age(10, 9, displayClock: "unknown", retainedClock: "unknown") == nil, "matching unknown clocks insufficient")
+        check(age(10, 9, qualified: false) == nil, "matched clocks cannot replace source pose verification")
+        check(age(.nan, 9) == nil && age(10, .infinity) == nil && age(10, nil) == nil, "nonfinite/missing age inputs suppressed")
+        check(age(.greatestFiniteMagnitude, -.greatestFiniteMagnitude) == nil, "nonfinite age difference suppressed")
+        check(GameWorldCompletedPair.commandGPUInterval(start: 100, end: 100.25) == 0.25, "same-command GPU interval")
+        for (start, end): (Double?, Double?) in [(nil, 1), (1, nil), (0, 1), (2, 1), (1, 1), (.nan, 2), (1, .infinity)] {
+            check(GameWorldCompletedPair.commandGPUInterval(start: start, end: end) == nil, "invalid/missing GPU interval suppressed")
+        }
+        var clockEye0 = eye(0), clockEye1 = eye(1)
+        clockEye0.retainedPoseClock = compositorClock; clockEye0.retainedPoseQualified = true
+        clockEye1.retainedPoseClock = "unknown"; clockEye1.retainedPoseQualified = true
+        var clockPair = pair(81, eyes: [clockEye0, clockEye1])
+        check(clockPair.predictedDisplayClock == "unknown", "other/test pair constructors default to unknown clock")
+        clockPair.predictedDisplayClock = compositorClock
+        let clockTelemetry = GameWorldCompletedPairTelemetry(environment: ["MUGUET_COMPOSITOR_COMPLETED_PAIR_TELEMETRY": "1"])
+        clockTelemetry.complete(clockPair, successful: true, acknowledged: true, at: 200, gpuStart: 100, gpuEnd: 100.25)
+        let clockRow = rows(clockTelemetry)[0], clockEyes = clockRow["eyes"] as! [[String: Any]]
+        check(clockEyes[0]["source_pose_age_at_predicted_display_seconds"] as? Double == -200, "export preserves qualified negative pose age")
+        check(clockEyes[1]["source_pose_age_at_predicted_display_seconds"] == nil, "unknown retained clock omits derived field")
+        check(clockRow["command_gpu_interval_seconds"] as? Double == 0.25, "completed pair retains its command interval")
+        clockTelemetry.complete(clockPair, successful: true, acknowledged: true, at: 201, gpuStart: 0, gpuEnd: 1)
+        check(rows(clockTelemetry)[1]["command_gpu_interval_seconds"] == nil, "unavailable command timing keeps record without interval")
+        clockTelemetry.complete(clockPair, successful: false, acknowledged: false, at: 202, gpuStart: 100, gpuEnd: 101)
+        check(rows(clockTelemetry).count == 2, "failed command cannot publish GPU interval or pose age")
+        check(JSONSerialization.isValidJSONObject(clockTelemetry.reportValue), "tagged clock/GPU export JSON valid")
         let concurrent = GameWorldCompletedPairTelemetry(environment: ["MUGUET_COMPOSITOR_COMPLETED_PAIR_TELEMETRY": "1"])
         let immutable = pair(80)
         DispatchQueue.concurrentPerform(iterations: 64) { _ in

@@ -906,10 +906,12 @@ final class GameWorldRenderer: @unchecked Sendable {
                 var headFrame: UInt64?
                 if retainsAnchors {
                     headFrame = XRHeadTracking.shared.submit(timestamp: timestamp, stageFromHead: stageFromHead, tracked: true,
-                                                              anchor: trackedAnchor, requestFrame: requestFrame, eyes: eyes, retain: true)
+                                                              anchor: trackedAnchor, requestFrame: requestFrame, eyes: eyes, retain: true,
+                                                              timestampClock: GameWorldCompletedPair.Clock.compositorPresentationEpoch.rawValue)
                 } else {
                     headFrame = XRHeadTracking.shared.submit(timestamp: timestamp, stageFromHead: stageFromHead, tracked: true,
-                                                              anchor: trackedAnchor, requestFrame: requestFrame, eyes: eyes, retain: false)
+                                                              anchor: trackedAnchor, requestFrame: requestFrame, eyes: eyes, retain: false,
+                                                              timestampClock: GameWorldCompletedPair.Clock.compositorPresentationEpoch.rawValue)
                 }
                 displayHeadFrame = headFrame
                 if let headFrame {
@@ -1006,7 +1008,8 @@ final class GameWorldRenderer: @unchecked Sendable {
                 let sample = GameWorldCompletedPair(compositorFrame: frameNumber, predictedDisplayTime: timestamp,
                     displayRequest: displayRequestFrame, displayHead: displayHeadFrame,
                     displayStageFromHead: GameWorldCompletedPair.bits(stageFromHead),
-                    pairAcquiredAtomically: pairQualified, eyes: encoded.completionEyes)
+                    pairAcquiredAtomically: pairQualified, eyes: encoded.completionEyes,
+                    predictedDisplayClock: GameWorldCompletedPair.Clock.compositorPresentationEpoch.rawValue)
                 if sample.qualified { completedPairSample = sample }
                 else { imageQuality.completedPairs.discardUnqualifiedSample() }
             } else if sampleCompletedPair { imageQuality.completedPairs.discardUnqualifiedSample() }
@@ -1132,7 +1135,9 @@ final class GameWorldRenderer: @unchecked Sendable {
                     && completedPresentation?.headFrames == completedPair.eyes.map(\.head)
                     && Array(completedLeases.prefix(2)).map { $0.native.lease } == completedPair.eyes.map(\.lease)
                 pairTelemetry.complete(completedPair, successful: buffer.status == .completed,
-                    acknowledged: pairAcknowledged, at: ProcessInfo.processInfo.systemUptime)
+                    acknowledged: pairAcknowledged, at: ProcessInfo.processInfo.systemUptime,
+                    gpuStart: buffer.status == .completed ? buffer.gpuStartTime : nil,
+                    gpuEnd: buffer.status == .completed ? buffer.gpuEndTime : nil)
             }
             if let gpuTiming,
                let summary = gpuTiming.record(completed: buffer.status == .completed, error: buffer.status == .error,
@@ -1558,6 +1563,8 @@ final class GameWorldRenderer: @unchecked Sendable {
                     // actual retained anchor separately from the current pose.
                     completionEye?.sourceAnchorStageFromHead = copyDecision.map { GameWorldCompletedPair.bits($0.retained.stageFromHead) }
                     completionEye?.sourceAnchorPoseTime = copyDecision?.retained.timestamp
+                    completionEye?.retainedPoseClock = retained?.timestampClock ?? GameWorldCompletedPair.Clock.unknown.rawValue
+                    completionEye?.retainedPoseQualified = matched
                 }
             }
             let skyOutcome: GameWorldFiniteSkyTelemetry.Outcome

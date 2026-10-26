@@ -34,6 +34,9 @@ struct XRRetainedHeadPose: @unchecked Sendable {
     /// have used these eye transforms.
     let requestFrame: UInt64
     let timestamp: Double
+    // Diagnostic provenance only. Unknown for callers that do not explicitly
+    // name the timestamp origin; never used by tracking or retention policy.
+    var timestampClock = "unknown"
     let stageFromHead: simd_float4x4
     let anchor: DeviceAnchor?
     let eyes: [XRRetainedEyeView]
@@ -103,7 +106,8 @@ final class XRHeadTracking: @unchecked Sendable {
     /// its reference, so every retained anchor is dropped with it.
     @discardableResult
     func submit(timestamp: Double, stageFromHead: simd_float4x4?, tracked: Bool,
-                anchor: DeviceAnchor?, requestFrame: UInt64, eyes: [XRRetainedEyeView], retain: Bool) -> UInt64? {
+                anchor: DeviceAnchor?, requestFrame: UInt64, eyes: [XRRetainedEyeView], retain: Bool,
+                timestampClock: String = "unknown") -> UInt64? {
         #if SV_GAME_RUNTIME
         lock.lock()
         defer { lock.unlock() }
@@ -122,7 +126,7 @@ final class XRHeadTracking: @unchecked Sendable {
                     && $0.sourceGuardBandScale.isFinite && $0.sourceGuardBandScale >= 1 }
             if finite, anchor == nil || anchor?.isTracked == true {
                 retainLocked(XRRetainedHeadPose(headFrame: published, requestFrame: requestFrame, timestamp: timestamp,
-                                                stageFromHead: stageFromHead, anchor: anchor, eyes: eyes,
+                                                timestampClock: timestampClock, stageFromHead: stageFromHead, anchor: anchor, eyes: eyes,
                                                 epoch: retainedEpoch), now: timestamp)
             } else {
                 statistics.rejectedInputs &+= 1

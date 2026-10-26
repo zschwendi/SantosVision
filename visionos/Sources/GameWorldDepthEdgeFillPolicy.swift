@@ -178,6 +178,27 @@ struct GameWorldSamplingDensity: Sendable, Equatable {
 /// Diagnostic values only. Matrices retain every Float bit in column-major
 /// order, including nonfinite bit patterns, without invalid JSON numbers.
 struct GameWorldCompletedPair: Sendable {
+    enum Clock: String, Sendable {
+        case unknown
+        case compositorPresentationEpoch = "layer_renderer_presentation_epoch"
+        case systemUptime = "process_system_uptime"
+    }
+
+    /// Only the audited compositor presentation epoch is accepted here. Source
+    /// pose matching is independent of clock matching; both must be explicit.
+    static func sourcePoseAge(display: Double, displayClock: String, retained: Double?,
+                              retainedClock: String, sourcePoseQualified: Bool) -> Double? {
+        guard sourcePoseQualified, displayClock == Clock.compositorPresentationEpoch.rawValue,
+              retainedClock == displayClock, display.isFinite, let retained, retained.isFinite else { return nil }
+        let delta = display - retained
+        return delta.isFinite ? delta : nil // Preserve negative/future age; no clamping.
+    }
+
+    static func commandGPUInterval(start: Double?, end: Double?) -> Double? {
+        guard let start, let end, start.isFinite, end.isFinite, start > 0, end > start else { return nil }
+        let interval = end - start
+        return interval.isFinite && interval > 0 ? interval : nil
+    }
     struct Eye: Sendable {
         let displayEye: Int
         let sourceEye: Int
@@ -203,6 +224,8 @@ struct GameWorldCompletedPair: Sendable {
         var orderedPreparation = "not_attempted"
         var sourceAnchorStageFromHead: [UInt32]?
         var sourceAnchorPoseTime: Double?
+        var retainedPoseClock = Clock.unknown.rawValue
+        var retainedPoseQualified = false
 
         var reportValue: [String: Any] {
             var row: [String: Any] = ["display_eye": displayEye, "source_eye": sourceEye,
@@ -232,6 +255,7 @@ struct GameWorldCompletedPair: Sendable {
     let displayStageFromHead: [UInt32]
     let pairAcquiredAtomically: Bool
     let eyes: [Eye]
+    var predictedDisplayClock = Clock.unknown.rawValue
 
     var qualified: Bool {
         eyes.count == 2 && eyes.map(\.displayEye) == [0, 1] && eyes.map(\.sourceEye) == [0, 1]
@@ -241,12 +265,29 @@ struct GameWorldCompletedPair: Sendable {
             && eyes[0].lease != eyes[1].lease && predictedDisplayTime.isFinite
     }
 
-    func reportValue(completedAt: Double, acknowledged: Bool) -> [String: Any] {
+    func reportValue(completedAt: Double, acknowledged: Bool, gpuInterval: Double? = nil) -> [String: Any] {
+        let eyeRows = eyes.map { eye -> [String: Any] in
+            var value = eye.reportValue
+            value["source_retained_pose_clock"] = eye.retainedPoseClock
+            value["source_retained_pose_qualified"] = eye.retainedPoseQualified
+            if let age = Self.sourcePoseAge(display: predictedDisplayTime, displayClock: predictedDisplayClock,
+                retained: eye.retainedPoseTime, retainedClock: eye.retainedPoseClock,
+                sourcePoseQualified: eye.retainedPoseQualified) {
+                value["source_pose_age_at_predicted_display_seconds"] = age
+                value["source_pose_age_provenance"] = "matched_source_pose_and_projection; both timestamps from LayerRenderer.Clock presentation epoch"
+            }
+            return value
+        }
         var row: [String: Any] = ["compositor_frame": compositorFrame,
             "predicted_display_timestamp_seconds": predictedDisplayTime,
             "completion_observed_at_uptime_seconds": completedAt, "metal_status": "completed",
             "native_acknowledged": acknowledged, "pair_acquired_atomically": pairAcquiredAtomically,
-            "display_stage_from_head_float_bits": displayStageFromHead, "eyes": eyes.map(\.reportValue)]
+            "display_stage_from_head_float_bits": displayStageFromHead, "eyes": eyeRows,
+            "predicted_display_clock": predictedDisplayClock]
+        if let gpuInterval, gpuInterval.isFinite, gpuInterval > 0 {
+            row["command_gpu_interval_seconds"] = gpuInterval
+            row["command_gpu_interval_scope"] = "Successful compositor command gpuEndTime minus gpuStartTime only; overlapping GPU scheduling interval, not isolated busy time or FPS."
+        }
         if let displayRequest { row["display_request_frame"] = displayRequest }
         if let displayHead { row["display_head_frame"] = displayHead }
         return row
@@ -276,7 +317,7 @@ final class GameWorldCompletedPairTelemetry: @unchecked Sendable {
     let enabled: Bool
     private let lock = NSLock()
     private var nextSample: Double = 0
-    private var completed: [(pair: GameWorldCompletedPair, at: Double, acknowledged: Bool)] = []
+    private var completed: [(pair: GameWorldCompletedPair, at: Double, acknowledged: Bool, gpuInterval: Double?)] = []
     private var failed: UInt64 = 0
     private var published: UInt64 = 0
     private var reserved: UInt64 = 0
@@ -303,14 +344,15 @@ final class GameWorldCompletedPairTelemetry: @unchecked Sendable {
         lock.unlock()
     }
 
-    func complete(_ pair: GameWorldCompletedPair, successful: Bool, acknowledged: Bool, at: Double) {
+    func complete(_ pair: GameWorldCompletedPair, successful: Bool, acknowledged: Bool, at: Double,
+                  gpuStart: Double? = nil, gpuEnd: Double? = nil) {
         guard enabled, pair.qualified, at.isFinite else { return }
         lock.lock()
         defer { lock.unlock() }
         guard successful else { failed &+= 1; return }
         published &+= 1
         if completed.count == Self.capacity { completed.removeFirst() }
-        completed.append((pair, at, acknowledged))
+        completed.append((pair, at, acknowledged, GameWorldCompletedPair.commandGPUInterval(start: gpuStart, end: gpuEnd)))
     }
 
     var reportValue: [String: Any] {
@@ -322,9 +364,9 @@ final class GameWorldCompletedPairTelemetry: @unchecked Sendable {
             "minimum_sample_interval_seconds": 1, "failed_sampled_commands": failedSnapshot,
             "reserved_samples": reservedSnapshot, "unqualified_reserved_samples": unqualifiedSnapshot,
             "successful_sampled_commands": publishedSnapshot,
-            "pairs": snapshot.map { $0.pair.reportValue(completedAt: $0.at, acknowledged: $0.acknowledged) },
+            "pairs": snapshot.map { $0.pair.reportValue(completedAt: $0.at, acknowledged: $0.acknowledged, gpuInterval: $0.gpuInterval) },
             "scope": "Two encoded distinct actual source eyes on one built-in drawable and one successfully completed Metal command; native acknowledgement is separate. Completion is not physical scanout or visual acceptance. Rows follow callback order; compositor_frame identifies submission order. Independent acquisition may select different game/request/head generations, retained exactly per eye.",
-            "clock_domains": "predicted_display_timestamp_seconds is LayerRenderer.Clock epoch; source_native_presentation_time_seconds is the unmodified native lease field; source_retained_pose_timestamp_seconds is the exact matched retained request timestamp; completion_observed_at_uptime_seconds is ProcessInfo.systemUptime. No cross-clock differences are calculated.",
+            "clock_domains": "predicted_display_timestamp_seconds is LayerRenderer.Clock epoch; source_native_presentation_time_seconds is the unmodified native lease field; source_retained_pose_timestamp_seconds is the exact matched retained request timestamp; completion_observed_at_uptime_seconds is ProcessInfo.systemUptime. Only source_pose_age_at_predicted_display_seconds subtracts exact matched retained pose time from predicted display time when both explicitly name the same audited LayerRenderer.Clock presentation epoch. Native source presentation and completion uptime are never subtracted. command_gpu_interval_seconds subtracts only command GPU end/start.",
             "matrix_encoding": "Float32 bit patterns, column-major, four columns of four values. Source matrices are the lease matrices used for rendering, never replaced by retained request matrices."]
     }
 }
