@@ -184,7 +184,10 @@ final class GameWorldFiniteSkySupport: @unchecked Sendable {
         let orderedEligible = !(allowVerticalReconstruction && verticalPipeline != nil) && uniforms.reserved == .zero
         let orderedResources = orderedEligible
             ? ordered?.helper.prepare(commands: commands, uniforms: uniforms, depth: depth, source: orderedSource) : nil
-        let orderedPreparation = orderedResources.map { $0.reusedCompletedSource ? "completed_source_cache_hit" : "fresh_preparation" }
+        let orderedPreparation = orderedResources.map {
+            $0.reusedCompletedSource ? "completed_source_cache_hit"
+                : ($0.pendingDuplicatePreparation ? "pending_source_fresh_transient" : "fresh_preparation")
+        }
             ?? (!orderedRequested ? "not_requested" : ordered == nil ? "pipeline_unavailable"
                 : !orderedEligible ? "reconstruction_ineligible" : "preparation_unavailable")
         if orderedResources == nil, let corners,
@@ -273,6 +276,7 @@ final class GameWorldFiniteSkySupport: @unchecked Sendable {
             status["source_cache_misses"] = statistics.cacheMisses
             status["ready_cached_sets"] = statistics.readyCached
             status["cache_reader_leases"] = statistics.readerLeases
+            status["pending_transient_admissions"] = statistics.pendingTransientAdmissions
         }
         return status
     }

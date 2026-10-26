@@ -44,7 +44,8 @@ struct OrderedSourceReuseImageValidation {
             width:UInt32(width),height:UInt32(height),presentationBits:Double(5).bitPattern,
             projectionBits:columns.flatMap {[$0.x.bitPattern,$0.y.bitPattern,$0.z.bitPattern,$0.w.bitPattern]})
         struct Image { let rgb:[UInt8]; let depth:[UInt32]; let owner:[UInt8] }
-        func render(_ helper:GameWorldFiniteSkySupport,pose:Int)->Image {
+        var heldCanonical: (any MTLCommandBuffer)?
+        func render(_ helper:GameWorldFiniteSkySupport,pose:Int,hold:Bool=false,preparation:String?=nil)->Image {
             var relative=simd_float4x4(simd_quatf(angle:Float(pose)*0.015,axis:SIMD3(0,1,0)))
             relative[3]=SIMD4(Float(pose)*0.015,Float(pose)*0.005,0,1)
             let values=GameWorldUniforms(sourceEyeFromClip:projection.inverse,currentEyeFromSourceEye:relative,
@@ -61,6 +62,7 @@ struct OrderedSourceReuseImageValidation {
             let result=helper.encode(commands:command,pass:pass,viewport:viewport,projection:projection,far:1000,
                 uniforms:values,color:color,depth:depth,orderedSource:source)!
             require(result.orderedCorners,"Assembled normal world draw uses ordered path")
+            if let preparation { require(result.orderedPreparation == preparation,"Actual per-eye preparation label matches the exercised path") }
             let overlay=MTLRenderPassDescriptor()
             overlay.colorAttachments[0].texture=target;overlay.colorAttachments[0].loadAction = .load;overlay.colorAttachments[0].storeAction = .store
             overlay.depthAttachment.texture=targetDepth;overlay.depthAttachment.loadAction = .load;overlay.depthAttachment.storeAction = .store
@@ -76,7 +78,13 @@ struct OrderedSourceReuseImageValidation {
             blit.copy(from:result.ownership,sourceSlice:0,sourceLevel:0,sourceOrigin:MTLOrigin(),
                 sourceSize:MTLSize(width:outWidth,height:outHeight,depth:1),to:owners,destinationOffset:0,
                 destinationBytesPerRow:row,destinationBytesPerImage:row*outHeight)
-            blit.endEncoding();command.commit();command.waitUntilCompleted()
+            blit.endEncoding()
+            if hold {
+                require(heldCanonical == nil,"One immutable canonical source writer is retained for overlapped cadence")
+                heldCanonical=command
+                return Image(rgb:[],depth:[],owner:[])
+            }
+            command.commit();command.waitUntilCompleted()
             require(command.status == .completed,"Assembled actual Metal image completed")
             var rgb=[UInt8](repeating:0,count:outWidth*outHeight*4), bits=[UInt32](repeating:0,count:outWidth*outHeight)
             rgb.withUnsafeMutableBytes {target.getBytes($0.baseAddress!,bytesPerRow:outWidth*4,
@@ -97,12 +105,30 @@ struct OrderedSourceReuseImageValidation {
         require(cached.orderedCornerStatus()["source_cache_hits"] as? UInt64 == UInt64(poses.count-1),
             "Only the first source preparation executes; later distinct display poses hit completed cached data")
         require(reference.orderedCornerStatus()["source_cache_hits"] as? UInt64 == 0,"Cacheless reference never hits")
+        let overlapped=GameWorldFiniteSkySupport(device:device,library:library,colorFormat:.rgba8Unorm,
+            depthFormat:.depth32Float,precomputeCorners:false,orderedCorners:true,reuseOrderedSources:true)!
+        _ = render(overlapped,pose:0,hold:true,preparation:"fresh_preparation")
+        for pose in poses {
+            let expected=autoreleasepool {render(reference,pose:pose)}
+            let actual=autoreleasepool {render(overlapped,pose:pose,preparation:"pending_source_fresh_transient")}
+            require(actual.rgb==expected.rgb && actual.depth==expected.depth && actual.owner==expected.owner,
+                "Each overlapping display pose retains exact full RGB/Float32-depth/owner parity without fine fallback")
+        }
+        require(overlapped.orderedCornerStatus()["source_cache_hits"] as? UInt64 == 0,
+            "No transient reads an uncommitted canonical writer")
+        require(overlapped.orderedCornerStatus()["pending_transient_admissions"] as? UInt64 == UInt64(poses.count),
+            "Every overlapped pose is an actual admitted fresh transient")
+        heldCanonical!.commit();heldCanonical!.waitUntilCompleted();heldCanonical=nil
+        _ = render(overlapped,pose:0,preparation:"completed_source_cache_hit")
+        require(overlapped.orderedCornerStatus()["source_cache_hits"] as? UInt64 == 1,
+            "Only completing the original canonical writer makes the source reusable")
         let report:[String:Any]=["schema":1,"device":device.name,"checks":checks,"pass":true,
-            "completed_full_pipeline_renders":poses.count*2,"display_pose_indices":poses,"cache_hits":poses.count-1,
+            "completed_full_pipeline_renders":poses.count*4+2,"display_pose_indices":poses,"cache_hits":poses.count-1,
+            "overlapped_pending_transient_renders":poses.count,"canonical_uncommitted_during_transients":true,
             "rgb_depth_final_owner_byte_identical":true,"finite_sky_and_gap_fill_actual":true,
             "source_fixture":"Immutable synthetic finite geometry, depth discontinuities and clear sky",
             "physical_game_quality_stereo_or_fps_acceptance":false]
         try JSONSerialization.data(withJSONObject:report,options:[.prettyPrinted,.sortedKeys]).write(to:output,options:.withoutOverwriting)
-        print("PASS cached-source assembled images: \(checks) checks, \(poses.count*2) completed full-pipeline Metal renders, \(poses.count-1) source hits")
+        print("PASS cached-source assembled images: \(checks) checks, \(poses.count*4+2) completed full-pipeline Metal renders, including \(poses.count) pending-source transients")
     }
 }

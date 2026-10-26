@@ -124,14 +124,98 @@ struct OrderedSourceReuseMetalValidation {
         let pending = GameWorldOrderedCorners(device: device, library: library, reuseSources: true)!
         autoreleasepool {
             let command = queue.makeCommandBuffer()!
-            require(pending.prepare(commands: command, uniforms: uniforms(a), depth: a, source: keyA) != nil, "First writer prepared")
+            let canonical = pending.prepare(commands: command, uniforms: uniforms(a), depth: a, source: keyA)!
+            require(!canonical.pendingDuplicatePreparation, "First writer remains canonical")
+            let transient = read(pending, depth: a, id: keyA, via: queue)
+            let original = read(reference, depth: a, id: nil, via: queue)
+            require(transient.resources.indices !== canonical.indices && transient.resources.corners !== canonical.corners,
+                "Pending source uses independent fresh resources, never unfinished canonical data")
+            require(transient.resources.pendingDuplicatePreparation && !transient.resources.reusedCompletedSource,
+                "The actual pending-transient path is labelled explicitly")
+            require(transient.indices == original.indices && transient.corners == original.corners,
+                "A completed transient equals fresh ordered baseline bit-for-bit")
+            require(pending.statistics.readyCached == 0 && pending.statistics.busy == 1,
+                "Transient completing before uncommitted canonical writer cannot publish a ready cache")
             let newer = queue.makeCommandBuffer()!
-            require(pending.prepare(commands: newer, uniforms: uniforms(a), depth: a, source: keyA) == nil,
-                "Pending or uncommitted writers are never shared or redundantly prepared")
-            require(pending.statistics.sets == 1 && pending.statistics.readyCached == 0, "No partial source admitted")
+            let recycled = pending.prepare(commands: newer, uniforms: uniforms(a), depth: a, source: keyA)!
+            require(recycled.indices === transient.resources.indices && recycled.indices !== canonical.indices,
+                "Only completed idle unkeyed transient resources may be recycled")
+            require(pending.statistics.sets == 2 && pending.statistics.readyCached == 0
+                && pending.statistics.pendingTransientAdmissions == 2, "No partial source admitted; transient admissions bounded")
         }
         require(pending.statistics.busy == 0 && pending.statistics.readyCached == 0,
             "Abandoning a writer never publishes cached data")
+        // A real committed writer blocked on a GPU event exercises overlapping
+        // compositor cadence, including preserving the other eye's ready cache.
+        let overlap = GameWorldOrderedCorners(device: device, library: library, reuseSources: true)!
+        let eyeB = identity(30, depth: b, eye: 1)
+        let otherEye = read(overlap, depth: b, id: eyeB, via: queue)
+        autoreleasepool {
+            let gate = device.makeSharedEvent()!, canonical = queue.makeCommandBuffer()!
+            canonical.encodeWaitForEvent(gate, value: 1)
+            let first = overlap.prepare(commands: canonical, uniforms: uniforms(a), depth: a, source: keyA)!
+            canonical.commit()
+            require(canonical.status != .completed, "Canonical writer is actually committed and GPU-blocked")
+            var commands: [any MTLCommandBuffer] = [], resources: [GameWorldOrderedCorners.Resources] = []
+            let retainedEye = queue.makeCommandBuffer()!
+            for ordinal in 0..<4 {
+                let command = queue.makeCommandBuffer()!
+                let fresh = overlap.prepare(commands: command, uniforms: uniforms(a), depth: a, source: keyA)!
+                require(fresh.pendingDuplicatePreparation && fresh.indices !== first.indices
+                    && fresh.indices !== otherEye.resources.indices && !resources.contains { $0.indices === fresh.indices },
+                    "Every pending duplicate owns a distinct allocation, preserving canonical and other-eye data")
+                command.commit(); commands.append(command); resources.append(fresh)
+                if ordinal == 0 {
+                    require(overlap.statistics.readyCached == 1,
+                        "Idle other-eye cache remains preferred over eviction while spare capacity exists")
+                    let reader = overlap.prepare(commands: retainedEye, uniforms: uniforms(b), depth: b, source: eyeB)!
+                    require(reader.indices === otherEye.resources.indices, "Other-eye reader pins original ready data for pressure check")
+                    let target = device.makeBuffer(length: b.width * b.height * 6 * 4, options: .storageModeShared)!
+                    let blit = retainedEye.makeBlitCommandEncoder()!
+                    blit.copy(from: reader.indices, sourceOffset: 0, to: target, destinationOffset: 0, size: target.length)
+                    blit.endEncoding()
+                }
+            }
+            let excess = queue.makeCommandBuffer()!
+            require(overlap.prepare(commands: excess, uniforms: uniforms(a), depth: a, source: keyA) == nil,
+                "Six sets remain the hard limit, with one busy canonical and four transients plus other-eye cache")
+            require(overlap.statistics.readyCached == 1 && overlap.statistics.sets == 6,
+                "Spare-budget transient preparation never evicts the other eye's ready cache")
+            gate.signaledValue = 1; canonical.waitUntilCompleted()
+            for command in commands { command.waitUntilCompleted(); require(command.status == .completed, "Queued transient GPU work completes") }
+            retainedEye.commit(); retainedEye.waitUntilCompleted()
+            require(overlap.statistics.readyCached == 2 && overlap.statistics.busy == 0,
+                "Only canonical writers publish cache entries after all overlapping work completes")
+            let current = read(overlap, depth: a, id: keyA, via: queue)
+            require(current.resources.indices === first.indices && current.resources.reusedCompletedSource,
+                "Completed canonical writer remains the sole cached source, never overwritten by transients")
+            let preserved = read(overlap, depth: b, id: eyeB, via: queue)
+            require(preserved.resources.indices === otherEye.resources.indices && preserved.resources.reusedCompletedSource,
+                "Other-eye cache survives transient overlap while capacity was available")
+        }
+        for ordinal in [1,2] { for commit in [false,true] {
+            let failures = GameWorldOrderedCorners(device: device, library: library, reuseSources: true)!
+            autoreleasepool {
+                let canonical = queue.makeCommandBuffer()!
+                let original = failures.prepare(commands: canonical, uniforms: uniforms(a), depth: a, source: keyA)!
+                autoreleasepool {
+                    failures.validationRejectEncoderOrdinal = ordinal
+                    let partial = queue.makeCommandBuffer()!
+                    require(failures.prepare(commands: partial, uniforms: uniforms(a), depth: a, source: keyA) == nil,
+                        "Transient encoder refusal returns complete fine fallback")
+                    require(failures.statistics.busy == (ordinal == 1 ? 1 : 2),
+                        "Only already-encoded transient work retains a lease until completion/disposal")
+                    if commit { partial.commit(); partial.waitUntilCompleted(); require(partial.status == .completed, "Partial transient command completes") }
+                }
+                require(failures.statistics.busy == 1 && failures.statistics.readyCached == 0,
+                    "Transient failure or abandonment cannot release or publish the canonical writer")
+                failures.validationRejectEncoderOrdinal = nil
+                canonical.commit(); canonical.waitUntilCompleted()
+                let cached = read(failures, depth: a, id: keyA, via: queue)
+                require(cached.resources.indices === original.indices && cached.resources.reusedCompletedSource,
+                    "Canonical source survives each transient encoder failure/disposal")
+            }
+        } }
         pending.validationRejectEncoderOrdinal = 2
         autoreleasepool {
             let command = queue.makeCommandBuffer()!
@@ -198,9 +282,79 @@ struct OrderedSourceReuseMetalValidation {
             "Idle reusable derived data is included in the unchanged total byte budget")
         memory.retireSourceCache()
         require(memory.statistics.sets == 0 && memory.statistics.bytes == 0, "Idle cached storage retires immediately")
+        // Two tall sets fill the byte budget well before the six-set cap.
+        // A transient must decline rather than recycle the other eye's cache;
+        // a new canonical source still retains the original pressure LRU.
+        let pressure = GameWorldOrderedCorners(device: device, library: library, reuseSources: true)!
+        autoreleasepool {
+            let other = queue.makeCommandBuffer()!, otherID = identity(61, depth: tallB, eye: 1)
+            let saved = pressure.prepare(commands: other, uniforms: uniforms(tallB), depth: tallB, source: otherID)!
+            other.commit(); other.waitUntilCompleted()
+            let canonical = queue.makeCommandBuffer()!, canonicalID = identity(60, depth: tallA)
+            let original = pressure.prepare(commands: canonical, uniforms: uniforms(tallA), depth: tallA, source: canonicalID)!
+            let before = pressure.statistics, duplicate = queue.makeCommandBuffer()!
+            require(pressure.prepare(commands: duplicate, uniforms: uniforms(tallA), depth: tallA, source: canonicalID) == nil,
+                "Pending transient declines byte pressure instead of evicting idle keyed other-eye data")
+            require(pressure.statistics.readyCached == 1 && pressure.statistics.bytes == before.bytes
+                && pressure.statistics.pendingTransientAdmissions == 0, "Declined transient preserves all keyed cache resources")
+            let reader = queue.makeCommandBuffer()!
+            let preserved = pressure.prepare(commands: reader, uniforms: uniforms(tallB), depth: tallB, source: otherID)!
+            require(preserved.reusedCompletedSource && preserved.indices === saved.indices,
+                "Other-eye cache remains a real hit after pressure refusal")
+            reader.commit(); reader.waitUntilCompleted()
+            let newSource = queue.makeCommandBuffer()!
+            let replacement = pressure.prepare(commands: newSource, uniforms: uniforms(tallA), depth: tallA,
+                source: identity(62, depth: tallA))!
+            require(!replacement.pendingDuplicatePreparation && replacement.indices === saved.indices && replacement.indices !== original.indices,
+                "Normal new canonical source retains existing idle keyed pressure LRU")
+            newSource.commit(); canonical.commit(); newSource.waitUntilCompleted(); canonical.waitUntilCompleted()
+        }
+        pressure.retireSourceCache()
+        // Find a real driver-padding boundary: two actual allocations plus a
+        // third nominal allocation fit, but three actual allocations do not.
+        // No production budget/refusal hook is used.
+        var paddingFixture: (height: Int, nominal: Int, actual: Int)?
+        for h in stride(from: 1872, through: 1840, by: -1) {
+            let candidate: (Int,Int)? = autoreleasepool {
+                let layout = GameWorldOrderedCornersBudget.layout(width: 2560, height: h, maxBufferLength: device.maxBufferLength)!
+                let d = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .r32Float, width: 2561, height: h + 1, mipmapped: false)
+                d.storageMode = .private; d.usage = [.shaderRead,.shaderWrite]
+                guard let t = device.makeTexture(descriptor: d), let b = device.makeBuffer(length: layout.indexBytes, options: .storageModePrivate) else { return nil }
+                let actual = max(layout.cornerBytes,t.allocatedSize) + max(layout.indexBytes,b.allocatedSize)
+                return (layout.bytes,actual)
+            }
+            if let (nominal,actual) = candidate, 2 * actual + nominal <= 384 << 20 && 3 * actual > 384 << 20 {
+                paddingFixture = (h,nominal,actual); break
+            }
+        }
+        require(paddingFixture != nil,"Actual M4 driver allocation padding boundary found within bounded 33 probes")
+        let padding = paddingFixture!, padded = GameWorldOrderedCorners(device: device, library: library, reuseSources: true)!
+        autoreleasepool {
+            let d = texture(2560,padding.height), one = queue.makeCommandBuffer()!, otherID = identity(71,depth:d,eye:1)
+            let saved = padded.prepare(commands: one, uniforms: uniforms(d), depth: d, source: otherID)!
+            one.commit(); one.waitUntilCompleted()
+            let canonical = queue.makeCommandBuffer()!, id = identity(70,depth:d)
+            _ = padded.prepare(commands: canonical, uniforms: uniforms(d), depth: d, source: id)!
+            let before = padded.statistics
+            require(before.bytes + padding.nominal <= 384 << 20 && before.bytes + padding.actual > 384 << 20,
+                "Nominal admission passes while the real padded allocation must be refused")
+            let transient = queue.makeCommandBuffer()!
+            require(padded.prepare(commands: transient, uniforms: uniforms(d), depth: d, source: id) == nil,
+                "Actual-allocation-size refusal returns fine fallback")
+            require(padded.statistics.bytes == before.bytes && padded.statistics.sets == 2 && padded.statistics.readyCached == 1,
+                "Actual padding refusal preserves keyed resources and the canonical writer")
+            let reader = queue.makeCommandBuffer()!
+            let preserved = padded.prepare(commands: reader, uniforms: uniforms(d), depth: d, source: otherID)!
+            require(preserved.reusedCompletedSource && preserved.indices === saved.indices,
+                "Other-eye cache remains a hit after actual padded-byte refusal")
+            reader.commit(); canonical.commit(); reader.waitUntilCompleted(); canonical.waitUntilCompleted()
+        }
+        padded.retireSourceCache()
         let report: [String:Any] = ["schema":1,"device":device.name,"checks":checks,"pass":true,
             "actual_two_tall_cached_bytes":peakBytes,"completed_success_only":true,
             "multi_inflight_reader_no_overwrite":true,"source_pointer_reuse_simulation":true,
+            "pending_transients_never_evict_keyed_cache":true,"normal_canonical_pressure_lru_retained":true,
+            "actual_padding_refusal_preserves_keyed_cache":true,"padding_fixture":["height":padding.height,"nominal":padding.nominal,"actual":padding.actual],
             "native_publication_liveness_proof":"Separate actual Rust world_frame source-ID slot-reuse test",
             "bounds":["sets":6,"bytes":384 << 20,"outstanding_checkouts":12],
             "physical_performance_or_quality_acceptance":false]

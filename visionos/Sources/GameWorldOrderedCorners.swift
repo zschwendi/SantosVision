@@ -94,6 +94,7 @@ final class GameWorldOrderedCorners: @unchecked Sendable {
         let corners: any MTLTexture
         let indices: any MTLBuffer
         var reusedCompletedSource = false
+        var pendingDuplicatePreparation = false
     }
 
     struct Statistics: Sendable {
@@ -105,6 +106,7 @@ final class GameWorldOrderedCorners: @unchecked Sendable {
         let cacheMisses: UInt64
         let readyCached: Int
         let readerLeases: Int
+        let pendingTransientAdmissions: UInt64
     }
 
     private final class Pool: @unchecked Sendable {
@@ -129,6 +131,7 @@ final class GameWorldOrderedCorners: @unchecked Sendable {
         private var released: UInt64 = 0
         private var hits: UInt64 = 0
         private var misses: UInt64 = 0
+        private var pendingTransients: UInt64 = 0
         private var acceptsCache = true
 
         func acquire(device: any MTLDevice, layout: GameWorldOrderedCornersBudget.Layout,
@@ -137,6 +140,11 @@ final class GameWorldOrderedCorners: @unchecked Sendable {
             lock.lock()
             defer { lock.unlock() }
             let key = acceptsCache ? requestedKey : nil
+            // The requested key still governs retirement and idle/LRU choice.
+            // Only cache admission changes for an independently prepared copy
+            // while the canonical writer for this exact source is unfinished.
+            var admissionKey = key
+            var pendingDuplicate = false
             guard nextCheckout < .max else { return nil }
             guard entries.reduce(0, { $0 + $1.checkouts.count }) < GameWorldOrderedCornersBudget.maximumCheckouts else { return nil }
             nextCheckout += 1
@@ -144,10 +152,13 @@ final class GameWorldOrderedCorners: @unchecked Sendable {
             func claim(_ index: Int) -> (Resources, CompletionLease, Bool) {
                 assert(entries[index].checkouts.isEmpty)
                 entries[index].checkouts.insert(checkout); entries[index].writer = checkout
-                entries[index].key = key; entries[index].ready = false
-                entries[index].queue = key == nil ? nil : queue; entries[index].lastUse = checkout
+                entries[index].key = admissionKey; entries[index].ready = false
+                entries[index].queue = admissionKey == nil ? nil : queue; entries[index].lastUse = checkout
                 entries[index].discardWhenIdle = !acceptsCache
-                return (entries[index].resources,
+                var resources = entries[index].resources
+                resources.pendingDuplicatePreparation = pendingDuplicate
+                if pendingDuplicate && pendingTransients < .max { pendingTransients += 1 }
+                return (resources,
                     CompletionLease(pool: self, checkout: checkout, prepared: false), false)
             }
             if let key {
@@ -167,9 +178,12 @@ final class GameWorldOrderedCorners: @unchecked Sendable {
                         CompletionLease(pool: self, checkout: checkout, prepared: true), true)
                 }
                 if misses < .max { misses += 1 }
-                // A queued/incomplete writer is never a cache hit. Avoid a
-                // duplicate preparation; the caller retains its fine draw.
-                if entries.contains(where: { $0.key == key && $0.writer != nil }) { return nil }
+                // Never read/share an unfinished writer. With spare bounded
+                // capacity use fresh independent ordered preparation, retaining
+                // the canonical key/writer and the other eye's cache preference.
+                if entries.contains(where: { $0.key == key && $0.writer != nil }) {
+                    admissionKey = nil; pendingDuplicate = true
+                }
             }
             if let index = entries.indices.filter({ entries[$0].checkouts.isEmpty
                 && entries[$0].width == layout.width && entries[$0].height == layout.height
@@ -182,6 +196,11 @@ final class GameWorldOrderedCorners: @unchecked Sendable {
             entries.removeAll { $0.checkouts.isEmpty && (key == nil || $0.key == nil) }
             var heldBytes = entries.reduce(0) { $0 + $1.bytes }
             if !GameWorldOrderedCornersBudget.canAdd(bytes: layout.bytes, heldBytes: heldBytes, heldSets: entries.count) {
+                // A transient is only spare-capacity assistance. It must never
+                // evict keyed canonical data, including the other eye's cache.
+                // A later actual-allocation-size refusal below also leaves all
+                // keyed entries intact; only idle unkeyed sets were discarded.
+                if pendingDuplicate { return nil }
                 // Preserve the other eye's ready cache while spare capacity
                 // exists. Under pressure, evict only an idle allocation.
                 if let index = entries.indices.filter({ entries[$0].checkouts.isEmpty
@@ -210,8 +229,11 @@ final class GameWorldOrderedCorners: @unchecked Sendable {
             let resources = Resources(corners: corners, indices: indices)
             entries.append(Entry(resources: resources, width: layout.width, height: layout.height,
                 bytes: actual.partialValue, checkouts: [checkout], writer: checkout,
-                key: key, ready: false, queue: key == nil ? nil : queue, lastUse: checkout, discardWhenIdle: !acceptsCache))
-            return (resources, CompletionLease(pool: self, checkout: checkout, prepared: false), false)
+                key: admissionKey, ready: false, queue: admissionKey == nil ? nil : queue, lastUse: checkout, discardWhenIdle: !acceptsCache))
+            var returned = resources
+            returned.pendingDuplicatePreparation = pendingDuplicate
+            if pendingDuplicate && pendingTransients < .max { pendingTransients += 1 }
+            return (returned, CompletionLease(pool: self, checkout: checkout, prepared: false), false)
         }
 
         func release(checkout: UInt64, success: Bool) {
@@ -247,7 +269,8 @@ final class GameWorldOrderedCorners: @unchecked Sendable {
             return Statistics(sets: entries.count, busy: entries.filter { !$0.checkouts.isEmpty }.count,
                 bytes: entries.reduce(0) { $0 + $1.bytes }, releasedLeases: released,
                 cacheHits: hits, cacheMisses: misses, readyCached: entries.filter { $0.ready && $0.key != nil }.count,
-                readerLeases: entries.reduce(0) { $0 + $1.checkouts.count - ($1.writer == nil ? 0 : 1) })
+                readerLeases: entries.reduce(0) { $0 + $1.checkouts.count - ($1.writer == nil ? 0 : 1) },
+                pendingTransientAdmissions: pendingTransients)
         }
     }
 
