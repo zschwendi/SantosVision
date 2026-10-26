@@ -1,5 +1,9 @@
 # Third-person immersive fidelity on the27 baseline
 
+## Latest local candidate — V27.7, October26
+
+The new agent implemented and locally verified a production color-path correction: decode-before-filter source sampling, explicit sRGB-to-linear-Display-P3 output, original encoded-domain HUD composition and color-tagged captures. Registered actual-game Metal before/after comparisons preserve depth and ownership. V27.6 remains frozen and uninstalled; V27.7 is a separate local candidate. No device, iPad or simulator action occurred. See [V27.7 color fidelity and acceptance](THIRD-PERSON-COLOR-FIDELITY-20261026.md) for evidence, remaining overscan/performance limits and the next single headset test. The older candidate and performance-experiment sections below remain historical evidence, not instructions to install V27.6 or enable its experiments.
+
 The user's current scope is third-person immersive quality approaching the windowed image. Sense-specific input, hands/arms, first-person/ADS, reticle and firing changes are deferred. The canonical checkout remains exact27 `75be389` on `codex/restored27-baseline-20261025`; all later experiments remain separately preserved. Active source is this `SantosVision-third-person27` worktree on `codex/third-person-fidelity27`.
 
 The project is now **spatial-V**, with app display name **V**. Branding build27.5 replaces customer-facing Los Santos labels and preserves all technical save, iCloud, bundle and scene identities. See [project identity](PROJECT-IDENTITY.md).

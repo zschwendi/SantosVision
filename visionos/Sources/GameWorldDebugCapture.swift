@@ -1,8 +1,103 @@
 #if SV_GAME_RUNTIME
 import Foundation
+import CoreGraphics
+import ImageIO
 import Metal
 import OSLog
 import simd
+
+// BEGIN GameWorldColorFile
+/// A texture format describes storage, not the image's primaries or purpose.
+/// Guest bytes are finished sRGB. CompositorServices consumes linear Display P3;
+/// an sRGB attachment only changes how those linear values are stored.
+enum GameWorldColorFile {
+    enum Role: String {
+        case guest = "finished_guest_srgb"
+        case compositor = "compositor_display_p3"
+    }
+
+    static func colorSpace(role: Role, format: MTLPixelFormat) -> CGColorSpace? {
+        if role == .guest { return CGColorSpace(name: CGColorSpace.sRGB) }
+        let encoded = format == .rgba8Unorm_srgb || format == .bgra8Unorm_srgb
+        return CGColorSpace(name: encoded ? CGColorSpace.displayP3 : CGColorSpace.linearDisplayP3)
+    }
+
+    /// PNG is a tagged viewing companion. The raw PPM/half-float file remains
+    /// the numerical oracle. Float output keeps every raw bit separately; its
+    /// PNG is explicitly a bounded, 16-bit linear-P3 preview, without tonemapping.
+    static func writePNG(_ bytes: UnsafeRawBufferPointer, width: Int, height: Int,
+                         rowBytes: Int, format: MTLPixelFormat, role: Role,
+                         to url: URL) throws -> [String: Any] {
+        let halfFloat = format == .rgba16Float
+        let supported: Set<MTLPixelFormat> = [.rgba8Unorm, .bgra8Unorm, .rgba8Unorm_srgb, .bgra8Unorm_srgb, .rgba16Float]
+        let bytesPerPixel = halfFloat ? 8 : 4
+        let (packedRow, rowOverflow) = width.multipliedReportingOverflow(by: bytesPerPixel)
+        let (byteCount, sizeOverflow) = rowBytes.multipliedReportingOverflow(by: height)
+        guard supported.contains(format), !(halfFloat && role == .guest), width > 0, height > 0,
+              !rowOverflow, !sizeOverflow, rowBytes >= packedRow, byteCount <= bytes.count,
+              byteCount <= 96 * 1024 * 1024, let base = bytes.baseAddress,
+              let space = colorSpace(role: role, format: format) else {
+            throw NSError(domain: "GameWorldColorFile", code: 1,
+                          userInfo: [NSLocalizedDescriptionKey: "Invalid color export layout or role"])
+        }
+        let bgra = format == .bgra8Unorm || format == .bgra8Unorm_srgb
+        var clipped = 0, nonfinite = 0
+        var pixels = Data(count: width * height * bytesPerPixel)
+        pixels.withUnsafeMutableBytes { destination in
+            let output = destination.bindMemory(to: UInt8.self)
+            for y in 0..<height { for x in 0..<width {
+                let input = base.advanced(by: y * rowBytes + x * bytesPerPixel)
+                let at = (y * width + x) * bytesPerPixel
+                if halfFloat {
+                    for channel in 0..<3 {
+                        let value = Float(Float16(bitPattern: input.loadUnaligned(fromByteOffset: channel * 2, as: UInt16.self)))
+                        if !value.isFinite { nonfinite += 1 }
+                        else if value < 0 || value > 1 { clipped += 1 }
+                        let bounded: Float = value.isFinite ? min(1, max(0, value)) : 0
+                        let encoded = UInt16((bounded * 65535).rounded())
+                        output[at + channel * 2] = UInt8(encoded >> 8)
+                        output[at + channel * 2 + 1] = UInt8(encoded & 255)
+                    }
+                    output[at + 6] = 255; output[at + 7] = 255
+                } else {
+                    let input = input.assumingMemoryBound(to: UInt8.self)
+                    output[at] = input[bgra ? 2 : 0]
+                    output[at + 1] = input[1]
+                    output[at + 2] = input[bgra ? 0 : 2]
+                    output[at + 3] = 255
+                }
+            } }
+        }
+        let bitmap = CGBitmapInfo(rawValue: CGImageAlphaInfo.noneSkipLast.rawValue)
+            .union(halfFloat ? .byteOrder16Big : [])
+        guard let provider = CGDataProvider(data: pixels as CFData),
+              let image = CGImage(width: width, height: height, bitsPerComponent: halfFloat ? 16 : 8,
+                  bitsPerPixel: bytesPerPixel * 8, bytesPerRow: width * bytesPerPixel, space: space,
+                  bitmapInfo: bitmap, provider: provider, decode: nil, shouldInterpolate: false,
+                  intent: .relativeColorimetric),
+              let encoded = CFDataCreateMutable(nil, 0),
+              let destination = CGImageDestinationCreateWithData(encoded, "public.png" as CFString, 1, nil) else {
+            throw NSError(domain: "GameWorldColorFile", code: 2,
+                          userInfo: [NSLocalizedDescriptionKey: "Could not create tagged PNG"])
+        }
+        CGImageDestinationAddImage(destination, image, nil)
+        guard CGImageDestinationFinalize(destination) else {
+            throw NSError(domain: "GameWorldColorFile", code: 3,
+                          userInfo: [NSLocalizedDescriptionKey: "Could not encode tagged PNG"])
+        }
+        try (encoded as Data).write(to: url, options: [.withoutOverwriting])
+        return ["path": url.path, "role": role.rawValue,
+                "icc_profile": space.name.map { $0 as String } ?? "unknown",
+                "primaries": role == .guest ? "sRGB / Rec.709 D65" : "Display P3 D65",
+                "transfer": role == .guest || format == .rgba8Unorm_srgb || format == .bgra8Unorm_srgb ? "sRGB" : "linear",
+                "alpha": "opaque viewing companion; raw alpha is not used to darken the image",
+                "bits_per_component": halfFloat ? 16 : 8,
+                "preview_clipped_channels": clipped, "preview_nonfinite_channels_replaced_with_zero": nonfinite,
+                "preview_note": halfFloat ? "Float RGB clipped to [0,1] and quantized to 16-bit linear Display P3; inspect raw rgba16f for extended values. No tonemapping."
+                    : "RGB bytes unchanged apart from BGRA channel order; ICC profile defines interpretation."]
+    }
+}
+// END GameWorldColorFile
 
 // BEGIN GameWorldDepthFile
 /// CPU-only export of an already completed readback. Rows are streamed from the
@@ -102,7 +197,8 @@ final class GameWorldDebugCapture: @unchecked Sendable {
               color.sampleCount == 1, depth.sampleCount == 1,
               !color.isFramebufferOnly, !depth.isFramebufferOnly,
               color.storageMode != .memoryless, depth.storageMode != .memoryless else { return nil }
-        let outputSupported = formats.contains(outputColor.pixelFormat) && outputDepth.pixelFormat == .depth32Float
+        let outputSupported = (formats.contains(outputColor.pixelFormat) || outputColor.pixelFormat == .rgba16Float)
+            && outputDepth.pixelFormat == .depth32Float
             && outputColor.sampleCount == 1 && outputDepth.sampleCount == 1
             && !outputColor.isFramebufferOnly && !outputDepth.isFramebufferOnly
             && outputColor.storageMode != .memoryless && outputDepth.storageMode != .memoryless
@@ -111,12 +207,14 @@ final class GameWorldDebugCapture: @unchecked Sendable {
             && x + width <= outputDepth.width && y + height <= outputDepth.height
             && slice >= 0 && slice < outputColor.arrayLength && slice < outputDepth.arrayLength
         func allocate(_ width: Int, _ height: Int, _ format: MTLPixelFormat) -> Image? {
-            let rowBytes = (width * 4 + 255) & ~255
+            let rowBytes = (width * (format == .rgba16Float ? 8 : 4) + 255) & ~255
             guard let buffer = device.makeBuffer(length: rowBytes * height, options: .storageModeShared) else { return nil }
             return Image(buffer: buffer, width: width, height: height, rowBytes: rowBytes, format: format)
         }
         let sourceBytes = ((color.width * 4 + 255) & ~255) * color.height * 2
-        let outputBytes = outputSupported ? ((width * 4 + 255) & ~255) * height * 2 : 0
+        let outputBytes = outputSupported
+            ? (((width * (outputColor.pixelFormat == .rgba16Float ? 8 : 4) + 255) & ~255)
+                + ((width * 4 + 255) & ~255)) * height : 0
         guard sourceBytes + outputBytes <= 96 * 1024 * 1024,
               let sourceColorBuffer = allocate(color.width, color.height, color.pixelFormat),
               let sourceDepthBuffer = allocate(depth.width, depth.height, depth.pixelFormat),
@@ -132,7 +230,11 @@ final class GameWorldDebugCapture: @unchecked Sendable {
         self.currentEyeFromSourceEye = currentEyeFromSourceEye
         self.currentClipFromEye = currentClipFromEye
         self.nearFadeDistances = nearFadeDistances
-        var details: [String: Any] = ["schema": 2, "scope": "Readback of actual leased textures and the normal compositor shader output before presentation; no substitute render.",
+        let publishedColor = UnsafeRawPointer(bitPattern: UInt(native.color_texture)).flatMap {
+            Unmanaged<AnyObject>.fromOpaque($0).takeUnretainedValue() as? any MTLTexture
+        }
+        var details: [String: Any] = ["schema": 3, "scope": "Readback of actual leased textures and the normal compositor shader output before presentation; no substitute render.",
+                    "color_export_contract": "Raw files preserve stored RGB. Tagged PNG companions distinguish guest sRGB from CompositorServices Display P3, including attachment transfer encoding. No display screenshot or physical appearance certification.",
                     "game_frame": native.game_frame, "request_frame": native.request_frame,
                     "head_frame": native.head_frame, "view_count": native.view_count,
                     "view_index": native.view_index, "presentation_time": timestamp,
@@ -148,6 +250,9 @@ final class GameWorldDebugCapture: @unchecked Sendable {
                     "source_near": native.depth_near, "source_far": native.depth_far,
                     "near_fade_distances_m": [nearFadeDistances.x, nearFadeDistances.y],
                     "source_color_format": color.pixelFormat.rawValue,
+                    "source_sampling_texture_format": color.pixelFormat.rawValue,
+                    "native_published_final_color_format": publishedColor.map { $0.pixelFormat.rawValue as Any } ?? NSNull(),
+                    "source_color_format_note": "The copied sampling texture may be a zero-copy sRGB view of the native UNORM allocation or the same-lease HUD-free allocation. Its format does not change the stored source bytes; native publication format is recorded separately.",
                     "source_depth_format": depth.pixelFormat.rawValue,
                     "output_color_format": outputColor.pixelFormat.rawValue,
                     "output_depth_format": outputDepth.pixelFormat.rawValue,
@@ -188,7 +293,7 @@ final class GameWorldDebugCapture: @unchecked Sendable {
             Self.log.info("Exporting actual world shader diagnostic: \(self.prefix.path, privacy: .public)")
             do {
                 try FileManager.default.createDirectory(at: prefix.deletingLastPathComponent(), withIntermediateDirectories: true)
-                let sourceStats = try saveColor(sourceColor, suffix: "-source.ppm")
+                let sourceStats = try saveColor(sourceColor, suffix: "-source", role: .guest)
                 var report = metadata
                 report["metal_command_status"] = "completed"
                 report["compositor_acknowledged"] = compositorAcknowledged
@@ -196,9 +301,9 @@ final class GameWorldDebugCapture: @unchecked Sendable {
                 report["source_depth"] = try saveDepth(sourceDepth, suffix: "-source-depth.f32",
                                                        pairedColorSuffix: "-source.ppm")
                 if let outputColor, let outputDepth {
-                    report["output_color"] = try saveColor(outputColor, suffix: "-output.ppm")
+                    report["output_color"] = try saveColor(outputColor, suffix: "-output", role: .compositor)
                     report["output_depth"] = try saveDepth(outputDepth, suffix: "-output-depth.f32",
-                                                           pairedColorSuffix: "-output.ppm")
+                        pairedColorSuffix: outputColor.format == .rgba16Float ? "-output.rgba16f" : "-output.ppm")
                 }
                 report["sampled_vertex_checks"] = vertexChecks()
                 let data = try JSONSerialization.data(withJSONObject: report, options: [.prettyPrinted, .sortedKeys])
@@ -219,7 +324,33 @@ final class GameWorldDebugCapture: @unchecked Sendable {
         withUnsafeBytes(of: tuple) { Array($0.bindMemory(to: Float.self)) }
     }
 
-    private func saveColor(_ image: Image, suffix: String) throws -> [String: Any] {
+    private func saveColor(_ image: Image, suffix: String, role: GameWorldColorFile.Role) throws -> [String: Any] {
+        let bytes = UnsafeRawBufferPointer(start: image.buffer.contents(), count: image.buffer.length)
+        var report: [String: Any]
+        if image.format == .rgba16Float {
+            let packedRow = image.width * 8
+            var raw = Data(capacity: packedRow * image.height)
+            for y in 0..<image.height {
+                raw.append(bytes.bindMemory(to: UInt8.self).baseAddress!.advanced(by: y * image.rowBytes), count: packedRow)
+            }
+            let path = prefix.path + suffix + ".rgba16f"
+            try raw.write(to: URL(fileURLWithPath: path), options: [.withoutOverwriting])
+            report = ["width": image.width, "height": image.height, "path": path,
+                "encoding": "Raw IEEE754 binary16 RGBA little-endian, tightly packed rows, no header; all bits preserved",
+                "transfer": "linear", "primaries": "Display P3 D65", "byte_count": raw.count,
+                "raw_data_not_a_tagged_viewing_image": true]
+        } else { report = try saveRawColor(image, suffix: suffix + ".ppm") }
+        report["role"] = role.rawValue
+        report["metal_pixel_format"] = image.format.rawValue
+        report["primaries"] = role == .guest ? "sRGB / Rec.709 D65" : "Display P3 D65"
+        report["transfer"] = role == .guest || image.format == .rgba8Unorm_srgb || image.format == .bgra8Unorm_srgb ? "sRGB" : "linear"
+        report["tagged_png"] = try GameWorldColorFile.writePNG(bytes, width: image.width, height: image.height,
+            rowBytes: image.rowBytes, format: image.format, role: role,
+            to: URL(fileURLWithPath: prefix.path + suffix + ".png"))
+        return report
+    }
+
+    private func saveRawColor(_ image: Image, suffix: String) throws -> [String: Any] {
         let bytes = image.buffer.contents().assumingMemoryBound(to: UInt8.self)
         let bgra = image.format == .bgra8Unorm || image.format == .bgra8Unorm_srgb
         var rgb = Data(count: image.width * image.height * 3)
@@ -241,7 +372,9 @@ final class GameWorldDebugCapture: @unchecked Sendable {
         let path = prefix.path + suffix
         try data.write(to: URL(fileURLWithPath: path), options: [.withoutOverwriting])
         return ["width": image.width, "height": image.height, "nonblack_pixels": nonblack,
-                "nonzero_alpha_pixels": alphaNonzero, "maximum_channel_8bit": maximum, "path": path]
+                "nonzero_alpha_pixels": alphaNonzero, "maximum_channel_8bit": maximum, "path": path,
+                "encoding": "Raw stored RGB bytes in P6 PPM; no ICC profile or transfer conversion",
+                "raw_data_not_a_tagged_viewing_image": true]
     }
 
     private func depthStats(_ image: Image) -> [String: Any] {
@@ -278,7 +411,7 @@ final class GameWorldDebugCapture: @unchecked Sendable {
         report["metal_pixel_format"] = image.format.rawValue
         report["pixel_coordinates"] = "Top-left origin; x increases right, y increases down; Float32 byte offset = (y * width + x) * 4"
         report["paired_color_path"] = prefix.path + pairedColorSuffix
-        report["paired_color_registration"] = "Depth[x,y] and paired PPM RGB[x,y] are the same captured texel, with identical dimensions and crop. Output coordinates are local to the report viewport crop."
+        report["paired_color_registration"] = "Depth[x,y] and paired raw color[x,y] are the same captured texel, with identical dimensions and crop. Output coordinates are local to the report viewport crop."
         report["preserves_nonfinite_and_clear_bits"] = true
         return report
     }
