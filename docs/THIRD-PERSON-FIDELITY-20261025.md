@@ -1,6 +1,10 @@
 # Third-person immersive fidelity on the27 baseline
 
-## Latest local candidate — V27.9, October26
+## V27.10 source checkpoint — October26
+
+The new correction admits exact same-eye camera-coordinate aliases that the former callback-ID rule rejected. In actual comparable20-second local observation windows, GPU-complete source publications increased from46 to972; genuine camera changes still reject. Resolution, graphics effects, source pixels and independent-eye rendering are preserved. Source and CPU verification pass; the separate local package is being prepared. This does not establish repaired headset grain/shading or remove the guard3 detail limit. See [V27.10 source publication evidence and acceptance boundary](WORLD-PROVENANCE-FIDELITY-20261026.md).
+
+## Preserved local candidate — V27.9, October26
 
 V27.9 fixes a demonstrated native color-input/output binding conflict that invalidated real game render passes. The identical formerly failing shader now reaches the correct persistent-null path; native pixel tests, independent actual-game span replay, a clean bounded game run and 40 signed-package checks pass. Original game bytes, graphics settings, independent eyes and V27.6–V27.8 rollback packages remain preserved. No device or simulator action occurred. See [V27.9 correction, evidence, limits and single headset test](COLOR-BINDING-FIDELITY-20261026.md). This supersedes the older candidate acceptance plans below; full headset image quality remains unaccepted.
 

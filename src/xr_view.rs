@@ -31,6 +31,24 @@ const HISTORY: usize = 96;
 const MAX_MARKERS: usize = 4096;
 const MAX_PRESENTS: usize = 128;
 
+// Exact same-eye coordinate identity is the ordinary policy. Only the private
+// Mac capture feature can explicitly request the historical sequence-only
+// baseline; app environments cannot disable this correctness rule.
+fn same_ray_alias_policy(private_capture: bool, setting: Option<&str>) -> bool {
+    !private_capture || setting != Some("0")
+}
+static SAME_RAY_ALIAS_ENABLED: LazyLock<bool> = LazyLock::new(|| {
+    #[cfg(all(target_os = "macos", feature = "native-draw-capture"))]
+    { same_ray_alias_policy(true, std::env::var("MUGUET_XR_SAME_RAY_ALIAS").ok().as_deref()) }
+    #[cfg(not(all(target_os = "macos", feature = "native-draw-capture")))]
+    { same_ray_alias_policy(false, None) }
+});
+// The separate exact-first lookup was not observed to improve actual matches.
+// Keep that unpromoted experiment private and disabled by default.
+static EXACT_VIEWPORT_MATCH_CANDIDATE: LazyLock<bool> = LazyLock::new(||
+    cfg!(all(target_os = "macos", feature = "native-draw-capture"))
+        && std::env::var("MUGUET_XR_EXACT_VIEWPORT_MATCH").as_deref() == Ok("1"));
+
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct SVXREyeView {
@@ -341,6 +359,9 @@ pub(crate) fn consumed_request_receipt(view: &WorldView) -> Option<serde_json::V
     if request.frame != view.request_frame || request.view_count != 2 { return None; }
     let bytes = request_bytes(request);
     Some(serde_json::json!({"schema":1,"source":"sv_xr_submit_views",
+        "identity_scope":if *SAME_RAY_ALIAS_ENABLED {
+            "Oldest complete exact same-eye coordinate basis; later bit-identical ray aliases may use this basis. This is not proof every draw consumed this callback sequence."
+        } else { "Exact consumed camera callback identity" },
         "request_bytes_hex":bytes.iter().map(|byte| format!("{byte:02x}")).collect::<String>(),
         "provenance_epoch":view.provenance_epoch,"head_pose_frame":view.head_pose_frame}))
 }
@@ -412,6 +433,8 @@ struct State {
     foreground_marker_changes: u64,
     frame_world: Option<WorldView>,
     frame_conflict: bool,
+    ray_alias: RayAliasState,
+    viewport_match: ViewportMatchQualification,
     presents: VecDeque<Option<WorldView>>,
     correlation_failed: bool,
     camera_calls: u64,
@@ -449,6 +472,110 @@ struct State {
     last_main: Option<SavedViewport>,
     last_current: Option<WorldView>,
     last_error: Option<String>,
+}
+
+#[derive(Default)]
+struct RayAliasState {
+    anchor: Option<WorldView>,
+    equivalent_this_present: bool,
+    normalized_this_present: bool,
+    foreground_this_present: bool,
+    equivalent_draws: u64,
+    normalized_draws: u64,
+    equivalent_presents: u64,
+    admitted_alias_presents: u64,
+    refusals: BTreeMap<&'static str, u64>,
+    // First occurrence of each class, with a hard four-example bound.
+    examples: Vec<(&'static str, u64, WorldView, WorldView)>,
+}
+
+#[derive(Default)]
+struct ViewportMatchQualification {
+    exact_matches: u64,
+    approximate_fallbacks: u64,
+    exact_over_newer_approximate: u64,
+    corrected_selections: u64,
+    example: Option<(u64, [f32;16], [f32;16], WorldView, WorldView)>,
+}
+
+impl RayAliasState {
+    fn end_present(&mut self) {
+        self.anchor = None;
+        self.equivalent_this_present = false;
+        self.normalized_this_present = false;
+        self.foreground_this_present = false;
+    }
+
+    fn example(&mut self, reason: &'static str, command: u64, first: WorldView, current: WorldView) {
+        if self.examples.len() < 4 && !self.examples.iter().any(|entry| entry.0 == reason) {
+            self.examples.push((reason, command, first, current));
+        }
+    }
+}
+
+/// The same stationary camera can be matched to a newer primary-history entry
+/// by a later SetCurrent. Sequence numbers then differ although the bytes
+/// actually used for the eye rays do not. This is an exact geometric alias,
+/// not permission to combine different eyes, poses, scopes or near/far planes.
+fn canonical_same_ray_alias(first: WorldView, current: WorldView) -> Result<WorldView, &'static str> {
+    if !first.headset_applied || !current.headset_applied || first.provenance_epoch != current.provenance_epoch {
+        return Err("epoch_or_non_headset");
+    }
+    if first.eye_index != current.eye_index || first.view_count != current.view_count
+        || first.view_count != 2 || first.eye_index >= 2 { return Err("different_eye"); }
+    if first.optics.scope_sequence != current.optics.scope_sequence
+        || first.optics.magnification.to_bits() != current.optics.magnification.to_bits()
+        || first.optics.reference_fov_degrees.to_bits() != current.optics.reference_fov_degrees.to_bits()
+        || first.optics.actual_fov_degrees.to_bits() != current.optics.actual_fov_degrees.to_bits()
+        || !first.optics.valid() || !current.optics.valid() { return Err("different_optics"); }
+    if !same_matrix_bits(&first.game_from_eye, &current.game_from_eye)
+        || !rigid(&first.game_from_eye) { return Err("different_camera"); }
+    if !same_matrix_bits(&first.game_from_stage, &current.game_from_stage)
+        || !rigid(&first.game_from_stage) { return Err("different_stage"); }
+    if first.projection_from_eye.iter().zip(current.projection_from_eye).enumerate()
+        .any(|(i, (a, b))| i % 4 != 2 && a.to_bits() != b.to_bits()) {
+        return Err("different_screen_rays");
+    }
+    let depth_equivalent = if first.depth_reverse_z == current.depth_reverse_z {
+        same_matrix_bits(&first.projection_from_eye, &current.projection_from_eye)
+    } else if first.depth_reverse_z {
+        same_matrix_bits(&first.projection_from_eye, &flip_projection_depth(current.projection_from_eye))
+    } else {
+        same_matrix_bits(&flip_projection_depth(first.projection_from_eye), &current.projection_from_eye)
+    };
+    if !depth_equivalent || projection_scalars(&first.projection_from_eye).is_none()
+        || projection_scalars(&current.projection_from_eye).is_none()
+        || reverse_z(&first.projection_from_eye) != Some(first.depth_reverse_z)
+        || reverse_z(&current.projection_from_eye) != Some(current.depth_reverse_z) {
+        return Err("different_depth_projection");
+    }
+    if !first.presentation_time_seconds.is_finite() || !current.presentation_time_seconds.is_finite()
+        || first.presentation_time_seconds < 0.
+        || current.presentation_time_seconds < first.presentation_time_seconds
+        || current.camera_sequence < first.camera_sequence
+        || current.request_frame < first.request_frame || current.head_pose_frame < first.head_pose_frame {
+        return Err("older_or_invalid_time");
+    }
+    // Keep the oldest complete identity, never a synthetic newer timestamp.
+    // Only the actual writer's certified depth convention follows the draw.
+    Ok(WorldView { projection_from_eye: current.projection_from_eye,
+        depth_reverse_z: current.depth_reverse_z, ..first })
+}
+
+fn retain_alias_request(state: &mut State, first: WorldView, canonical: WorldView) -> bool {
+    if find_consumed_request(state, &canonical).is_some() { return true; }
+    let Some(request) = find_consumed_request(state, &first) else { return false; };
+    if validate_request(&request).is_err() || request.frame != first.request_frame
+        || request.presentation_time_seconds.to_bits() != first.presentation_time_seconds.to_bits() {
+        return false;
+    }
+    let Some(forward) = optical_projection(for_game_depth(
+        request.views[first.eye_index as usize].projection_from_eye, false), first.optics.magnification)
+        else { return false; };
+    let expected = if canonical.depth_reverse_z { flip_projection_depth(forward) } else { forward };
+    if !same_matrix_bits(&canonical.projection_from_eye, &expected) { return false; }
+    push_consumed_request(state, canonical, request);
+    true
 }
 
 static STATE: LazyLock<Mutex<State>> = LazyLock::new(|| Mutex::new(State::default()));
@@ -545,6 +672,7 @@ fn invalidate_state(state: &mut State) {
     state.last_emitted = None;
     state.frame_world = None;
     state.frame_conflict = false;
+    state.ray_alias.end_present();
     // Preserve queue positions for commands already published; convert their
     // payloads to nonworld rather than shifting the presentation correspondence.
     for view in state.markers.values_mut() { *view = None; }
@@ -1085,16 +1213,62 @@ fn diagnose_unmatched(state: &mut State, mem: &SharedMemory, pointer: u64) {
     while state.unmatched_near_world.len() > 8 { state.unmatched_near_world.pop_front(); }
 }
 
-fn match_viewport(state: &State, mem: &SharedMemory, pointer: u64) -> Option<WorldView> {
+#[derive(Clone, Copy, Default)]
+struct ViewportHistoryMatch { legacy: Option<WorldView>, exact: Option<WorldView> }
+
+impl ViewportHistoryMatch {
+    fn selected(self, prefer_exact: bool) -> Option<WorldView> {
+        if prefer_exact { self.exact.or(self.legacy) } else { self.legacy }
+    }
+}
+
+fn viewport_history_match(history: &VecDeque<SavedViewport>, camera: &[f32;16],
+    projection: &[f32;16], epoch: u64, mut projection_current: impl FnMut() -> bool,
+    search_exact: bool) -> ViewportHistoryMatch {
+    let mut result=ViewportHistoryMatch::default();
+    let mut qualified_projection=None;
+    for saved in history.iter().rev() {
+        if saved.view.provenance_epoch != epoch
+            || !same_matrix(camera,&saved.view.game_from_eye)
+            || !same_matrix(projection,&saved.view.projection_from_eye)
+            || (saved.view.headset_applied && !*qualified_projection.get_or_insert_with(&mut projection_current)) {
+            continue;
+        }
+        result.legacy.get_or_insert(saved.view);
+        if same_matrix_bits(camera,&saved.view.game_from_eye)
+            && same_matrix_bits(projection,&saved.view.projection_from_eye) {
+            result.exact=Some(saved.view);
+            break;
+        }
+        if !search_exact { break; }
+    }
+    result
+}
+
+fn match_viewport(state: &mut State, mem: &SharedMemory, pointer: u64) -> Option<WorldView> {
     if pointer == 0 { return None; }
     let camera = read_matrix(mem, pointer.checked_add(CAMERA_OFFSET)?)?;
     let projection = read_matrix(mem, pointer.checked_add(PROJECTION_OFFSET)?)?;
     // Baked command copies have different pointers. Match BOTH immutable matrices
     // against bounded source/scene history, never against a newer mutable camera.
-    state.history.iter().rev().find(|saved| saved.view.provenance_epoch == EPOCH.load(Ordering::Acquire)
-        && same_matrix(&camera, &saved.view.game_from_eye)
-        && same_matrix(&projection, &saved.view.projection_from_eye)
-        && (!saved.view.headset_applied || projection_state_is_current(mem,pointer,&projection))).map(|saved| saved.view)
+    let observe=cfg!(all(target_os="macos",feature="native-draw-capture"));
+    let matches=viewport_history_match(&state.history,&camera,&projection,EPOCH.load(Ordering::Acquire),
+        ||projection_state_is_current(mem,pointer,&projection),observe);
+    if observe {
+        if matches.exact.is_some() { state.viewport_match.exact_matches+=1; }
+        else if matches.legacy.is_some() { state.viewport_match.approximate_fallbacks+=1; }
+        if let (Some(legacy),Some(exact))=(matches.legacy,matches.exact) {
+            if legacy != exact {
+                state.viewport_match.exact_over_newer_approximate+=1;
+                if *EXACT_VIEWPORT_MATCH_CANDIDATE { state.viewport_match.corrected_selections+=1; }
+                state.viewport_match.example.get_or_insert((pointer,camera,projection,legacy,exact));
+            }
+        }
+    }
+    // Search the whole active history for exact bytes before taking the former
+    // newest-within-epsilon fallback. The returned value is an original stored
+    // WorldView, not relabelled or synthesized camera/identity metadata.
+    matches.selected(*EXACT_VIEWPORT_MATCH_CANDIDATE)
 }
 
 /// Reproduce the guest's certified RegeneratePerspective/SetInvertZ operation
@@ -1171,7 +1345,7 @@ pub fn current_view(caller: &mut Caller<'_, HostState>, viewport: u64, _set_wind
     if !TRACE_ENABLED.load(Ordering::Acquire) { return Ok(()); }
     let mem = &RT.get().context("missing runtime")?.mem;
     let mut state = lock_world_state(); state.current_calls += 1;
-    let mut view = if crate::xr::is_active() { match_viewport(&state, mem, viewport) } else { None };
+    let mut view = if crate::xr::is_active() { match_viewport(&mut state, mem, viewport) } else { None };
     let clone = if view.is_none() && viewport != 0 && ENABLED.load(Ordering::Acquire) { match_reverse_clone(&state,mem,viewport) } else { None };
     if view.is_none() && clone.is_none() && viewport != 0 && ENABLED.load(Ordering::Acquire) { diagnose_unmatched(&mut state,mem,viewport); }
     drop(state);
@@ -1280,6 +1454,15 @@ pub fn gpu_command(caller: &mut Caller<'_, HostState>, command: u64) -> Result<(
 /// A marker is written only on change; GPU consumption order is ring order.
 fn record_foreground(state: &mut State, command: u64, mark: Option<foreground_depth::ForegroundMark>, epoch: u64) {
     let mark = mark.filter(|mark| mark.view.provenance_epoch == epoch);
+    if mark.is_some() {
+        state.ray_alias.foreground_this_present = true;
+        // First-person attribution has a separate certified identity. Leave it
+        // untouched and refuse this present if an alias preceded it.
+        if state.ray_alias.normalized_this_present {
+            state.frame_conflict = true;
+            *state.ray_alias.refusals.entry("foreground_alias_unqualified").or_default() += 1;
+        }
+    }
     if mark != state.last_foreground {
         if state.foreground_markers.len() >= MAX_MARKERS || state.foreground_markers.contains_key(&command) {
             // A lost transition would mislabel later commands: refuse images.
@@ -1306,7 +1489,46 @@ pub(crate) fn take_command_foreground(command_address: u64) -> Option<Option<for
 }
 
 fn record_emission(state: &mut State, command: u64, opcode: u32, current: Option<WorldView>) {
+    record_emission_with_alias_policy(state, command, opcode, current,
+        *SAME_RAY_ALIAS_ENABLED || cfg!(all(target_os = "macos", feature = "native-draw-capture")),
+        *SAME_RAY_ALIAS_ENABLED, *CAPTURE_CONSUMED_REQUESTS);
+}
+
+fn record_emission_with_alias_policy(state: &mut State, command: u64, opcode: u32,
+    mut current: Option<WorldView>, observe_alias: bool, normalize_alias: bool, require_receipt: bool) {
     state.emitted_commands += 1;
+    // Run before installing this command's positional marker, while the guest
+    // Emit mutex still prevents the GPU worker from seeing its ring bytes.
+    if observe_alias && opcode == 32 {
+        if let Some(view) = current {
+            let first = *state.ray_alias.anchor.get_or_insert(view);
+            if first.camera_sequence != view.camera_sequence || first.eye_index != view.eye_index {
+                let alias = canonical_same_ray_alias(first, view).and_then(|canonical|
+                    if state.ray_alias.foreground_this_present { Err("foreground_alias_unqualified") }
+                    else { Ok(canonical) });
+                match alias {
+                    Ok(canonical) => {
+                        state.ray_alias.equivalent_draws += 1;
+                        state.ray_alias.equivalent_this_present = true;
+                        state.ray_alias.example("same_ray_identity", command, first, view);
+                        if normalize_alias {
+                            if !require_receipt || retain_alias_request(state, first, canonical) {
+                                current = Some(canonical);
+                                state.ray_alias.normalized_draws += 1;
+                                state.ray_alias.normalized_this_present = true;
+                            } else {
+                                *state.ray_alias.refusals.entry("canonical_request_unavailable").or_default() += 1;
+                            }
+                        }
+                    }
+                    Err(reason) => {
+                        *state.ray_alias.refusals.entry(reason).or_default() += 1;
+                        state.ray_alias.example(reason, command, first, view);
+                    }
+                }
+            }
+        }
+    }
     if current != state.last_emitted {
         if state.markers.len() >= MAX_MARKERS || state.markers.contains_key(&command) {
             state.correlation_failed = true; state.last_error = Some("GPU ring view marker overrun; refusing uncorrelated images".into());
@@ -1328,10 +1550,15 @@ fn record_emission(state: &mut State, command: u64, opcode: u32, current: Option
         state.emitted_presents += 1;
         let view = if state.frame_conflict || state.correlation_failed { None } else { state.frame_world };
         if state.frame_conflict { state.conflicting_presents += 1; }
+        if state.ray_alias.equivalent_this_present { state.ray_alias.equivalent_presents += 1; }
         if state.presents.len() >= MAX_PRESENTS {
             state.correlation_failed = true; state.last_error = Some("GPU presentation metadata overrun; refusing uncorrelated images".into());
-        } else { state.presents.push_back(view); }
+        } else {
+            state.presents.push_back(view);
+            if view.is_some() && state.ray_alias.normalized_this_present { state.ray_alias.admitted_alias_presents += 1; }
+        }
         state.frame_world = None; state.frame_conflict = false;
+        state.ray_alias.end_present();
     }
 }
 
@@ -1399,6 +1626,29 @@ pub fn status_json() -> serde_json::Value {
         "unmatched_near_world":unmatched,
         "rendering_method":"one eye per natural game frame; two views use alternate-eye rendering, not simultaneous stereo"});
     status["projection_clones_already_current"] = serde_json::json!(state.projection_clones_already_current);
+    status["exact_viewport_match_qualification"] = serde_json::json!({
+        "available":cfg!(all(target_os="macos",feature="native-draw-capture")),
+        "candidate_enabled":*EXACT_VIEWPORT_MATCH_CANDIDATE,
+        "exact_matches":state.viewport_match.exact_matches,
+        "approximate_fallbacks":state.viewport_match.approximate_fallbacks,
+        "exact_over_newer_approximate":state.viewport_match.exact_over_newer_approximate,
+        "corrected_selections":state.viewport_match.corrected_selections,
+        "example":state.viewport_match.example.map(|(pointer,camera,projection,legacy,exact)|
+            serde_json::json!({"viewport":pointer,"actual_camera":camera,"actual_projection":projection,
+                "legacy_selected":describe(legacy),"exact_selected":describe(exact)})),
+        "scope":"Original stored view selected by exact camera and projection bytes before the unchanged approximate fallback. No alias normalization or final color/depth/HUD admission relaxation."});
+    status["same_ray_source_identity"] = serde_json::json!({
+        "enabled":*SAME_RAY_ALIAS_ENABLED,
+        "private_baseline_override_available":cfg!(all(target_os="macos",feature="native-draw-capture")),
+        "equivalent_draws":state.ray_alias.equivalent_draws,
+        "normalized_draws":state.ray_alias.normalized_draws,
+        "equivalent_presents":state.ray_alias.equivalent_presents,
+        "admitted_alias_presents":state.ray_alias.admitted_alias_presents,
+        "refusals":state.ray_alias.refusals,
+        "examples":state.ray_alias.examples.iter().map(|(reason,command,first,current)|
+            serde_json::json!({"reason":reason,"command":command,
+                "oldest":describe(*first),"later":describe(*current)})).collect::<Vec<_>>(),
+        "scope":"Oldest exact same-eye coordinate basis within one original present. No target dependency relaxation; mixed eyes and first-person aliases still reject. Admitted alias presents are enqueued metadata, not GPU-complete publications."});
     status["first_person_foreground_markers"] = serde_json::json!({"changes":state.foreground_marker_changes,
         "pending":state.foreground_markers.len(),"last_generation":state.last_foreground.map(|mark|mark.generation)});
     status["primary_crop_restoration"] = serde_json::json!({"pending":state.primary_crop_owner.is_some(),
@@ -2174,6 +2424,264 @@ mod tests {
         record_emission(&mut state,160,7,None);
         assert!(state.correlation_failed);
         assert_eq!(state.presents.len(),MAX_PRESENTS);
+    }
+    #[test]
+    fn same_ray_sequence_alias_baseline_reproducer() {
+        // Two original callbacks can describe identical stationary eye rays.
+        // Matching a baked viewport against newest history assigns the newer
+        // sequence without changing any matrix the game rendered.
+        let first = view(0, 41);
+        let later = WorldView { camera_sequence:43, request_frame:2, head_pose_frame:2,
+            presentation_time_seconds:1.02, ..first };
+        assert!(same_matrix_bits(&first.game_from_eye, &later.game_from_eye));
+        assert!(same_matrix_bits(&first.game_from_stage, &later.game_from_stage));
+        assert!(same_matrix_bits(&first.projection_from_eye, &later.projection_from_eye));
+        let mut state = State::default();
+        record_emission_with_alias_policy(&mut state,100,32,Some(first),true,false,false);
+        record_emission_with_alias_policy(&mut state,120,32,Some(later),true,false,false);
+        record_emission_with_alias_policy(&mut state,140,7,None,true,false,false);
+        assert_eq!(state.presents.pop_front(),Some(None));
+        assert_eq!(state.conflicting_presents,1);
+        assert!(!crate::world_frame::shares_screen_rays(&first, &later));
+    }
+    #[test]
+    fn same_ray_production_policy_ignores_private_environment_and_private_baseline_is_explicit() {
+        for setting in [None,Some("0"),Some("1"),Some(""),Some("false"),Some("invalid")] {
+            assert!(same_ray_alias_policy(false,setting),"ordinary build setting {setting:?}");
+            assert_eq!(same_ray_alias_policy(true,setting),setting!=Some("0"));
+        }
+        let first=view(0,41);
+        let later=WorldView {camera_sequence:43,request_frame:2,head_pose_frame:2,
+            presentation_time_seconds:1.02,..first};
+        for (private,setting,admitted) in [(false,Some("0"),true),(true,Some("0"),false),
+            (true,Some("1"),true),(false,None,true),(true,None,true)] {
+            let mut state=State::default();
+            let enabled=same_ray_alias_policy(private,setting);
+            for (command,opcode,current) in [(100,32,Some(first)),(120,32,Some(later)),(140,7,None)] {
+                record_emission_with_alias_policy(&mut state,command,opcode,current,enabled||private,enabled,false);
+            }
+            assert_eq!(state.presents.pop_front(),Some(if admitted {Some(first)} else {None}));
+        }
+    }
+    #[test]
+    fn same_ray_alias_keeps_actual_depth_and_exact_color_hud_request_joins() {
+        let mut first = view(0, 41);
+        first.projection_from_eye = for_game_depth(projection(), false);
+        first.depth_reverse_z = false;
+        let mut later = WorldView { camera_sequence:43, request_frame:2, head_pose_frame:2,
+            presentation_time_seconds:1.02, ..first };
+        later.projection_from_eye = flip_projection_depth(first.projection_from_eye);
+        later.depth_reverse_z = true;
+        let request = SVXRViewRequest { version:1,size:288,frame:1,presentation_time_seconds:1.,
+            view_count:2,reserved:0,views:[SVXREyeView { head_from_eye:identity(),
+                projection_from_eye:projection() };2] };
+        let mut state = State::default();
+        push_consumed_request(&mut state, first, request);
+        record_emission_with_alias_policy(&mut state,100,32,Some(first),true,true,true);
+        record_emission_with_alias_policy(&mut state,120,32,Some(later),true,true,true);
+        let canonical_depth = state.markers[&120].unwrap();
+        assert_eq!(canonical_depth, WorldView { projection_from_eye:later.projection_from_eye,
+            depth_reverse_z:true, ..first });
+        assert!(same_matrix_bits(&canonical_depth.projection_from_eye, &later.projection_from_eye));
+        assert_eq!(canonical_depth.presentation_time_seconds.to_bits(),first.presentation_time_seconds.to_bits());
+        // These are the unchanged production predicates used to join the
+        // finished color, frozen depth and retained HUD at publication.
+        assert!(crate::world_frame::shares_screen_rays(&first, &canonical_depth));
+        assert!(crate::world_frame::shares_screen_rays(&canonical_depth, &first));
+        assert!(!crate::world_frame::shares_screen_rays(&canonical_depth, &later));
+        assert_eq!(request_bytes(find_consumed_request(&state,&canonical_depth).unwrap()),request_bytes(request));
+        assert_eq!(state.consumed_requests.len(),2);
+        record_emission_with_alias_policy(&mut state,140,32,Some(later),true,true,true);
+        assert_eq!(state.consumed_requests.len(),2,"repeat aliases do not evict original receipts");
+        record_emission_with_alias_policy(&mut state,160,32,None,true,true,true); // ordinary HUD
+        record_emission_with_alias_policy(&mut state,180,7,None,true,true,true);
+        assert_eq!(state.presents.pop_front(),Some(Some(canonical_depth)));
+        assert_eq!((state.conflicting_presents,state.ray_alias.admitted_alias_presents),(0,1));
+        assert!(state.ray_alias.anchor.is_none());
+    }
+    #[test]
+    fn same_ray_alias_observation_does_not_change_original_admission() {
+        let first = view(0,41);
+        let later = WorldView { camera_sequence:43,request_frame:2,head_pose_frame:2,
+            presentation_time_seconds:1.02,..first };
+        let mut legacy=State::default(); let mut observed=State::default();
+        for (command,opcode,current) in [(100,32,Some(first)),(120,32,Some(later)),(140,7,None)] {
+            record_emission_with_alias_policy(&mut legacy,command,opcode,current,false,false,false);
+            record_emission_with_alias_policy(&mut observed,command,opcode,current,true,false,false);
+        }
+        assert_eq!(legacy.markers,observed.markers);
+        assert_eq!(legacy.presents,observed.presents);
+        assert_eq!(legacy.conflicting_presents,observed.conflicting_presents);
+        assert_eq!((observed.ray_alias.equivalent_draws,observed.ray_alias.equivalent_presents),(1,1));
+        assert_eq!(observed.ray_alias.normalized_draws,0);
+    }
+    #[test]
+    fn same_ray_alias_refuses_every_camera_ulp_other_eye_scope_depth_and_older_identity() {
+        let first=view(0,41);
+        let later=WorldView {camera_sequence:43,request_frame:2,head_pose_frame:2,
+            presentation_time_seconds:1.02,..first};
+        assert!(canonical_same_ray_alias(first,later).is_ok());
+        let mut rejected=Vec::new();
+        for field in 0..16 {
+            let mut changed=later;changed.game_from_eye[field]=f32::from_bits(changed.game_from_eye[field].to_bits()+1);
+            rejected.push(changed);
+            let mut changed=later;changed.game_from_stage[field]=f32::from_bits(changed.game_from_stage[field].to_bits()+1);
+            rejected.push(changed);
+            let mut changed=later;changed.projection_from_eye[field]=f32::from_bits(changed.projection_from_eye[field].to_bits()+1);
+            rejected.push(changed);
+        }
+        rejected.extend([
+            WorldView { eye_index:1,..later },WorldView { provenance_epoch:2,..later },
+            WorldView { view_count:1,..later },WorldView { headset_applied:false,..later },
+            WorldView { presentation_time_seconds:0.99,..later },WorldView { presentation_time_seconds:f64::NAN,..later },
+            WorldView { camera_sequence:40,..later },WorldView { request_frame:0,..later },WorldView { head_pose_frame:0,..later },
+            WorldView { depth_reverse_z:false,..later },
+            WorldView { optics:ScopeOptics { magnification:f32::from_bits(1.0f32.to_bits()+1),..first.optics },..later },
+        ]);
+        for (i,changed) in rejected.into_iter().enumerate() {
+            assert!(canonical_same_ray_alias(first,changed).is_err(),"mutation {i}");
+            let mut state=State::default();
+            record_emission_with_alias_policy(&mut state,100,32,Some(first),true,true,false);
+            record_emission_with_alias_policy(&mut state,120,32,Some(changed),true,true,false);
+            record_emission_with_alias_policy(&mut state,140,7,None,true,true,false);
+            assert_eq!(state.presents.pop_front(),Some(None),"mutation {i}");
+            assert_eq!(state.ray_alias.normalized_draws,0);
+        }
+    }
+    #[test]
+    fn same_ray_alias_does_not_cross_present_epoch_foreground_or_missing_receipt() {
+        let first=view(0,41);
+        let later=WorldView {camera_sequence:43,request_frame:2,head_pose_frame:2,
+            presentation_time_seconds:1.02,..first};
+        let mut missing=State::default();
+        record_emission_with_alias_policy(&mut missing,100,32,Some(first),true,true,true);
+        record_emission_with_alias_policy(&mut missing,120,32,Some(later),true,true,true);
+        record_emission_with_alias_policy(&mut missing,140,7,None,true,true,true);
+        assert_eq!(missing.presents.pop_front(),Some(None));
+        assert_eq!(missing.ray_alias.refusals["canonical_request_unavailable"],1);
+        for foreground_before in [false,true] {
+            let mut state=State::default();
+            record_emission_with_alias_policy(&mut state,100,32,Some(first),true,true,false);
+            let mark=foreground_depth::ForegroundMark {generation:1,family:44415,view:first};
+            if foreground_before { record_foreground(&mut state,105,Some(mark),1); }
+            record_emission_with_alias_policy(&mut state,120,32,Some(later),true,true,false);
+            if !foreground_before { record_foreground(&mut state,125,Some(mark),1); }
+            record_emission_with_alias_policy(&mut state,140,7,None,true,true,false);
+            assert_eq!(state.presents.pop_front(),Some(None));
+            assert_eq!(state.last_foreground,Some(mark),"foreground attribution is untouched");
+        }
+        let mut state=State::default();
+        record_emission_with_alias_policy(&mut state,100,32,Some(first),true,true,false);
+        record_emission_with_alias_policy(&mut state,120,7,None,true,true,false);
+        record_emission_with_alias_policy(&mut state,140,32,Some(later),true,true,false);
+        record_emission_with_alias_policy(&mut state,160,7,None,true,true,false);
+        assert_eq!(state.presents,VecDeque::from([Some(first),Some(later)]));
+        assert_eq!(state.ray_alias.normalized_draws,0);
+        record_emission_with_alias_policy(&mut state,180,32,Some(first),true,true,false);
+        invalidate_state(&mut state);
+        assert!(state.ray_alias.anchor.is_none());
+        record_emission_with_alias_policy(&mut state,200,32,Some(later),true,true,false);
+        assert_eq!(state.frame_world,Some(later));
+    }
+    #[test]
+    fn same_ray_alias_queue_exhaustion_is_not_counted_recovered_and_examples_are_bounded() {
+        let first=view(0,41);
+        let later=WorldView {camera_sequence:43,request_frame:2,head_pose_frame:2,
+            presentation_time_seconds:1.02,..first};
+        let mut state=State::default();
+        record_emission_with_alias_policy(&mut state,100,32,Some(first),true,true,false);
+        record_emission_with_alias_policy(&mut state,120,32,Some(later),true,true,false);
+        state.presents=VecDeque::from(vec![None;MAX_PRESENTS]);
+        record_emission_with_alias_policy(&mut state,140,7,None,true,true,false);
+        assert!(state.correlation_failed);
+        assert_eq!(state.ray_alias.admitted_alias_presents,0);
+        assert_eq!(state.ray_alias.equivalent_presents,1);
+        for reason in ["a","b","c","d","e","f"] {
+            state.ray_alias.example(reason,200,first,later);
+        }
+        assert_eq!(state.ray_alias.examples.len(),4);
+    }
+    fn saved_view(view:WorldView)->SavedViewport {
+        SavedViewport {pointer:1000+view.camera_sequence*1024,source:984,
+            base_camera:view.game_from_eye,base_projection:view.projection_from_eye,view}
+    }
+    #[test]
+    fn exact_viewport_match_prefers_recorded_older_bytes_over_newer_micro_motion() {
+        // Actual immutable v6 alias-off examples: the older opaque camera and
+        // later forward camera differ only in Z by45.7763671875 micrometres.
+        // Build the corresponding older forward history entry; this executable
+        // discriminator does not assert that the unrecorded live viewport had
+        // these bytes. The bounded runtime sample is required to prove that.
+        let camera=[-0.2758519947528839,-0.9612001180648804,0.,0.,
+            0.05030590295791626,-0.01443714275956154,0.9986295104026794,0.,
+            -0.9598827958106996,0.275473952293396,0.05233655497431755,0.,
+            1977.0068359375,3816.708740234375,33.214176177978516,1.];
+        let forward=[1.,0.,0.,0.,0.,1.,0.,0.,0.,0.,-1.0000499486923218,-1.,
+            0.,0.,-0.05000250041484833,0.];
+        let older=WorldView {camera_sequence:81,request_frame:92,head_pose_frame:92,
+            presentation_time_seconds:11.266642917,game_from_eye:camera,
+            projection_from_eye:forward,depth_reverse_z:false,..view(0,81)};
+        let mut newer=WorldView {camera_sequence:83,request_frame:99,head_pose_frame:99,
+            presentation_time_seconds:12.060276167,..older};
+        newer.game_from_eye[14]=33.2142219543457;
+        assert_eq!(newer.game_from_eye[14]-older.game_from_eye[14],0.0000457763671875);
+        assert!(same_matrix(&camera,&newer.game_from_eye));
+        assert!(!same_matrix_bits(&camera,&newer.game_from_eye));
+        let history=VecDeque::from([saved_view(older),saved_view(newer)]);
+        let matches=viewport_history_match(&history,&camera,&forward,1,||true,true);
+        assert_eq!(matches.selected(false),Some(newer),"legacy admits a nonidentical camera first");
+        assert_eq!(matches.selected(true),Some(older),"exact priority preserves the original complete identity");
+        assert!(same_matrix_bits(&matches.selected(true).unwrap().game_from_eye,&camera));
+        let reversed=flip_projection_depth(forward);
+        assert!(reverse_clone_view(&camera,&reversed,&saved_view(newer)).is_none());
+        let exact_depth=reverse_clone_view(&camera,&reversed,&saved_view(older)).unwrap();
+        assert!(!crate::world_frame::shares_screen_rays(&newer,&exact_depth));
+        assert!(crate::world_frame::shares_screen_rays(&older,&exact_depth));
+    }
+    #[test]
+    fn exact_viewport_match_preserves_no_exact_fallback_and_epoch_eye_projection_guards() {
+        let older=view(0,41);
+        let mut newer=WorldView {camera_sequence:43,..older};newer.game_from_eye[14]=0.00008;
+        let mut between=older.game_from_eye;between[14]=0.00004;
+        let history=VecDeque::from([saved_view(older),saved_view(newer)]);
+        let matches=viewport_history_match(&history,&between,&projection(),1,||true,true);
+        assert!(matches.exact.is_none());
+        assert_eq!(matches.selected(true),Some(newer));
+        assert_eq!(matches.selected(false),Some(newer));
+        assert_eq!(viewport_history_match(&history,&between,&projection(),1,||true,false).selected(false),Some(newer));
+        assert!(viewport_history_match(&history,&between,&projection(),1,||false,true).selected(true).is_none());
+        let wrong_epoch=WorldView {provenance_epoch:2,camera_sequence:45,..older};
+        let mut other_eye=WorldView {eye_index:1,camera_sequence:44,..older};other_eye.game_from_eye[12]=0.064;
+        let guarded=VecDeque::from([saved_view(older),saved_view(other_eye),saved_view(wrong_epoch)]);
+        assert_eq!(viewport_history_match(&guarded,&older.game_from_eye,&projection(),1,||true,true).selected(true),Some(older));
+        assert_eq!(viewport_history_match(&guarded,&other_eye.game_from_eye,&projection(),1,||true,true).selected(true),Some(other_eye));
+        let mut wrong_projection=projection();wrong_projection[0]=1.01;
+        assert!(viewport_history_match(&guarded,&older.game_from_eye,&wrong_projection,1,||true,true).selected(true).is_none());
+        let mut changed_projection=WorldView {camera_sequence:43,..older};
+        changed_projection.projection_from_eye[0]=f32::from_bits(1.0f32.to_bits()+1);
+        let projected=VecDeque::from([saved_view(older),saved_view(changed_projection)]);
+        let matches=viewport_history_match(&projected,&older.game_from_eye,&projection(),1,||true,true);
+        assert_eq!(matches.legacy,Some(changed_projection));
+        assert_eq!(matches.exact,Some(older));
+    }
+    #[test]
+    fn exact_viewport_match_keeps_newest_exact_identity_and_original_projection_validation() {
+        let older=view(0,41);let newer=WorldView {camera_sequence:43,..older};
+        let history=VecDeque::from([saved_view(older),saved_view(newer)]);
+        let mut validations=0;
+        let matches=viewport_history_match(&history,&older.game_from_eye,&projection(),1,
+            ||{validations+=1;true},true);
+        assert_eq!(matches.selected(true),Some(newer));
+        assert_eq!(matches.selected(false),Some(newer));
+        assert_eq!(validations,1);
+        let mut validations=0;
+        let matches=viewport_history_match(&history,&older.game_from_eye,&projection(),1,
+            ||{validations+=1;false},true);
+        assert!(matches.selected(true).is_none());
+        assert_eq!(validations,1,"one immutable viewport projection qualification per search");
+        let inactive=WorldView {headset_applied:false,..older};
+        let history=VecDeque::from([saved_view(inactive),saved_view(newer)]);
+        assert_eq!(viewport_history_match(&history,&older.game_from_eye,&projection(),1,||false,true).selected(true),Some(inactive));
     }
     #[test]
     fn invalidation_preserves_ring_positions_and_discards_ready_provenance() {
