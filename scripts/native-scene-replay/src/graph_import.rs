@@ -119,7 +119,7 @@ impl Assembly {
                     &draw.writes
                 },
                 Command::Dispatch{dispatch}=>{for b in &dispatch.bindings{if let BindingValue::Texture{versions,..}=&b.value{reads.extend(versions.clone());}} &dispatch.writes},
-                Command::DepthToColor{source,destination}|Command::StencilToColor{source,destination}|Command::GenerateMip{source,destination}|Command::Copy{source,destination}=>{reads.push(source.clone());std::slice::from_ref(destination)},
+                Command::FloatToDepth{source,destination}|Command::DepthToColor{source,destination}|Command::StencilToColor{source,destination}|Command::GenerateMip{source,destination}|Command::Copy{source,destination}=>{reads.push(source.clone());std::slice::from_ref(destination)},
                 Command::Clear{transition,..}=>std::slice::from_ref(transition),
                 Command::CopyRegion{sources,destinations,..}=>{reads.extend(sources.clone());destinations},
                 Command::OriginalOmission{..}=>&[],
@@ -191,7 +191,7 @@ impl Assembly {
         for t in &self.scene.textures{for i in &t.initial{current.insert(Slice{resource:t.id.clone(),mip:i.mip,layer:i.layer,aspect:i.aspect.clone()},i.content_version);}}
         for (index,e) in self.events {
             if let Some(loads)=self.declared_loads.get(&index){for v in loads{require(current.get(&v.slice)==Some(&v.content_version),"graph attachment load changed version")?;}}
-            let writes:&[Transition]=match &e.command{Command::Draw{draw}|Command::ContextDraw{draw,..}=>&draw.writes,Command::Dispatch{dispatch}=>&dispatch.writes,Command::DepthToColor{destination,..}|Command::StencilToColor{destination,..}|Command::GenerateMip{destination,..}|Command::Copy{destination,..}=>std::slice::from_ref(destination),Command::Clear{transition,..}=>std::slice::from_ref(transition),Command::CopyRegion{destinations,..}=>destinations,_=>&[]};
+            let writes:&[Transition]=match &e.command{Command::Draw{draw}|Command::ContextDraw{draw,..}=>&draw.writes,Command::Dispatch{dispatch}=>&dispatch.writes,Command::FloatToDepth{destination,..}|Command::DepthToColor{destination,..}|Command::StencilToColor{destination,..}|Command::GenerateMip{destination,..}|Command::Copy{destination,..}=>std::slice::from_ref(destination),Command::Clear{transition,..}=>std::slice::from_ref(transition),Command::CopyRegion{destinations,..}=>destinations,_=>&[]};
             for w in writes{require(current.get(&w.slice)==Some(&w.before),"graph transition missing preceding owner")?;current.insert(w.slice.clone(),w.after);}
             if let Command::Checkpoint{expected}=&e.command{for x in expected{require(current.get(&x.version.slice)==Some(&x.version.content_version),"graph checkpoint is not current")?;last_refs.insert(x.version.slice.clone(),x.clone());}}
             if let Command::FinishedEndpoint{hud_free_source,hud_world,depth_source,..}=&e.command {
@@ -295,6 +295,24 @@ fn operation(a:&mut Assembly,kind:&str,o:&Value,used:&mut BTreeSet<String>)->Res
     let event=num(o,"event_index")?;let ordinal=num(o,"command_sequence")?;
     let mut expected=vec![];
     let command=match kind {
+        "float_to_depth"=>{
+            shape(o,&["event_index","checkpoint_event_index","command_sequence","source","before","after","source_descriptor","destination_descriptor","source_blob","initial_blob","final_blob","shader","clear_depth_bits","depth_compare","depth_write_enabled","vertices","instances"])?;
+            let source=version(get(o,"source")?)?;let before=version(get(o,"before")?)?;let after=version(get(o,"after")?)?;
+            require(before.slice==after.slice&&before.content_version<after.content_version&&source.slice.resource!=before.slice.resource
+                &&source.slice.aspect==Aspect::Color&&before.slice.aspect==Aspect::Depth&&source.slice.mip==before.slice.mip&&source.slice.layer==before.slice.layer,"float depth native version/view scope")?;
+            let sd=descriptor(get(o,"source_descriptor")?)?;let dd=descriptor(get(o,"destination_descriptor")?)?;
+            require(sd.dimension==TextureDimension::D2&&dd.dimension==TextureDimension::D2&&crate::validate::float_depth_source_format(sd.format)&&dd.format==TextureFormat::Depth32Float
+                &&sd.width==dd.width&&sd.height==dd.height&&sd.layers==dd.layers&&sd.mips==dd.mips,"float depth native descriptor scope")?;
+            let shader=get(o,"shader")?;shape(shader,&["wgsl","sha256","vertex_entry","fragment_entry","compilation_options"])?;
+            let wgsl=crate::execute::FLOAT_TO_DEPTH_WGSL;
+            require(txt(shader,"wgsl")?==wgsl&&txt(shader,"sha256")?==sha(wgsl.as_bytes())&&shader["vertex_entry"]=="vs"&&shader["fragment_entry"]=="fs"&&shader["compilation_options"]=="wgpu default"
+                &&num(o,"clear_depth_bits")?==1.0f32.to_bits() as u64&&o["depth_compare"]=="always"&&o["depth_write_enabled"]==true&&num(o,"vertices")?==3&&num(o,"instances")?==1,"float depth native implementation changed")?;
+            let se=operation_expected(source.clone(),get(o,"source_blob")?,a)?;let initial=operation_expected(before.clone(),get(o,"initial_blob")?,a)?;
+            a.texture(operation_texture(&source,sd,Initial::Captured{blob:se.blob.clone()},false)?)?;
+            a.texture(operation_texture(&before,dd,Initial::Captured{blob:initial.blob},true)?)?;
+            expected.push(se);expected.push(operation_expected(after.clone(),get(o,"final_blob")?,a)?);
+            Command::FloatToDepth{source,destination:Transition{slice:before.slice,before:before.content_version,after:after.content_version}}
+        },
         "clear"=>{
             shape(o,&["event_index","command_sequence","before","after","descriptor","view_format","value","checkpoint_event_index","final_blob"])?;
             let before=version(get(o,"before")?)?;let after=version(get(o,"after")?)?;
@@ -474,7 +492,7 @@ fn convert(m:&Value,source_hash:String,payload:&[(PathBuf,Vec<u8>)])->Result<Con
                 require(index>stage_order,"graph proxy stage order")?;stage_order=index;
                 used_names.insert(txt(operation,"source_blob")?.to_owned());used_names.insert(txt(operation,"final_blob")?.to_owned());let output=proxy(&mut a,operation,stencil)?;if !stencil{proxies.insert(output);}
             },
-            "clear"|"copy_region"|"generate_mip"=>{
+            "clear"|"copy_region"|"generate_mip"|"float_to_depth"=>{
                 require(finished&&stage.get("capture").is_none(),"operation requires finished graph")?;
                 let o=get(stage,"operation")?;let index=num(o,"event_index")?;require(index>stage_order,"operation stage order")?;stage_order=index;
                 operation(&mut a,txt(stage,"kind")?,o,&mut used_names)?;
@@ -1078,4 +1096,90 @@ mod tests {
         Ok(())
 
     }
+    fn float_depth_operation()->Value {
+        let desc=json!({"width":2,"height":2,"depth_or_array_layers":1,"mip_level_count":1,"sample_count":1,"dimension":"2d","format":"rgba8unorm"});
+        let mut dd=desc.clone();dd["format"]="depth32float".into();
+        let depth=|n|json!({"allocation_id":800,"content_version":n,"subresource":{"mip":0,"layer":0,"aspect":"depth"}});
+        json!({"event_index":45,"checkpoint_event_index":46,"command_sequence":433,
+            "source":v(100,44,0,0),"before":depth(49),"after":depth(53),"source_descriptor":desc,"destination_descriptor":dd,
+            "source_blob":"final.bin","initial_blob":"depth-final.bin","final_blob":"depth-initial.bin",
+            "shader":{"wgsl":crate::execute::FLOAT_TO_DEPTH_WGSL,"sha256":sha(crate::execute::FLOAT_TO_DEPTH_WGSL.as_bytes()),"vertex_entry":"vs","fragment_entry":"fs","compilation_options":"wgpu default"},
+            "clear_depth_bits":1.0f32.to_bits(),"depth_compare":"always","depth_write_enabled":true,"vertices":3,"instances":1})
+    }
+    #[test]
+    fn finished_float_depth_stage_preserves_actual_contract_and_initial_reference()->Result<()> {
+        let(mut m,files)=executed_fixture();
+        let stage=json!({"kind":"float_to_depth","capture_id":"fixture-single-capture","native_present":1,"operation":float_depth_operation()});
+        m["stages"].as_array_mut().unwrap().insert(7,stage);
+        for schema in [8,7] {
+            let mut m=m.clone();if schema==7{m["schema"]=7.into();m["kind"]="native_finished_graph".into();m["source"]["method"]="single native finished graph".into();m["stages"].as_array_mut().unwrap().remove(1);for k in ["execution_contract","all_requested_draws_executed","original_omission_count"]{m.as_object_mut().unwrap().remove(k);}}
+            let c=convert(&m,"a".repeat(64),&payload(&files))?;
+            assert_eq!(c.scene.commands.iter().filter(|c|matches!(c,Command::FloatToDepth{..})).count(),1);
+            let dest=c.scene.textures.iter().find(|t|t.id=="native-texture:800").unwrap();
+            assert_eq!(dest.descriptor.format,TextureFormat::Depth32Float);assert!(matches!(&dest.initial[0].origin,Initial::Captured{blob}if blob=="depth-final.bin"));
+            let dir=std::env::temp_dir().join(format!("float-depth-graph-import-{}-{schema}",std::process::id()));fs::create_dir(&dir)?;
+            for(n,b)in &files{fs::write(dir.join(n),b)?;}fs::write(dir.join("capture.json"),serde_json::to_vec(&m)?)?;
+            native(&dir.join("capture.json"),&dir.join("imported"))?;assert!(!Input::load(&dir.join("imported/scene.json"))?.targets_have_resolution_independent_initialization);
+            fs::remove_dir_all(dir)?;
+        }
+        Ok(())
+    }
+    #[test]
+    fn float_depth_native_metadata_and_legacy_gate_fail_closed()->Result<()> {
+        let(mut m,files)=executed_fixture();let stage=json!({"kind":"float_to_depth","capture_id":"fixture-single-capture","native_present":1,"operation":float_depth_operation()});m["stages"].as_array_mut().unwrap().insert(7,stage.clone());let p=payload(&files);
+        for(path,value)in [
+            (vec!["source","subresource","aspect"],json!("depth")),(vec!["before","subresource","aspect"],json!("color")),
+            (vec!["after","subresource","mip"],json!(1)),(vec!["source","subresource","layer"],json!(1)),
+            (vec!["source_descriptor","format"],json!("rgba8uint")),(vec!["destination_descriptor","format"],json!("depth32float-stencil8")),
+            (vec!["destination_descriptor","width"],json!(4)),(vec!["source_descriptor","dimension"],json!("3d")),
+            (vec!["shader","wgsl"],json!(crate::execute::DEPTH_TO_COLOR_WGSL)),(vec!["shader","sha256"],json!("0".repeat(64))),
+            (vec!["shader","vertex_entry"],json!("main")),(vec!["clear_depth_bits"],json!(0)),
+            (vec!["depth_compare"],json!("less-equal")),(vec!["depth_write_enabled"],json!(false)),
+            (vec!["vertices"],json!(6)),(vec!["instances"],json!(2)),(vec!["initial_blob"],Value::Null),
+            (vec!["initial_blob"],json!("absent.bin")),(vec!["shader","custom_clamp"],json!(true))] {
+            let mut bad=m.clone();let mut at=&mut bad["stages"][7]["operation"];for k in &path{at=&mut at[*k];}*at=value;
+            assert!(convert(&bad,"b".repeat(64),&p).is_err(),"admitted changed float depth {path:?}");
+        }
+        let(mut legacy,lfiles)=fixture();legacy["stages"].as_array_mut().unwrap().insert(1,stage);
+        let err=match convert(&legacy,"6".repeat(64),&payload(&lfiles)){Ok(_)=>panic!("schema6 admitted float depth"),Err(e)=>e};assert!(err.to_string().contains("operation requires finished graph"));
+        Ok(())
+    }
+
+    #[test]
+    fn adjacent_same_target_context_intervals_preserve_versions_and_endpoint_anchor()->Result<()> {
+        let(mut m,files)=executed_fixture();
+        let mut changed=m["stages"][5].clone();let mut raw=m["world_view"].clone();
+        raw["camera_sequence"]=11.into();raw["request_frame"]=21.into();raw["head_pose_frame"]=22.into();
+        raw["depth_reverse_z"]=true.into();raw["projection_from_eye"][0]=1.25.into();
+        let r=&mut changed["capture"];r["world_view"]=raw.clone();r["draws"][0]["world_view"]=raw.clone();
+        r["draws"][0]["event_index"]=34.into();r["draws"][0]["command_sequence"]=420.into();
+        r["draws"][0]["writes"][0]["after"]=v(100,41,0,0);r["attachments"][0]["final_version"]=v(100,41,0,0);
+        r["closure"]["interval_start_command"]=420.into();r["closure"]["interval_end_command"]=424.into();r["closure"]["checkpoint_event_index"]=35.into();
+        let next=&mut m["stages"][5]["capture"];next["attachments"][0]["initial_version"]=v(100,41,0,0);next["draws"][0]["writes"][0]["before"]=v(100,41,0,0);next["closure"]["interval_start_command"]=424.into();
+        assert_eq!(changed["capture"]["target_domain"],next["target_domain"]);assert!(next["world_view"].is_null());
+        m["stages"].as_array_mut().unwrap().insert(5,changed);
+        let c=convert(&m,"c".repeat(64),&payload(&files))?;
+        let contexts=c.scene.commands.iter().filter_map(|c|match c{Command::ContextDraw{draw,context}=>Some((draw,context)),_=>None}).collect::<Vec<_>>();
+        assert_eq!(contexts.len(),2);assert_eq!(contexts[0].1.world_view,raw);assert!(contexts[1].1.world_view.is_null());
+        assert!(contexts.iter().all(|(draw,_)|draw.eye.is_none()));assert_eq!(serde_json::to_value(&contexts[0].0.colors)?,serde_json::to_value(&contexts[1].0.colors)?);
+        assert_eq!(contexts[0].0.writes[0].after,41);assert_eq!(contexts[1].0.writes[0].before,41);
+        assert!(c.elided.iter().any(|e|e["version"]["slice"]["resource"]=="native-texture:100"&&e["version"]["content_version"]==41&&e["reuploaded"]==false));
+        let anchor=crate::native_import::world(&m["world_view"])?;assert_eq!(c.scene.eye.as_ref(),Some(&anchor));
+        let Command::FinishedEndpoint{depth_world,publication,..}=c.scene.commands.last().unwrap()else{panic!("endpoint lost")};
+        assert_eq!(depth_world,&m["world_view"]);assert_eq!(publication["world_view"],m["world_view"]);
+        let dir=std::env::temp_dir().join(format!("adjacent-context-graph-{}",std::process::id()));fs::create_dir(&dir)?;
+        for(n,b)in &files{fs::write(dir.join(n),b)?;}fs::write(dir.join("capture.json"),serde_json::to_vec(&m)?)?;
+        native(&dir.join("capture.json"),&dir.join("imported"))?;let input=Input::load(&dir.join("imported/scene.json"))?;
+        let i=input.scene.commands.iter().position(|c|matches!(c,Command::ContextDraw{..})).unwrap();
+        for (field,value)in [("eye_index",json!(1)),("provenance_epoch",json!(2))] {
+            let mut bad=input.scene.clone();if let Command::ContextDraw{context,..}=&mut bad.commands[i]{context.world_view[field]=value;}
+            fs::write(dir.join("imported/negative.json"),serde_json::to_vec(&bad)?)?;assert!(Input::load(&dir.join("imported/negative.json")).is_err(),"admitted context {field} splice");
+        }
+        let mut bad=m.clone();bad["stages"][6]["capture"]["attachments"][0]["initial_blob"]="initial.bin".into();
+        assert!(convert(&bad,"c".repeat(64),&payload(&files)).is_err(),"changed context predecessor pixels admitted");
+        let mut bad=m;let last=bad["stages"].as_array().unwrap().len()-1;bad["stages"][last]["operation"]["publication"]["world_view"]=raw;
+        assert!(convert(&bad,"c".repeat(64),&payload(&files)).is_err(),"unqualified context promoted to endpoint anchor");
+        fs::remove_dir_all(dir)?;Ok(())
+    }
+
 }

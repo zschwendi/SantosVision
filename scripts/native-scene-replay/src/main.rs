@@ -2,6 +2,10 @@ use native_scene_replay::{execute, import, require, sha, validate::Input, Result
 use std::{fs, path::Path};
 fn main() -> Result<()> {
     let a = std::env::args().collect::<Vec<_>>();
+    if a.len() == 3 && a[1] == "make-float-depth" {
+        native_scene_replay::float_depth_fixture::make(Path::new(&a[2]))?;
+        return Ok(());
+    }
     if a.len() == 3 && a[1] == "make-finished-ops" {
         native_scene_replay::finished_ops_fixture::make(Path::new(&a[2]))?;
         return Ok(());

@@ -537,6 +537,20 @@ impl Input {
                     require(!native || !native_initial_versions.contains(&destination.after),"native stencil proxy reused initial version")?;
                     advance(destination,&mut versions,&mut last_write)?;initialized.insert(destination.slice.clone());independent=false;
                 }
+                Command::FloatToDepth{source,destination} => {
+                    require(s.provenance.is_finished()||matches!(s.provenance,Provenance::Authored{..}),"float depth proxy requires finished graph")?;
+                    check_version(source,&versions,&initialized)?;
+                    let a=self.texture(&source.slice.resource)?;let b=self.texture(&destination.slice.resource)?;
+                    require(a.descriptor.dimension==TextureDimension::D2&&b.descriptor.dimension==TextureDimension::D2
+                        &&float_depth_source_format(a.descriptor.format)&&b.descriptor.format==TextureFormat::Depth32Float
+                        &&source.slice.aspect==Aspect::Color&&destination.slice.aspect==Aspect::Depth
+                        &&a.id!=b.id&&b.mutable_target&&source.slice.mip==destination.slice.mip&&source.slice.layer==destination.slice.layer
+                        &&a.descriptor.width==b.descriptor.width&&a.descriptor.height==b.descriptor.height
+                        &&a.descriptor.mips==b.descriptor.mips&&a.descriptor.layers==b.descriptor.layers,
+                        "float depth proxy native allocation/view contract")?;
+                    require(!native||!native_initial_versions.contains(&destination.after),"native float depth proxy reused initial version")?;
+                    advance(destination,&mut versions,&mut last_write)?;initialized.insert(destination.slice.clone());independent=false;
+                }
                 Command::OriginalOmission{omission} => {
                     require(s.provenance.is_executed_finished(),"original omission requires schema8 provenance")?;
                     validate_original_omission(omission)?;
@@ -1202,6 +1216,11 @@ fn native_id(scene:&Scene,s:&Slice)->Result<u64>{
     let t=scene.textures.iter().find(|t|t.id==s.resource).ok_or("endpoint texture missing")?;
     let id=t.native_allocation_id.ok_or("endpoint native texture identity")?;
     require(id>0&&s.resource==format!("native-texture:{id}"),"endpoint native texture identity")?;Ok(id)
+}
+pub(crate) fn float_depth_source_format(f:TextureFormat)->bool {
+    matches!(f,TextureFormat::R32Float|TextureFormat::Rg32Float|TextureFormat::Rgba32Float
+        |TextureFormat::R16Float|TextureFormat::Rg16Float|TextureFormat::Rgba16Float
+        |TextureFormat::Rgba8Unorm|TextureFormat::Rgba8UnormSrgb|TextureFormat::Bgra8Unorm|TextureFormat::Bgra8UnormSrgb)
 }
 pub(crate) fn validate_original_omission(o:&OriginalOmission)->Result<()> {
     require(serde_json::to_vec(o)?.len()<=64<<10,"original omission metadata bound")?;

@@ -165,3 +165,19 @@ Schema 8 accepts only an explicit live staging/map receipt limit of 512 MiB or
 render target or replay allocation budget: individual blobs remain at most
 256 MiB, packed finished payload/import remains 1 GiB and logical persistent GPU
 allocation remains 256 MiB. No limit is increased automatically.
+
+## Exact float-to-depth proxy
+
+Finished schemas 7/8 can retain the original `float_to_depth` helper passes.
+Each selected source mip/layer is loaded by the exact native WGSL shader; its red
+channel becomes `frag_depth` in a distinct Depth32Float allocation. The pass clears
+to 1, writes with Always comparison, and has no color or stencil attachment. Native
+full dimensions, mip count, layer count, selected indices and actual initial/final
+bytes are preserved. Other graph schemas reject the operation.
+
+`make-float-depth NEW_DIRECTORY` authors an independent finite Float32 oracle:
+selected mip/layer isolation, neighboring contents, downstream depth sampling,
+then all passes in native mip-major/layer-minor order. It tests exact in-range bits
+and finite out-of-range depth behavior against CPU expectations. It makes no
+NaN/infinity/subnormal or game-image claim. Creating/admitting it is CPU-only;
+running it through `run.py` requires the serialized GPU slot.

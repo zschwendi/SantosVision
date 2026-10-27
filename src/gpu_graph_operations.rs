@@ -116,6 +116,15 @@ fn d2_shape(t: &Texture, mip: u32, layer: u32) -> Result<[u32; 2], String> {
     aspects(t.format())?;
     Ok([(t.width() >> mip).max(1), (t.height() >> mip).max(1)])
 }
+fn float_depth_formats(source:TextureFormat,destination:TextureFormat)->Result<(),String> {
+    if !matches!(source,TextureFormat::R32Float|TextureFormat::Rg32Float|TextureFormat::Rgba32Float
+        |TextureFormat::R16Float|TextureFormat::Rg16Float|TextureFormat::Rgba16Float
+        |TextureFormat::Rgba8Unorm|TextureFormat::Rgba8UnormSrgb|TextureFormat::Bgra8Unorm|TextureFormat::Bgra8UnormSrgb)
+        || destination!=TextureFormat::Depth32Float {
+        return Err(format!("finished float-to-depth exact formats unsupported: {source:?} -> {destination:?}"));
+    }
+    Ok(())
+}
 fn copy_shape(
     source: [u32; 2],
     destination: [u32; 2],
@@ -537,6 +546,55 @@ impl Capture {
             operation,
         }))
     }
+    /// One actual native helper pass, in the original mip-outer/layer-inner loop.
+    pub(in super::super) fn graph_aux_begin_float_depth(
+        &mut self,gpu:&mut Gpu,source:&Texture,destination:&Texture,mip:u32,layer:u32,
+    )->Result<Option<AuxToken>,String> {
+        if !self.aux_active(gpu)? {return Ok(None);}
+        if self.pending.as_ref().is_some_and(|p|!p.finished) {
+            return Err("finished float-to-depth began inside an unclosed raster interval".into());
+        }
+        float_depth_formats(source.format(),destination.format())?;
+        if source==destination || d2_shape(source,mip,layer)?!=d2_shape(destination,mip,layer)?
+            || source.width()!=destination.width() || source.height()!=destination.height()
+            || source.depth_or_array_layers()!=destination.depth_or_array_layers()
+            || source.mip_level_count()!=destination.mip_level_count() {
+            return Err("finished float-to-depth actual parent/shape mismatch".into());
+        }
+        let source=self.aux_slice(gpu,source,mip,layer,&[Aspect::Color])?;
+        let destination=self.aux_slice(gpu,destination,mip,layer,&[Aspect::Depth])?;
+        if source.native_id==destination.native_id {return Err("finished float-to-depth native identity aliases".into());}
+        let source_blob=self.aux_snapshot(gpu,&source)?.remove(0);
+        let initial_blob=self.aux_snapshot(gpu,&destination)?.remove(0);
+        let shader=super::super::FLOAT_TO_DEPTH_PROXY_WGSL;
+        let event=self.graph_next_event();
+        let operation=json!({"event_index":event,"command_sequence":self.sequence,
+            "source":source.references[0],"before":destination.references[0],"source_blob":source_blob,"initial_blob":initial_blob,
+            "source_descriptor":descriptor(&source.texture),"destination_descriptor":descriptor(&destination.texture),
+            "shader":{"wgsl":shader,"sha256":sha(shader.as_bytes()),"vertex_entry":"vs","fragment_entry":"fs","compilation_options":"wgpu default"},
+            "clear_depth_bits":1.0f32.to_bits(),"depth_compare":"always","depth_write_enabled":true,"vertices":3,"instances":1});
+        Ok(Some(AuxToken{kind:"float_to_depth",event,sequence:self.sequence,sources:vec![source],destination,operation}))
+    }
+    /// The native pass has completed encoding. Advance only its exact depth
+    /// slice; no invented write to a later mip/layer is exposed to the graph.
+    pub(in super::super) fn graph_aux_end_float_depth(&mut self,gpu:&mut Gpu,token:AuxToken)->Result<(),String> {
+        if token.kind!="float_to_depth" || !self.aux_active(gpu)? || token.sequence!=self.sequence
+            || token.sources.len()!=1 || token.sources[0].references.len()!=1 || token.destination.references.len()!=1 {
+            return Err("finished float-to-depth completion token invalid".into());
+        }
+        let source=&token.sources[0];let destination=&token.destination;
+        for slice in [source,destination] {
+            let r=slice.references[0];
+            if self.finished_native_identity(gpu,&slice.texture)?!=slice.native_id
+                || self.finished_version(r.allocation_id,r.subresource.mip,r.subresource.layer,r.subresource.aspect)?!=r {
+                return Err("finished float-to-depth parent/version changed during original pass".into());
+            }
+        }
+        let before=destination.references[0];
+        self.texture_ledger.as_mut().filter(|l|l.active()).ok_or("finished float-to-depth ledger inactive")?
+            .produced(destination.native_id,before.subresource,"original_float_to_depth_proxy",source.references.clone(),vec![],true);
+        self.graph_aux_end(gpu,token)
+    }
     fn aux_after(&self, gpu: &Gpu, token: &AuxToken) -> Result<Vec<VersionRef>, String> {
         if !self.aux_active(gpu)? || token.sequence != self.sequence || token.event == 0 {
             return Err("finished operation completion changed original command scope".into());
@@ -798,6 +856,39 @@ mod tests {
             )
             .is_err()
         );
+    }
+    #[test]
+    fn float_to_depth_contract_is_exact_and_has_no_stencil_or_integer_alias() {
+        for source in [TextureFormat::R32Float,TextureFormat::Rg32Float,TextureFormat::Rgba32Float,
+            TextureFormat::R16Float,TextureFormat::Rg16Float,TextureFormat::Rgba16Float,
+            TextureFormat::Rgba8Unorm,TextureFormat::Rgba8UnormSrgb,TextureFormat::Bgra8Unorm,TextureFormat::Bgra8UnormSrgb] {
+            assert!(float_depth_formats(source,TextureFormat::Depth32Float).is_ok());
+            assert!(float_depth_formats(source,TextureFormat::Depth32FloatStencil8).is_err());
+        }
+        for source in [TextureFormat::Depth32Float,TextureFormat::R32Uint,TextureFormat::Rgba8Sint,TextureFormat::Bc1RgbaUnorm] {
+            assert!(float_depth_formats(source,TextureFormat::Depth32Float).is_err());
+        }
+        assert_eq!(sha(super::super::super::FLOAT_TO_DEPTH_PROXY_WGSL.as_bytes()),
+            "9bb14289ac19dadd2fad243de07016ab6ee20d02ca7a6c888a02197cca0759aa");
+    }
+    #[test]
+    fn float_to_depth_versions_advance_in_original_selected_pass_order() {
+        use texture_ledger::{Allocation,Ledger,Subresource};
+        let mut ledger=Ledger::new();
+        for (id,format,aspect) in [(1,"R32Float",Aspect::Color),(2,"Depth32Float",Aspect::Depth)] {
+            ledger.register(Allocation{allocation_id:id,guest_id:1,origin:"test".into(),width:34,height:34,layers:2,mips:2,
+                dimension:"d2".into(),format:format.into(),aspects:vec![aspect]});
+        }
+        let original=ledger.current(2,Subresource{mip:1,layer:1,aspect:Aspect::Depth}).unwrap();
+        let mut previous=0;
+        for mip in 0..2 {for layer in 0..2 {
+            let src=ledger.current(1,Subresource{mip,layer,aspect:Aspect::Color}).unwrap();
+            let dst=Subresource{mip,layer,aspect:Aspect::Depth};
+            if (mip,layer)!=(1,1) {assert_eq!(ledger.current(2,original.subresource),Some(original));}
+            ledger.produced(2,dst,"original_float_to_depth_proxy",vec![src],vec![],true);
+            let after=ledger.current(2,dst).unwrap();assert!(after.content_version>previous);previous=after.content_version;
+            assert_eq!(ledger.current(1,src.subresource),Some(src));
+        }}
     }
     #[test]
     fn query_identity_follows_native_lifetime_without_retaining_guest_completion() {

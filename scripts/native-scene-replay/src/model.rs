@@ -349,6 +349,11 @@ pub enum Command {
         source: Version,
         destination: Transition,
     },
+    /// Exact native float depth proxy; selected source red becomes Depth32Float.
+    FloatToDepth {
+        source: Version,
+        destination: Transition,
+    },
     /// Ordered, fully typed evidence of one specific original no-GPU early return.
     OriginalOmission { omission:OriginalOmission },
     /// Original query/readback side effects stay in the guest; only captured source bytes are checked.

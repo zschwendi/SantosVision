@@ -1185,6 +1185,10 @@ pub fn max_msaa() -> u32 {
         .unwrap_or(1)
 }
 
+const FLOAT_TO_DEPTH_PROXY_WGSL:&str = "@group(0) @binding(0) var src: texture_2d<f32>;
+                 @vertex fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4f { var p = array<vec2f, 3>(vec2f(-1, -1), vec2f(3, -1), vec2f(-1, 3)); return vec4f(p[i], 0, 1); }
+                 @fragment fn fs(@builtin(position) pos: vec4f) -> @builtin(frag_depth) f32 { return textureLoad(src, vec2i(pos.xy), 0).x; }";
+
 const MIPMAP_WGSL:&str = "@group(0) @binding(0) var src: texture_2d<f32>;
                  @group(0) @binding(1) var smp: sampler;
                  @vertex fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4f { var p = array<vec2f, 3>(vec2f(-1, -1), vec2f(3, -1), vec2f(-1, 3)); return vec4f(p[i], 0, 1); }
@@ -3042,9 +3046,7 @@ impl Gpu {
         self.materialize_clears(id);
         if self.f2d_pipeline.is_none() {
             let module = self.device.create_shader_module(ShaderModuleDescriptor { label: None, source: ShaderSource::Wgsl(
-                "@group(0) @binding(0) var src: texture_2d<f32>;
-                 @vertex fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4f { var p = array<vec2f, 3>(vec2f(-1, -1), vec2f(3, -1), vec2f(-1, 3)); return vec4f(p[i], 0, 1); }
-                 @fragment fn fs(@builtin(position) pos: vec4f) -> @builtin(frag_depth) f32 { return textureLoad(src, vec2i(pos.xy), 0).x; }".into()) });
+                FLOAT_TO_DEPTH_PROXY_WGSL.into()) });
             let ds = DepthStencilState { format: TextureFormat::Depth32Float, depth_write_enabled: Some(true), depth_compare: Some(CompareFunction::Always), stencil: Default::default(), bias: Default::default() };
             self.f2d_pipeline = Some(self.simple_pipeline(&module, None, Some(ds)));
         }
@@ -3054,11 +3056,14 @@ impl Gpu {
         let trace_identities=self.command_trace.captures_native_identities();
         #[cfg(all(target_os = "macos", feature = "native-draw-capture"))]
         let trace_identities=trace_identities || self.texture_ledger_enabled();
+        let proxy_usage = TextureUsages::TEXTURE_BINDING | TextureUsages::RENDER_ATTACHMENT;
+        #[cfg(all(target_os = "macos", feature = "native-draw-capture"))]
+        let proxy_usage = if self.draw_capture.as_ref().is_some_and(|c|c.captures_finished_graph()) {proxy_usage | TextureUsages::COPY_SRC}else{proxy_usage};
         let t = self.tex_mut(id).unwrap();
         if t.proxy_fdepth.is_none() {
             let ptex = dev.create_texture(&TextureDescriptor {
                 label: None, size: Extent3d { width: desc.w, height: desc.h, depth_or_array_layers: desc.d }, mip_level_count: desc.mips, sample_count: 1,
-                dimension: TextureDimension::D2, format: TextureFormat::Depth32Float, usage: TextureUsages::TEXTURE_BINDING | TextureUsages::RENDER_ATTACHMENT, view_formats: &[],
+                dimension: TextureDimension::D2, format: TextureFormat::Depth32Float, usage: proxy_usage, view_formats: &[],
             });
             let mut passes = Vec::new();
             for mip in 0..desc.mips {
@@ -3076,14 +3081,20 @@ impl Gpu {
         let out = (px.tex.clone(), px.format);
         #[cfg(all(target_os = "macos", feature = "native-draw-capture"))]
         let ledger_written=px.dirty;
+        #[cfg(all(target_os = "macos", feature = "native-draw-capture"))]
+        let mut captured_passes=0usize;
         if px.dirty {
             px.dirty = false;
             let passes: Vec<_> = px.passes.iter().map(|(v, b)| (v.clone(), b.clone())).collect();
             #[cfg(all(target_os = "macos", feature = "native-draw-capture"))]
-            self.finished_aux_reject("finished graph unsupported original float-to-depth proxy write");
+            self.texture_ledger_proxy(id,"float_to_depth",false);
             self.end_pass();
-            let enc = self.encoder();
-            for (dst, bg) in &passes {
+            for (index,(dst, bg)) in passes.iter().enumerate() {
+                #[cfg(all(target_os = "macos", feature = "native-draw-capture"))]
+                let operation=self.finished_aux(true,|c,g|c.graph_aux_begin_float_depth(g,&tex,&out.0,index as u32 / desc.d,index as u32 % desc.d)).flatten();
+                #[cfg(not(all(target_os = "macos", feature = "native-draw-capture")))]
+                let _=index;
+                let enc = self.encoder();
                 let mut p = enc.begin_render_pass(&RenderPassDescriptor {
                     label: None, color_attachments: &[],
                     depth_stencil_attachment: Some(RenderPassDepthStencilAttachment { view: dst, depth_ops: Some(Operations { load: LoadOp::Clear(1.0), store: StoreOp::Store }), stencil_ops: None }),
@@ -3092,11 +3103,17 @@ impl Gpu {
                 p.set_pipeline(&pl);
                 p.set_bind_group(0, bg, &[]);
                 p.draw(0..3, 0..1);
+                drop(p);
+                #[cfg(all(target_os = "macos", feature = "native-draw-capture"))]
+                if let Some(operation)=operation {
+                    captured_passes+=1;
+                    self.finished_aux(false,|c,g|c.graph_aux_end_float_depth(g,operation));
+                }
             }
             self.use_tex(id);
         }
         #[cfg(all(target_os = "macos", feature = "native-draw-capture"))]
-        self.texture_ledger_proxy(id,"float_to_depth",ledger_written);
+        self.texture_ledger_proxy(id,"float_to_depth",ledger_written && captured_passes==0);
         Some(out)
     }
 
