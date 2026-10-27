@@ -30,7 +30,7 @@ def main():
     frozen.mkdir()
     (frozen / "scene.json").write_bytes(raw)
     checked = [(manifest, digest(raw)), (frozen / "scene.json", digest(raw))]
-    if metadata.get("provenance", {}).get("kind") == "native":
+    if metadata.get("provenance", {}).get("kind") in ("native", "native_graph"):
         native = root / "native-capture.json"
         imported = root / "native-import.json"
         if native.stat().st_size > 32 << 20 or imported.stat().st_size > 64 << 10:

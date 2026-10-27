@@ -419,7 +419,7 @@ fn expand_metadata(m: &Value) -> Result<Cow<'_, Value>> {
     Ok(Cow::Owned(expanded))
 }
 
-fn convert(m: &Value, source_hash: String) -> Result<Scene> {
+pub(crate) fn convert(m: &Value, source_hash: String) -> Result<Scene> {
     let normalized = expand_metadata(m)?;
     let m = normalized.as_ref();
     require(

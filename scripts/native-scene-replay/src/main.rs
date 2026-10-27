@@ -20,10 +20,15 @@ fn main() -> Result<()> {
     }
     require(
         a.len() == 4,
-        "usage: native-scene-replay import-legacy|import-native|import-native-compute|validate|run INPUT NEW_OUTPUT",
+        "usage: native-scene-replay import-legacy|import-native|import-native-compute|import-native-graph|validate|run INPUT NEW_OUTPUT",
     )?;
     let input = Path::new(&a[2]);
     let out = Path::new(&a[3]);
+    if a[1] == "import-native-graph" {
+        native_scene_replay::graph_import::native(input, out)?;
+        println!("Imported one connected native raster/proxy/compute graph; no finished-frame or density claim");
+        return Ok(());
+    }
     if a[1] == "import-native-compute" {
         native_scene_replay::compute_import::native(input, out)?;
         println!("Imported isolated original compute dispatch; no finished-world or eye claim");

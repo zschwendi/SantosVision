@@ -308,7 +308,7 @@ fn version_identity(seen: &mut BTreeMap<u64, Slice>, v: &Version) -> Result<()> 
     }
     Ok(())
 }
-fn convert(m: &Value, source_hash: String) -> Result<Scene> {
+pub(crate) fn convert(m: &Value, source_hash: String) -> Result<Scene> {
     shape(
         m,
         &[
