@@ -30,7 +30,9 @@ GRAPHICS = {
 MAX_BLOBS = 256 << 20
 MAX_JSON = 16 << 20
 MAX_LOG = 128 << 20
-CAPTURE_KINDS = ("two-draw", "color-null", "target-span", "compute", "graph")
+CAPTURE_KINDS = ("two-draw", "color-null", "target-span", "compute", "graph", "finished")
+MAX_FINISHED_PAYLOAD = 1 << 30
+MAX_FINISHED_STAGING = 512 << 20
 FLAGS = {
     "MUGUET_MUTE": "1", "MUGUET_MASTER_VOLUME": "0",
     "MUGUET_XR_MOTION_AIM": "0", "MUGUET_XR_MOTION_ARMS": "0",
@@ -180,7 +182,7 @@ def validate_capture(directory, capture_kind="two-draw"):
     need(not (directory / "rejected.json").exists(), "capture module rejected the span")
     capture = load_json(directory / "capture.json")
     expected = {"two-draw": (2,"native_draw_span"), "color-null": (3,"native_color_null_draw"),
-                "target-span": (4,"native_target_span"), "compute": (5,"native_compute_dispatch"), "graph": (6,"native_connected_graph")}[capture_kind]
+                "target-span": (4,"native_target_span"), "compute": (5,"native_compute_dispatch"), "graph": (6,"native_connected_graph"), "finished": (7,"native_finished_graph")}[capture_kind]
     need((capture.get("schema"), capture.get("kind"), capture.get("status")) ==
          (*expected, "captured"), "unsupported or incomplete capture for selected kind")
     closure = capture.get("closure", {})
@@ -207,6 +209,25 @@ def validate_capture(directory, capture_kind="two-draw"):
         need(type(closure.get("gpu_errors")) is int and closure["gpu_errors"] == 0, "graph capture GPU errors")
         need(isinstance(capture.get("stages"), list) and 3 <= len(capture["stages"]) <= 25, "bounded connected stages required")
         need(capture.get("finished_frame_or_density_accepted") is False, "graph cannot certify finished image")
+    elif capture_kind == "finished":
+        for name in ("same_capture", "same_native_namespace", "same_present", "continuous_command_interval", "queries_original_only"):
+            need(closure.get(name) is True, f"missing finished graph closure: {name}")
+        need(type(closure.get("queries_inactive")) is bool and type(closure.get("gpu_errors")) is int and closure["gpu_errors"] == 0,
+             "finished graph original query/error closure")
+        stages = capture.get("stages")
+        need(isinstance(stages, list) and 3 <= len(stages) <= 8192 and stages[-1].get("kind") == "finished_endpoint",
+             "bounded finished endpoint stage required")
+        publication = stages[-1].get("operation", {}).get("publication", {})
+        source = capture.get("source", {})
+        need(isinstance(source.get("capture_id"), str) and source["capture_id"]
+             and source.get("native_namespace") == source["capture_id"]
+             and type(source.get("native_present")) is int and source["native_present"] > 0
+             and publication.get("capture_id") == source["capture_id"]
+             and publication.get("native_present") == source["native_present"], "finished publication source identity")
+        for name in ("accepted", "graph_end_before_hud", "postlude_original_only", "hud_world_is_ready_hud_world"):
+            need(publication.get(name) is True, f"missing finished publication: {name}")
+        need(capture.get("finished_frame_or_density_accepted") is False and capture.get("coherent_stereo_accepted") is False,
+             "finished HUD-free capture cannot certify density/stereo")
     elif capture_kind == "compute":
         for name in ("single_original_dispatch", "queries_inactive"):
             need(closure.get(name) is True, f"missing capture closure: {name}")
@@ -221,8 +242,10 @@ def validate_capture(directory, capture_kind="two-draw"):
              "color-null capture reports GPU errors or an invalid error count")
         need(isinstance(capture.get("draw"), dict) and "draws" not in capture, "single original draw required")
     blobs = capture.get("blobs")
-    need(isinstance(blobs, list) and 0 < len(blobs) <= 16384, "bounded nonempty blob list required")
-    names = set(); total = 0
+    finished = capture_kind == "finished"
+    limit = MAX_FINISHED_PAYLOAD if finished else MAX_BLOBS
+    need(isinstance(blobs, list) and 0 < len(blobs) <= (32768 if finished else 16384), "bounded nonempty blob list required")
+    names = set(); total = 0; padded_total = 0
     for blob in blobs:
         name = blob.get("path")
         need(isinstance(name, str) and name not in ("", ".", "..", "capture.json", "rejected.json")
@@ -230,9 +253,29 @@ def validate_capture(directory, capture_kind="two-draw"):
         names.add(name); path = exact_path(directory / name)
         size = blob.get("byte_length")
         need(type(size) is int and 0 < size <= MAX_BLOBS, "invalid blob size")
-        total += size; need(total <= MAX_BLOBS, "payload budget exceeded")
+        total += size; need(total <= limit, "payload budget exceeded")
+        if finished:
+            row, rows, pitch = (blob.get(k) for k in ("packed_row_bytes", "row_count", "readback_pitch"))
+            need(all(type(n) is int and n > 0 for n in (row, rows, pitch)) and row * rows == size
+                 and pitch >= row and pitch * rows <= MAX_BLOBS, "finished payload staging shape/bound")
+            padded_total += pitch * rows
         need(path.is_file() and path.stat().st_size == size and digest(path) == blob.get("sha256"),
              f"payload absent or differs: {name}")
+    if finished:
+        spool = capture.get("spool", {})
+        epochs = spool.get("natural_submission_epochs")
+        need(isinstance(epochs, list) and 0 < len(epochs) <= 8192
+             and all(type(n) is int and n > 0 for n in epochs)
+             and all(a < b for a, b in zip(epochs, epochs[1:])), "finished natural submission epochs")
+        exact = {"submitted_batches": len(epochs), "completed_batches": len(epochs), "raw_payload_bytes": total,
+                 "cumulative_padded_staging_bytes": padded_total, "payload_bound": MAX_FINISHED_PAYLOAD,
+                 "live_staging_bound": MAX_FINISHED_STAGING, "capture_forced_submissions": 0}
+        need(all(type(spool.get(k)) is int and spool[k] == v for k, v in exact.items()), "finished spool accounting")
+        need(type(capture.get("allocated_readback_bytes")) is int and capture["allocated_readback_bytes"] == padded_total,
+             "finished cumulative staging accounting")
+        need(type(capture.get("peak_live_staging_bytes")) is int and 0 < capture["peak_live_staging_bytes"] <= MAX_FINISHED_STAGING
+             and type(spool.get("peak_completed_map_bytes")) is int and 0 <= spool["peak_completed_map_bytes"] <= MAX_FINISHED_STAGING,
+             "finished live/map staging bound")
     need({p.name for p in directory.iterdir()} == names | {"capture.json"}, "unmanifested capture contents")
     return {"capture_kind": capture_kind, "capture_sha256": digest(directory / "capture.json"), "blob_count": len(blobs),
             "payload_bytes": total, "byte_admission_passed": True,

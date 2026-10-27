@@ -46,6 +46,56 @@ class RunnerBoundaries(unittest.TestCase):
         (p / "capture.json").write_text(json.dumps(value))
         return p, value
 
+    def finished_capture(self):
+        p, value = self.capture()
+        del value["draws"]
+        publication = dict(capture_id="cpu-fixture", native_present=1, accepted=True,
+            graph_end_before_hud=True, postlude_original_only=True, hud_world_is_ready_hud_world=True)
+        value.update(schema=7, kind="native_finished_graph", source=dict(capture_id="cpu-fixture", native_namespace="cpu-fixture", native_present=1),
+            stages=[{"kind":"raster"}, {"kind":"compute"}, {"kind":"finished_endpoint", "operation":{"publication":publication}}],
+            finished_frame_or_density_accepted=False, coherent_stereo_accepted=False,
+            allocated_readback_bytes=256, peak_live_staging_bytes=256)
+        value["closure"].update(same_capture=True, same_native_namespace=True, same_present=True,
+            continuous_command_interval=True, queries_original_only=True, queries_inactive=True, gpu_errors=0)
+        size=value["blobs"][0]["byte_length"]
+        value["blobs"][0].update(packed_row_bytes=size,row_count=1,readback_pitch=256)
+        value["spool"]=dict(natural_submission_epochs=[1], submitted_batches=1, completed_batches=1,
+            raw_payload_bytes=size, cumulative_padded_staging_bytes=256, payload_bound=runner.MAX_FINISHED_PAYLOAD,
+            live_staging_bound=runner.MAX_FINISHED_STAGING, peak_completed_map_bytes=256,capture_forced_submissions=0)
+        (p/"capture.json").write_text(json.dumps(value));return p,value
+
+    def test_finished_mode_is_distinct_and_requires_real_publication_and_spool_closure(self):
+        p, original=self.finished_capture()
+        self.assertTrue(runner.validate_capture(p,"finished")["semantic_replay_admission_required"])
+        with self.assertRaises(ValueError):runner.validate_capture(p,"graph")
+        mutations=[]
+        for k,v in [("accepted",False),("native_present",2),("capture_id","other"),("postlude_original_only",False)]:
+            x=copy.deepcopy(original);x["stages"][-1]["operation"]["publication"][k]=v;mutations.append(x)
+        for k,v in [("completed_batches",0),("peak_completed_map_bytes",runner.MAX_FINISHED_STAGING+1),("capture_forced_submissions",1),("raw_payload_bytes",1),("submitted_batches",True)]:
+            x=copy.deepcopy(original);x["spool"][k]=v;mutations.append(x)
+        for k,v in [("peak_live_staging_bytes",runner.MAX_FINISHED_STAGING+1),("allocated_readback_bytes",1),("finished_frame_or_density_accepted",True)]:
+            x=copy.deepcopy(original);x[k]=v;mutations.append(x)
+        x=copy.deepcopy(original);x["blobs"]=[x["blobs"][0]]*32769;mutations.append(x)
+        for i,x in enumerate(mutations):
+            (p/"capture.json").write_text(json.dumps(x))
+            with self.subTest(case=i),self.assertRaises(ValueError):runner.validate_capture(p,"finished")
+
+    def test_finished_cumulative_budget_does_not_raise_old_mode_or_single_blob_cap(self):
+        p,value=self.finished_capture();size=value["blobs"][0]["byte_length"]
+        (p/"second.bin").write_bytes((p/"payload.bin").read_bytes())
+        value["blobs"][0]["readback_pitch"]=size
+        second=copy.deepcopy(value["blobs"][0]);second["path"]="second.bin";value["blobs"].append(second)
+        value.update(allocated_readback_bytes=size*2,peak_live_staging_bytes=size)
+        value["spool"].update(raw_payload_bytes=size*2,cumulative_padded_staging_bytes=size*2,
+            payload_bound=size*2,live_staging_bound=size,peak_completed_map_bytes=size)
+        with patch.object(runner,"MAX_BLOBS",size),patch.object(runner,"MAX_FINISHED_PAYLOAD",size*2),patch.object(runner,"MAX_FINISHED_STAGING",size):
+            (p/"capture.json").write_text(json.dumps(value))
+            self.assertEqual(runner.validate_capture(p,"finished")["payload_bytes"],size*2)
+            old=copy.deepcopy(value);old.update(schema=2,kind="native_draw_span",draws=[{},{}])
+            old["closure"].update(ordered_two_draws=True,resource_mutation_rejections=0)
+            (p/"capture.json").write_text(json.dumps(old))
+            with self.assertRaisesRegex(ValueError,"payload budget"):runner.validate_capture(p,"two-draw")
+
     def test_complete_bytes_require_separate_semantic_admission(self):
         p, _ = self.capture()
         result = runner.validate_capture(p)

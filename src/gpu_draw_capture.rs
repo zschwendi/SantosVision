@@ -16,12 +16,19 @@ mod target_span;
 mod compute_capture;
 #[path = "gpu_graph_capture.rs"]
 mod graph_capture;
+#[path = "gpu_capture_spool.rs"]
+mod capture_spool;
+#[path = "gpu_finished_capture.rs"]
+mod finished_capture;
+#[path = "gpu_graph_operations.rs"]
+pub(super) mod graph_operations;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum CaptureKind { TwoDraw, ColorNull, TargetSpan, Compute, Graph }
+enum CaptureKind { TwoDraw, ColorNull, TargetSpan, Compute, Graph, Finished }
 impl CaptureKind {
+    fn is_graph(self)->bool {matches!(self,Self::Graph|Self::Finished)}
     fn parse(value:Option<&str>)->Option<Self> {
-        match value {None|Some("two-draw")=>Some(Self::TwoDraw),Some("color-null")=>Some(Self::ColorNull),Some("target-span")=>Some(Self::TargetSpan),Some("compute")=>Some(Self::Compute),Some("graph")=>Some(Self::Graph),_=>None}
+        match value {None|Some("two-draw")=>Some(Self::TwoDraw),Some("color-null")=>Some(Self::ColorNull),Some("target-span")=>Some(Self::TargetSpan),Some("compute")=>Some(Self::Compute),Some("graph")=>Some(Self::Graph),Some("finished")=>Some(Self::Finished),_=>None}
     }
     fn draw_count(self)->usize {if self==Self::TwoDraw {2}else{1}}
 }
@@ -31,6 +38,9 @@ const PS: &str = "75cf2d53bf9497c9";
 const VS_TEXT: &str = "04f353256b2a27c7141076f68c572d451f551a0b8370bafd6f521fc8dc90cb94";
 const PS_TEXT: &str = "1e31e158d1f81369d39401dabee56c4b988eec1110f81b21f5b99ad3c8e6c5af";
 const MAX_BYTES: u64 = 256 << 20;
+// Private finished-graph readbacks can span a complete original encoder before
+// its first natural submission. Keep every older mode/single snapshot at256MiB.
+const FINISHED_STAGING_BYTES:u64=512<<20;
 const MAX_PIPELINES: usize = 4096;
 const MAX_PIPELINE_BYTES: usize = 8 << 20;
 
@@ -92,6 +102,7 @@ pub(super) struct Capture {
     span: target_span::SpanState,
     compute_state:compute_capture::ComputeState,
     graph:graph_capture::GraphState,
+    finished:finished_capture::FinishedState,
     epoch_reservations:Vec<Arc<SnapshotReservation>>,
 }
 
@@ -185,10 +196,17 @@ fn enqueue(gpu: &mut Gpu, plans: Vec<Plan>) -> Vec<Readback> {
 }
 
 impl Capture {
+    fn staging_limit(&self)->u64 {if self.kind==CaptureKind::Finished {FINISHED_STAGING_BYTES}else{MAX_BYTES}}
+    fn reserve_fits(&self,live:u64,added:u64,final_reserved:u64)->bool {
+        live.checked_add(added).and_then(|n|n.checked_add(final_reserved)).is_some_and(|n|n<=self.staging_limit())
+    }
+    fn add_epoch_bytes(&self,bytes:u64)->Result<u64,String> {
+        self.epoch_bytes.checked_add(bytes).filter(|n|*n<=self.staging_limit()).ok_or("capture original encoder staging bound".into())
+    }
     fn tracks_color_null_cause(&self)->bool {
         // The original two-draw export may finish before the later faulty
         // shader path. Its bounded diagnostic observation must continue.
-        match self.kind {CaptureKind::TwoDraw=>!self.color_null_recorded,CaptureKind::ColorNull=>!self.done,CaptureKind::TargetSpan|CaptureKind::Compute|CaptureKind::Graph=>false}
+        match self.kind {CaptureKind::TwoDraw=>!self.color_null_recorded,CaptureKind::ColorNull=>!self.done,CaptureKind::TargetSpan|CaptureKind::Compute|CaptureKind::Graph|CaptureKind::Finished=>false}
     }
     pub(super) fn color_srv_binding(&self,gpu:&Gpu,opcode:u32,stage:usize,slot:usize,input:u32,resolved:u32) {
         if !self.tracks_color_null_cause() || stage!=1 || slot!=5 {return;}
@@ -476,10 +494,10 @@ impl Capture {
         (self.kind==CaptureKind::ColorNull || self.captures_target_span()) && color_null::dummy_copyable(b.dim,b.sample,b.ms)
     }
     pub(super) fn captures_target_span(&self)->bool {
-        matches!(self.kind,CaptureKind::TargetSpan|CaptureKind::Graph) && !self.done && !self.pending.as_ref().is_some_and(|p|p.finished)
+        matches!(self.kind,CaptureKind::TargetSpan|CaptureKind::Graph|CaptureKind::Finished) && !self.done && !self.finished.postlude && !self.pending.as_ref().is_some_and(|p|p.finished)
     }
     pub(super) fn captures_resolved_bindings(&self)->bool {
-        matches!(self.kind,CaptureKind::TargetSpan|CaptureKind::Compute|CaptureKind::Graph) && !self.done && !self.pending.as_ref().is_some_and(|p|p.finished)
+        matches!(self.kind,CaptureKind::TargetSpan|CaptureKind::Compute|CaptureKind::Graph|CaptureKind::Finished) && !self.done && !self.finished.postlude && !self.pending.as_ref().is_some_and(|p|p.finished)
     }
     pub(super) fn from_env() -> Option<Self> {
         let path = std::env::var_os("MUGUET_NATIVE_DRAW_CAPTURE")?;
@@ -496,9 +514,9 @@ impl Capture {
             attempts: 0, sequence: 0, epoch_bytes: 0, rejected: BTreeMap::new(), pipeline_bytes: 0,
             rejected_starts: Default::default(), live_bytes: Arc::new(AtomicU64::new(0)), feedback_recorded:false,
             color_null_binding:RefCell::new(None),color_null_recorded:false,
-            texture_ledger: (matches!(kind,CaptureKind::TargetSpan|CaptureKind::Compute|CaptureKind::Graph) || std::env::var("MUGUET_NATIVE_TEXTURE_LEDGER").as_deref()==Ok("1")).then(texture_ledger::Ledger::new),
-            shader_sources: (matches!(kind,CaptureKind::TargetSpan|CaptureKind::Compute|CaptureKind::Graph) || std::env::var("MUGUET_NATIVE_SHADER_SOURCES").as_deref()==Ok("1"))
-                .then(||RefCell::new(shader_sources::Registry::new())), span:Default::default(),compute_state:Default::default(),graph:Default::default(),epoch_reservations:Vec::new() })
+            texture_ledger: (matches!(kind,CaptureKind::TargetSpan|CaptureKind::Compute|CaptureKind::Graph|CaptureKind::Finished) || std::env::var("MUGUET_NATIVE_TEXTURE_LEDGER").as_deref()==Ok("1")).then(texture_ledger::Ledger::new),
+            shader_sources: (matches!(kind,CaptureKind::TargetSpan|CaptureKind::Compute|CaptureKind::Graph|CaptureKind::Finished) || std::env::var("MUGUET_NATIVE_SHADER_SOURCES").as_deref()==Ok("1"))
+                .then(||RefCell::new(shader_sources::Registry::new())), span:Default::default(),compute_state:Default::default(),graph:Default::default(),finished:Default::default(),epoch_reservations:Vec::new() })
     }
     pub(super) fn remember_shader(&self, module:&ShaderModule, text:&str, origin:&str) {
         if self.done {return;}
@@ -523,7 +541,7 @@ impl Capture {
     }
     pub(super) fn reject_graph(&mut self,reason:&str) {self.reject(reason);}
     pub(super) fn graph_counter_write(&mut self) {
-        if self.kind==CaptureKind::Graph && !self.done && self.graph.anchor.is_some()
+        if self.kind.is_graph() && !self.done && !self.finished.postlude && self.graph.anchor.is_some()
             && !self.pending.as_ref().is_some_and(|p|p.finished) {
             self.reject("connected graph contains actual UAV counter write (opcode 38)");
         }
@@ -533,13 +551,23 @@ impl Capture {
         if *count==0 {log(&format!("native draw capture candidate rejected: {reason}; first command_sequence={}",self.sequence));}
         *count+=1;
         if let Some(p)=self.pending.take() {self.rejected_starts.insert(p.candidate_key);}
-        if matches!(self.kind,CaptureKind::TargetSpan|CaptureKind::Compute|CaptureKind::Graph) {self.span.clear_interval();}
-        if self.kind==CaptureKind::Graph {self.graph=Default::default();self.compute_state=Default::default();}
+        if matches!(self.kind,CaptureKind::TargetSpan|CaptureKind::Compute|CaptureKind::Graph|CaptureKind::Finished) {self.span.clear_interval();}
+        if self.kind==CaptureKind::Finished && self.graph.anchor.is_some() {
+            // Streamed bytes have immutable names. A rejected anchored attempt
+            // is terminal: never restart into the same directory or grow it via
+            // unbounded rejected prefixes.
+            self.done=true;
+            self.finished.spool.take();
+            self.finished.extra_readbacks.clear();
+            let _=publish_new(&self.directory.join("rejected.json"),&serde_json::to_vec_pretty(&json!({"schema":7,"status":"rejected","reason":reason})).unwrap());
+        }
+        if self.kind.is_graph() {self.graph=Default::default();self.compute_state=Default::default();}
     }
     pub(super) fn command(&mut self, op: u32) {
         self.sequence = self.sequence.saturating_add(1);
         if self.texture_ledger_active(){if let Some(ledger)=&mut self.texture_ledger {ledger.command();}}
         if self.kind==CaptureKind::Compute {self.compute_command(op);return;}
+        if self.kind==CaptureKind::Finished {self.finished_command(op);return;}
         if self.kind==CaptureKind::Graph {
             if self.done || self.pending.as_ref().is_some_and(|p|p.finished) {return;}
             if self.graph.dispatch_pending.take().is_some() {self.reject("connected graph dispatch was not captured");return;}
@@ -576,14 +604,15 @@ impl Capture {
         }
     }
     pub(super) fn skipped_draw(&mut self) {
-        if self.kind==CaptureKind::Graph && (self.done || self.pending.as_ref().is_some_and(|p|p.finished)) {return;}
-        if self.kind==CaptureKind::Graph && self.graph.anchor.is_some() {self.reject("connected graph contains skipped draw");return;}
+        if self.kind.is_graph() && (self.done || self.finished.postlude || self.pending.as_ref().is_some_and(|p|p.finished)) {return;}
+        if self.kind.is_graph() && self.graph.anchor.is_some() {self.reject("connected graph contains skipped draw");return;}
         if self.pending.as_ref().is_some_and(|p| !p.finished) { self.reject("intervening skipped draw"); }
         if self.kind==CaptureKind::TargetSpan {self.span.clear_interval();}
     }
     pub(super) fn before(&mut self, gpu: &mut Gpu, draw: &Resolved<'_>) {
         if self.kind==CaptureKind::Compute {self.observe_compute_world(gpu,draw);return;}
-        if self.kind==CaptureKind::Graph {
+        if self.kind.is_graph() {
+            if self.finished.postlude {return;}
             self.observe_compute_world(gpu,draw);self.before_target_span(gpu,draw);return;
         }
         if self.kind==CaptureKind::TargetSpan {self.before_target_span(gpu,draw);return;}
@@ -651,7 +680,7 @@ impl Capture {
     }
     pub(super) fn after(&mut self, gpu: &mut Gpu) {
         if self.kind==CaptureKind::Compute {return;}
-        if matches!(self.kind,CaptureKind::TargetSpan|CaptureKind::Graph) {self.after_target_span(gpu);return;}
+        if matches!(self.kind,CaptureKind::TargetSpan|CaptureKind::Graph|CaptureKind::Finished) {if !self.finished.postlude {self.after_target_span(gpu);}return;}
         let Some(pending) = &mut self.pending else { return; };
         if pending.finished || pending.draws.len() != pending.kind.draw_count() { return; }
         let plans = pending.targets.iter().map(|(t,a,r)| texture_plan(format!("final-{r}.bin"),t,0,*a)).collect::<Result<Vec<_>,_>>();
@@ -662,7 +691,7 @@ impl Capture {
     }
     pub(super) fn submitted(&mut self, gpu: &Gpu, epoch: u64) {
         let submitted_bytes=std::mem::take(&mut self.epoch_bytes);
-        if matches!(self.kind,CaptureKind::TargetSpan|CaptureKind::Compute|CaptureKind::Graph) {
+        if matches!(self.kind,CaptureKind::TargetSpan|CaptureKind::Compute|CaptureKind::Graph|CaptureKind::Finished) {
             let reservations=std::mem::take(&mut self.epoch_reservations);
             if !reservations.is_empty() {
                 let inflight=gpu.inflight.clone();inflight.fetch_add(1,Ordering::SeqCst);
@@ -678,6 +707,10 @@ impl Capture {
                 live_bytes.fetch_sub(submitted_bytes,Ordering::SeqCst);
                 inflight.fetch_sub(1,Ordering::SeqCst);
             });
+        }
+        if self.kind==CaptureKind::Finished {
+            if let Err(e)=self.finished_spool_submitted(epoch) {self.reject(&e);}
+            return;
         }
         // Complete intervals may cross ordinary producer submissions. Their
         // already enqueued snapshots stay retained until the final submission.
@@ -697,7 +730,7 @@ impl Capture {
         // Immutable pending evidence has already been detached. Retire private
         // history now; postcapture observation only needs the original probes.
         self.texture_ledger.take();
-        if matches!(self.kind,CaptureKind::TargetSpan|CaptureKind::Compute|CaptureKind::Graph) {self.span.clear_interval();}
+        if matches!(self.kind,CaptureKind::TargetSpan|CaptureKind::Compute|CaptureKind::Graph|CaptureKind::Finished) {self.span.clear_interval();}
         if self.kind==CaptureKind::ColorNull {self.color_null_binding.borrow_mut().take();}
         let directory = self.directory.clone(); let rejected = self.rejected.clone();
         let errors = gpu.errors.clone(); let inflight = gpu.inflight.clone();
@@ -902,11 +935,24 @@ mod tests {
         Capture { kind:CaptureKind::TwoDraw,directory:PathBuf::new(),pipelines:HashMap::new(),pending:None,done:false,attempts:0,sequence:0,
             epoch_bytes:0,rejected:BTreeMap::new(),pipeline_bytes:0,rejected_starts:Default::default(),
             live_bytes:Arc::new(AtomicU64::new(0)),feedback_recorded:false,
-            color_null_binding:RefCell::new(None),color_null_recorded:false,texture_ledger:None,shader_sources:None,span:Default::default(),compute_state:Default::default(),graph:Default::default(),epoch_reservations:Vec::new() }
+            color_null_binding:RefCell::new(None),color_null_recorded:false,texture_ledger:None,shader_sources:None,span:Default::default(),compute_state:Default::default(),graph:Default::default(),finished:Default::default(),epoch_reservations:Vec::new() }
     }
     fn pending() -> Pending {
         Pending {kind:CaptureKind::TwoDraw,alias:None,initialization_ledger:None,shader_sources:None,epoch:1,errors:0,view:Value::Null,domain:Value::Null,draws:vec![Value::Null],attachments:vec![],
             targets:vec![],readbacks:vec![],bytes:0,final_bytes:0,finished:false,intervening_commands:vec![],candidate_key:vec![23,42]}
+    }
+    #[test]
+    fn finished_only_staging_bound_keeps_older_capture_and_blob_limits() {
+        let mut c=capture();
+        for kind in [CaptureKind::TwoDraw,CaptureKind::ColorNull,CaptureKind::TargetSpan,CaptureKind::Compute,CaptureKind::Graph] {
+            c.kind=kind;assert!(c.reserve_fits(MAX_BYTES-1,1,0));assert!(!c.reserve_fits(MAX_BYTES,1,0));
+        }
+        c.kind=CaptureKind::Finished;
+        assert!(c.reserve_fits(MAX_BYTES,MAX_BYTES,0));assert!(!c.reserve_fits(MAX_BYTES,MAX_BYTES,1));
+        assert!(!c.reserve_fits(u64::MAX,1,0));
+        assert!(!c.reserve_fits(1,u64::MAX,1));
+        c.epoch_bytes=FINISHED_STAGING_BYTES-1;assert_eq!(c.add_epoch_bytes(1).unwrap(),FINISHED_STAGING_BYTES);
+        assert!(c.add_epoch_bytes(2).is_err());assert_eq!(MAX_BYTES,256<<20);
     }
     #[test]
     fn original_two_draw_completion_keeps_later_null_diagnostic_alive() {

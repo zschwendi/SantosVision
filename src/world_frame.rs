@@ -524,9 +524,36 @@ pub(crate) fn publish_with_hud(device:&Device, queue:&Queue, color:&Texture,
 }
 
 pub(crate) fn publish_with_hud_and_optics(device:&Device, queue:&Queue, color:&Texture,
-    depth:&Texture, frozen_depth:Option<FrozenPreUiDepth>, mut frame:WorldFrame,
+    depth:&Texture, frozen_depth:Option<FrozenPreUiDepth>, frame:WorldFrame,
     provenance_epoch:u64, hud:Option<Arc<crate::xr_hud::HudImages>>,
     camera_sequence:u64,optics:crate::xr_view::ScopeOptics) {
+    publish_with_hud_and_optics_inner(device,queue,color,depth,frozen_depth,frame,provenance_epoch,hud,camera_sequence,optics,
+        #[cfg(all(target_os="macos",feature="native-draw-capture"))] None);
+}
+
+#[cfg(all(target_os="macos",feature="native-draw-capture"))]
+pub(crate) fn publish_with_hud_and_optics_captured(device:&Device, queue:&Queue, color:&Texture,
+    depth:&Texture, frozen_depth:Option<FrozenPreUiDepth>, frame:WorldFrame,
+    provenance_epoch:u64, hud:Option<Arc<crate::xr_hud::HudImages>>,
+    camera_sequence:u64,optics:crate::xr_view::ScopeOptics,
+    capture:Option<Arc<crate::gpu::finished_endpoint::PublicationToken>>) {
+    publish_with_hud_and_optics_inner(device,queue,color,depth,frozen_depth,frame,provenance_epoch,hud,camera_sequence,optics,capture);
+}
+
+fn publish_with_hud_and_optics_inner(device:&Device, queue:&Queue, color:&Texture,
+    depth:&Texture, frozen_depth:Option<FrozenPreUiDepth>, mut frame:WorldFrame,
+    provenance_epoch:u64, hud:Option<Arc<crate::xr_hud::HudImages>>,
+    camera_sequence:u64,optics:crate::xr_view::ScopeOptics,
+    #[cfg(all(target_os="macos",feature="native-draw-capture"))] capture:Option<Arc<crate::gpu::finished_endpoint::PublicationToken>>) {
+    #[cfg(all(target_os="macos",feature="native-draw-capture"))]
+    let mut capture_guard=capture.map(|token|token.guard());
+    #[cfg(all(target_os="macos",feature="native-draw-capture"))]
+    if let Some(guard)=capture_guard.as_mut() {
+        if let Err(reason)=guard.validate_inputs(color,depth,hud.as_ref(),&frame,provenance_epoch,camera_sequence) {
+            // Capture failures never alter normal publication behavior.
+            if let Some(guard)=capture_guard.take(){guard.reject(reason);}
+        }
+    }
     let optics=FrameOptics{camera_sequence,optics};
     let result = (|| -> anyhow::Result<()> {
         anyhow::ensure!(optics.optics.valid(),"invalid immutable optical frame metadata");
@@ -605,6 +632,8 @@ pub(crate) fn publish_with_hud_and_optics(device:&Device, queue:&Queue, color:&T
         let pending = PendingSnapshotCallback::new();
         if crate::world_latency_trace::enabled() { crate::world_latency_trace::record("snapshot_submitted",
             latency_identity(frame,provenance_epoch,Some(camera_sequence)),Default::default()); }
+        #[cfg(all(target_os="macos",feature="native-draw-capture"))]
+        let capture_guard=capture_guard.take();
         queue.on_submitted_work_done(move || {
             let _pending = pending;
             if crate::world_latency_trace::enabled() { crate::world_latency_trace::record("snapshot_callback_observed",
@@ -617,6 +646,13 @@ pub(crate) fn publish_with_hud_and_optics(device:&Device, queue:&Queue, color:&T
                 if hud.is_some(){crate::xr_hud::record_result(true,None);}
                 frames.latest[index] = Some(Ready { slot, frame, source_id, generation, provenance_epoch,
                     pair_epoch: 0, ready_at: Instant::now(), snapshot_submit_to_gpu_completion_seconds, hud, optics });
+                #[cfg(all(target_os="macos",feature="native-draw-capture"))]
+                if let Some(guard)=capture_guard {
+                    if let Some(ready)=frames.latest[index].as_ref() {
+                        guard.accepted(&ready.slot.color,&ready.slot.depth,ready.hud.as_ref(),&ready.frame,
+                            ready.source_id,ready.generation,ready.provenance_epoch,ready.optics.camera_sequence);
+                    }
+                }
                 frames.published += 1;
                 if used_frozen_depth { frames.frozen_depth_handoffs += 1; }
                 else { frames.copied_depth_snapshots += 1; }

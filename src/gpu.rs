@@ -1,3 +1,7 @@
+#[cfg(all(target_os = "macos", feature = "native-draw-capture"))]
+#[path = "gpu_finished_endpoint.rs"]
+pub(crate) mod finished_endpoint;
+
 // muguet - gpu.rs
 // Constantin Clerc (c22dev) - 0.1
 
@@ -1181,6 +1185,18 @@ pub fn max_msaa() -> u32 {
         .unwrap_or(1)
 }
 
+const MIPMAP_WGSL:&str = "@group(0) @binding(0) var src: texture_2d<f32>;
+                 @group(0) @binding(1) var smp: sampler;
+                 @vertex fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4f { var p = array<vec2f, 3>(vec2f(-1, -1), vec2f(3, -1), vec2f(-1, 3)); return vec4f(p[i], 0, 1); }
+                 @fragment fn fs(@builtin(position) pos: vec4f) -> @location(0) vec4f {
+                   let dst = max(vec2f(1.0), floor(vec2f(textureDimensions(src, 0)) * 0.5));
+                   return textureSampleLevel(src, smp, pos.xy / dst, 0.0);
+                 }";
+
+const STENCIL_PROXY_WGSL:&str = "@group(0) @binding(0) var src: texture_2d<u32>;
+             @vertex fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4f { var p = array<vec2f, 3>(vec2f(-1, -1), vec2f(3, -1), vec2f(-1, 3)); return vec4f(p[i], 0, 1); }
+             @fragment fn fs(@builtin(position) pos: vec4f) -> @location(0) vec4<u32> { let s = textureLoad(src, vec2i(pos.xy), 0).x; return vec4<u32>(s, s, 0u, 1u); }";
+
 const DEPTH_PROXY_WGSL:&str = "@group(0) @binding(0) var src: texture_depth_2d;
              @vertex fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4f { var p = array<vec2f, 3>(vec2f(-1, -1), vec2f(3, -1), vec2f(-1, 3)); return vec4f(p[i], 0, 1); }
              @fragment fn fs(@builtin(position) pos: vec4f) -> @location(0) vec4f { return vec4f(textureLoad(src, vec2i(pos.xy), 0), 0, 0, 1); }";
@@ -1366,10 +1382,19 @@ impl Gpu {
             usage: TextureUsages::COPY_DST | TextureUsages::COPY_SRC | TextureUsages::TEXTURE_BINDING,
             view_formats: &[] });
         self.end_pass();
+        #[cfg(all(target_os = "macos", feature = "native-draw-capture"))]
+        let operation=self.finished_aux(true,|c,g|{
+            c.graph_aux_register_texture(g,&snapshot,"original_preui_depth_snapshot")?;
+            c.graph_aux_begin_copy(g,&depth,0,0,&snapshot,0,0,[0,0,0],[0,0,0],[depth.width(),depth.height(),1])
+        }).flatten();
         self.encoder().copy_texture_to_texture(
             TexelCopyTextureInfo { texture: &depth, mip_level: 0, origin: Origin3d::ZERO, aspect: TextureAspect::All },
             TexelCopyTextureInfo { texture: &snapshot, mip_level: 0, origin: Origin3d::ZERO, aspect: TextureAspect::All },
             Extent3d { width: depth.width(), height: depth.height(), depth_or_array_layers: 1 });
+        #[cfg(all(target_os = "macos", feature = "native-draw-capture"))]
+        if let Some(operation)=operation {self.finished_aux(false,|c,g|{
+            c.graph_aux_external_copy_written(g,&depth,&snapshot)?;c.graph_aux_end(g,operation)
+        });}
         self.world_depth_snapshots_this_present += 1;
         self.world_depth_before_ui.insert(id, (view,
             crate::world_frame::FrozenPreUiDepth::new_snapshot(snapshot), draws));
@@ -1543,9 +1568,22 @@ impl Gpu {
         if !ps.is_some_and(|p|crate::xr_hud::fragment_abi_supported(&p.text)){self.hud_reject("HUD fragment return ABI differs");return None;}
         if capture.images.is_none() {
             let source=capture.final_texture.clone();
+            #[cfg(all(target_os = "macos", feature = "native-draw-capture"))]
+            self.finished_aux(true,|_,_|Ok(()));
             self.end_pass();self.materialize_clears(id);
             let Some(images)=self.reserve_hud_images(&source)else{self.hud_reject("bounded HUD snapshot pool full");return None;};
+            #[cfg(all(target_os = "macos", feature = "native-draw-capture"))]
+            let operation=self.finished_aux(false,|c,g|{
+                c.graph_aux_register_texture(g,&images.world,"original_hud_world_snapshot")?;
+                c.graph_aux_begin_copy(g,&source,0,0,&images.world,0,0,[0,0,0],[0,0,0],[source.width(),source.height(),1])
+            }).flatten();
             self.encoder().copy_texture_to_texture(TexelCopyTextureInfo{texture:&source,mip_level:0,origin:Origin3d::ZERO,aspect:TextureAspect::All},TexelCopyTextureInfo{texture:&images.world,mip_level:0,origin:Origin3d::ZERO,aspect:TextureAspect::All},Extent3d{width:source.width(),height:source.height(),depth_or_array_layers:1});
+            #[cfg(all(target_os = "macos", feature = "native-draw-capture"))]
+            if let Some(operation)=operation {self.finished_aux(false,|c,g|{
+                c.graph_aux_external_copy_written(g,&source,&images.world)?;c.graph_aux_end(g,operation)?;
+                let source_id=c.finished_native_identity(g,&source)?;let world_id=c.finished_native_identity(g,&images.world)?;
+                c.finished_hud_world_copy(g,&source,source_id,&images.world,world_id)
+            });}
             let view=images.contribution.create_view(&TextureViewDescriptor::default());
             {let _clear=self.encoder().begin_render_pass(&RenderPassDescriptor{label:Some("Clear real HUD contribution"),color_attachments:&[Some(RenderPassColorAttachment{view:&view,depth_slice:None,resolve_target:None,ops:Operations{load:LoadOp::Clear(Color::TRANSPARENT),store:StoreOp::Store}})],depth_stencil_attachment:None,timestamp_writes:None,occlusion_query_set:None,multiview_mask:None});}
             self.hud_capture.as_mut().unwrap().images=Some(images);
@@ -2880,11 +2918,11 @@ impl Gpu {
         if self.texture_ledger_enabled() {
             for (i,load) in color_loads.iter().enumerate().take(8) {
                 if let (LoadOp::Clear(c),Some((_,format)))=(load,&colors[i]) {let r=self.s.rt[i].clone();
-                    self.texture_ledger_clear(r.tex,r.mip,r.slice,*format,texture_ledger::ClearValue::Color{bits:[c.r.to_bits(),c.g.to_bits(),c.b.to_bits(),c.a.to_bits()]});}
+                    self.finished_aux_clear(r.tex,r.mip,r.slice,*format,texture_ledger::ClearValue::Color{bits:[c.r.to_bits(),c.g.to_bits(),c.b.to_bits(),c.a.to_bits()]},false);}
             }
             if let Some((_,format))=&ds_att {if let Some(c)=ds_clear {
-                if !ro_d {if let Some(d)=c.depth{self.texture_ledger_clear(ds.tex,ds.mip,ds.slice,*format,texture_ledger::ClearValue::Depth{bits:d.to_bits()});}}
-                if !ro_s && has_stencil(*format) {if let Some(s)=c.stencil{self.texture_ledger_clear(ds.tex,ds.mip,ds.slice,*format,texture_ledger::ClearValue::Stencil{value:s});}}
+                if !ro_d {if let Some(d)=c.depth{self.finished_aux_clear(ds.tex,ds.mip,ds.slice,*format,texture_ledger::ClearValue::Depth{bits:d.to_bits()},false);}}
+                if !ro_s && has_stencil(*format) {if let Some(s)=c.stencil{self.finished_aux_clear(ds.tex,ds.mip,ds.slice,*format,texture_ledger::ClearValue::Stencil{value:s},false);}}
             }}
             self.texture_ledger_pass_start();
         }
@@ -2905,9 +2943,7 @@ impl Gpu {
         let code = if kind == "depth" {
             DEPTH_PROXY_WGSL
         } else {
-            "@group(0) @binding(0) var src: texture_2d<u32>;
-             @vertex fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4f { var p = array<vec2f, 3>(vec2f(-1, -1), vec2f(3, -1), vec2f(-1, 3)); return vec4f(p[i], 0, 1); }
-             @fragment fn fs(@builtin(position) pos: vec4f) -> @location(0) vec4<u32> { let s = textureLoad(src, vec2i(pos.xy), 0).x; return vec4<u32>(s, s, 0u, 1u); }"
+            STENCIL_PROXY_WGSL
         };
         let module = self.device.create_shader_module(ShaderModuleDescriptor { label: None, source: ShaderSource::Wgsl(code.into()) });
         let fmt = if kind == "depth" { TextureFormat::R32Float } else { STENCIL_PROXY };
@@ -2973,7 +3009,7 @@ impl Gpu {
         if passes.is_some() {
             self.texture_ledger_proxy(id,if stencil {"stencil"}else{"depth"},false);
             if let Some(mut capture)=self.draw_capture.take() {
-                if let Err(e)=capture.graph_before_proxy(self,id,stencil) {capture.reject_graph(&e);}
+                if let Err(e)=capture.finished_before_aux(self).and_then(|_|capture.graph_before_proxy(self,id,stencil)) {capture.reject_graph(&e);}
                 self.draw_capture=Some(capture);
             }
         }
@@ -3043,6 +3079,8 @@ impl Gpu {
         if px.dirty {
             px.dirty = false;
             let passes: Vec<_> = px.passes.iter().map(|(v, b)| (v.clone(), b.clone())).collect();
+            #[cfg(all(target_os = "macos", feature = "native-draw-capture"))]
+            self.finished_aux_reject("finished graph unsupported original float-to-depth proxy write");
             self.end_pass();
             let enc = self.encoder();
             for (dst, bg) in &passes {
@@ -4326,6 +4364,27 @@ impl Gpu {
         }
     }
 
+    #[cfg(all(target_os = "macos", feature = "native-draw-capture"))]
+    fn finished_aux<T>(&mut self, close:bool, action:impl FnOnce(&mut draw_capture::Capture,&mut Gpu)->Result<T,String>)->Option<T> {
+        let mut capture=self.draw_capture.take()?;
+        if !capture.captures_finished_graph(){self.draw_capture=Some(capture);return None;}
+        let result=if close {capture.finished_before_aux(self).and_then(|_|action(&mut capture,self))}
+            else {action(&mut capture,self)};
+        let value=match result {Ok(value)=>Some(value),Err(reason)=>{capture.reject_graph(&reason);None}};
+        self.draw_capture=Some(capture);value
+    }
+    #[cfg(all(target_os = "macos", feature = "native-draw-capture"))]
+    fn finished_aux_reject(&mut self,reason:&str) {
+        self.finished_aux(false,|capture,gpu|capture.graph_aux_unsupported(gpu,reason));
+    }
+    #[cfg(all(target_os = "macos", feature = "native-draw-capture"))]
+    fn finished_aux_clear(&mut self,id:u32,mip:u32,layer:u32,format:TextureFormat,value:texture_ledger::ClearValue,checkpoint:bool) {
+        let texture=self.tex(id).map(|t|t.tex.clone());
+        let token=texture.and_then(|t|self.finished_aux(false,|c,g|c.graph_aux_begin_clear(g,&t,mip,layer,format,value.clone())).flatten());
+        self.texture_ledger_clear(id,mip,layer,format,value);
+        if let Some(token)=token {self.finished_aux(false,|c,g|if checkpoint {c.graph_aux_end(g,token)}else{c.graph_aux_finish_clear_metadata(g,token)});}
+    }
+
     fn clear_view(&mut self, id: u32, mip: u32, slice: u32) -> Option<TextureView> {
         let t = self.tex(id)?;
         if t.desc.dim == TextureDimension::D3 {
@@ -4377,6 +4436,8 @@ impl Gpu {
         }
     }
     fn clear_rt_now(&mut self, id: u32, mip: u32, slice: u32, color: Color) {
+        #[cfg(all(target_os = "macos", feature = "native-draw-capture"))]
+        self.finished_aux(true,|_,_|Ok(()));
         if self.tex(id).is_none() { return; }
         self.end_pass();
         let Some(view) = self.clear_view(id, mip, slice) else { return };
@@ -4387,9 +4448,11 @@ impl Gpu {
             depth_stencil_attachment: None, timestamp_writes: None, occlusion_query_set: None, multiview_mask: None,
         });
         #[cfg(all(target_os = "macos", feature = "native-draw-capture"))]
-        if let Some(format)=self.tex(id).map(|t|t.format) {self.texture_ledger_clear(id,mip,slice,format,texture_ledger::ClearValue::Color{bits:[color.r.to_bits(),color.g.to_bits(),color.b.to_bits(),color.a.to_bits()]});}
+        if let Some(format)=self.tex(id).map(|t|t.format) {self.finished_aux_clear(id,mip,slice,format,texture_ledger::ClearValue::Color{bits:[color.r.to_bits(),color.g.to_bits(),color.b.to_bits(),color.a.to_bits()]},true);}
     }
     fn clear_ds_now(&mut self, id: u32, mip: u32, slice: u32, depth: Option<f32>, stencil: Option<u32>) {
+        #[cfg(all(target_os = "macos", feature = "native-draw-capture"))]
+        self.finished_aux(true,|_,_|Ok(()));
         let Some(fmt) = self.tex(id).map(|t| t.format) else { return };
         if depth.is_some() && mip == 0 && slice == 0 { self.invalidate_world_depth_inner(id, serde_json::json!("clear_ds_now"), WorldDepthChange::LiveClear); }
         self.end_pass();
@@ -4406,13 +4469,15 @@ impl Gpu {
         });
         #[cfg(all(target_os = "macos", feature = "native-draw-capture"))]
         {
-            if let Some(d)=depth{self.texture_ledger_clear(id,mip,slice,fmt,texture_ledger::ClearValue::Depth{bits:d.to_bits()});}
-            if has_stencil(fmt){if let Some(s)=stencil{self.texture_ledger_clear(id,mip,slice,fmt,texture_ledger::ClearValue::Stencil{value:s});}}
+            if let Some(d)=depth{self.finished_aux_clear(id,mip,slice,fmt,texture_ledger::ClearValue::Depth{bits:d.to_bits()},true);}
+            if has_stencil(fmt){if let Some(s)=stencil{self.finished_aux_clear(id,mip,slice,fmt,texture_ledger::ClearValue::Stencil{value:s},true);}}
         }
         // The invalidation above can have refreshed the proxy before this clear.
         self.mark_depth_dirty(id);
     }
     fn clear_uav(&mut self, id: u32, values: [u32; 4]) {
+        #[cfg(all(target_os = "macos", feature = "native-draw-capture"))]
+        self.finished_aux_reject("finished graph unsupported actual clear UAV writer");
         let Some((res, is_buf, a)) = self.view_obj(id).map(|v| (v.res, v.is_buf, v.a)) else { return };
         let zero = values.iter().all(|&v| v == 0);
         if is_buf {
@@ -4480,10 +4545,16 @@ impl Gpu {
     }
     #[allow(clippy::too_many_arguments)]
     fn copy_region(&mut self, dst: u32, dst_sub: u32, dx: u32, dy: u32, dz: u32, src: u32, src_sub: u32, has_box: bool, l: u32, t: u32, f: u32, r: u32, b: u32, bk: u32) {
+        #[cfg(all(target_os = "macos", feature = "native-draw-capture"))]
+        self.finished_aux(true,|_,_|Ok(()));
         self.materialize_clears(src);
         self.materialize_clears(dst);
         if self.obj(src).is_none() || self.obj(dst).is_none() { return; }
         self.end_pass();
+        if self.buf(src).is_some() && self.buf(dst).is_some() {
+            #[cfg(all(target_os = "macos", feature = "native-draw-capture"))]
+            self.finished_aux_reject("finished graph unsupported original buffer copy");
+        }
         if let (Some(sb), Some(db)) = (self.buf(src), self.buf(dst)) {
             let (Some(sg), Some(dg)) = (sb.gpu.clone(), db.gpu.clone()) else { return };
             let size = if has_box { (r - l) as u64 } else { sb.size.min(db.size) };
@@ -4502,6 +4573,10 @@ impl Gpu {
         let d3 = d.desc.dim == TextureDimension::D3;
         let (stex, dtex, sf, df) = (s.tex.clone(), d.tex.clone(), s.format, d.format);
         self.invalidate_world_depth(dst, serde_json::json!("copy_region"));
+        #[cfg(all(target_os = "macos", feature = "native-draw-capture"))]
+        let operation=self.finished_aux(false,|c,g|c.graph_aux_begin_copy(g,&stex,ss.0,ss.1,&dtex,ds.0,ds.1,
+            [if has_box{l}else{0},if has_box{t}else{0},if three{if has_box{f}else{0}}else{0}],
+            [dx,dy,if d3{dz}else{0}],[w,h,if three{dep}else{1}])).flatten();
         if sf != df && !three && !d3 && (block_bytes(sf) != 0) != (block_bytes(df) != 0) && block_bytes(sf).max(block_bytes(df)) == texel_bytes(sf).max(texel_bytes(df)) {
             let bytes = block_bytes(sf).max(block_bytes(df));
             let s_bc = block_bytes(sf) != 0;
@@ -4533,12 +4608,16 @@ impl Gpu {
         }
         #[cfg(all(target_os = "macos", feature = "native-draw-capture"))]
         self.texture_ledger_copy(dst,src,Some((ds.0,if d3 {0}else{ds.1})),Some((ss.0,if three {0}else{ss.1})),false,"copy_region");
+        #[cfg(all(target_os = "macos", feature = "native-draw-capture"))]
+        if let Some(operation)=operation {self.finished_aux(false,|c,g|c.graph_aux_end(g,operation));}
         self.mark_depth_dirty(dst);
         self.mark_color_dirty(dst);
         self.use_tex(src);
         self.use_tex(dst);
     }
     fn copy_resource(&mut self, dst: u32, src: u32) {
+        #[cfg(all(target_os = "macos", feature = "native-draw-capture"))]
+        self.finished_aux(true,|_,_|Ok(()));
         self.materialize_clears(src);
         self.materialize_clears(dst);
         if self.buf(src).is_some() { self.copy_region(dst, 0, 0, 0, 0, src, 0, false, 0, 0, 0, 0, 0, 0); return; }
@@ -4546,6 +4625,17 @@ impl Gpu {
         let (stex, dtex, sd, dd) = (s.tex.clone(), d.tex.clone(), s.desc, d.desc);
         self.invalidate_world_depth(dst, serde_json::json!("copy_resource"));
         self.end_pass();
+        #[cfg(all(target_os = "macos", feature = "native-draw-capture"))]
+        let operations=self.finished_aux(false,|c,g|{
+            let mut operations=Vec::new();
+            for mip in 0..sd.mips.min(dd.mips) {
+                if sd.dim!=TextureDimension::D2 || dd.dim!=TextureDimension::D2 {return Err("finished copy_resource requires native D2 arrays".into());}
+                for layer in 0..sd.d {
+                    if let Some(token)=c.graph_aux_begin_copy(g,&stex,mip,layer,&dtex,mip,layer,[0,0,0],[0,0,0],[(sd.w>>mip).max(1),(sd.h>>mip).max(1),1])? {operations.push(token);}
+                }
+            }
+            Ok(operations)
+        }).unwrap_or_default();
         let enc = self.encoder();
         for mip in 0..sd.mips.min(dd.mips) {
             let (w, h) = ((sd.w >> mip).max(1), (sd.h >> mip).max(1));
@@ -4563,12 +4653,16 @@ impl Gpu {
                 && (sd.dim!=TextureDimension::D3 || dd.dim==TextureDimension::D3 && (sd.d>>mip).max(1)==(dd.d>>mip).max(1));
             for layer in 0..source_layers {self.texture_ledger_copy(dst,src,Some((mip,layer)),Some((mip,layer)),whole,"copy_resource");}
         }
+        #[cfg(all(target_os = "macos", feature = "native-draw-capture"))]
+        for operation in operations {self.finished_aux(false,|c,g|c.graph_aux_end(g,operation));}
         self.mark_depth_dirty(dst);
         self.mark_color_dirty(dst);
         self.use_tex(src);
         self.use_tex(dst);
     }
     fn resolve(&mut self, dst: u32, dst_sub: u32, src: u32, src_sub: u32) {
+        #[cfg(all(target_os = "macos", feature = "native-draw-capture"))]
+        self.finished_aux_reject("finished graph unsupported native MSAA resolve/source discard");
         self.foreground_foreign_write(dst, "resolve_destination");
         self.materialize_clears(src);
         self.materialize_clears(dst);
@@ -4590,6 +4684,8 @@ impl Gpu {
     }
 
     fn generate_mips(&mut self, srv_id: u32) {
+        #[cfg(all(target_os = "macos", feature = "native-draw-capture"))]
+        self.finished_aux(true,|_,_|Ok(()));
         let Some(res) = self.view_obj(srv_id).map(|v| v.res) else { return };
         self.materialize_clears(res);
         let Some((fmt, desc, tex)) = self.tex(res).map(|t| (t.format, t.desc, t.tex.clone())) else { return };
@@ -4598,13 +4694,7 @@ impl Gpu {
         self.end_pass();
         if !self.mip_pipelines.contains_key(&fmt) {
             let module = self.device.create_shader_module(ShaderModuleDescriptor { label: None, source: ShaderSource::Wgsl(
-                "@group(0) @binding(0) var src: texture_2d<f32>;
-                 @group(0) @binding(1) var smp: sampler;
-                 @vertex fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4f { var p = array<vec2f, 3>(vec2f(-1, -1), vec2f(3, -1), vec2f(-1, 3)); return vec4f(p[i], 0, 1); }
-                 @fragment fn fs(@builtin(position) pos: vec4f) -> @location(0) vec4f {
-                   let dst = max(vec2f(1.0), floor(vec2f(textureDimensions(src, 0)) * 0.5));
-                   return textureSampleLevel(src, smp, pos.xy / dst, 0.0);
-                 }".into()) });
+                MIPMAP_WGSL.into()) });
             let pl = self.simple_pipeline(&module, Some(fmt), None);
             self.mip_pipelines.insert(fmt, pl);
         }
@@ -4626,24 +4716,37 @@ impl Gpu {
             t.mip_passes = Some(passes);
         }
         let passes = t.mip_passes.clone().unwrap();
-        let enc = self.encoder();
-        for (dst, bg) in &passes {
-            let mut p = enc.begin_render_pass(&RenderPassDescriptor {
-                label: None,
-                color_attachments: &[Some(RenderPassColorAttachment { view: dst, depth_slice: None, resolve_target: None, ops: Operations { load: LoadOp::Clear(Color::BLACK), store: StoreOp::Store } })],
-                depth_stencil_attachment: None, timestamp_writes: None, occlusion_query_set: None, multiview_mask: None,
-            });
-            p.set_pipeline(&pl);
-            p.set_bind_group(0, bg, &[]);
-            p.draw(0..3, 0..1);
+        for (index,(dst,bg)) in passes.iter().enumerate() {
+            #[cfg(all(target_os = "macos", feature = "native-draw-capture"))]
+            let (layer,mip)=((index as u32)/(desc.mips-1),(index as u32)%(desc.mips-1)+1);
+            #[cfg(not(all(target_os = "macos", feature = "native-draw-capture")))]
+            let _=index;
+            #[cfg(all(target_os = "macos", feature = "native-draw-capture"))]
+            let operation=self.finished_aux(false,|c,g|c.graph_aux_begin_mip(g,&tex,layer,mip-1,mip)).flatten();
+            {
+                let enc=self.encoder();
+                let mut p = enc.begin_render_pass(&RenderPassDescriptor {
+                    label: None,
+                    color_attachments: &[Some(RenderPassColorAttachment { view: dst, depth_slice: None, resolve_target: None, ops: Operations { load: LoadOp::Clear(Color::BLACK), store: StoreOp::Store } })],
+                    depth_stencil_attachment: None, timestamp_writes: None, occlusion_query_set: None, multiview_mask: None,
+                });
+                p.set_pipeline(&pl);
+                p.set_bind_group(0, bg, &[]);
+                p.draw(0..3, 0..1);
+            }
+            #[cfg(all(target_os = "macos", feature = "native-draw-capture"))]
+            {
+                self.texture_ledger_copy(res,res,Some((mip,layer)),Some((mip-1,layer)),true,"generate_mips");
+                if let Some(operation)=operation {self.finished_aux(false,|c,g|c.graph_aux_end(g,operation));}
+            }
         }
-        #[cfg(all(target_os = "macos", feature = "native-draw-capture"))]
-        for mip in 1..desc.mips {self.texture_ledger_write(res,Some(mip),None,"generate_mips");}
         self.use_tex(res);
         self.mark_color_dirty(res);
     }
 
     fn readback(&mut self, p: u64) {
+        #[cfg(all(target_os = "macos", feature = "native-draw-capture"))]
+        self.finished_aux(true,|_,_|Ok(()));
         let mb = self.base;
         let u = move |w: u64| unsafe { std::ptr::read_volatile(mb.add(((p + w) * 4) as usize) as *const u32) };
         let (src, sub, has_box) = (u(0), u(1), u(2) != 0);
@@ -4653,8 +4756,14 @@ impl Gpu {
         let flag = u(15) as u64 + u(16) as u64 * 4294967296;
         self.materialize_clears(src);
         let done = |me: &Self| { if flag != 0 { atomic(&me.mem, flag).store(0, Ordering::SeqCst); let _ = me.mem.atomic_notify(flag, u32::MAX); } };
-        if self.obj(src).is_none() { done(self); return; }
+        if self.obj(src).is_none() {
+            #[cfg(all(target_os = "macos", feature = "native-draw-capture"))]
+            self.finished_aux_reject("finished graph readback has no original native source");
+            done(self); return;
+        }
         if is_buf {
+            #[cfg(all(target_os = "macos", feature = "native-draw-capture"))]
+            self.finished_aux_reject("finished graph unsupported original buffer readback");
             let Some((g, bsize)) = self.buf(src).and_then(|bo| bo.gpu.clone().map(|g| (g, bo.size))) else { done(self); return };
             let n = if has_box { (r - l) as u64 } else { size.min(bsize) };
             let padded = ((n + 3) & !3).max(4);
@@ -4668,15 +4777,24 @@ impl Gpu {
             self.map_pending(rb, MapKind::Readback { flag, rows });
             return;
         }
-        let Some((tex, fmt, desc, decoded)) = self.tex(src).map(|x| (x.tex.clone(), x.format, x.desc, x.bc_source)) else { done(self); return };
+        let Some((tex, fmt, desc, decoded)) = self.tex(src).map(|x| (x.tex.clone(), x.format, x.desc, x.bc_source)) else {
+            #[cfg(all(target_os = "macos", feature = "native-draw-capture"))]
+            self.finished_aux_reject("finished graph texture readback has no actual texture source");
+            done(self); return
+        };
         if let Some(source) = decoded {
+            #[cfg(all(target_os = "macos", feature = "native-draw-capture"))]
+            self.finished_aux_reject("finished graph decoded BC readback original no-op is not modelled");
             // The guest destination is laid out in BC blocks, but this device
             // holds the texture as decoded RGBA: different row count and pitch.
             log_once(&format!("rbbc{source:?}"), &format!("readback of software-decoded {source:?} texture skipped; the guest destination is not written"));
             done(self);
             return;
         }
-        if desc.samples > 1 || is_depth(fmt) { log_once(&format!("rbfmt{fmt:?}"), &format!("readback of {fmt:?} not supported")); done(self); return; }
+        if desc.samples > 1 || is_depth(fmt) {
+            #[cfg(all(target_os = "macos", feature = "native-draw-capture"))]
+            self.finished_aux_reject("finished graph depth/MSAA readback original no-op is not modelled");
+            log_once(&format!("rbfmt{fmt:?}"), &format!("readback of {fmt:?} not supported")); done(self); return; }
         let (mip, layer) = (sub % desc.mips, sub / desc.mips);
         let (mw, mh) = ((desc.w >> mip).max(1), (desc.h >> mip).max(1));
         let three = desc.dim == TextureDimension::D3;
@@ -4689,6 +4807,15 @@ impl Gpu {
         let row_bytes = (bx * bytes) as u64;
         let bpr = row_bytes.div_ceil(256) * 256;
         let rb_size = bpr * by as u64 * d as u64;
+        #[cfg(all(target_os = "macos", feature = "native-draw-capture"))]
+        {
+            let end=row_pitch.checked_mul(by.saturating_sub(1) as u64).and_then(|n|n.checked_add(row_bytes));
+            if three || d!=1 || bw!=1 || bh!=1 || by==0 || end.is_none_or(|n|n>size || addr.checked_add(n).is_none_or(|a|a>self.mem.data_size() as u64)) {
+                self.finished_aux_reject("finished graph readback unsupported shape or actual guest row truncation");
+            } else {
+                self.finished_aux(false,|c,g|c.graph_aux_readback(g,&tex,mip,layer,[x0,y0,0],[w,h,1],row_bytes as u32,by,row_pitch as u32,slice_pitch as u32,size));
+            }
+        }
         let rb = self.device.create_buffer(&BufferDescriptor { label: Some("readback"), size: rb_size.max(4), usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ, mapped_at_creation: false });
         self.end_pass();
         self.encoder().copy_texture_to_buffer(
@@ -4777,17 +4904,27 @@ impl Gpu {
         let Some(q) = self.occlusion_active else { return };
         if !matches!(self.obj(q), Some(Obj::Query(_))) { self.end_active_occlusion(); return; }
         if self.pass.is_none() || self.occlusion_pass_slot.is_some() { return; }
+        #[cfg(all(target_os = "macos", feature = "native-draw-capture"))]
+        self.finished_aux(false,|c,g|c.graph_aux_query_capacity(g));
         if self.occlusion_next >= OCCLUSION_CAPACITY { log_once("qfull", "occlusion query set exhausted"); return; }
         let slot = self.occlusion_next;
         self.occlusion_next += 1;
         if let Some(Obj::Query(qo)) = self.obj_mut(q) { qo.slots.push(slot); }
         self.pass.as_mut().unwrap().begin_occlusion_query(slot);
         self.occlusion_pass_slot = Some(slot);
+        #[cfg(all(target_os = "macos", feature = "native-draw-capture"))]
+        if let Some((life,qtype))=match self.obj(q){Some(Obj::Query(q))=>Some((q.life.clone(),q.qtype)),_=>None}{
+            self.finished_aux(false,|c,g|c.graph_aux_query(g,&life,qtype,"pass_slot",0,&[slot]));
+        }
     }
     fn begin_query(&mut self, id: u32) {
         let Some(Obj::Query(q)) = self.obj_mut(id) else { return };
         if !Self::is_occlusion(q.qtype) { return; }
         q.slots.clear();
+        #[cfg(all(target_os = "macos", feature = "native-draw-capture"))]
+        let query=(q.life.clone(),q.qtype);
+        #[cfg(all(target_os = "macos", feature = "native-draw-capture"))]
+        self.finished_aux(false,|c,g|c.graph_aux_query(g,&query.0,query.1,"begin",0,&[]));
         self.occlusion_active = Some(id);
         self.begin_occlusion_in_pass();
     }
@@ -4797,8 +4934,12 @@ impl Gpu {
         if Self::is_occlusion(qtype) {
             if self.occlusion_active == Some(id) { self.end_active_occlusion(); }
             let slots = match self.obj_mut(id) { Some(Obj::Query(q)) => std::mem::take(&mut q.slots), _ => vec![] };
+            #[cfg(all(target_os = "macos", feature = "native-draw-capture"))]
+            self.finished_aux(false,|c,g|c.graph_aux_query(g,&life,qtype,"end",seq,&slots));
             self.pending_resolve.push((life, seq, slots));
         } else {
+            #[cfg(all(target_os = "macos", feature = "native-draw-capture"))]
+            self.finished_aux(false,|c,g|c.graph_aux_query(g,&life,qtype,"end",seq,&[]));
             let t = Instant::now().duration_since(*START).as_nanos() as u64;
             self.pending_events.push((life, seq, if qtype == 2 { t } else { 1 }));
         }
@@ -4808,6 +4949,12 @@ impl Gpu {
         let mut layout = Vec::new();
         let mut bytes = 0u64;
         for (life, seq, slots) in list {
+            #[cfg(all(target_os = "macos", feature = "native-draw-capture"))]
+            {
+                let qtype=self.objs.iter().flatten().find_map(|o|match o{Obj::Query(q)if Arc::ptr_eq(&q.life,&life)=>Some(q.qtype),_=>None});
+                if let Some(qtype)=qtype{self.finished_aux(false,|c,g|c.graph_aux_query(g,&life,qtype,"resolve",seq,&slots));}
+                else if life.is_live(){self.finished_aux_reject("finished graph resolving query lifetime without actual type");}
+            }
             if !life.is_live() { continue; }
             if slots.is_empty() { life.complete(&self.mem, 0, seq); continue; }
             let consecutive = slots.windows(2).all(|w| w[1] == w[0] + 1);
@@ -5030,6 +5177,8 @@ impl Gpu {
         }
         let Some(view) = present_view.filter(|view| view.headset_applied) else { return; };
         let Some(original_color) = self.tex(color_id).map(|t| t.tex.clone()) else { return; };
+        #[cfg(all(target_os = "macos", feature = "native-draw-capture"))]
+        let captured_hud_draw_count=hud_capture.as_ref().map_or(0,|c|c.draws);
         let hud=match hud_capture {
             Some(capture) if capture.final_id==color_id && capture.final_texture==original_color
                 && capture.rejected.is_none() && capture.draws>0
@@ -5113,6 +5262,24 @@ impl Gpu {
             game_from_stage: view.game_from_stage, depth_near: near, depth_far: far,
             ..Default::default()
         };
+        #[cfg(all(target_os = "macos", feature = "native-draw-capture"))]
+        let publication_capture=if let Some(mut capture)=self.draw_capture.take(){
+            let token=if capture.captures_finished_publication(){
+                let result=(||->Result<_,String>{
+                    let images=hud.as_ref().ok_or("finished publication has no qualified HUD world")?;
+                    let color_native=capture.finished_native_identity(self,&color)?;
+                    let world_native=capture.finished_native_identity(self,&images.world)?;
+                    let depth_native=capture.finished_native_identity(self,&depth)?;
+                    capture.finished_publication(self,&color,color_native,&images.world,world_native,&depth,depth_native,view,captured_hud_draw_count)
+                })();
+                match result{Ok(token)=>token,Err(reason)=>{capture.reject_graph(&reason);None}}
+            }else{None};
+            self.draw_capture=Some(capture);token
+        }else{None};
+        #[cfg(all(target_os = "macos", feature = "native-draw-capture"))]
+        crate::world_frame::publish_with_hud_and_optics_captured(&self.device,&self.queue,&color,
+            &depth,frozen_depth,frame,view.provenance_epoch,hud,view.camera_sequence,view.optics,publication_capture);
+        #[cfg(not(all(target_os = "macos", feature = "native-draw-capture")))]
         crate::world_frame::publish_with_hud_and_optics(&self.device, &self.queue, &color,
             &depth, frozen_depth, frame, view.provenance_epoch,hud,view.camera_sequence,view.optics);
     }

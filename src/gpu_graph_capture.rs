@@ -9,6 +9,7 @@ const MAX_EVENTS: u64 = 1 << 20;
 
 #[derive(Default)]
 pub(super) struct GraphState {
+    pub(super) aux: graph_operations::AuxState,
     pub(super) stages: Vec<Pending>,
     pub(super) operations: Vec<Value>,
     pub(super) present: Option<u64>,
@@ -20,6 +21,34 @@ pub(super) struct GraphState {
     pub(super) proxy_bytes: u64,
     pub(super) capture_id: String,
     proxy_parents: Option<(Texture, Texture)>,
+}
+
+fn proxy_contract(kind: CaptureKind, stencil: bool) -> Result<(Aspect, TextureFormat), String> {
+    if stencil {
+        if kind != CaptureKind::Finished {
+            return Err("graph stencil proxy requires explicit Finished capture mode".into());
+        }
+        Ok((Aspect::Stencil, TextureFormat::Rg8Uint))
+    } else {
+        Ok((Aspect::Depth, TextureFormat::R32Float))
+    }
+}
+fn proxy_source_format(aspect: Aspect, format: TextureFormat) -> bool {
+    match aspect {
+        Aspect::Depth => matches!(
+            format,
+            TextureFormat::Depth32Float | TextureFormat::Depth32FloatStencil8
+        ),
+        Aspect::Stencil => format == TextureFormat::Depth32FloatStencil8,
+        Aspect::Color => false,
+    }
+}
+fn proxy_completion_kind(stencil: bool, aspect: Aspect, operation: &Value) -> bool {
+    if stencil {
+        aspect == Aspect::Stencil && operation["operation_kind"] == "stencil_to_color"
+    } else {
+        aspect == Aspect::Depth && operation.get("operation_kind").is_none()
+    }
 }
 
 fn anchor_matches(
@@ -106,12 +135,18 @@ impl Capture {
             .presents
             .checked_add(1)
             .ok_or("graph present overflow")?;
-        anchor_matches(
-            self.graph.anchor.as_ref(),
-            self.graph.present,
-            view,
-            present,
-        )?;
+        if self.kind == CaptureKind::Finished && self.graph.anchor.is_some() {
+            if self.graph.present != Some(present) {
+                return Err("finished graph crossed original present".into());
+            }
+        } else {
+            anchor_matches(
+                self.graph.anchor.as_ref(),
+                self.graph.present,
+                view,
+                present,
+            )?;
+        }
         if self.graph.anchor.is_none() {
             let pass = gpu.pass_info.as_ref().ok_or("graph main pass absent")?;
             if pass.rt_formats != vec![Some(TextureFormat::Bgra8Unorm); 4]
@@ -127,19 +162,26 @@ impl Capture {
         Ok(())
     }
     pub(super) fn graph_retain_stage(&mut self, mut p: Pending) -> Result<(), String> {
-        if self.graph.stages.len() >= MAX_STAGES
+        if self.graph.stages.len()
+            >= if self.kind == CaptureKind::Finished {
+                1024
+            } else {
+                MAX_STAGES
+            }
             || p.kind != CaptureKind::TargetSpan
             || !p.finished
             || p.draws.is_empty()
         {
             return Err("graph requires a bounded complete raster stage".into());
         }
-        anchor_matches(
-            self.graph.anchor.as_ref(),
-            self.graph.present,
-            &p.view,
-            self.graph.present.ok_or("graph present absent")?,
-        )?;
+        if self.kind != CaptureKind::Finished {
+            anchor_matches(
+                self.graph.anchor.as_ref(),
+                self.graph.present,
+                &p.view,
+                self.graph.present.ok_or("graph present absent")?,
+            )?;
+        }
         let checkpoint = p
             .alias
             .as_ref()
@@ -179,50 +221,91 @@ impl Capture {
     ) -> Result<(), String> {
         // Pre-anchor helper outputs remain ordinary immutable external inputs.
         // Once a complete main interval exists, every dirty proxy is an edge.
-        if self.kind != CaptureKind::Graph || self.done || self.graph.stages.is_empty() {
+        if !self.kind.is_graph()
+            || self.done
+            || (self.kind == CaptureKind::Finished
+                && (self.graph.anchor.is_none() || self.finished.postlude))
+            || (self.kind == CaptureKind::Graph && self.graph.stages.is_empty())
+        {
             return Ok(());
         }
-        if stencil
-            || self.graph.operations.len() >= MAX_PROXIES
-            || self.graph.proxy_pending.is_some()
-            || self
-                .pending
-                .as_ref()
-                .is_some_and(|p| p.kind != CaptureKind::TargetSpan || p.finished)
-            || self.graph.present != gpu.presents.checked_add(1)
-            || gpu.errors.load(Ordering::SeqCst) != 0
-            || gpu.occlusion_active.is_some()
-            || gpu.occlusion_pass_slot.is_some()
-            || !gpu.pending_resolve.is_empty()
-        {
-            return Err(
-                "graph dirty proxy has unsupported kind, stage, present, or query state".into(),
-            );
+        let (source_aspect, destination_format) = proxy_contract(self.kind, stencil)?;
+        let limit = if self.kind == CaptureKind::Finished {
+            1024
+        } else {
+            MAX_PROXIES
+        };
+        if self.graph.operations.len() >= limit {
+            return Err(format!(
+                "graph proxy operation bound: stencil={stencil}, count={}, limit={limit}",
+                self.graph.operations.len()
+            ));
         }
-        let native = gpu.tex(id).ok_or("graph depth source allocation absent")?;
-        let proxy = native
-            .proxy_depth
+        if self.graph.proxy_pending.is_some() {
+            return Err(format!(
+                "graph proxy overlaps unfinished helper: stencil={stencil}"
+            ));
+        }
+        if let Some(p) = self
+            .pending
             .as_ref()
-            .ok_or("graph actual depth proxy absent")?;
+            .filter(|p| p.kind != CaptureKind::TargetSpan || p.finished)
+        {
+            return Err(format!(
+                "graph proxy pending interval unsupported: stencil={stencil}, kind={:?}, finished={}",
+                p.kind, p.finished
+            ));
+        }
+        if self.graph.present != gpu.presents.checked_add(1) {
+            return Err(format!(
+                "graph proxy native present mismatch: stencil={stencil}, retained={:?}, current={:?}",
+                self.graph.present,
+                gpu.presents.checked_add(1)
+            ));
+        }
+        if gpu.errors.load(Ordering::SeqCst) != 0 {
+            return Err(format!(
+                "graph proxy follows GPU validation error: stencil={stencil}, errors={}",
+                gpu.errors.load(Ordering::SeqCst)
+            ));
+        }
+        if self.kind != CaptureKind::Finished
+            && (gpu.occlusion_active.is_some()
+                || gpu.occlusion_pass_slot.is_some()
+                || !gpu.pending_resolve.is_empty())
+        {
+            return Err(format!(
+                "graph proxy query state unsupported: stencil={stencil}, active={}, pass_slot={}, pending_resolves={}",
+                gpu.occlusion_active.is_some(),
+                gpu.occlusion_pass_slot.is_some(),
+                gpu.pending_resolve.len()
+            ));
+        }
+        let native = gpu.tex(id).ok_or("graph proxy source allocation absent")?;
+        let proxy = if stencil {
+            native.proxy_stencil.as_ref()
+        } else {
+            native.proxy_depth.as_ref()
+        }
+        .ok_or("graph actual selected proxy absent")?;
         let source = &native.tex;
         let destination = &proxy.tex;
         if source == destination
             || source.dimension() != TextureDimension::D2
-            || !matches!(
-                source.format(),
-                TextureFormat::Depth32Float | TextureFormat::Depth32FloatStencil8
-            )
+            || !proxy_source_format(source_aspect, source.format())
             || destination.dimension() != TextureDimension::D2
-            || destination.format() != TextureFormat::R32Float
+            || destination.format() != destination_format
             || [source, destination].iter().any(|t| {
                 t.sample_count() != 1 || t.mip_level_count() != 1 || t.depth_or_array_layers() != 1
             })
             || source.width() != destination.width()
             || source.height() != destination.height()
         {
-            return Err(
-                "graph proxy requires exact single-mip/layer D2 Float32 depth to R32Float".into(),
-            );
+            return Err(format!(
+                "graph proxy unsupported selected layout: stencil={stencil}, source={}, destination={}",
+                descriptor(source),
+                descriptor(destination)
+            ));
         }
         let ledger = self
             .texture_ledger
@@ -249,10 +332,10 @@ impl Capture {
                 Subresource {
                     mip: 0,
                     layer: 0,
-                    aspect: Aspect::Depth,
+                    aspect: source_aspect,
                 },
             )
-            .ok_or("graph source depth version absent")?;
+            .ok_or("graph selected source aspect version absent")?;
         let before = ledger
             .current(
                 destination_id,
@@ -263,19 +346,21 @@ impl Capture {
                 },
             )
             .ok_or("graph proxy before version absent")?;
-        if !self.graph.stages.iter().any(|stage| {
-            stage
-                .attachments
-                .iter()
-                .any(|a| a["final_version"] == json!(source_version))
-        }) {
+        if self.kind != CaptureKind::Finished
+            && !self.graph.stages.iter().any(|stage| {
+                stage
+                    .attachments
+                    .iter()
+                    .any(|a| a["final_version"] == json!(source_version))
+            })
+        {
             return Err("graph proxy source is not an actual closed raster output".into());
         }
         let source_blob = self
             .span
             .texture_blobs
             .get(&ref_key(source_version))
-            .ok_or("graph proxy depth source has no earlier exact snapshot")?
+            .ok_or("graph selected proxy source has no earlier exact snapshot")?
             .clone();
         let index = self.graph_next_event();
         if index >= MAX_EVENTS {
@@ -290,10 +375,14 @@ impl Capture {
             TextureAspect::All,
         )?;
         let reserved = self.pending.as_ref().map_or(0, |p| p.final_bytes);
-        if !reservation_fits(self.live_bytes.load(Ordering::SeqCst), plan.bytes, reserved) {
+        if !self.reserve_fits(self.live_bytes.load(Ordering::SeqCst), plan.bytes, reserved) {
             return Err("graph proxy checkpoint exceeds aggregate live snapshot bound".into());
         }
-        let shader = super::super::DEPTH_PROXY_WGSL;
+        let shader = if stencil {
+            super::super::STENCIL_PROXY_WGSL
+        } else {
+            super::super::DEPTH_PROXY_WGSL
+        };
         self.graph.proxy_pending = Some(
             json!({"event_index":index,"command_sequence":self.sequence,
             "source":source_version,"before":before,"source_descriptor":descriptor(source),
@@ -301,6 +390,10 @@ impl Capture {
             "shader":{"wgsl":shader,"sha256":sha(shader.as_bytes()),"vertex_entry":"vs","fragment_entry":"fs","compilation_options":"wgpu default"},
             "clear_rgba_bits":[0u64,0,0,1.0f64.to_bits()],"vertices":3,"instances":1}),
         );
+        if stencil {
+            self.graph.proxy_pending.as_mut().unwrap()["operation_kind"] =
+                "stencil_to_color".into();
+        }
         self.graph.proxy_parents = Some((source.clone(), destination.clone()));
         Ok(())
     }
@@ -310,7 +403,7 @@ impl Capture {
         id: u32,
         stencil: bool,
     ) -> Result<(), String> {
-        if self.kind != CaptureKind::Graph || self.done {
+        if !self.kind.is_graph() || self.done || self.finished.postlude {
             return Ok(());
         }
         let Some(mut operation) = self.graph.proxy_pending.take() else {
@@ -321,17 +414,25 @@ impl Capture {
             .proxy_parents
             .take()
             .ok_or("graph retained proxy parents absent")?;
-        if stencil || self.graph.present != gpu.presents.checked_add(1) {
+        let (source_aspect, _) = proxy_contract(self.kind, stencil)?;
+        if self.graph.present != gpu.presents.checked_add(1) {
             return Err("graph proxy completion changed scope".into());
         }
         let native = gpu
             .tex(id)
             .ok_or("graph depth source replaced during proxy")?;
-        let proxy = native
-            .proxy_depth
-            .as_ref()
-            .ok_or("graph depth proxy replaced")?;
+        let proxy = if stencil {
+            native.proxy_stencil.as_ref()
+        } else {
+            native.proxy_depth.as_ref()
+        }
+        .ok_or("graph actual selected proxy replaced")?;
         let source_version = reference(&operation, "source")?;
+        if !proxy_completion_kind(stencil, source_version.subresource.aspect, &operation)
+            || source_version.subresource.aspect != source_aspect
+        {
+            return Err("graph proxy kind/aspect changed between original hooks".into());
+        }
         let before = reference(&operation, "before")?;
         if native.tex != source
             || proxy.tex != destination
@@ -362,12 +463,19 @@ impl Capture {
         let plan =
             target_span::subresource_plan(blob.clone(), &destination, 0, 0, TextureAspect::All)?;
         let reserved = self.pending.as_ref().map_or(0, |p| p.final_bytes);
-        if !reservation_fits(self.live_bytes.load(Ordering::SeqCst), plan.bytes, reserved) {
+        if !self.reserve_fits(self.live_bytes.load(Ordering::SeqCst), plan.bytes, reserved) {
             return Err("graph proxy checkpoint exceeded live snapshot bound".into());
         }
         let bytes = plan.bytes;
-        let proxy_bytes = add(self.graph.proxy_bytes, bytes)?;
-        let epoch_bytes = add(self.epoch_bytes, bytes)?;
+        let proxy_bytes = if self.kind == CaptureKind::Finished {
+            self.graph
+                .proxy_bytes
+                .checked_add(bytes)
+                .ok_or("finished proxy byte overflow")?
+        } else {
+            add(self.graph.proxy_bytes, bytes)?
+        };
+        let epoch_bytes = self.add_epoch_bytes(bytes)?;
         operation["after"] = json!(after);
         let readbacks = self.enqueue_span(gpu, vec![plan]);
         self.graph.proxy_readbacks.extend(readbacks);
@@ -388,9 +496,10 @@ impl Capture {
             || self.graph.proxy_pending.is_some()
             || self.graph.present != gpu.presents.checked_add(1)
             || gpu.errors.load(Ordering::SeqCst) != 0
-            || gpu.occlusion_active.is_some()
-            || gpu.occlusion_pass_slot.is_some()
-            || !gpu.pending_resolve.is_empty()
+            || (self.kind != CaptureKind::Finished
+                && (gpu.occlusion_active.is_some()
+                    || gpu.occlusion_pass_slot.is_some()
+                    || !gpu.pending_resolve.is_empty()))
         {
             return Err("graph completion lacks closed original raster/proxy stages".into());
         }
@@ -550,6 +659,50 @@ impl Capture {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn stencil_proxy_is_finished_only_and_preserves_two_integer_channels() {
+        for kind in [
+            CaptureKind::TwoDraw,
+            CaptureKind::ColorNull,
+            CaptureKind::TargetSpan,
+            CaptureKind::Compute,
+            CaptureKind::Graph,
+        ] {
+            assert!(proxy_contract(kind, true).is_err());
+        }
+        assert_eq!(
+            proxy_contract(CaptureKind::Finished, true).unwrap(),
+            (Aspect::Stencil, TextureFormat::Rg8Uint)
+        );
+        assert_eq!(
+            proxy_contract(CaptureKind::Graph, false).unwrap(),
+            (Aspect::Depth, TextureFormat::R32Float)
+        );
+        assert!(proxy_source_format(
+            Aspect::Stencil,
+            TextureFormat::Depth32FloatStencil8
+        ));
+        assert!(!proxy_source_format(
+            Aspect::Stencil,
+            TextureFormat::Depth32Float
+        ));
+        assert!(!proxy_source_format(Aspect::Stencil, TextureFormat::R8Uint));
+        assert!(!proxy_source_format(
+            Aspect::Color,
+            TextureFormat::Depth32FloatStencil8
+        ));
+    }
+    #[test]
+    fn proxy_completion_cannot_relabel_depth_as_stencil_or_hide_kind() {
+        let depth = json!({"source":{"subresource":{"aspect":"depth"}}});
+        let stencil = json!({"operation_kind":"stencil_to_color"});
+        assert!(proxy_completion_kind(false, Aspect::Depth, &depth));
+        assert!(proxy_completion_kind(true, Aspect::Stencil, &stencil));
+        assert!(!proxy_completion_kind(true, Aspect::Stencil, &depth));
+        assert!(!proxy_completion_kind(true, Aspect::Depth, &stencil));
+        assert!(!proxy_completion_kind(false, Aspect::Depth, &stencil));
+        assert!(!proxy_completion_kind(false, Aspect::Stencil, &depth));
+    }
     #[test]
     fn graph_anchor_is_exact_and_cannot_cross_eye_camera_or_present() {
         let a = json!({"view_count":2,"headset_applied":true,"eye_index":1,"provenance_epoch":2,
