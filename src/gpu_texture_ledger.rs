@@ -134,6 +134,9 @@ impl Ledger {
     pub fn active(&self) -> bool {
         self.disabled.is_none()
     }
+    pub fn disabled_reason(&self) -> Option<&str> {
+        self.disabled.as_deref()
+    }
     pub fn command(&mut self) {
         self.operation = self.operation.saturating_add(1);
     }
@@ -167,7 +170,9 @@ impl Ledger {
                 .and_then(|n| self.current.len().checked_add(n))
                 .is_none_or(|n| n > self.max_subresources)
         {
-            self.fail("native texture metadata capacity exceeded");
+            self.fail(&format!("native texture metadata capacity exceeded: allocations={}/{}, current_subresources={}/{}, requested_subresources={count:?}, next_allocation={}, dimension={}, mips={}, layers={}, aspects={}",
+                self.allocations.len(),self.max_allocations,self.current.len(),self.max_subresources,
+                allocation.allocation_id,allocation.dimension,allocation.mips,allocation.layers,allocation.aspects.len()));
             return;
         }
         let id = allocation.allocation_id;
@@ -1131,6 +1136,25 @@ mod tests {
         assert!(!l.active());
         assert!(l.current(1, sub(0, 0)).is_none());
         assert!(l.snapshot(vec![]).disabled_reason.is_some());
+    }
+    #[test]
+    fn disabled_reason_retains_first_cause_and_identifies_capacity() {
+        let mut ledger = Ledger::bounded(1, 8, 8);
+        assert_eq!(ledger.disabled_reason(), None);
+        ledger.register(allocation(1));
+        ledger.register(allocation(2));
+        let reason = ledger.disabled_reason().unwrap().to_owned();
+        assert!(reason.contains("allocations=1/1"));
+        assert!(reason.contains("current_subresources=4/8"));
+        assert!(reason.contains("requested_subresources=Some(4)"));
+        ledger.fail("later failure must not replace the original");
+        assert_eq!(ledger.disabled_reason(), Some(reason.as_str()));
+        let mut subresource_bound = Ledger::bounded(8, 3, 8);
+        subresource_bound.register(allocation(1));
+        assert!(subresource_bound
+            .disabled_reason()
+            .unwrap()
+            .contains("current_subresources=0/3"));
     }
     #[test]
     fn depth_stencil_clear_versions_are_independent() {

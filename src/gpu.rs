@@ -36,6 +36,9 @@ mod uniform_snapshot;
 #[path = "gpu_draw_capture.rs"]
 mod draw_capture;
 #[cfg(all(target_os = "macos", feature = "native-draw-capture"))]
+#[path = "gpu_capture_bindings.rs"]
+mod capture_bindings;
+#[cfg(all(target_os = "macos", feature = "native-draw-capture"))]
 #[path = "gpu_texture_ledger.rs"]
 mod texture_ledger;
 use uniform_snapshot::UniformSnapshot;
@@ -1021,7 +1024,10 @@ struct VbReq { slot: u32, instance: bool, stride: u64, last: u64 }
 struct PendingClear { color: Option<Color>, depth: Option<f32>, stencil: Option<u32> }
 
 struct Chunk { buf: Buffer, id: u64, base: u64, stage: Vec<u8>, lo: u64, hi: u64 }
-struct BgResult { bg: BindGroup, uid: u64, dyn_off: Option<u32> }
+struct BgResult { bg: BindGroup, uid: u64, dyn_off: Option<u32>,
+    #[cfg(all(target_os = "macos", feature = "native-draw-capture"))]
+    capture: Option<Arc<capture_bindings::CapturedGroup>>,
+}
 
 struct PendingMap {
     buf: Buffer,
@@ -1131,6 +1137,8 @@ struct Gpu {
     dbg_idx: u64,
     #[cfg(all(target_os = "macos", feature = "native-draw-capture"))]
     draw_capture: Option<draw_capture::Capture>,
+    #[cfg(all(target_os = "macos", feature = "native-draw-capture"))]
+    capture_bindings: Option<capture_bindings::Registry>,
     geometry_stereo_capture: bool,
     geometry_stereo_capture_done: bool,
     geometry_capture_diagnostics: GeometryCaptureDiagnostics,
@@ -1282,6 +1290,8 @@ impl Gpu {
             dbg_idx: if dbg != 0 { dbg + 424 } else { 0 },
             #[cfg(all(target_os = "macos", feature = "native-draw-capture"))]
             draw_capture: draw_capture::Capture::from_env(),
+            #[cfg(all(target_os = "macos", feature = "native-draw-capture"))]
+            capture_bindings: None,
             geometry_stereo_capture: std::env::var("MUGUET_GEOMETRY_STEREO_CAPTURE").as_deref() == Ok("1"),
             geometry_stereo_capture_done: false,
             geometry_capture_diagnostics: GeometryCaptureDiagnostics::default(),
@@ -1668,6 +1678,8 @@ impl Gpu {
             // texture creation must not split an unrelated render pass.
             if id != 0 && self.in_open_pass(id) { self.end_pass(); }
             self.pending_clears.remove(&id);
+            #[cfg(all(target_os = "macos", feature = "native-draw-capture"))]
+            self.capture_binding_retire_texture(id);
             self.invalidate_texture_views(id);
         }
         // Texture identity correctness is independent of the lookup-preparation
@@ -1675,6 +1687,8 @@ impl Gpu {
         if texture_lifetime || self.bind_group_prepare.enabled {
             if texture_lifetime || binding_cache_needs_invalidation(self.objs[i].as_ref(), Some(&o)) {
                 self.bind_groups.clear();
+                #[cfg(all(target_os = "macos", feature = "native-draw-capture"))]
+                self.capture_binding_cache_clear();
                 self.bind_group_prepare.invalidated();
             } else if let Some(kind) = o.nonbinding_kind() {
                 self.bind_group_prepare.skipped_set_obj(kind);
@@ -1889,6 +1903,12 @@ impl Gpu {
     }
 
     fn exec(&mut self, op: u32, p: u64, n: u64) {
+        #[cfg(all(target_os = "macos", feature = "native-draw-capture"))]
+        if let Some(mut capture) = self.draw_capture.take() {
+            let buffer_write=if matches!(op,12|47) {self.buf(self.u(p)).and_then(|b|b.gpu.clone())}else{None};
+            capture.before_command(self,op,buffer_write.as_ref());
+            self.draw_capture=Some(capture);
+        }
         #[cfg(all(target_os = "macos", feature = "native-draw-capture"))]
         if let Some(capture) = &mut self.draw_capture { capture.command(op); }
         let mb = self.base;
@@ -2236,10 +2256,16 @@ impl Gpu {
         if self.obj(id).is_none() { return; }
         if self.used(id) { self.flush(); }
         let texture_lifetime = matches!(self.obj(id), Some(Obj::Tex(_)));
-        if texture_lifetime { self.invalidate_texture_views(id); }
+        if texture_lifetime {
+            #[cfg(all(target_os = "macos", feature = "native-draw-capture"))]
+            self.capture_binding_retire_texture(id);
+            self.invalidate_texture_views(id);
+        }
         if texture_lifetime || self.bind_group_prepare.enabled {
             if texture_lifetime || binding_cache_needs_invalidation(self.obj(id), None) {
                 self.bind_groups.clear();
+                #[cfg(all(target_os = "macos", feature = "native-draw-capture"))]
+                self.capture_binding_cache_clear();
                 self.bind_group_prepare.invalidated();
             } else if let Some(kind) = self.obj(id).and_then(Obj::nonbinding_kind) {
                 self.bind_group_prepare.skipped_destroy(kind);
@@ -2525,7 +2551,10 @@ impl Gpu {
                     data[i * 4] = v.as_i64().map(|x| x as u32).or_else(|| v.as_f64().map(|x| x as i64 as u32)).unwrap_or(0);
                 }
                 let bytes: Vec<u8> = data.iter().flat_map(|x| x.to_le_bytes()).collect();
-                let b = self.device.create_buffer(&BufferDescriptor { label: None, size: (bytes.len() as u64).max(16), usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST, mapped_at_creation: false });
+                let usage=BufferUsages::UNIFORM | BufferUsages::COPY_DST;
+                #[cfg(all(target_os = "macos", feature = "native-draw-capture"))]
+                let usage=if self.target_span_bindings_active(){usage|BufferUsages::COPY_SRC}else{usage};
+                let b = self.device.create_buffer(&BufferDescriptor { label: None, size: (bytes.len() as u64).max(16), usage, mapped_at_creation: false });
                 measured_write_buffer(&mut self.uploads, &self.device, &self.queue, &mut self.buffer_uploads[UPLOAD_SHADER_CONSTS], &b, 0, &bytes);
                 consts = Some(b);
             }
@@ -3074,6 +3103,8 @@ impl Gpu {
             vd.aspect = if fmt == 47 || fmt == 22 { TextureAspect::StencilOnly } else { TextureAspect::DepthOnly };
         }
         let v = self.scoped("SRV view", |_| tex.create_view(&vd))?;
+        #[cfg(all(target_os = "macos", feature = "native-draw-capture"))]
+        self.capture_binding_view(&v,&vd,false,!proxied);
         if !proxied {
             if let Some(vo) = self.view_obj_mut(srv_id) { vo.views.insert(key, v.clone()); }
         }
@@ -3180,11 +3211,16 @@ impl Gpu {
         if b.ms { usage |= TextureUsages::RENDER_ATTACHMENT; usage.remove(TextureUsages::COPY_DST); }
         #[cfg(all(target_os = "macos", feature = "native-draw-capture"))]
         if self.draw_capture.as_ref().is_some_and(|capture|capture.captures_color_null_dummy(b)) {usage|=TextureUsages::COPY_SRC;}
+        #[cfg(all(target_os = "macos", feature = "native-draw-capture"))]
+        if self.target_span_bindings_active() && capture_bindings::supported_texture_view(dimension,Some(b.dim),if b.ms {4}else{1}) {usage|=TextureUsages::COPY_SRC;}
         let tex = self.device.create_texture(&TextureDescriptor {
             label: Some("dummy"), size: Extent3d { width: 1, height: 1, depth_or_array_layers: if cube { 6 } else { 1 } }, mip_level_count: 1,
             sample_count: if b.ms { 4 } else { 1 }, dimension, format, usage, view_formats: &[],
         });
-        let v = tex.create_view(&TextureViewDescriptor { dimension: Some(b.dim), ..Default::default() });
+        let descriptor=TextureViewDescriptor { dimension: Some(b.dim), ..Default::default() };
+        let v = tex.create_view(&descriptor);
+        #[cfg(all(target_os = "macos", feature = "native-draw-capture"))]
+        self.capture_binding_view(&v,&descriptor,true,true);
         self.dummy_tex.insert(key, v.clone());
         v
     }
@@ -3197,7 +3233,10 @@ impl Gpu {
     }
     fn dummy_buffer(&mut self, binding: u32) -> Buffer {
         let dev = self.device.clone();
-        self.dummy_bufs.entry(binding).or_insert_with(|| dev.create_buffer(&BufferDescriptor { label: Some("dummy"), size: 65536, usage: BufferUsages::STORAGE | BufferUsages::COPY_DST, mapped_at_creation: false })).clone()
+        let usage=BufferUsages::STORAGE | BufferUsages::COPY_DST;
+        #[cfg(all(target_os = "macos", feature = "native-draw-capture"))]
+        let usage=if self.target_span_bindings_active(){usage|BufferUsages::COPY_SRC}else{usage};
+        self.dummy_bufs.entry(binding).or_insert_with(|| dev.create_buffer(&BufferDescriptor { label: Some("dummy"), size: 65536, usage, mapped_at_creation: false })).clone()
     }
     fn counter_buffer(&mut self, buf_id: u32) -> Option<Buffer> {
         let dev = self.device.clone();
@@ -3216,7 +3255,11 @@ impl Gpu {
     }
 
     fn stage_bind_group_inner(&mut self, stage: usize, prog: &Program, group: u32, bgl: &(BindGroupLayout, u64)) -> Option<BgResult> {
-        if self.bind_group_prepare.enabled && self.bind_group_prepare.key_first {
+        #[cfg(not(all(target_os = "macos", feature = "native-draw-capture")))]
+        let key_first_allowed=true;
+        #[cfg(all(target_os = "macos", feature = "native-draw-capture"))]
+        let key_first_allowed=!self.target_span_bindings_active();
+        if key_first_allowed && self.bind_group_prepare.enabled && self.bind_group_prepare.key_first {
             let bindings = prog.group_bindings.get(&group).map(Vec::as_slice).unwrap_or(&[]);
             if self.key_first_bindings_eligible(stage, prog, bindings) {
                 return self.stage_bind_group_key_first(stage, prog, bindings, bgl);
@@ -3229,18 +3272,26 @@ impl Gpu {
         let mut entries = EntryScratch::<(u32, Res)>::new(fast);
         let mut key = KeyScratch::new(fast, &[bgl.1, prog.uid, stage as u64]);
         let mut dyn_off = None;
+        #[cfg(all(target_os = "macos", feature = "native-draw-capture"))]
+        let mut captured=if self.target_span_bindings_active() {self.capture_binding_begin_group();Some(capture_bindings::CapturedGroup::new())} else {None};
         for b in bindings.as_ref() {
             match b.kind {
                 Kind::Uniform => {
                     if b.binding == 15 {
                         match &prog.consts {
-                            Some(c) => entries.push((15, Res::Buf(c.clone(), 0, None))),
+                            Some(c) => {
+                                #[cfg(all(target_os = "macos", feature = "native-draw-capture"))]
+                                if let Some(capture)=&mut captured {capture.buffer(Self::layout_entry(b,stage as u32),c,0,None,None,false);}
+                                entries.push((15, Res::Buf(c.clone(), 0, None)))
+                            },
                             None => { log_once(&format!("c15{}", prog.label), &format!("shader {} declares binding 15 but has no constant table", prog.label)); return None; }
                         }
                         continue;
                     }
                     let (ci, off) = self.pack_copy(prog, stage)?;
                     let c = &self.ubo_slots[self.ubo_slot][ci];
+                    #[cfg(all(target_os = "macos", feature = "native-draw-capture"))]
+                    if let Some(capture)=&mut captured {capture.buffer(Self::layout_entry(b,stage as u32),&c.buf,0,Some(prog.pack.as_ref().unwrap().size),Some((c.base+off)as u32),false);}
                     entries.push((0, Res::Buf(c.buf.clone(), 0, Some(prog.pack.as_ref().unwrap().size))));
                     dyn_off = Some((c.base + off) as u32);
                     key.push(c.id);
@@ -3253,6 +3304,8 @@ impl Gpu {
                         Some(s) => { key.push(sid as u64); s }
                         None => { key.push(0); self.dummy_sampler(want_cmp) }
                     };
+                    #[cfg(all(target_os = "macos", feature = "native-draw-capture"))]
+                    if let Some(capture)=&mut captured {self.capture_binding_sampler(capture,Self::layout_entry(b,stage as u32),sid,want_cmp,&s);}
                     entries.push((b.binding, Res::Smp(s)));
                 }
                 Kind::Texture => {
@@ -3267,9 +3320,15 @@ impl Gpu {
                             if let Some(t) = self.tex_mut(res) { t.in_bg = true; }
                             key.push(id as u64);
                             key.push(0);
+                            #[cfg(all(target_os = "macos", feature = "native-draw-capture"))]
+                            if let Some(capture)=&mut captured {self.capture_binding_texture(capture,Self::layout_entry(b,stage as u32),&v);}
                             entries.push((b.binding, Res::View(v)));
                         }
-                        None => { key.push(0); let d = self.dummy_texture(b); entries.push((b.binding, Res::View(d))); }
+                        None => { key.push(0); let d = self.dummy_texture(b);
+                            #[cfg(all(target_os = "macos", feature = "native-draw-capture"))]
+                            if let Some(capture)=&mut captured {self.capture_binding_texture(capture,Self::layout_entry(b,stage as u32),&d);}
+                            entries.push((b.binding, Res::View(d)));
+                        }
                     }
                 }
                 Kind::ReadOnlyStorage | Kind::Storage => {
@@ -3307,9 +3366,13 @@ impl Gpu {
                         key.push(0);
                     }
                     key.push(res_off);
+                    #[cfg(all(target_os = "macos", feature = "native-draw-capture"))]
+                    if let Some(capture)=&mut captured {capture.buffer(Self::layout_entry(b,stage as u32),&gb,res_off,res_size,None,self.dummy_bufs.values().any(|value|value==&gb));}
                     entries.push((b.binding, Res::Buf(gb, res_off, res_size)));
                 }
                 Kind::StorageTexture => {
+                    #[cfg(all(target_os = "macos", feature = "native-draw-capture"))]
+                    if let Some(capture)=&mut captured {capture.fail("storage texture bindings are unsupported");}
                     let uid = *self.s.uav[stage].get((b.binding as usize).wrapping_sub(160)).unwrap_or(&0);
                     let (res, a, bb, c, vdim) = match self.view_obj(uid).filter(|v| !v.is_buf) { Some(v) => (v.res, v.a, v.b, v.c, v.vdim), None => {
                         log_once(&format!("nouavtex{}", prog.label), &format!("{}: storage texture u{} has no UAV bound", prog.label, b.binding - 160));
@@ -3346,7 +3409,13 @@ impl Gpu {
         self.render_prepare.bind_group_lookup(cached.is_some());
         self.bind_group_prepare.lookup(cached.is_some(), key.spilled(), entries.spilled());
         if let Some((bg, uid)) = cached {
-            return Some(BgResult { bg: bg.clone(), uid: *uid, dyn_off });
+            let bg=bg.clone();let uid=*uid;
+            #[cfg(all(target_os = "macos", feature = "native-draw-capture"))]
+            let capture=captured.map(|capture|self.capture_binding_group(capture,uid,true));
+            return Some(BgResult { bg, uid, dyn_off,
+                #[cfg(all(target_os = "macos", feature = "native-draw-capture"))]
+                capture,
+            });
         }
         self.bind_group_prepare.materialized_miss(entries.len());
         let entries = entries.into_vec();
@@ -3362,11 +3431,18 @@ impl Gpu {
         let bg = self.scoped(&format!("bind group {}", prog.label), |d| d.create_bind_group(&BindGroupDescriptor { label: None, layout: &bgl.0, entries: &wentries }))?;
         if self.bind_groups.len() > BG_LIMIT * 3 / 2 {
             self.bind_groups.clear();
+            #[cfg(all(target_os = "macos", feature = "native-draw-capture"))]
+            self.capture_binding_cache_clear();
             self.bind_group_prepare.invalidated();
         }
         let uid = self.uid();
         self.bind_groups.insert(key, (bg.clone(), uid));
-        Some(BgResult { bg, uid, dyn_off })
+        #[cfg(all(target_os = "macos", feature = "native-draw-capture"))]
+        let capture=captured.map(|capture|self.capture_binding_group(capture,uid,false));
+        Some(BgResult { bg, uid, dyn_off,
+            #[cfg(all(target_os = "macos", feature = "native-draw-capture"))]
+            capture,
+        })
     }
 
     fn get_pipeline(&mut self, vs_id: u32, ps_id: u32, vs: &Rc<Program>, ps: Option<&Rc<Program>>, layout: &Rc<LayoutObj>) -> Option<Rc<Pl>> {
@@ -3992,6 +4068,10 @@ impl Gpu {
                 groups: [g0.as_ref(),g1.as_ref()],
                 viewport: viewport.unwrap_or([0.,0.,pass_width as f32,pass_height as f32,0.,1.]),
                 scissor, blend: bf, stencil: sref,
+                emitted_first_vertex:v_first, emitted_first_instance:i_first,
+                emitted_base_vertex:if fold_v {0}else{base_vertex},
+                emitted_viewport:viewport.map(|v|[v[0],v[1],v[2].max(1.),v[3].max(1.),v[4].clamp(0.,1.),v[5].clamp(v[4].clamp(0.,1.),1.)])
+                    .unwrap_or([0.,0.,pass_width as f32,pass_height as f32,0.,1.]),
             });
             self.draw_capture = Some(capture);
             if self.pass.is_none() && !self.ensure_pass() { self.skip(); return; }

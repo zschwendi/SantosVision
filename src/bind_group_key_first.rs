@@ -204,6 +204,8 @@ impl Gpu {
                 bg: group.clone(),
                 uid: *uid,
                 dyn_off,
+                #[cfg(all(target_os = "macos", feature = "native-draw-capture"))]
+                capture: None,
             });
         }
         self.bind_group_prepare.materialized_miss(plans.len());
@@ -257,6 +259,8 @@ impl Gpu {
         })?;
         if self.bind_groups.len() > BG_LIMIT * 3 / 2 {
             self.bind_groups.clear();
+            #[cfg(all(target_os = "macos", feature = "native-draw-capture"))]
+            self.capture_binding_cache_clear();
             self.bind_group_prepare.invalidated();
         }
         let uid = self.uid();
@@ -266,6 +270,8 @@ impl Gpu {
             bg: group,
             uid,
             dyn_off,
+            #[cfg(all(target_os = "macos", feature = "native-draw-capture"))]
+            capture: None,
         })
     }
 }

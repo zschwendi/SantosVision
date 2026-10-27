@@ -10,11 +10,14 @@ mod color_null;
 #[path = "gpu_shader_capture.rs"]
 mod shader_sources;
 
+#[path = "gpu_target_span_capture.rs"]
+mod target_span;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum CaptureKind { TwoDraw, ColorNull }
+enum CaptureKind { TwoDraw, ColorNull, TargetSpan }
 impl CaptureKind {
     fn parse(value:Option<&str>)->Option<Self> {
-        match value {None|Some("two-draw")=>Some(Self::TwoDraw),Some("color-null")=>Some(Self::ColorNull),_=>None}
+        match value {None|Some("two-draw")=>Some(Self::TwoDraw),Some("color-null")=>Some(Self::ColorNull),Some("target-span")=>Some(Self::TargetSpan),_=>None}
     }
     fn draw_count(self)->usize {if self==Self::TwoDraw {2}else{1}}
 }
@@ -35,14 +38,22 @@ pub(super) struct Resolved<'a> {
     pub index: Option<&'a (Buffer, IndexFormat, u64, u32)>,
     pub groups: [Option<&'a BgResult>; 2], pub viewport: [f32; 6],
     pub scissor: [u32; 4], pub blend: [f64; 4], pub stencil: u32,
+    pub emitted_first_vertex: u32, pub emitted_first_instance: u32,
+    pub emitted_base_vertex: i32, pub emitted_viewport: [f32; 6],
 }
 
 enum Source {
     Buffer { buffer: Buffer, offset: u64, size: u64 },
-    Texture { texture: Texture, mip: u32, aspect: TextureAspect, width: u32, height: u32 },
+    Texture { texture: Texture, mip: u32, layer: u32, depth: u32, aspect: TextureAspect, width: u32, height: u32 },
 }
-struct Plan { name: String, source: Source, row: u32, rows: u32, pitch: u32, bytes: u64 }
-struct Readback { plan: Plan, buffer: Buffer }
+struct Plan { name: String, source: Source, row: u32, rows: u32, image_rows: u32, pitch: u32, bytes: u64 }
+struct Readback { plan: Plan, buffer: Buffer, _reservation: Option<Arc<SnapshotReservation>> }
+// A target-span staging allocation stays charged until BOTH the original
+// command buffer has completed and the last CPU/readback owner has released it.
+struct SnapshotReservation { bytes:u64, live:Arc<AtomicU64> }
+impl Drop for SnapshotReservation {
+    fn drop(&mut self) {self.live.fetch_sub(self.bytes,Ordering::SeqCst);}
+}
 struct Prepared { draw: Value, view: Value, domain: Value, targets: Vec<(Texture, TextureAspect, String)>, plans: Vec<Plan>, alias:Option<Value> }
 struct Pending {
     kind:CaptureKind, alias:Option<Value>,
@@ -74,6 +85,8 @@ pub(super) struct Capture {
     color_null_recorded: bool,
     pub(super) texture_ledger: Option<texture_ledger::Ledger>,
     shader_sources: Option<RefCell<shader_sources::Registry<ShaderModule>>>,
+    span: target_span::SpanState,
+    epoch_reservations:Vec<Arc<SnapshotReservation>>,
 }
 
 fn sha(bytes: &[u8]) -> String {
@@ -127,7 +140,7 @@ fn buffer_plan(name: String, buffer: &Buffer, offset: u64, size: u64) -> Result<
         || !offset.checked_add(size).is_some_and(|n| n <= buffer.size())
         || !buffer.usage().contains(BufferUsages::COPY_SRC) { return Err("uncopyable or invalid buffer range".into()); }
     Ok(Plan { name, source: Source::Buffer { buffer: buffer.clone(), offset, size }, row: size as u32,
-        rows: 1, pitch: size as u32, bytes: size })
+        rows: 1, image_rows: 1, pitch: size as u32, bytes: size })
 }
 fn texture_plan(name: String, texture: &Texture, mip: u32, aspect: TextureAspect) -> Result<Plan, String> {
     if texture.dimension() != TextureDimension::D2 || texture.depth_or_array_layers() != 1
@@ -145,8 +158,8 @@ fn texture_plan(name: String, texture: &Texture, mip: u32, aspect: TextureAspect
     // logical 2x2/1x1 mip levels. Export metadata keeps the logical extent.
     let copy_width=width.div_ceil(bw).checked_mul(bw).ok_or("physical mip width overflow")?;
     let copy_height=height.div_ceil(bh).checked_mul(bh).ok_or("physical mip height overflow")?;
-    Ok(Plan { name, source: Source::Texture { texture: texture.clone(), mip, aspect,
-        width:copy_width, height:copy_height }, row, rows, pitch, bytes })
+    Ok(Plan { name, source: Source::Texture { texture: texture.clone(), mip, layer: 0, depth:1, aspect,
+        width:copy_width, height:copy_height }, row, rows, image_rows: rows, pitch, bytes })
 }
 fn plan_bytes(plans: &[Plan]) -> Result<u64, String> { plans.iter().try_fold(0, |n, p| add(n, p.bytes)) }
 fn enqueue(gpu: &mut Gpu, plans: Vec<Plan>) -> Vec<Readback> {
@@ -155,13 +168,13 @@ fn enqueue(gpu: &mut Gpu, plans: Vec<Plan>) -> Vec<Readback> {
             size: plan.bytes, usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ, mapped_at_creation: false });
         match &plan.source {
             Source::Buffer { buffer: source, offset, size } => gpu.encoder().copy_buffer_to_buffer(source, *offset, &buffer, 0, *size),
-            Source::Texture { texture, mip, aspect, width, height } => gpu.encoder().copy_texture_to_buffer(
-                TexelCopyTextureInfo { texture, mip_level: *mip, origin: Origin3d::ZERO, aspect: *aspect },
+            Source::Texture { texture, mip, layer, depth, aspect, width, height } => gpu.encoder().copy_texture_to_buffer(
+                TexelCopyTextureInfo { texture, mip_level: *mip, origin: Origin3d {x:0,y:0,z:*layer}, aspect: *aspect },
                 TexelCopyBufferInfo { buffer: &buffer, layout: TexelCopyBufferLayout { offset: 0,
-                    bytes_per_row: Some(plan.pitch), rows_per_image: Some(plan.rows) } },
-                Extent3d { width: *width, height: *height, depth_or_array_layers: 1 }),
+                    bytes_per_row: Some(plan.pitch), rows_per_image: Some(plan.image_rows) } },
+                Extent3d { width: *width, height: *height, depth_or_array_layers: *depth }),
         }
-        Readback { plan, buffer }
+        Readback { plan, buffer, _reservation:None }
     }).collect()
 }
 
@@ -169,7 +182,7 @@ impl Capture {
     fn tracks_color_null_cause(&self)->bool {
         // The original two-draw export may finish before the later faulty
         // shader path. Its bounded diagnostic observation must continue.
-        match self.kind {CaptureKind::TwoDraw=>!self.color_null_recorded,CaptureKind::ColorNull=>!self.done}
+        match self.kind {CaptureKind::TwoDraw=>!self.color_null_recorded,CaptureKind::ColorNull=>!self.done,CaptureKind::TargetSpan=>false}
     }
     pub(super) fn color_srv_binding(&self,gpu:&Gpu,opcode:u32,stage:usize,slot:usize,input:u32,resolved:u32) {
         if !self.tracks_color_null_cause() || stage!=1 || slot!=5 {return;}
@@ -454,7 +467,10 @@ impl Capture {
         !self.done && self.texture_ledger.as_ref().is_some_and(texture_ledger::Ledger::active)
     }
     pub(super) fn captures_color_null_dummy(&self,b:&Binding)->bool {
-        self.kind==CaptureKind::ColorNull && color_null::dummy_copyable(b.dim,b.sample,b.ms)
+        (self.kind==CaptureKind::ColorNull || self.captures_target_span()) && color_null::dummy_copyable(b.dim,b.sample,b.ms)
+    }
+    pub(super) fn captures_target_span(&self)->bool {
+        self.kind==CaptureKind::TargetSpan && !self.done && !self.pending.as_ref().is_some_and(|p|p.finished)
     }
     pub(super) fn from_env() -> Option<Self> {
         let path = std::env::var_os("MUGUET_NATIVE_DRAW_CAPTURE")?;
@@ -471,9 +487,9 @@ impl Capture {
             attempts: 0, sequence: 0, epoch_bytes: 0, rejected: BTreeMap::new(), pipeline_bytes: 0,
             rejected_starts: Default::default(), live_bytes: Arc::new(AtomicU64::new(0)), feedback_recorded:false,
             color_null_binding:RefCell::new(None),color_null_recorded:false,
-            texture_ledger: (std::env::var("MUGUET_NATIVE_TEXTURE_LEDGER").as_deref()==Ok("1")).then(texture_ledger::Ledger::new),
-            shader_sources: (std::env::var("MUGUET_NATIVE_SHADER_SOURCES").as_deref()==Ok("1"))
-                .then(||RefCell::new(shader_sources::Registry::new())) })
+            texture_ledger: (kind==CaptureKind::TargetSpan || std::env::var("MUGUET_NATIVE_TEXTURE_LEDGER").as_deref()==Ok("1")).then(texture_ledger::Ledger::new),
+            shader_sources: (kind==CaptureKind::TargetSpan || std::env::var("MUGUET_NATIVE_SHADER_SOURCES").as_deref()==Ok("1"))
+                .then(||RefCell::new(shader_sources::Registry::new())), span:Default::default(),epoch_reservations:Vec::new() })
     }
     pub(super) fn remember_shader(&self, module:&ShaderModule, text:&str, origin:&str) {
         if self.done {return;}
@@ -501,10 +517,12 @@ impl Capture {
         if *count==0 {log(&format!("native draw capture candidate rejected: {reason}"));}
         *count+=1;
         if let Some(p)=self.pending.take() {self.rejected_starts.insert(p.candidate_key);}
+        if self.kind==CaptureKind::TargetSpan {self.span.clear_interval();}
     }
     pub(super) fn command(&mut self, op: u32) {
         self.sequence = self.sequence.saturating_add(1);
         if self.texture_ledger_active(){if let Some(ledger)=&mut self.texture_ledger {ledger.command();}}
+        if self.kind==CaptureKind::TargetSpan {self.span_command(op);return;}
         // ClearState supplies its own NULL bindings; a later draw must not
         // attribute those to an earlier color conflict.
         if op==33 {self.color_null_binding.borrow_mut().take();}
@@ -521,8 +539,10 @@ impl Capture {
     }
     pub(super) fn skipped_draw(&mut self) {
         if self.pending.as_ref().is_some_and(|p| !p.finished) { self.reject("intervening skipped draw"); }
+        if self.kind==CaptureKind::TargetSpan {self.span.clear_interval();}
     }
     pub(super) fn before(&mut self, gpu: &mut Gpu, draw: &Resolved<'_>) {
+        if self.kind==CaptureKind::TargetSpan {self.before_target_span(gpu,draw);return;}
         self.record_color_null_draw(gpu,draw);
         self.record_color_feedback(gpu,draw);
         if self.done || self.pending.as_ref().is_some_and(|p| p.finished) || self.attempts >= 128 { return; }
@@ -586,6 +606,7 @@ impl Capture {
         }
     }
     pub(super) fn after(&mut self, gpu: &mut Gpu) {
+        if self.kind==CaptureKind::TargetSpan {self.after_target_span(gpu);return;}
         let Some(pending) = &mut self.pending else { return; };
         if pending.finished || pending.draws.len() != pending.kind.draw_count() { return; }
         let plans = pending.targets.iter().map(|(t,a,r)| texture_plan(format!("final-{r}.bin"),t,0,*a)).collect::<Result<Vec<_>,_>>();
@@ -596,7 +617,13 @@ impl Capture {
     }
     pub(super) fn submitted(&mut self, gpu: &Gpu, epoch: u64) {
         let submitted_bytes=std::mem::take(&mut self.epoch_bytes);
-        if submitted_bytes!=0 {
+        if self.kind==CaptureKind::TargetSpan {
+            let reservations=std::mem::take(&mut self.epoch_reservations);
+            if !reservations.is_empty() {
+                let inflight=gpu.inflight.clone();inflight.fetch_add(1,Ordering::SeqCst);
+                gpu.queue.on_submitted_work_done(move||{drop(reservations);inflight.fetch_sub(1,Ordering::SeqCst);});
+            }
+        }else if submitted_bytes!=0 {
             let live_bytes=self.live_bytes.clone(); let inflight=gpu.inflight.clone();
             inflight.fetch_add(1,Ordering::SeqCst);
             // Aborted candidates are still retained by the command buffer.
@@ -607,6 +634,9 @@ impl Capture {
                 inflight.fetch_sub(1,Ordering::SeqCst);
             });
         }
+        // Complete intervals may cross ordinary producer submissions. Their
+        // already enqueued snapshots stay retained until the final submission.
+        if self.kind==CaptureKind::TargetSpan && self.pending.as_ref().is_some_and(|p|!p.finished) {return;}
         let Some(mut pending) = self.pending.take() else { return; };
         if !pending.finished || pending.epoch != epoch {
             self.rejected_starts.insert(pending.candidate_key);
@@ -622,6 +652,7 @@ impl Capture {
         // Immutable pending evidence has already been detached. Retire private
         // history now; postcapture observation only needs the original probes.
         self.texture_ledger.take();
+        if self.kind==CaptureKind::TargetSpan {self.span.clear_interval();}
         if self.kind==CaptureKind::ColorNull {self.color_null_binding.borrow_mut().take();}
         let directory = self.directory.clone(); let rejected = self.rejected.clone();
         let errors = gpu.errors.clone(); let inflight = gpu.inflight.clone();
@@ -662,6 +693,76 @@ fn publish_new(path:&std::path::Path,bytes:&[u8])->Result<(),String> {
     }
     Ok(())
 }
+
+fn json_size_bounded(value:&Value,limit:usize)->Result<usize,String> {
+    struct Count {bytes:usize,limit:usize}
+    impl Write for Count {
+        fn write(&mut self,bytes:&[u8])->std::io::Result<usize> {
+            self.bytes=self.bytes.checked_add(bytes.len()).filter(|n|*n<=self.limit)
+                .ok_or_else(||std::io::Error::other("expanded metadata size bound"))?;
+            Ok(bytes.len())
+        }
+        fn flush(&mut self)->std::io::Result<()> {Ok(())}
+    }
+    let mut count=Count{bytes:0,limit};
+    serde_json::to_writer(&mut count,value).map_err(|e|e.to_string())?;
+    Ok(count.bytes)
+}
+
+fn intern_shared_metadata(value:Value,table:&mut Vec<Value>,indices:&mut HashMap<String,usize>,limit:usize)->Result<usize,String> {
+    if !value.is_object() {return Err("shared draw metadata must be an object".into());}
+    let bytes=serde_json::to_vec(&value).map_err(|e|e.to_string())?;
+    let hash=sha(&bytes);
+    if let Some(&index)=indices.get(&hash) {
+        if table[index]!=value {return Err("shared draw metadata hash collision".into());}
+        return Ok(index);
+    }
+    if table.len()>=limit {return Err("shared draw metadata table bound".into());}
+    let index=table.len();table.push(value);indices.insert(hash,index);Ok(index)
+}
+
+// Whole native intervals repeat the same immutable material views and pipeline
+// descriptors thousands of times. Intern exact objects, including each draw's
+// complete world/target identity, without changing draw order or ownership. The importer expands these refs
+// before the same semantic checks; this does not relax the 16 MiB manifest cap.
+fn compact_target_span_metadata(manifest:&mut Value)->Result<(),String> {
+    if manifest["schema"]!=4 || manifest["kind"]!="native_target_span"
+        || manifest.get("draw_metadata_encoding").is_some() || manifest.get("shared_draw_metadata").is_some() {
+        return Err("unexpected target span metadata encoding".into());
+    }
+    let original_bytes=json_size_bounded(manifest,128<<20)?;
+    let draws=manifest["draws"].as_array_mut().ok_or("target span draws absent")?;
+    if draws.is_empty() || draws.len()>4096 {return Err("shared metadata draw bound".into());}
+    let (mut pipelines,mut bindings)=(Vec::new(),Vec::new());
+    let (mut pipeline_indices,mut binding_indices)=(HashMap::new(),HashMap::new());
+    let (mut world_views,mut target_domains)=(Vec::new(),Vec::new());
+    let (mut world_indices,mut domain_indices)=(HashMap::new(),HashMap::new());
+    let mut binding_refs_count=0usize;
+    for draw in draws {
+        let object=draw.as_object_mut().ok_or("target span draw is not an object")?;
+        if ["pipeline_ref","binding_refs","world_view_ref","target_domain_ref"].iter().any(|k|object.contains_key(*k)) {
+            return Err("mixed draw metadata encoding".into());
+        }
+        let pipeline=object.remove("pipeline").ok_or("target span pipeline absent")?;
+        let world=object.remove("world_view").ok_or("target span world identity absent")?;
+        let domain=object.remove("target_domain").ok_or("target span target identity absent")?;
+        let inline=object.remove("bindings").ok_or("target span bindings absent")?;
+        let Value::Array(inline)=inline else{return Err("target span bindings not an array".into());};
+        binding_refs_count=binding_refs_count.checked_add(inline.len()).ok_or("shared binding reference overflow")?;
+        if inline.len()>256 || binding_refs_count>262144 {return Err("shared binding reference bound".into());}
+        let pipeline=intern_shared_metadata(pipeline,&mut pipelines,&mut pipeline_indices,4096)?;
+        let world=intern_shared_metadata(world,&mut world_views,&mut world_indices,4096)?;
+        let domain=intern_shared_metadata(domain,&mut target_domains,&mut domain_indices,4096)?;
+        let refs=inline.into_iter().map(|v|intern_shared_metadata(v,&mut bindings,&mut binding_indices,65536))
+            .collect::<Result<Vec<_>,_>>()?;
+        object.insert("pipeline_ref".into(),json!(pipeline));object.insert("binding_refs".into(),json!(refs));
+        object.insert("world_view_ref".into(),json!(world));object.insert("target_domain_ref".into(),json!(domain));
+    }
+    manifest["draw_metadata_encoding"]="shared_v1".into();
+    manifest["shared_draw_metadata"]=json!({"pipelines":pipelines,"bindings":bindings,"world_views":world_views,"target_domains":target_domains});
+    manifest["unshared_metadata_bytes"]=json!(original_bytes);
+    Ok(())
+}
 fn complete(pending: Pending, rx: std::sync::mpsc::Receiver<(usize,Result<(),String>)>, directory: &std::path::Path,
     errors: &AtomicU64, backend: &str, rejected: BTreeMap<String,u64>) -> Result<(),String> {
     let mut mapped = std::collections::HashSet::new();
@@ -679,7 +780,14 @@ fn complete(pending: Pending, rx: std::sync::mpsc::Receiver<(usize,Result<(),Str
             let bytes=&view[row*rb.plan.pitch as usize..row*rb.plan.pitch as usize+rb.plan.row as usize];
             file.write_all(bytes).map_err(|e|e.to_string())?;hash.update(bytes);
         }
-        file.sync_all().map_err(|e|e.to_string())?;
+        // Thousands of tiny immutable buffers are common in a whole interval.
+        // Closing each payload before atomic manifest publication is sufficient
+        // for byte admission, which reopens and hashes every file. A crash can
+        // leave an incomplete bundle; it cannot bypass those hashes. Preserve
+        // the older small-capture durability behavior, but avoid thousands of
+        // synchronous filesystem barriers in the bounded target-span writer.
+        if pending.kind!=CaptureKind::TargetSpan {file.sync_all().map_err(|e|e.to_string())?;}
+        drop(file);
         drop(view); rb.buffer.unmap();
         blobs.push(json!({"path":rb.plan.name,"byte_length":rb.plan.row as u64*rb.plan.rows as u64,"sha256":hash.finish(),
             "packed_row_bytes":rb.plan.row,"row_count":rb.plan.rows,"readback_pitch":rb.plan.pitch}));
@@ -693,6 +801,19 @@ fn complete(pending: Pending, rx: std::sync::mpsc::Receiver<(usize,Result<(),Str
             "initial_contents_captured":true,"original_final_captured":true,"natural_submission_completed":true},
         "prior_rejected_candidates":rejected,"normal_frame_publication_changed":false,
         "uniform_binding_normalization":"exact selected GPU range copied to immutable offset-zero static binding; original dynamic offset separately recorded"})}
+    else if pending.kind==CaptureKind::TargetSpan {json!({"schema":4,"kind":"native_target_span","status":"captured",
+        "source":{"method":"Gpu::do_draw resolved bindings","backend":backend,"encoder_epoch":pending.epoch},
+        "world_view":pending.view,"target_domain":pending.domain,"draws":pending.draws,
+        "attachments":pending.attachments,"blobs":blobs,"allocated_readback_bytes":pending.bytes,
+        "intervening_commands":pending.intervening_commands,"prior_rejected_candidates":rejected,
+        "closure":{"complete_target_interval":true,"first_executed_draw_captured":true,"last_executed_draw_captured":true,
+            "interval_start_command":pending.alias.as_ref().and_then(|v|v.get("interval_start_command")),
+            "interval_end_command":pending.alias.as_ref().and_then(|v|v.get("interval_end_command")),
+            "unmodelled_commands":0,"initial_contents_captured":true,"original_final_captured":true,
+            "natural_submission_completed":true,"queries_inactive":true,"gpu_errors":0},
+        "normal_frame_publication_changed":false,"finished_frame_or_density_accepted":false,
+        "artifact_publication":"close every payload, then publish one synced atomic manifest; every payload must pass hash admission; interrupted or crash-damaged bundles are not accepted",
+        "initialization_scope":"exact captured original-density contents; no complete earlier dependency or high-density initialization claim"})}
     else {json!({"schema":3,"kind":"native_color_null_draw","status":"captured",
         "source":{"method":"Gpu::do_draw resolved bindings","backend":backend,"encoder_epoch":pending.epoch},
         "world_view":pending.view,"target_domain":pending.domain,"draw":pending.draws.into_iter().next().ok_or("color-null draw missing")?,
@@ -705,8 +826,9 @@ fn complete(pending: Pending, rx: std::sync::mpsc::Receiver<(usize,Result<(),Str
         "uniform_binding_normalization":"exact selected GPU range copied to immutable offset-zero static binding; original dynamic offset separately recorded"})};
     if let Some(ledger)=pending.initialization_ledger {manifest["initialization_ledger"]=ledger;}
     if let Some(sources)=pending.shader_sources {manifest["effective_shader_sources"]=sources;}
-    let bytes=serde_json::to_vec_pretty(&manifest).map_err(|e|e.to_string())?;
-    if bytes.len()>16<<20 {return Err("serialized capture manifest exceeds 16 MiB bound".into());}
+    if pending.kind==CaptureKind::TargetSpan {compact_target_span_metadata(&mut manifest)?;}
+    let bytes=if pending.kind==CaptureKind::TargetSpan {serde_json::to_vec(&manifest)}else{serde_json::to_vec_pretty(&manifest)}.map_err(|e|e.to_string())?;
+    if bytes.len()>16<<20 {return Err(format!("serialized capture manifest {} bytes exceeds 16 MiB bound",bytes.len()));}
     publish_new(&directory.join("capture.json"),&bytes)
 }
 
@@ -717,7 +839,7 @@ mod tests {
         Capture { kind:CaptureKind::TwoDraw,directory:PathBuf::new(),pipelines:HashMap::new(),pending:None,done:false,attempts:0,sequence:0,
             epoch_bytes:0,rejected:BTreeMap::new(),pipeline_bytes:0,rejected_starts:Default::default(),
             live_bytes:Arc::new(AtomicU64::new(0)),feedback_recorded:false,
-            color_null_binding:RefCell::new(None),color_null_recorded:false,texture_ledger:None,shader_sources:None }
+            color_null_binding:RefCell::new(None),color_null_recorded:false,texture_ledger:None,shader_sources:None,span:Default::default(),epoch_reservations:Vec::new() }
     }
     fn pending() -> Pending {
         Pending {kind:CaptureKind::TwoDraw,alias:None,initialization_ledger:None,shader_sources:None,epoch:1,errors:0,view:Value::Null,domain:Value::Null,draws:vec![Value::Null],attachments:vec![],
@@ -758,6 +880,58 @@ mod tests {
         assert!(!reservation_fits(u64::MAX,1,0));
         assert!(!reservation_fits(0,u64::MAX,1));
         assert!(!reservation_fits(0,0,u64::MAX));
+    }
+    #[test]
+    fn target_span_staging_releases_only_after_gpu_and_cpu_owners() {
+        for gpu_first in [false,true] {
+            let live=Arc::new(AtomicU64::new(64));
+            let cpu=Arc::new(SnapshotReservation{bytes:64,live:live.clone()});
+            let gpu=cpu.clone();
+            if gpu_first {drop(gpu);assert_eq!(live.load(Ordering::SeqCst),64);drop(cpu);}
+            else {drop(cpu);assert_eq!(live.load(Ordering::SeqCst),64);drop(gpu);}
+            assert_eq!(live.load(Ordering::SeqCst),0);
+        }
+    }
+    #[test]
+    fn complete_target_span_allows_snapshotted_uploads_but_rejects_missing_operations() {
+        for op in 0..=48 {
+            let mut c=capture();c.kind=CaptureKind::TargetSpan;c.pending=Some(pending());
+            c.command(op);
+            assert_eq!(c.pending.is_some(),matches!(op,0|1|2|9|10|12|18..=32|47),"opcode {op}");
+        }
+    }
+    #[test]
+    fn shared_metadata_preserves_exact_ordered_draws_and_distinct_resources() {
+        let p=json!({"effective_shaders":{"vertex":"actual module"},"depth":{"compare":"greater"}});
+        let a=json!({"kind":"texture","native_allocation_id":10,"version":17,"view":{"mip":0}});
+        let b=json!({"kind":"texture","native_allocation_id":10,"version":18,"view":{"mip":0}});
+        let first=json!({"pipeline":p,"bindings":[a,b,a],"world_view":{"eye_index":0},"target_domain":{"native_allocation_id":10},"command_sequence":7});
+        let second=json!({"pipeline":p,"bindings":[b,a],"world_view":{"eye_index":1},"target_domain":{"native_allocation_id":10},"command_sequence":9});
+        let original=json!({"schema":4,"kind":"native_target_span","draws":[first,second]});
+        let mut packed=original.clone();compact_target_span_metadata(&mut packed).unwrap();
+        assert_eq!(packed["shared_draw_metadata"]["pipelines"].as_array().unwrap().len(),1);
+        assert_eq!(packed["shared_draw_metadata"]["bindings"].as_array().unwrap().len(),2);
+        assert_eq!(packed["shared_draw_metadata"]["world_views"].as_array().unwrap().len(),2,"different eyes must never deduplicate");
+        assert_eq!(packed["shared_draw_metadata"]["target_domains"].as_array().unwrap().len(),1);
+        assert_eq!(packed["draws"][0]["binding_refs"],json!([0,1,0]));
+        let tables=packed["shared_draw_metadata"].clone();
+        for draw in packed["draws"].as_array_mut().unwrap() {
+            let object=draw.as_object_mut().unwrap();
+            let pipeline=object.remove("pipeline_ref").unwrap().as_u64().unwrap() as usize;
+            let refs=object.remove("binding_refs").unwrap();
+            object.insert("pipeline".into(),tables["pipelines"][pipeline].clone());
+            for (field,reference,table) in [("world_view","world_view_ref","world_views"),("target_domain","target_domain_ref","target_domains")] {
+                let i=object.remove(reference).unwrap().as_u64().unwrap() as usize;
+                object.insert(field.into(),tables[table][i].clone());
+            }
+            object.insert("bindings".into(),json!(refs.as_array().unwrap().iter().map(|i|tables["bindings"][i.as_u64().unwrap()as usize].clone()).collect::<Vec<_>>()));
+        }
+        assert_eq!(packed["draws"],original["draws"]);
+        assert!(compact_target_span_metadata(&mut packed).is_err());
+        assert_eq!(json_size_bounded(&json!([1,2,3]),7).unwrap(),7);
+        assert!(json_size_bounded(&json!([1,2,3]),6).is_err());
+        let mut excess=original;excess["draws"][0]["bindings"]=json!(vec![json!({"id":1});257]);
+        assert!(compact_target_span_metadata(&mut excess).is_err());
     }
     #[test]
     fn apple_sha_matches_standard_vector() {

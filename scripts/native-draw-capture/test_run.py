@@ -83,6 +83,27 @@ class RunnerBoundaries(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "selected kind"):
             runner.validate_capture(p, "color-null")
 
+    def test_complete_target_interval_requires_every_boundary_and_exact_sources(self):
+        p, value = self.capture()
+        value.update(schema=4, kind="native_target_span", effective_shader_sources={"complete": True})
+        value["closure"].update(complete_target_interval=True, first_executed_draw_captured=True,
+                                last_executed_draw_captured=True, queries_inactive=True, gpu_errors=0,
+                                interval_start_command=10, interval_end_command=40)
+        (p / "capture.json").write_text(json.dumps(value))
+        self.assertTrue(runner.validate_capture(p, "target-span")["byte_admission_passed"])
+        mutations = [("complete_target_interval", False), ("first_executed_draw_captured", False),
+                     ("last_executed_draw_captured", False), ("queries_inactive", False),
+                     ("gpu_errors", 1), ("interval_start_command", 40), ("interval_end_command", None)]
+        for key, replacement in mutations:
+            bad = copy.deepcopy(value); bad["closure"][key] = replacement
+            (p / "capture.json").write_text(json.dumps(bad))
+            with self.subTest(key=key), self.assertRaises(ValueError):
+                runner.validate_capture(p, "target-span")
+        value["effective_shader_sources"]["complete"] = False
+        (p / "capture.json").write_text(json.dumps(value))
+        with self.assertRaisesRegex(ValueError, "exact final shader"):
+            runner.validate_capture(p, "target-span")
+
     def test_color_null_retains_general_payload_byte_admission(self):
         p, _ = self.color_null_capture()
         (p / "payload.bin").write_bytes(b"wrong")

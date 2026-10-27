@@ -30,7 +30,7 @@ GRAPHICS = {
 MAX_BLOBS = 256 << 20
 MAX_JSON = 16 << 20
 MAX_LOG = 128 << 20
-CAPTURE_KINDS = ("two-draw", "color-null")
+CAPTURE_KINDS = ("two-draw", "color-null", "target-span")
 FLAGS = {
     "MUGUET_MUTE": "1", "MUGUET_MASTER_VOLUME": "0",
     "MUGUET_XR_MOTION_AIM": "0", "MUGUET_XR_MOTION_ARMS": "0",
@@ -179,7 +179,8 @@ def validate_capture(directory, capture_kind="two-draw"):
     need(capture_kind in CAPTURE_KINDS, "unsupported capture kind")
     need(not (directory / "rejected.json").exists(), "capture module rejected the span")
     capture = load_json(directory / "capture.json")
-    expected = (2, "native_draw_span") if capture_kind == "two-draw" else (3, "native_color_null_draw")
+    expected = {"two-draw": (2,"native_draw_span"), "color-null": (3,"native_color_null_draw"),
+                "target-span": (4,"native_target_span")}[capture_kind]
     need((capture.get("schema"), capture.get("kind"), capture.get("status")) ==
          (*expected, "captured"), "unsupported or incomplete capture for selected kind")
     closure = capture.get("closure", {})
@@ -192,6 +193,14 @@ def validate_capture(directory, capture_kind="two-draw"):
         need(closure.get("ordered_two_draws") is True, "missing capture closure: ordered_two_draws")
         need(closure.get("resource_mutation_rejections") == 0, "span has resource mutation")
         need(isinstance(capture.get("draws"), list) and len(capture["draws"]) == 2, "exact two-draw span required")
+    elif capture_kind == "target-span":
+        for name in ("complete_target_interval", "first_executed_draw_captured", "last_executed_draw_captured", "queries_inactive"):
+            need(closure.get(name) is True, f"missing capture closure: {name}")
+        need(type(closure.get("gpu_errors")) is int and closure["gpu_errors"] == 0, "target interval GPU errors")
+        need(type(closure.get("interval_start_command")) is int and type(closure.get("interval_end_command")) is int
+             and 0 < closure["interval_start_command"] < closure["interval_end_command"], "target interval boundary")
+        need(isinstance(capture.get("draws"), list) and 2 <= len(capture["draws"]) <= 4096, "bounded complete draw list required")
+        need(capture.get("effective_shader_sources", {}).get("complete") is True, "exact final shader sources required")
     else:
         for name in ("single_original_draw", "queries_inactive"):
             need(closure.get(name) is True, f"missing capture closure: {name}")
@@ -199,7 +208,7 @@ def validate_capture(directory, capture_kind="two-draw"):
              "color-null capture reports GPU errors or an invalid error count")
         need(isinstance(capture.get("draw"), dict) and "draws" not in capture, "single original draw required")
     blobs = capture.get("blobs")
-    need(isinstance(blobs, list) and 0 < len(blobs) <= 4096, "bounded nonempty blob list required")
+    need(isinstance(blobs, list) and 0 < len(blobs) <= 16384, "bounded nonempty blob list required")
     names = set(); total = 0
     for blob in blobs:
         name = blob.get("path")
@@ -319,7 +328,7 @@ def main():
         p.add_argument("--" + name, required=True)
     p.add_argument("--deadline", type=int, default=180)
     p.add_argument("--capture-kind", choices=CAPTURE_KINDS, default="two-draw",
-                   help="two-draw preserves the original span; color-null captures one corrected draw with nullable world provenance")
+                   help="two-draw captures the original pair; color-null captures one corrected draw; target-span captures a complete heterogeneous target interval")
     p.add_argument("--scene-provenance", action="store_true",
                    help="include bounded native allocation/version and exact final shader source metadata; does not certify full scene closure")
     p.add_argument("--same-ray-alias", action="store_true",
