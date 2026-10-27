@@ -1,6 +1,6 @@
-# V27.10 source publication correction
+# V28 source publication correction
 
-V27.10 repairs a demonstrated source-publication failure. Different camera callback IDs could describe exactly the same eye rays within one original game presentation. The former global ID check rejected that finished image, even though its color and depth coordinates agreed. The corrected path retains the oldest complete coordinate identity and each draw's actual depth convention. It changes no rendered pixels, projection, resolution, material, post-processing or stereo policy.
+V28 repairs a demonstrated source-publication failure. Different camera callback IDs could describe exactly the same eye rays within one original game presentation. The former global ID check rejected that finished image, even though its color and depth coordinates agreed. The corrected path retains the oldest complete coordinate identity and each draw's actual depth convention. It changes no rendered pixels, projection, resolution, material, post-processing or stereo policy.
 
 ## Actual local before and after
 
@@ -33,11 +33,11 @@ The separate exact-first viewport lookup remains private and disabled: actual v7
 
 ## Signed local checkpoint
 
-V27.10 is signed and frozen at `target/fidelity-v27-10/SantosVision.app`, built from `dc838560bb709d5c4cc234b884250ac48bd77ce5`. All41 package checks pass, including strict signatures, original game/AOT bytes and RX protection, technical identities/entitlements, unchanged47 compositor source files, and exclusion of private diagnostic switches. All V27.6–V27.9 rollback files and the V27.9 archive remain exact. No installation occurred.
+V28 is signed and frozen at `target/fidelity-v28/SantosVision.app`, with actual bundle build28 and source commit `823fa3b795255887f7a6e66e0d7d2e36f17102eb`. It reuses the verified native archive from `dc838560bb709d5c4cc234b884250ac48bd77ce5` byte-for-byte. All41 package checks pass, including strict signatures, original game/AOT bytes and RX protection, technical identities/entitlements, unchanged47 compositor source files, and exclusion of private diagnostic switches. All V27.6–V27.10 rollback packages and existing archives remain exact. No installation occurred.
 
-- Executable SHA256: `b931b65c1a450f8308457fa28253edcf50f0f41d5a1c5f2a0d2ff68937151a8f`.
+- Executable SHA256: `af9e5515aca19ab4a0bd45cf6ac70d62f849ece50e860063cb7c93f141686261`.
 - Native archive SHA256: `9b7e4740957f8e8bac39e42a2d17ef88126cd0c674f294a403692472de042bc7`.
-- Package receipt: `target/fidelity-v27-10/candidate-receipt.json`; independent final file checks: `target/fidelity-v27-10/root-verification.json`.
+- Package receipt: `target/fidelity-v28/candidate-receipt.json`; package checks: `target/fidelity-v28/package-verification.json`.
 - Supporting commits: `b8f2d5c` ordered native replay; `6cc8a15` bounded native resource/shader capture.
 
 ## Supporting implementation and verification
@@ -52,4 +52,4 @@ Color correctness remains the independently verified V27.7 correction. This chan
 
 No headset, iPad or simulator action or query was performed. The reported bad headset scene was not reproduced here. HUD publication and compositor presentation were inactive in this local fixture; their strict join predicates were checked in CPU tests, not accepted interactively. The old physical27.3 report recorded zero camera conflicts, so this local defect is not established as the sole cause of the user's grain, shading or flicker complaint. M2 source/compositor contention and the extra valid snapshot-copy workload still need hardware acceptance.
 
-After the local-only hold is lifted, the next single test is V27.10 in the same bad scene at1440 Clarity: window→normal third-person immersive,15 seconds still,15 seconds slow yaw,15 seconds still. Compare texture detail, dark shading, thin edges, HUD and flicker, and retain a matched completed source/output pair with timing scope labeled. Keep experimental cache/common-target/single-source paths off. V27.6–V27.9 remain rollback packages; no save or graphics-setting replacement is required.
+After the local-only hold is lifted, the next single test is V28 in the same bad scene at1440 Clarity: window→normal third-person immersive,15 seconds still,15 seconds slow yaw,15 seconds still. Compare texture detail, dark shading, thin edges, HUD and flicker, and retain a matched completed source/output pair with timing scope labeled. Keep experimental cache/common-target/single-source paths off. V27.6–V27.10 remain rollback packages; no save or graphics-setting replacement is required.
