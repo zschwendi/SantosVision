@@ -10,8 +10,45 @@ pub enum Provenance {
     NativeGraph { source_sha256: String },
     /// One native frame with a qualified endpoint; context draws remain unattributed.
     NativeFinishedGraph { source_sha256: String, capture_id: String, native_present: u64 },
+    /// Exact current-native output with explicitly recorded original draw omissions.
+    NativeExecutedFinishedGraph { source_sha256: String, capture_id: String, native_present: u64 },
     LegacyCaptured { manifest_sha256: String },
     Authored { description: String },
+}
+impl Provenance {
+    pub fn is_finished(&self)->bool {matches!(self,Self::NativeFinishedGraph{..}|Self::NativeExecutedFinishedGraph{..})}
+    pub fn is_executed_finished(&self)->bool {matches!(self,Self::NativeExecutedFinishedGraph{..})}
+}
+/// A proven original early return. This is evidence, never a replacement draw.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OriginalOmission {
+    pub event_index:u64,
+    pub command_sequence:u64,
+    pub skip_reason:String,
+    pub omission_seam:String,
+    pub requested_raw_words:[u32;6],
+    pub resolved_raw_words:[u32;6],
+    pub vertex_shader:OmittedVertexShader,
+    pub topology:u32,
+    pub gpu_errors:u64,
+    pub pipeline_jobs_pending:u64,
+    pub pipeline_cache_pending:u64,
+    pub original_draw_was_not_emitted:bool,
+    pub native_behavior_changed:bool,
+    pub requested_geometry_validated:bool,
+    pub pixel_visibility_known:bool,
+    pub gpu_commands_emitted:u64,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OmittedVertexShader {
+    pub guest_id:u32,
+    pub hash:String,
+    pub stage:u32,
+    pub index_entry_present:bool,
+    pub translated_source_present:bool,
+    pub program_state:String,
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct EyeIdentity {
@@ -312,6 +349,8 @@ pub enum Command {
         source: Version,
         destination: Transition,
     },
+    /// Ordered, fully typed evidence of one specific original no-GPU early return.
+    OriginalOmission { omission:OriginalOmission },
     /// Original query/readback side effects stay in the guest; only captured source bytes are checked.
     OriginalOnly {
         operation_kind: String,

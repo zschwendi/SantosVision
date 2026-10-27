@@ -122,6 +122,7 @@ impl Assembly {
                 Command::DepthToColor{source,destination}|Command::StencilToColor{source,destination}|Command::GenerateMip{source,destination}|Command::Copy{source,destination}=>{reads.push(source.clone());std::slice::from_ref(destination)},
                 Command::Clear{transition,..}=>std::slice::from_ref(transition),
                 Command::CopyRegion{sources,destinations,..}=>{reads.extend(sources.clone());destinations},
+                Command::OriginalOmission{..}=>&[],
                 Command::FinishedEndpoint{hud_free_source,hud_world,depth_source,..}=>{
                     for x in [hud_free_source,hud_world,depth_source] {let k=key(&x.version);if let Some(old)=refs.get(&k){require(same_blob(old,&x.blob,&self.blobs)?,"graph endpoint bytes contradict same version")?;}else{refs.insert(k,x.blob.clone());}reads.push(x.version.clone());} &[]
                 },
@@ -145,7 +146,7 @@ impl Assembly {
                 let k=(slice.clone(),initial.content_version);
                 if let Some(producer)=producers.get(&k) {
                     require(uses.get(&k).is_some_and(|use_event|producer<use_event),"graph input consumed before its producer")?;
-                    if matches!(self.scene.provenance,Provenance::NativeFinishedGraph{..})&&matches!(initial.origin,Initial::Unknown{..}) {
+                    if self.scene.provenance.is_finished()&&matches!(initial.origin,Initial::Unknown{..}) {
                         // This is an exact predecessor version for an overwrite,
                         // not a captured pixel input. Runtime initialization checks
                         // still reject any read before the native producer executes.
@@ -237,6 +238,7 @@ fn referenced_blobs(v:&Value,out:&mut BTreeSet<String>)->Result<()> {
     }Ok(())
 }
 const FINISHED_STAGING_BOUND:u64=512<<20;
+const EXECUTED_STAGING_BOUND:u64=1<<30;
 fn stage_payload(c:&mut Value,rows:&BTreeMap<String,Value>,finished:bool)->Result<u64>{
     require(c.get("blobs").is_none(),"nested graph payload table forbidden")?;
     let mut names=BTreeSet::new();referenced_blobs(c,&mut names)?;
@@ -369,14 +371,18 @@ fn endpoint(a:&mut Assembly,o:&Value,used:&mut BTreeSet<String>)->Result<()> {
 
 struct Conversion{scene:Scene,elided:Vec<Value>,footprints:Vec<Value>}
 fn convert(m:&Value,source_hash:String,payload:&[(PathBuf,Vec<u8>)])->Result<Conversion>{
-    shape(m,&["schema","kind","status","source","world_view","stages","blobs","allocated_readback_bytes","prior_rejected_candidates","spool","peak_live_staging_bytes","closure","normal_frame_publication_changed","finished_frame_or_density_accepted","coherent_stereo_accepted"])?;
-    let finished=m["schema"]==7&&m["kind"]=="native_finished_graph";
+    shape(m,&["schema","kind","status","source","world_view","stages","blobs","allocated_readback_bytes","prior_rejected_candidates","spool","peak_live_staging_bytes","closure","normal_frame_publication_changed","finished_frame_or_density_accepted","coherent_stereo_accepted","execution_contract","all_requested_draws_executed","original_omission_count"])?;
+    let executed=m["schema"]==8&&m["kind"]=="native_executed_finished_graph";
+    let finished=executed||(m["schema"]==7&&m["kind"]=="native_finished_graph");
+    if executed {require(m["execution_contract"]=="executed_original_image_with_recorded_omissions"&&m["all_requested_draws_executed"]==false
+        &&num(m,"original_omission_count")?>0&&num(m,"original_omission_count")?<=1024,"executed graph omission contract")?;}
+    else{require(["execution_contract","all_requested_draws_executed","original_omission_count"].iter().all(|k|m.get(*k).is_none()),"strict graph unexpected executed contract")?;}
     require((finished||(m["schema"]==6&&m["kind"]=="native_connected_graph"))&&m["status"]=="captured"
         &&m["normal_frame_publication_changed"]==false&&m["finished_frame_or_density_accepted"]==false&&m["coherent_stereo_accepted"]==false,"requires bounded native graph")?;
     let source=get(m,"source")?;shape(source,&["method","backend","capture_id","native_namespace","native_present","encoder_epoch"])?;
     let capture_id=txt(source,"capture_id")?;let present=num(source,"native_present")?;
     require(!capture_id.is_empty()&&capture_id.len()<=256&&txt(source,"native_namespace")?==capture_id&&present>0&&num(source,"encoder_epoch")?>0
-        &&source["backend"]=="Metal"&&source["method"]==if finished{"single native finished graph"}else{"single native raster/proxy/compute graph"},"graph single native namespace absent")?;
+        &&source["backend"]=="Metal"&&source["method"]==if executed{"single native executed finished graph"}else if finished{"single native finished graph"}else{"single native raster/proxy/compute graph"},"graph single native namespace absent")?;
     let closure=get(m,"closure")?;shape(closure,&["same_capture","same_native_namespace","same_present","continuous_command_interval","initial_contents_captured","original_final_captured","unmodelled_commands","natural_submission_completed","queries_inactive","queries_original_only","gpu_errors"])?;
     for k in ["same_capture","same_native_namespace","same_present","continuous_command_interval","initial_contents_captured","original_final_captured","natural_submission_completed"]{require(closure[k]==true,"graph original closure absent")?;}
     if finished {require(closure["queries_original_only"]==true&&closure["queries_inactive"].is_boolean(),"finished graph query closure")?;}
@@ -399,16 +405,19 @@ fn convert(m:&Value,source_hash:String,payload:&[(PathBuf,Vec<u8>)])->Result<Con
     require(!blobs.is_empty()&&blobs.len()<=if finished{32768}else{16384}&&allocated==num(m,"allocated_readback_bytes")?,"graph actual union staging accounting")?;
     if finished {
         let spool=get(m,"spool")?;shape(spool,&["natural_submission_epochs","submitted_batches","completed_batches","raw_payload_bytes","cumulative_padded_staging_bytes","payload_bound","live_staging_bound","peak_completed_map_bytes","capture_forced_submissions"])?;
+        let declared_staging=num(spool,"live_staging_bound")?;
+        require(declared_staging==FINISHED_STAGING_BOUND||(executed&&declared_staging==EXECUTED_STAGING_BOUND),"finished graph declared staging bound")?;
         let epochs=array(spool,"natural_submission_epochs")?.iter().map(|v|v.as_u64().ok_or("spool epoch")).collect::<std::result::Result<Vec<_>,_>>()?;
         require(!epochs.is_empty()&&epochs.len()<=8192&&epochs[0]>0&&epochs.windows(2).all(|w|w[0]<w[1])
             &&num(spool,"submitted_batches")?==epochs.len() as u64&&num(spool,"completed_batches")?==epochs.len() as u64
             &&num(spool,"raw_payload_bytes")?==packed&&num(spool,"cumulative_padded_staging_bytes")?==allocated
-            &&num(spool,"payload_bound")?==MAX_FINISHED_PAYLOAD_BYTES&&num(spool,"live_staging_bound")?==FINISHED_STAGING_BOUND
-            &&num(spool,"peak_completed_map_bytes")?<=FINISHED_STAGING_BOUND&&num(spool,"capture_forced_submissions")?==0&&num(m,"peak_live_staging_bytes")?>0&&num(m,"peak_live_staging_bytes")?<=FINISHED_STAGING_BOUND,
+            &&num(spool,"payload_bound")?==MAX_FINISHED_PAYLOAD_BYTES
+            &&num(spool,"peak_completed_map_bytes")?<=declared_staging&&num(spool,"capture_forced_submissions")?==0&&num(m,"peak_live_staging_bytes")?>0&&num(m,"peak_live_staging_bytes")?<=declared_staging,
             "finished graph natural spool accounting")?;
     } else {require(m.get("spool").is_none()&&m.get("peak_live_staging_bytes").is_none(),"bounded graph unexpected spool")?;}
     let mut a=Assembly::new(source_hash.clone(),blobs);
-    if finished {a.scene.provenance=Provenance::NativeFinishedGraph{source_sha256:source_hash.clone(),capture_id:capture_id.into(),native_present:present};}
+    if executed {a.scene.provenance=Provenance::NativeExecutedFinishedGraph{source_sha256:source_hash.clone(),capture_id:capture_id.into(),native_present:present};}
+    else if finished {a.scene.provenance=Provenance::NativeFinishedGraph{source_sha256:source_hash.clone(),capture_id:capture_id.into(),native_present:present};}
     let mut footprints=vec![];let mut proxies=BTreeSet::new();let mut compute_inputs=BTreeSet::new();
     let stages=array(m,"stages")?;require(stages.len()>=3&&stages.len()<=if finished{8192}else{25},"graph stage bound")?;
     let mut rasters=0;let mut prior_raster_checkpoint=0;let mut computes=0;let mut stage_order=0;let mut compute_event=0;let mut compute_checkpoint=0;let mut used_names=BTreeSet::new();let anchor=get(m,"world_view")?;
@@ -470,6 +479,15 @@ fn convert(m:&Value,source_hash:String,payload:&[(PathBuf,Vec<u8>)])->Result<Con
                 let o=get(stage,"operation")?;let index=num(o,"event_index")?;require(index>stage_order,"operation stage order")?;stage_order=index;
                 operation(&mut a,txt(stage,"kind")?,o,&mut used_names)?;
             },
+            "original_omission"=>{
+                require(executed&&stage.get("capture").is_none(),"original omission requires schema8")?;
+                let op=get(stage,"operation")?;
+                require(serde_json::to_vec(op)?.len()<=64<<10,"original omission byte bound")?;
+                let omission:OriginalOmission=serde_json::from_value(op.clone())?;
+                crate::validate::validate_original_omission(&omission)?;
+                require(omission.event_index>stage_order,"original omission stage order")?;stage_order=omission.event_index;
+                a.event(omission.event_index,omission.command_sequence,Command::OriginalOmission{omission})?;
+            },
             "query"|"readback"=>{
                 require(finished&&stage.get("capture").is_none(),"original-only stage requires finished graph")?;
                 let o=get(stage,"operation")?;let index=num(o,"event_index")?;let ordinal=num(o,"command_sequence")?;
@@ -498,6 +516,12 @@ fn convert(m:&Value,source_hash:String,payload:&[(PathBuf,Vec<u8>)])->Result<Con
         let endpoint=a.events.last_key_value().unwrap();
         if let Command::FinishedEndpoint{depth_world,..}=&endpoint.1.command {require(crate::validate::same_screen_rays(anchor,depth_world)?,"finished endpoint depth changed screen rays")?;}
     } else {require(a.events.keys().all(|index|*index<=compute_event||*index==compute_checkpoint),"graph has events after final compute")?;}
+    let omission_count=a.events.values().filter(|e|matches!(e.command,Command::OriginalOmission{..})).count();
+    for omitted in a.events.values().filter(|e|matches!(e.command,Command::OriginalOmission{..})) {
+        require(a.events.values().filter(|e|e.ordinal==omitted.ordinal).count()==1,"original omission command also emitted graph work")?;
+    }
+    if executed{require(omission_count as u64==num(m,"original_omission_count")?&&omission_count<=1024,"executed omission count mismatch")?;}
+    else{require(omission_count==0,"strict graph omitted original draw")?;}
     require(used_names==rows.keys().cloned().collect(),"graph unused outer payload")?;
     let (scene,elided)=a.finish(payload)?;
     validate_buffer_overlaps(&scene,payload)?;
@@ -581,7 +605,7 @@ pub fn native(path:&Path,out:&Path)->Result<()> {
     let raw=fs::read(path)?;require(raw.len()<=32<<20,"graph manifest bound")?;
     let manifest=serde_json::from_slice::<UniqueValue>(&raw)?.0;
     let root=path.parent().ok_or("graph manifest parent")?.canonicalize()?;
-    let limit=if manifest["schema"]==7&&manifest["kind"]=="native_finished_graph"{MAX_FINISHED_PAYLOAD_BYTES}else{MAX_BYTES};
+    let limit=if (manifest["schema"]==7&&manifest["kind"]=="native_finished_graph")||(manifest["schema"]==8&&manifest["kind"]=="native_executed_finished_graph"){MAX_FINISHED_PAYLOAD_BYTES}else{MAX_BYTES};
     let mut payload=vec![];let mut total=0u64;let mut names=BTreeSet::new();
     for b in array(&manifest,"blobs")?{
         let rel=Path::new(txt(b,"path")?);let size=num(b,"byte_length")?;
@@ -601,9 +625,9 @@ pub fn native(path:&Path,out:&Path)->Result<()> {
     Input::load(&out.join("scene.json"))?;
     // Standard receipt is the last file; an incomplete import cannot pass run.py.
     fs::write(out.join("native-import.json"),serde_json::to_vec_pretty(&json!({
-        "schema":1,"adapter":if manifest["schema"]==7{"schema7 native finished HUD-free graph v1"}else{"schema6 single native connected graph v1"},"capture_sha256":sha(&raw),"scene_sha256":sha(&scene_bytes),
+        "schema":1,"adapter":if manifest["schema"]==8{"schema8 native executed finished HUD-free graph v1"}else if manifest["schema"]==7{"schema7 native finished HUD-free graph v1"}else{"schema6 single native connected graph v1"},"capture_sha256":sha(&raw),"scene_sha256":sha(&scene_bytes),
         "capture_id":manifest["source"]["capture_id"],"native_namespace":manifest["source"]["native_namespace"],"native_present":manifest["source"]["native_present"],
-        "native_identifiers_preserved":true,"compute_eye_ownership_assigned":false,"produced_input_initializers_elided":conversion.elided,
+        "native_identifiers_preserved":true,"compute_eye_ownership_assigned":false,"execution_contract":manifest.get("execution_contract"),"all_requested_draws_executed":manifest.get("all_requested_draws_executed"),"original_omission_count":manifest.get("original_omission_count"),"produced_input_initializers_elided":conversion.elided,
         "stage_reference_footprints":conversion.footprints,"outer_actual_readback_bytes":manifest["allocated_readback_bytes"],
         "finished_frame_or_density_accepted":false,"coherent_stereo_accepted":false
     }))?)?;
@@ -955,4 +979,103 @@ mod tests {
         Ok(())
     }
 
+    fn executed_fixture()->(Value,BTreeMap<String,Vec<u8>>){
+        let(mut m,files)=finished_fixture();
+        // Leave gaps to insert an omission and a second real draw inside one
+        // original raster interval, preserving the later dependency graph.
+        fn scale(v:&mut Value){match v{Value::Object(o)=>for(k,v)in o {
+            if ["event_index","checkpoint_event_index","command_sequence","interval_start_command","interval_end_command","content_version"].contains(&k.as_str()) {*v=(v.as_u64().unwrap()*4).into();}else{scale(v);}
+        },Value::Array(a)=>for v in a{scale(v)},_=>{}}}
+        scale(&mut m);
+        m["schema"]=8.into();m["kind"]="native_executed_finished_graph".into();m["source"]["method"]="single native executed finished graph".into();
+        m["all_requested_draws_executed"]=false.into();m["original_omission_count"]=1.into();m["execution_contract"]="executed_original_image_with_recorded_omissions".into();
+        let r=&mut m["stages"][0]["capture"];
+        let mut second=r["draws"][0].clone();second["event_index"]=6.into();second["command_sequence"]=406.into();
+        second["pipeline"]["depth_stencil"]["depth_write_enabled"]=false.into();second["writes"]=json!([{"before":v(100,12,0,0),"after":v(100,21,0,0)}]);
+        r["draws"].as_array_mut().unwrap().push(second);r["attachments"][0]["final_version"]=v(100,21,0,0);
+        let context=&mut m["stages"][4]["capture"];context["attachments"][0]["initial_version"]=v(100,21,0,0);context["draws"][0]["writes"][0]["before"]=v(100,21,0,0);
+        let op=json!({"event_index":5,"command_sequence":405,"skip_reason":"vertex_shader_unavailable","omission_seam":"vertex_shader_program_before_draw_preparation","requested_raw_words":[1,5742,1,0,0,0],"resolved_raw_words":[1,5742,1,0,0,0],"vertex_shader":{"guest_id":1602,"hash":"6edc9adb5e47f1e0","stage":0,"index_entry_present":false,"translated_source_present":false,"program_state":"failed"},"topology":35,"gpu_errors":0,"pipeline_jobs_pending":0,"pipeline_cache_pending":0,"original_draw_was_not_emitted":true,"native_behavior_changed":false,"requested_geometry_validated":false,"pixel_visibility_known":false,"gpu_commands_emitted":0});
+        m["stages"].as_array_mut().unwrap().insert(1,json!({"kind":"original_omission","capture_id":"fixture-single-capture","native_present":1,"operation":op}));
+        (m,files)
+    }
+    #[test]
+    fn executed_finished_preserves_nested_original_omission_and_endpoint()->Result<()> {
+        let(m,files)=executed_fixture();let c=convert(&m,"8".repeat(64),&payload(&files))?;
+        assert!(c.scene.provenance.is_executed_finished());
+        assert!(matches!(c.scene.commands[0],Command::Draw{..}));
+        let Command::OriginalOmission{omission}=&c.scene.commands[1]else{panic!("omission not between original draws")};
+        assert_eq!(serde_json::to_value(omission)?,m["stages"][1]["operation"]);
+        assert!(matches!(c.scene.commands[2],Command::Draw{..}));
+        assert!(matches!(c.scene.commands.last(),Some(Command::FinishedEndpoint{..})));
+        let dir=std::env::temp_dir().join(format!("executed-graph-import-{}",std::process::id()));fs::create_dir(&dir)?;
+        for(n,b)in &files{fs::write(dir.join(n),b)?;}let raw=serde_json::to_vec(&m)?;fs::write(dir.join("capture.json"),&raw)?;
+        native(&dir.join("capture.json"),&dir.join("imported"))?;
+        let mut input=Input::load(&dir.join("imported/scene.json"))?;
+        assert!(!input.targets_have_resolution_independent_initialization);
+        assert_eq!(fs::read(dir.join("imported/native-capture.json"))?,raw);
+        let receipt:Value=serde_json::from_slice(&fs::read(dir.join("imported/native-import.json"))?)?;
+        assert_eq!(receipt["all_requested_draws_executed"],false);assert_eq!(receipt["original_omission_count"],1);
+        assert_eq!(receipt["capture_sha256"],sha(&raw));assert_eq!(receipt["scene_sha256"],sha(&fs::read(dir.join("imported/scene.json"))?));
+        input.scene.provenance=Provenance::NativeFinishedGraph{source_sha256:sha(&raw),capture_id:"fixture-single-capture".into(),native_present:1};
+        fs::write(dir.join("imported/downgraded.json"),serde_json::to_vec(&input.scene)?)?;
+        assert!(Input::load(&dir.join("imported/downgraded.json")).is_err());
+        fs::remove_dir_all(dir)?;Ok(())
+    }
+    #[test]
+    fn executed_finished_rejects_unproven_omissions_and_contract_downgrades()->Result<()> {
+        let(m,files)=executed_fixture();let p=payload(&files);
+        let reject=|label:&str,f:&dyn Fn(&mut Value)|{let mut bad=m.clone();f(&mut bad);assert!(convert(&bad,"8".repeat(64),&p).is_err(),"accepted {label}");};
+        for(key,value)in [("skip_reason",json!("pipeline_pending")),("omission_seam",json!("after_draw_preparation")),("topology",json!(4)),("gpu_errors",json!(1)),("pipeline_jobs_pending",json!(1)),("pipeline_cache_pending",json!(1)),("gpu_commands_emitted",json!(1)),("original_draw_was_not_emitted",json!(false)),("native_behavior_changed",json!(true)),("requested_geometry_validated",json!(true)),("pixel_visibility_known",json!(true)),("event_index",json!(4)),("command_sequence",json!(404)),("writes",json!([]))] {
+            reject(key,&|m|m["stages"][1]["operation"][key]=value.clone());
+        }
+        for(key,value)in [("guest_id",json!(0)),("hash",json!("other")),("stage",json!(1)),("index_entry_present",json!(true)),("translated_source_present",json!(true)),("program_state",json!("pending")),("synthesized_source",json!(false))] {
+            reject(key,&|m|m["stages"][1]["operation"]["vertex_shader"][key]=value.clone());
+        }
+        for args in [json!([0,5742,1,0,0,0]),json!([2,5742,1,0,0,0]),json!([1,0,1,0,0,0]),json!([1,5742,0,0,0,0]),json!([1,5742,1,0,0]),json!([1,5742,1,0,0,4294967296u64]),json!([1,-1,1,0,0,0])] {
+            reject("invalid raw arguments",&|m|{m["stages"][1]["operation"]["requested_raw_words"]=args.clone();m["stages"][1]["operation"]["resolved_raw_words"]=args.clone();});
+        }
+        reject("reversed guest ordinal",&|m|m["stages"][1]["operation"]["command_sequence"]=403.into());
+        reject("reversed event",&|m|m["stages"][1]["operation"]["event_index"]=3.into());
+        reject("missing actual skip evidence",&|m|{m["stages"][1]["operation"].as_object_mut().unwrap().remove("pipeline_cache_pending");});
+        reject("raw/effective mismatch",&|m|m["stages"][1]["operation"]["resolved_raw_words"][1]=5743.into());
+        reject("duplicate stage event",&|m|{let op=m["stages"][1].clone();m["stages"].as_array_mut().unwrap().insert(2,op);m["original_omission_count"]=2.into();});
+        reject("count mismatch",&|m|m["original_omission_count"]=2.into());reject("count zero",&|m|m["original_omission_count"]=0.into());reject("count bound",&|m|m["original_omission_count"]=1025.into());
+        reject("effects claim",&|m|m["all_requested_draws_executed"]=true.into());reject("contract",&|m|m["execution_contract"]="finished_graph".into());
+        reject("source method",&|m|m["source"]["method"]="single native finished graph".into());
+        reject("capture splice",&|m|m["stages"][1]["capture_id"]="another".into());reject("present splice",&|m|m["stages"][1]["native_present"]=2.into());
+        reject("oversized record",&|m|m["stages"][1]["operation"]["skip_reason"]="x".repeat(64<<10).into());
+        reject("missing endpoint",&|m|{m["stages"].as_array_mut().unwrap().pop();});
+        reject("invalid accepted callback",&|m|m["stages"][8]["operation"]["publication"]["accepted"]=false.into());
+        reject("strict schema with executed fields",&|m|{m["schema"]=7.into();m["kind"]="native_finished_graph".into();m["source"]["method"]="single native finished graph".into();});
+        reject("strict schema with omission",&|m|{m["schema"]=7.into();m["kind"]="native_finished_graph".into();m["source"]["method"]="single native finished graph".into();for k in ["execution_contract","all_requested_draws_executed","original_omission_count"]{m.as_object_mut().unwrap().remove(k);}});
+        let(mut legacy,lfiles)=fixture();legacy["all_requested_draws_executed"]=false.into();assert!(convert(&legacy,"6".repeat(64),&payload(&lfiles)).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn executed_staging_is_explicit_bounded_and_schema_specific()->Result<()> {
+        assert_eq!(MAX_BYTES,256<<20);assert_eq!(MAX_FINISHED_PAYLOAD_BYTES,1<<30);
+        assert_eq!(FINISHED_STAGING_BOUND,512<<20);assert_eq!(EXECUTED_STAGING_BOUND,1<<30);
+        let(m,files)=executed_fixture();let p=payload(&files);
+        // Previously produced schema8 captures retain their declared512MiB gate.
+        convert(&m,"8".repeat(64),&p)?;
+        for bound in [FINISHED_STAGING_BOUND,EXECUTED_STAGING_BOUND] {
+            let mut at_limit=m.clone();at_limit["spool"]["live_staging_bound"]=bound.into();
+            at_limit["peak_live_staging_bytes"]=bound.into();at_limit["spool"]["peak_completed_map_bytes"]=bound.into();
+            convert(&at_limit,"8".repeat(64),&p)?;
+            for field in ["peak_live_staging_bytes","peak_completed_map_bytes"] {
+                let mut bad=at_limit.clone();
+                if field=="peak_live_staging_bytes"{bad[field]=(bound+1).into();}else{bad["spool"][field]=(bound+1).into();}
+                assert!(convert(&bad,"8".repeat(64),&p).is_err(),"admitted {field} above declared{bound}");
+            }
+        }
+        for bound in [0u64,256<<20,(512<<20)+1,(1<<30)+1,2<<30] {
+            let mut bad=m.clone();bad["spool"]["live_staging_bound"]=bound.into();
+            assert!(convert(&bad,"8".repeat(64),&p).is_err(),"admitted arbitrary declared bound{bound}");
+        }
+        let(mut strict,strict_files)=finished_fixture();strict["spool"]["live_staging_bound"]=EXECUTED_STAGING_BOUND.into();
+        assert!(convert(&strict,"7".repeat(64),&payload(&strict_files)).is_err(),"schema7 staging gate expanded");
+        Ok(())
+
+    }
 }

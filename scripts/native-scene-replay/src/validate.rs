@@ -7,7 +7,7 @@ use std::{
 use wgpu_types::*;
 pub const MAX_BYTES: u64 = 256 << 20;
 pub const MAX_FINISHED_PAYLOAD_BYTES:u64=1<<30;
-pub fn payload_bound(p:&Provenance)->u64{if matches!(p,Provenance::NativeFinishedGraph{..}){MAX_FINISHED_PAYLOAD_BYTES}else{MAX_BYTES}}
+pub fn payload_bound(p:&Provenance)->u64{if p.is_finished(){MAX_FINISHED_PAYLOAD_BYTES}else{MAX_BYTES}}
 pub struct Input {
     pub scene: Scene,
     pub bytes: BTreeMap<String, Vec<u8>>,
@@ -126,8 +126,8 @@ impl Input {
                 && s.omitted_commands == 0,
             "original closure missing",
         )?;
-        let native_graph = matches!(s.provenance, Provenance::NativeGraph { .. } | Provenance::NativeFinishedGraph { .. });
-        let native = matches!(s.provenance, Provenance::Native { .. } | Provenance::NativeGraph { .. } | Provenance::NativeFinishedGraph { .. });
+        let native_graph = matches!(s.provenance, Provenance::NativeGraph { .. } | Provenance::NativeFinishedGraph { .. } | Provenance::NativeExecutedFinishedGraph { .. });
+        let native = matches!(s.provenance, Provenance::Native { .. } | Provenance::NativeGraph { .. } | Provenance::NativeFinishedGraph { .. } | Provenance::NativeExecutedFinishedGraph { .. });
         let isolated_compute = !s.commands.is_empty()
             && s.pipelines.is_empty()
             && s.commands.iter().all(|c| matches!(c, Command::Dispatch { .. } | Command::DepthToColor { .. } | Command::Checkpoint { .. }))
@@ -146,10 +146,15 @@ impl Input {
                 "native same-eye identity",
             )?;
         }
-        if matches!(s.provenance, Provenance::NativeFinishedGraph{..}) {
+        if s.provenance.is_finished() {
             require(s.commands.iter().filter(|c|matches!(c,Command::FinishedEndpoint{..})).count()==1
                 && matches!(s.commands.last(),Some(Command::FinishedEndpoint{..})), "finished graph endpoint missing/duplicated")?;
         } else {require(!s.commands.iter().any(|c|matches!(c,Command::FinishedEndpoint{..})), "finished endpoint requires native finished graph")?;}
+        let omissions=s.commands.iter().filter_map(|c|match c{Command::OriginalOmission{omission}=>Some(omission),_=>None}).collect::<Vec<_>>();
+        if s.provenance.is_executed_finished() {
+            require(!omissions.is_empty()&&omissions.len()<=1024,"executed graph omission count")?;
+            require(omissions.windows(2).all(|w|w[0].event_index<w[1].event_index&&w[0].command_sequence<w[1].command_sequence),"original omission order/identity")?;
+        }else{require(omissions.is_empty(),"original omission requires executed finished provenance")?;}
         let mut ids = BTreeSet::new();
         let mut allocation_bytes = 0u64;
         let mut native_textures = BTreeSet::new();
@@ -239,7 +244,7 @@ impl Input {
                             | TextureFormat::R32Float
                             | TextureFormat::Depth32Float
                             | TextureFormat::Depth32FloatStencil8
-                    ) || (d.format==TextureFormat::Rg8Uint && matches!(s.provenance,Provenance::NativeFinishedGraph{..}|Provenance::Authored{..})),
+                    ) || (d.format==TextureFormat::Rg8Uint && matches!(s.provenance,Provenance::NativeFinishedGraph{..}|Provenance::NativeExecutedFinishedGraph{..}|Provenance::Authored{..})),
                 "unsupported persistent target format",
             )?;
             for i in &t.initial {
@@ -519,7 +524,7 @@ impl Input {
                     independent = false;
                 }
                 Command::StencilToColor { source, destination } => {
-                    require(matches!(s.provenance,Provenance::NativeFinishedGraph{..}|Provenance::Authored{..}),"stencil proxy requires finished graph")?;
+                    require(matches!(s.provenance,Provenance::NativeFinishedGraph{..}|Provenance::NativeExecutedFinishedGraph{..}|Provenance::Authored{..}),"stencil proxy requires finished graph")?;
                     check_version(source,&versions,&initialized)?;
                     let a=self.texture(&source.slice.resource)?;let b=self.texture(&destination.slice.resource)?;
                     require(a.descriptor.dimension==TextureDimension::D2 && b.descriptor.dimension==TextureDimension::D2
@@ -532,8 +537,13 @@ impl Input {
                     require(!native || !native_initial_versions.contains(&destination.after),"native stencil proxy reused initial version")?;
                     advance(destination,&mut versions,&mut last_write)?;initialized.insert(destination.slice.clone());independent=false;
                 }
+                Command::OriginalOmission{omission} => {
+                    require(s.provenance.is_executed_finished(),"original omission requires schema8 provenance")?;
+                    validate_original_omission(omission)?;
+                    independent=false;
+                }
                 Command::OriginalOnly{operation_kind:kind,expected,metadata} => {
-                    require(matches!(s.provenance,Provenance::NativeFinishedGraph{..}|Provenance::Authored{..}),"original-only event requires finished graph")?;
+                    require(matches!(s.provenance,Provenance::NativeFinishedGraph{..}|Provenance::NativeExecutedFinishedGraph{..}|Provenance::Authored{..}),"original-only event requires finished graph")?;
                     validate_original_only(self,kind,expected,metadata)?;
                     for e in expected {check_version(&e.version,&versions,&initialized)?;
                         let t=self.texture(&e.version.slice.resource)?;let(_,_,row,rows)=slice_bytes(&t.descriptor,e.version.slice.mip,&e.version.slice.aspect)?;
@@ -581,7 +591,7 @@ impl Input {
                     if let Command::ContextDraw{context,..}=c {
                         require(d.eye.is_none(), "context draw fabricated eye ownership")?;
                         match &s.provenance {
-                            Provenance::NativeFinishedGraph{native_present,..} => {
+                            Provenance::NativeFinishedGraph{native_present,..}|Provenance::NativeExecutedFinishedGraph{native_present,..} => {
                                 require(context.native_present==*native_present && *native_present>0, "context draw belongs to another native present")?;
                                 if !context.world_view.is_null() {
                                     let e=crate::native_import::world(&context.world_view)?;
@@ -942,7 +952,7 @@ impl Input {
         initialized: &BTreeSet<Slice>,
     ) -> Result<()> {
         require(d.eye == self.scene.eye
-            || (matches!(self.scene.provenance, Provenance::NativeGraph { .. } | Provenance::NativeFinishedGraph { .. }) && d.eye.is_none()),
+            || (matches!(self.scene.provenance, Provenance::NativeGraph { .. } | Provenance::NativeFinishedGraph { .. } | Provenance::NativeExecutedFinishedGraph { .. }) && d.eye.is_none()),
             "compute eye changed")?;
         require(d.workgroups.iter().all(|n| *n > 0 && *n <= 65535)
             && d.workgroups.iter().try_fold(1u64, |n, v| n.checked_mul(*v as u64)).is_some_and(|n| n <= 1 << 20),
@@ -1193,8 +1203,22 @@ fn native_id(scene:&Scene,s:&Slice)->Result<u64>{
     let id=t.native_allocation_id.ok_or("endpoint native texture identity")?;
     require(id>0&&s.resource==format!("native-texture:{id}"),"endpoint native texture identity")?;Ok(id)
 }
+pub(crate) fn validate_original_omission(o:&OriginalOmission)->Result<()> {
+    require(serde_json::to_vec(o)?.len()<=64<<10,"original omission metadata bound")?;
+    require(o.event_index>0&&o.event_index<1<<20&&o.command_sequence>0,"original omission event identity")?;
+    require(o.skip_reason=="vertex_shader_unavailable"&&o.omission_seam=="vertex_shader_program_before_draw_preparation",
+        "unsupported original omission seam")?;
+    let v=&o.vertex_shader;
+    require(v.guest_id>0&&v.hash=="6edc9adb5e47f1e0"&&v.stage==0&&!v.index_entry_present&&!v.translated_source_present&&v.program_state=="failed",
+        "original omission shader evidence")?;
+    require(o.topology==35&&o.requested_raw_words==o.resolved_raw_words&&o.resolved_raw_words[0]==1
+        &&o.resolved_raw_words[1]>0&&o.resolved_raw_words[2]>0,"original omission direct indexed arguments")?;
+    require(o.gpu_errors==0&&o.pipeline_jobs_pending==0&&o.pipeline_cache_pending==0&&o.gpu_commands_emitted==0
+        &&o.original_draw_was_not_emitted&&!o.native_behavior_changed&&!o.requested_geometry_validated&&!o.pixel_visibility_known,
+        "original omission is not a proven baseline no-GPU branch")
+}
 pub(crate) fn validate_finished_endpoint(scene:&Scene,command:&Command,depth_world:&serde_json::Value,p:&serde_json::Value)->Result<()> {
-    let Provenance::NativeFinishedGraph{capture_id,native_present,..}=&scene.provenance else{return Err("endpoint provenance".into())};
+    let (Provenance::NativeFinishedGraph{capture_id,native_present,..}|Provenance::NativeExecutedFinishedGraph{capture_id,native_present,..})=&scene.provenance else{return Err("endpoint provenance".into())};
     require(!capture_id.is_empty()&&*native_present>0,"endpoint source identity")?;
     let Command::FinishedEndpoint{hud_free_source,hud_world,depth_source,..}=command else{return Err("endpoint command".into())};
     let obj=p.as_object().ok_or("endpoint publication object")?;

@@ -130,3 +130,38 @@ Five final comparisons and all six initial subresources match on Metal. A separa
 actual game dispatch also matches all 115,200 RGBA16Float output bytes; see
 `docs/NATIVE-COMPUTE-REPLAY-20261026.md` in the checkout for identities and limits.
 Neither result establishes a complete finished frame or permits a density change.
+
+## Executed-image contract with original omissions
+
+Native schema 8 (`native_executed_finished_graph`) is a separate admission mode
+from strict schema 7. It retains every finished endpoint, resource identity,
+version, initialization and byte-comparison requirement, while recording one
+narrow original engine omission as an ordered no-GPU event. The accepted case is
+the unavailable control-point vertex shader `6edc9adb5e47f1e0`, topology 35,
+direct indexed positive count/instances, identical requested/resolved words,
+absent index/source, and zero pending pipelines or GPU errors. The original early
+return precedes rendering preparation. Other skip reasons remain rejected.
+
+Each record retains exact native command/event identity and raw draw arguments.
+It creates no shader, buffer, texture or output. At most 1,024 records of 64 KiB
+are admitted. Schema 6/7 reject both these records and the new top-level contract.
+The producer must explicitly report `all_requested_draws_executed: false`, exact
+`original_omission_count`, and
+`execution_contract: executed_original_image_with_recorded_omissions`.
+
+After successful original-density replay, schema 8 may report
+`executed_finished_hud_free_image_byte_parity: true`; the existing
+`finished_hud_free_graph_byte_parity` remains false. This proves reproduction of
+the current native engine's executed image only. It does not restore omitted
+effects, establish windowed/headset equivalence, certify stereo or accept a new
+density path. Original and frozen capture bytes remain authoritative.
+Use `import-native-graph` for strict CPU admission; it creates no GPU device.
+`python3 -m unittest discover -s scripts/native-scene-replay -p test_run.py`
+checks wrapper identity with its subprocess explicitly mocked, without Metal.
+
+Schema 8 accepts only an explicit live staging/map receipt limit of 512 MiB or
+1 GiB, with both observed peaks at or below that declared limit. Schema 7 retains
+512 MiB only. This is a producer readback-staging admission limit, not a larger
+render target or replay allocation budget: individual blobs remain at most
+256 MiB, packed finished payload/import remains 1 GiB and logical persistent GPU
+allocation remains 256 MiB. No limit is increased automatically.

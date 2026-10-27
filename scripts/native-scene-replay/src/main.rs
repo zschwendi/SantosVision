@@ -30,7 +30,7 @@ fn main() -> Result<()> {
     let out = Path::new(&a[3]);
     if a[1] == "import-native-graph" {
         native_scene_replay::graph_import::native(input, out)?;
-        println!("Imported one connected native raster/proxy/compute graph; no finished-frame or density claim");
+        println!("Imported native graph with explicit provenance and strict CPU admission; no GPU parity or density claim");
         return Ok(());
     }
     if a[1] == "import-native-compute" {

@@ -876,6 +876,9 @@ pub fn run(input: &Input) -> Result<Output> {
             }
             Command::DepthToColor { source, destination } => depth_stencil_to_color(&device, &q, &r, source, destination,false),
             Command::StencilToColor { source,destination } => depth_stencil_to_color(&device,&q,&r,source,destination,true),
+            // This exact original branch emitted no GPU command. Preserve only
+            // its audited event record; never prepare or substitute a shader.
+            Command::OriginalOmission{..} => {},
             Command::OriginalOnly{operation_kind:kind,expected,..} => {
                 for ex in expected {let bytes=read(&device,&q,&r.textures[&ex.version.slice.resource],&ex.version.slice,input)?;let reference=input.data(&ex.blob)?;
                     let count=bytes.iter().zip(reference).filter(|(a,b)|a!=b).count();
@@ -958,8 +961,28 @@ pub fn run(input: &Input) -> Result<Output> {
     let error = pollster::block_on(scope.pop());
     require(error.is_none(), &format!("replay validation: {error:?}"))?;
     let exact = comparisons.iter().chain(&checkpoint_comparisons).all(|v| v["different_bytes"] == 0);
+    let (strict_parity,executed_parity)=finished_parity(&input.scene.provenance,exact);
     Ok(Output {
         aspect_bytes: output,
-        report: serde_json::json!({"schema":1,"gpu_executed":true,"manifest_sha256":input.manifest_sha256,"provenance":input.scene.provenance,"eye":input.scene.eye,"eye_scope":if matches!(input.scene.provenance,Provenance::NativeFinishedGraph{..}) {"qualified_endpoint_context_draws_and_compute_unattributed"} else if matches!(input.scene.provenance,Provenance::NativeGraph{..}) {"world_raster_anchor_compute_unattributed"} else {"scene_identity_as_declared"},"initial_subresources_byte_exact":initial_checks,"uniform_clear_initial_subresources_byte_exact":clear_reference_checks,"all_expected_bytes_equal":exact,"comparisons":comparisons,"checkpoint_comparisons":checkpoint_comparisons,"depth_to_color_count":input.scene.commands.iter().filter(|c|matches!(c,Command::DepthToColor{..})).count(),"stencil_to_color_count":input.scene.commands.iter().filter(|c|matches!(c,Command::StencilToColor{..})).count(),"heterogeneous_pipeline_count":r.pipelines.len(),"compute_pipeline_count":r.compute_pipelines.len(),"dispatch_count":input.scene.commands.iter().filter(|c| matches!(c, Command::Dispatch { .. })).count(),"command_count":input.scene.commands.len(),"targets_have_resolution_independent_initialization":input.targets_have_resolution_independent_initialization,"finished_hud_free_graph_byte_parity":exact&&matches!(input.scene.provenance,Provenance::NativeFinishedGraph{..}),"original_only_event_count":input.scene.commands.iter().filter(|c|matches!(c,Command::OriginalOnly{..})).count(),"original_only_side_effects_replayed":false,"finished_frame_or_density_accepted":false,"scope":"Generic original-density ordered replay. External dependency and complete finished-frame closure remain separate gates.","adapter":format!("{:?}",adapter.get_info())}),
+        report: serde_json::json!({"schema":1,"gpu_executed":true,"manifest_sha256":input.manifest_sha256,"provenance":input.scene.provenance,"eye":input.scene.eye,"eye_scope":if input.scene.provenance.is_finished() {"qualified_endpoint_context_draws_and_compute_unattributed"} else if matches!(input.scene.provenance,Provenance::NativeGraph{..}) {"world_raster_anchor_compute_unattributed"} else {"scene_identity_as_declared"},"initial_subresources_byte_exact":initial_checks,"uniform_clear_initial_subresources_byte_exact":clear_reference_checks,"all_expected_bytes_equal":exact,"comparisons":comparisons,"checkpoint_comparisons":checkpoint_comparisons,"depth_to_color_count":input.scene.commands.iter().filter(|c|matches!(c,Command::DepthToColor{..})).count(),"stencil_to_color_count":input.scene.commands.iter().filter(|c|matches!(c,Command::StencilToColor{..})).count(),"heterogeneous_pipeline_count":r.pipelines.len(),"compute_pipeline_count":r.compute_pipelines.len(),"dispatch_count":input.scene.commands.iter().filter(|c| matches!(c, Command::Dispatch { .. })).count(),"command_count":input.scene.commands.len(),"targets_have_resolution_independent_initialization":input.targets_have_resolution_independent_initialization,"finished_hud_free_graph_byte_parity":strict_parity,"executed_finished_hud_free_image_byte_parity":executed_parity,"execution_contract":if input.scene.provenance.is_executed_finished(){Some("executed_original_image_with_recorded_omissions")}else{None},"all_requested_draws_executed":if input.scene.provenance.is_executed_finished(){Some(false)}else{None},"original_omission_count":input.scene.commands.iter().filter(|c|matches!(c,Command::OriginalOmission{..})).count(),"original_omissions":input.scene.commands.iter().filter_map(|c|match c{Command::OriginalOmission{omission}=>Some(omission),_=>None}).collect::<Vec<_>>(),"intended_effect_fidelity_accepted":false,"original_only_event_count":input.scene.commands.iter().filter(|c|matches!(c,Command::OriginalOnly{..})).count(),"original_only_side_effects_replayed":false,"finished_frame_or_density_accepted":false,"scope":"Generic original-density ordered replay. External dependency and complete finished-frame closure remain separate gates.","adapter":format!("{:?}",adapter.get_info())}),
     })
+}
+
+// Keep the two certificates disjoint, even when every compared byte is equal.
+fn finished_parity(provenance:&Provenance,exact:bool)->(bool,bool){
+    (exact&&matches!(provenance,Provenance::NativeFinishedGraph{..}),exact&&provenance.is_executed_finished())
+}
+#[cfg(test)]
+mod executed_contract_tests {
+    use super::*;
+    #[test]
+    fn executed_parity_never_promotes_strict_or_unverified_results(){
+        let executed=Provenance::NativeExecutedFinishedGraph{source_sha256:"a".repeat(64),capture_id:"test".into(),native_present:1};
+        let strict=Provenance::NativeFinishedGraph{source_sha256:"b".repeat(64),capture_id:"test".into(),native_present:1};
+        assert_eq!(finished_parity(&executed,true),(false,true));
+        assert_eq!(finished_parity(&strict,true),(true,false));
+        assert_eq!(finished_parity(&executed,false),(false,false));
+        assert_eq!(finished_parity(&strict,false),(false,false));
+        assert_eq!(finished_parity(&Provenance::Authored{description:"API qualification".into()},true),(false,false));
+    }
 }

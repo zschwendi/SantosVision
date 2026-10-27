@@ -11,6 +11,10 @@ def digest(raw):
     return hashlib.sha256(raw).hexdigest()
 
 
+def payload_bound(kind):
+    return (1 << 30) if kind in ("native_finished_graph", "native_executed_finished_graph") else (256 << 20)
+
+
 def main():
     if len(sys.argv) != 4:
         raise SystemExit("usage: run.py BINARY SCENE_JSON NEW_OUTPUT")
@@ -30,7 +34,7 @@ def main():
     frozen.mkdir()
     (frozen / "scene.json").write_bytes(raw)
     checked = [(manifest, digest(raw)), (frozen / "scene.json", digest(raw))]
-    if metadata.get("provenance", {}).get("kind") in ("native", "native_graph", "native_finished_graph"):
+    if metadata.get("provenance", {}).get("kind") in ("native", "native_graph", "native_finished_graph", "native_executed_finished_graph"):
         native = root / "native-capture.json"
         imported = root / "native-import.json"
         if native.stat().st_size > 32 << 20 or imported.stat().st_size > 64 << 10:
@@ -45,7 +49,7 @@ def main():
             copied = frozen / original.name
             copied.write_bytes(data)
             checked.extend(((original, digest(data)), (copied, digest(data))))
-    payload_limit = (1 << 30) if metadata.get("provenance", {}).get("kind") == "native_finished_graph" else (256 << 20)
+    payload_limit = payload_bound(metadata.get("provenance", {}).get("kind"))
     total = 0
     seen = set()
     for item in metadata["blobs"]:
