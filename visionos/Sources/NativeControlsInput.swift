@@ -42,7 +42,7 @@ enum SantosControlAction: Int, CaseIterable, Identifiable {
         switch self {
         case .resume: "Resume"
         case .window: "Window"
-        case .settings: "V settings"
+        case .settings: "spatial-V settings"
         case .quit: "Quit game"
         }
     }

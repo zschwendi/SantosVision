@@ -21,7 +21,7 @@ struct SantosVisionApp: App {
     @Environment(\.dismissImmersiveSpace) private var dismissImmersiveSpace
 
     var body: some Scene {
-        Window("V", id: "main") {
+        Window("spatial-V", id: "main") {
             #if SV_GAME_RUNTIME
             if runtime.windowGameMode {
                 WindowGameView(runtime: runtime, surface: windowSurface)
@@ -70,7 +70,7 @@ struct SantosVisionApp: App {
         .immersionStyle(selection: .constant(.full), in: .full)
 
         #if SV_GAME_RUNTIME
-        Window("V controls", id: "game-controls") {
+        Window("spatial-V controls", id: "game-controls") {
             ImmersiveGameControls(runtime: runtime, world: world, gameScenes: gameScenes)
         }
         .defaultSize(width: 460, height: 260)
@@ -252,7 +252,7 @@ private struct LauncherView: View {
     var body: some View {
         ScrollView {
         VStack(alignment: .leading, spacing: 20) {
-            Text("V").font(.largeTitle.bold())
+            Text("spatial-V").font(.largeTitle.bold())
             Text("Native engine and headset tracking").font(.title2)
             Text("The compatible GTA web-port engine is compiled for visionOS. The immersive game renderer requests the headset’s actual views and scene depth from the native engine.")
 
@@ -383,7 +383,7 @@ private struct LauncherView: View {
             .disabled(!runtime.canChangeGraphics)
             Text(runtime.graphicsStatus).font(.caption).foregroundStyle(.secondary)
             if runtime.hasStarted {
-                Text("Quit and reopen V to change graphics.")
+                Text("Quit and reopen spatial-V to change graphics.")
                     .font(.caption).foregroundStyle(.secondary)
             }
         }
@@ -401,7 +401,7 @@ private struct LauncherView: View {
             Toggle("Reduce rendering overhead (experimental)", isOn: Binding(
                 get: { runtime.drawSetupOverheadEnabled },
                 set: { runtime.setDrawSetupOverhead($0) }))
-            Text("Rendering overhead reductions reuse unchanged setup work and avoid empty GPU work while preserving your graphics settings. Frame-copy reduction starts on; the experimental options start off. Choose before starting the game, then quit and reopen V to change these settings.")
+            Text("Rendering overhead reductions reuse unchanged setup work and avoid empty GPU work while preserving your graphics settings. Frame-copy reduction starts on; the experimental options start off. Choose before starting the game, then quit and reopen spatial-V to change these settings.")
                 .font(.caption).foregroundStyle(.secondary)
             Toggle("Fill gaps beside near objects (experimental)", isOn: Binding(
                 get: { runtime.depthEdgeFillEnabled },

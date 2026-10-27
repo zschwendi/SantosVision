@@ -1,0 +1,22 @@
+{
+  "tool": "built-in image_gen",
+  "source_reference": "visionos/Assets.xcassets/AppIcon.solidimagestack/Back.solidimagestacklayer/Content.imageset/santos-five-visor.png",
+  "master": "assets/branding/spatial-v-front-glass-master-v28.png",
+  "asset": "visionos/Assets.xcassets/AppIcon.solidimagestack/Back.solidimagestacklayer/Content.imageset/spatial-v-front-glass.png",
+  "prompt_summary": "Refine the existing emerald coastal-sunset icon into Vision Pro front glass only: curved dark glass, fine silver edge, palm silhouettes and one sunset horizon, dark green background. Remove FIVE and all lettering; remove headband, fabric, side arms and bulky headset hardware. Preserve margin for the circular visionOS crop.",
+  "master_size": [
+    1254,
+    1254
+  ],
+  "asset_size": [
+    1024,
+    1024
+  ],
+  "asset_packaging": "sips size-only resample; generated artwork preserved in master",
+  "previous_icon_file_preserved": true,
+  "signed_v28_modified": false,
+  "master_sha256": "a956c9a70dfd1a57c864341d1cb179f56f39e49af16059adc906c27411c160ee",
+  "asset_sha256": "d4dae47547d6156041de4df01684ab9d85ac4d71b96fd4069e0ef474b0549929",
+  "ios_asset": "ios/Assets.xcassets/AppIcon.appiconset/spatial-v-front-glass.png",
+  "prompt": "Use case: precise-object-edit / logo-brand. Create the replacement square app icon for spatial-V, editing the attached current icon concept. Keep its emerald green and near-black palette and the warm coastal sunset with palm silhouettes reflected within the central glass. Replace the entire bulky ski-goggle/headset shape with a faithful, premium Apple Vision Pro FRONT GLASS face: a single smooth, wide, continuous curved dark laminated-glass panel, soft rounded outline and the subtle lower-center nose contour, a very fine polished silver edge, physically convincing clean reflections and glass depth. Front-on, symmetrical, only the elegant front glass face is visible. No headband, no top strap, no fabric, no ear pieces, no side arms, no protruding hardware, no cartoon goggles. The panel itself is the hero, centered and large, with a coherent single sunset horizon, two palms, and restrained emerald reflections visible behind the glass. Remove the entire FIVE word and all lettering; do not replace it with any other text or logo. Preserve the dark deep-green square background with a subtle emerald halo, enough safe margin for a circular visionOS icon crop. Refined product-render finish, crisp silhouette readable at small size, beautiful understated specular highlights rather than thick comic outlines. 1024x1024 square, opaque background. No words, no letters, no watermark. The input is the edit target and concept/color reference, not a shape to preserve."
+}

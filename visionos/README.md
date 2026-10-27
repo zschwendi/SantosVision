@@ -29,7 +29,7 @@ Install the extracted compatible package in the app's `Documents/game/` folder. 
 
 ## Graphics settings and the 60 FPS target
 
-The game launcher includes **Graphics** controls before engine startup. Low is the supported preset; resolution choices are **640×360**, **960×540**, **1280×720**, **1920×1080**, **2560×1440** and **3840×2160**, with **30** or **60 FPS** caps. Defaults are Low at 960×540 with a 60 FPS cap. **Restore low defaults** resets these values. Once startup is accepted, the controls lock: quit and reopen V before changing graphics. Closing and reopening immersion does not restart the engine.
+The game launcher includes **Graphics** controls before engine startup. Low is the supported preset; resolution choices are **640×360**, **960×540**, **1280×720**, **1920×1080**, **2560×1440** and **3840×2160**, with **30** or **60 FPS** caps. Defaults are Low at 960×540 with a 60 FPS cap. **Restore low defaults** resets these values. Once startup is accepted, the controls lock: quit and reopen spatial-V before changing graphics. Closing and reopening immersion does not restart the engine.
 
 Swift validates and atomically saves `native-graphics.json` in the selected save root before calling the native runtime. With the default save root, the file is `Documents/saves/native-graphics.json`:
 
