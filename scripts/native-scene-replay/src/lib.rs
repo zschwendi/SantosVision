@@ -23,3 +23,5 @@ mod native_clear;
 
 pub mod compute_fixture;
 pub mod compute_import;
+
+pub mod depth_proxy_fixture;

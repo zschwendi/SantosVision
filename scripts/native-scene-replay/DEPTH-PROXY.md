@@ -1,0 +1,13 @@
+# Exact depth-proxy replay
+
+`DepthToColor { source, destination }` replays the native renderer's depth proxy operation. It uses the same `texture_depth_2d` texel-load shader, full-screen triangle, `Color::BLACK` load clear, R32Float output, default primitive/multisample state, and no blending or depth/stencil test. Each source and destination explicitly selects one D2 mip and array layer with matching pixel extent. Supported source storage is Depth32Float or the depth aspect of Depth32FloatStencil8; output storage must be R32Float.
+
+Admission requires an initialized current source version, a distinct writable destination, its exact current before-version, and a fresh advancing after-version. The full overwrite can initialize an unknown destination for ordinary replay. It conservatively makes `targets_have_resolution_independent_initialization` false: copying captured depth does not create a higher-density producer.
+
+`Checkpoint { expected }` checks original bytes at that position in the command sequence, before later operations can overwrite them. It does not change versions or resources. The validator requires initialized current versions, exact byte extents and bounded readback volume. Runtime writes ordered results to `checkpoint_comparisons`; any checkpoint mismatch makes `all_expected_bytes_equal` false even if every final output matches.
+
+`NativeGraph` provenance keeps one valid world raster anchor. A graph must contain a raster draw, and every raster draw must have that exact eye identity. A compute dispatch may remain unattributed (`eye: null`); an explicit compute identity must match the anchor. This is not a certificate that all graph operations belong to an eye. Standalone Native compute/proxy/checkpoint chains retain their existing no-raster, unattributed admission.
+
+The explicitly authored `make-depth-proxy NEW_OUTPUT` fixture uses a 7×5 selected mip1/layer1, independently chosen Float32 bit patterns, combined depth/stencil source, and sentinel neighbor subresources. It checks an intermediate proxy, consumes it with compute, then overwrites the proxy and checks the new value. Original source and unselected output subresources remain referenced byte-for-byte. Its images are API qualification data, not game imagery.
+
+Build with an external `CARGO_TARGET_DIR`; keep compilation caches outside this source directory because `run.py` freezes the source tree. Generate the fixture with `native-scene-replay make-depth-proxy NEW_OUTPUT`, then use the ordinary guarded runner after obtaining the serialized local GPU slot. The native renderer, game settings, devices and production publication path are not changed by this consumer command.

@@ -6,6 +6,8 @@ use wgpu_types::*;
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Provenance {
     Native { source_sha256: String },
+    /// One captured graph with a raster anchor; compute eye ownership is not inferred.
+    NativeGraph { source_sha256: String },
     LegacyCaptured { manifest_sha256: String },
     Authored { description: String },
 }
@@ -274,6 +276,15 @@ pub enum Command {
     Copy {
         source: Version,
         destination: Transition,
+    },
+    /// Native depth-proxy operation; no color transform or resampling.
+    DepthToColor {
+        source: Version,
+        destination: Transition,
+    },
+    /// Verify historical output before subsequent commands can overwrite it.
+    Checkpoint {
+        expected: Vec<Expected>,
     },
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]

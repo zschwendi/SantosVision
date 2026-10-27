@@ -124,17 +124,21 @@ impl Input {
                 && s.omitted_commands == 0,
             "original closure missing",
         )?;
-        let native = matches!(s.provenance, Provenance::Native { .. });
+        let native_graph = matches!(s.provenance, Provenance::NativeGraph { .. });
+        let native = matches!(s.provenance, Provenance::Native { .. } | Provenance::NativeGraph { .. });
         let isolated_compute = !s.commands.is_empty()
             && s.pipelines.is_empty()
-            && s.commands.iter().all(|c| matches!(c, Command::Dispatch { .. }));
+            && s.commands.iter().all(|c| matches!(c, Command::Dispatch { .. } | Command::DepthToColor { .. } | Command::Checkpoint { .. }))
+            && s.commands.iter().any(|c| matches!(c, Command::Dispatch { .. } | Command::DepthToColor { .. }));
         if native {
+            require(!native_graph || s.commands.iter().any(|c| matches!(c, Command::Draw { .. })),
+                "native graph raster anchor absent")?;
             require(
                 s.original_gpu_errors == Some(0),
                 "native original GPU errors unobserved",
             )?;
             require(
-                (isolated_compute && s.eye.is_none()) || s.eye.as_ref().is_some_and(|e| {
+                (!native_graph && isolated_compute && s.eye.is_none()) || s.eye.as_ref().is_some_and(|e| {
                     e.eye < 2 && e.epoch > 0 && e.camera > 0 && e.request > 0 && e.head > 0
                 }),
                 "native same-eye identity",
@@ -399,6 +403,8 @@ impl Input {
         // writes share this ledger ordering; each transition also checks its
         // own exact preceding subresource version.
         let mut last_write = 0;
+        let mut output_bytes = 0u64;
+        let mut checkpoint_count = 0usize;
         for c in &s.commands {
             match c {
                 Command::Clear {
@@ -437,6 +443,44 @@ impl Input {
                     )?;
                     advance(destination, &mut versions, &mut last_write)?;
                     initialized.insert(destination.slice.clone());
+                }
+                Command::DepthToColor { source, destination } => {
+                    check_version(source, &versions, &initialized)?;
+                    let a = self.texture(&source.slice.resource)?;
+                    let b = self.texture(&destination.slice.resource)?;
+                    require(a.descriptor.dimension == TextureDimension::D2
+                        && b.descriptor.dimension == TextureDimension::D2
+                        && matches!(a.descriptor.format, TextureFormat::Depth32Float | TextureFormat::Depth32FloatStencil8)
+                        && b.descriptor.format == TextureFormat::R32Float
+                        && source.slice.aspect == Aspect::Depth
+                        && destination.slice.aspect == Aspect::Color
+                        && a.id != b.id && b.mutable_target
+                        && slice_bytes(&a.descriptor, source.slice.mip, &Aspect::Depth)?
+                            == slice_bytes(&b.descriptor, destination.slice.mip, &Aspect::Color)?,
+                        "depth proxy requires equal D2 Float32 depth and R32Float subresources")?;
+                    require(!native || !native_initial_versions.contains(&destination.after),
+                        "native depth proxy reused initial content version")?;
+                    advance(destination, &mut versions, &mut last_write)?;
+                    initialized.insert(destination.slice.clone());
+                    // A full overwrite does not make captured source pixels a
+                    // resolution-independent producer. Graph closure is separate.
+                    independent = false;
+                }
+                Command::Checkpoint { expected } => {
+                    require(!expected.is_empty(), "empty ordered checkpoint")?;
+                    checkpoint_count = checkpoint_count.checked_add(expected.len()).ok_or("checkpoint count overflow")?;
+                    require(checkpoint_count <= 16384, "checkpoint count bound")?;
+                    let mut selected = BTreeSet::new();
+                    for e in expected {
+                        require(selected.insert(e.version.slice.clone()), "duplicate checkpoint subresource")?;
+                        check_version(&e.version, &versions, &initialized)?;
+                        let t = self.texture(&e.version.slice.resource)?;
+                        let (_, _, row, rows) = slice_bytes(&t.descriptor, e.version.slice.mip, &e.version.slice.aspect)?;
+                        let bytes = (row as u64).checked_mul(rows as u64).ok_or("checkpoint byte overflow")?;
+                        require(self.data(&e.blob)?.len() as u64 == bytes, "checkpoint bytes extent")?;
+                        output_bytes = output_bytes.checked_add(bytes).ok_or("checkpoint size overflow")?;
+                        require(output_bytes <= MAX_BYTES, "output readback bound")?;
+                    }
                 }
                 Command::Dispatch { dispatch } => {
                     self.validate_dispatch(dispatch, &versions, &initialized)?;
@@ -771,7 +815,6 @@ impl Input {
             !s.expected.is_empty(),
             "original after-span references absent",
         )?;
-        let mut output_bytes = 0u64;
         for e in &s.expected {
             check_version(&e.version, &versions, &initialized)?;
             let t = self.texture(&e.version.slice.resource)?;
@@ -795,7 +838,9 @@ impl Input {
         versions: &BTreeMap<Slice, u64>,
         initialized: &BTreeSet<Slice>,
     ) -> Result<()> {
-        require(d.eye == self.scene.eye, "compute eye changed")?;
+        require(d.eye == self.scene.eye
+            || (matches!(self.scene.provenance, Provenance::NativeGraph { .. }) && d.eye.is_none()),
+            "compute eye changed")?;
         require(d.workgroups.iter().all(|n| *n > 0 && *n <= 65535)
             && d.workgroups.iter().try_fold(1u64, |n, v| n.checked_mul(*v as u64)).is_some_and(|n| n <= 1 << 20),
             "dispatch workgroup bounds")?;
@@ -1169,6 +1214,60 @@ mod tests {
         input.scene.commands.push(Command::Clear { transition: Transition { slice: input.scene.expected[0].version.slice.clone(),
             before: 1, after: 100 }, value: ClearValue::Color { rgba_bits: [0; 4] }, view_format: TextureFormat::Rgba32Float });
         assert!(input.validate().unwrap_err().to_string().contains("native same-eye identity"));
+        fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn native_graph_raster_anchor_does_not_assign_compute_eye() -> Result<()> {
+        let dir = std::env::temp_dir().join(format!("native-graph-eye-{}", std::process::id()));
+        crate::compute_fixture::make(&dir)?;
+        let mut input = Input::load(&dir.join("scene.json"))?;
+        let eye = EyeIdentity { epoch: 2, camera: 3, request: 4, head: 5, eye: 1 };
+        input.scene.provenance = Provenance::NativeGraph { source_sha256: "0".repeat(64) };
+        input.scene.eye = Some(eye.clone());
+        let mut current = BTreeMap::new();
+        let mut generation = 0;
+        for (n, t) in input.scene.textures.iter_mut().enumerate() {
+            t.native_allocation_id = Some(n as u64 + 1);
+            for i in &mut t.initial {
+                generation += 1; i.content_version = generation;
+                current.insert(Slice { resource: t.id.clone(), mip: i.mip, layer: i.layer, aspect: i.aspect.clone() }, generation);
+            }
+        }
+        input.scene.buffers[0].native_allocation_id = Some(100);
+        for c in &mut input.scene.commands {
+            let (bindings, writes) = match c {
+                Command::Dispatch { dispatch } => (&mut dispatch.bindings, &mut dispatch.writes),
+                Command::Draw { draw } => { draw.eye = Some(eye.clone()); (&mut draw.bindings, &mut draw.writes) },
+                _ => unreachable!(),
+            };
+            for b in bindings {
+                if let BindingValue::Texture { versions, .. } = &mut b.value {
+                    for r in versions { r.content_version = current[&r.slice]; }
+                }
+            }
+            for t in writes { t.before = current[&t.slice]; generation += 1; t.after = generation; current.insert(t.slice.clone(), generation); }
+        }
+        for e in &mut input.scene.expected { e.version.content_version = current[&e.version.slice]; }
+        input.validate()?;
+        let anchored_commands = input.scene.commands.clone();
+        input.scene.commands.retain(|c| !matches!(c, Command::Draw { .. }));
+        assert!(input.validate().unwrap_err().to_string().contains("native graph raster anchor absent"));
+        input.scene.commands = anchored_commands;
+        input.scene.eye = None;
+        assert!(input.validate().unwrap_err().to_string().contains("native same-eye identity"));
+        input.scene.eye = Some(eye.clone());
+        if let Command::Dispatch { dispatch } = &mut input.scene.commands[0] { dispatch.eye = Some(EyeIdentity { eye: 0, ..eye.clone() }); }
+        assert!(input.validate().unwrap_err().to_string().contains("compute eye changed"));
+        if let Command::Dispatch { dispatch } = &mut input.scene.commands[0] { dispatch.eye = Some(eye.clone()); }
+        input.validate()?;
+        if let Command::Dispatch { dispatch } = &mut input.scene.commands[0] { dispatch.eye = None; }
+        if let Command::Draw { draw } = &mut input.scene.commands[1] { draw.eye = None; }
+        assert!(input.validate().unwrap_err().to_string().contains("draw count/same-eye changed"));
+        if let Command::Draw { draw } = &mut input.scene.commands[1] { draw.eye = Some(eye); }
+        input.scene.provenance = Provenance::Native { source_sha256: "0".repeat(64) };
+        assert!(input.validate().unwrap_err().to_string().contains("compute eye changed"));
         fs::remove_dir_all(dir)?;
         Ok(())
     }
