@@ -1,6 +1,10 @@
 # Third-person immersive fidelity on the27 baseline
 
-## Review checkpoint — October 27
+## New direct renderer correction — October 27
+
+New local shader code corrects a one-sided depth-neighborhood rejection that creates unnecessary reprojection cracks. Same-source game comparisons recover 228 world pixels across six eye/pose cases with no lost coverage; a separate motion sequence has one lost sample. Exact shared corner work offsets the added checks, with a paired M4 command median of22.388→14.041ms. This is a bounded local improvement, not restored overscan detail or headset acceptance. See [new code, before/after evidence, costs and limits](IMMERSIVE-CORNER-SUPPORT-20261027.md). No new native replay infrastructure was added.
+
+## Earlier review checkpoint — October 27
 
 **No new visible-quality improvement has been proved over the already-signed V28 during the latest replay-tool work.** App title V and the front-glass icon are complete; V28 is unchanged and uninstalled. The latest actual capture remains rejected, and the following prepared run was refused before launch because disk headroom fell below its fixed floor. See the [concise checkpoint, commits, evidence and single acceptance test](LOCAL-CHECKPOINT-20261027.md). The overall visual-quality goal remains incomplete.
 

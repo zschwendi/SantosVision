@@ -65,8 +65,8 @@ final class GameWorldFiniteSkySupport: @unchecked Sendable {
 
     init?(device: any MTLDevice, library: any MTLLibrary,
           colorFormat: MTLPixelFormat, depthFormat: MTLPixelFormat,
-          precomputeCorners: Bool = ProcessInfo.processInfo.environment["MUGUET_COMPOSITOR_CORNER_PRECOMPUTE"] == "1",
-          orderedCorners: Bool = ProcessInfo.processInfo.environment["MUGUET_COMPOSITOR_ORDERED_CORNERS"] == "1",
+          precomputeCorners: Bool = ProcessInfo.processInfo.environment["MUGUET_COMPOSITOR_CORNER_PRECOMPUTE"] != "0",
+          orderedCorners: Bool = ProcessInfo.processInfo.environment["MUGUET_COMPOSITOR_ORDERED_CORNERS"] != "0",
           reuseOrderedSources: Bool = ProcessInfo.processInfo.environment["MUGUET_COMPOSITOR_ORDERED_SOURCE_REUSE"] == "1",
           verticalReconstruction: Bool = false) {
         orderedRequested = orderedCorners
@@ -125,10 +125,11 @@ final class GameWorldFiniteSkySupport: @unchecked Sendable {
             }
         }
         corners = precomputed
-        // A separate opt-in path shares only the already-qualified geometric
+        // Share only the already-qualified geometric
         // corners. Its index stream retains both original triangles for every
         // source pixel, in the original source order. Allocation/encode failure
-        // retains the complete original path below; no source samples are culled.
+        // uses bounded corner-only preparation or the complete direct path
+        // below; all paths use the same corrected geometry, without culling.
         var orderedPipeline: (GameWorldOrderedCorners, any MTLRenderPipelineState)?
         if orderedCorners, let vertex = library.makeFunction(name: "orderedCornerVertex"),
            let helper = GameWorldOrderedCorners(device: device, library: library, reuseSources: reuseOrderedSources) {

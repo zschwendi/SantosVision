@@ -213,11 +213,10 @@ static float boundedSmoothCornerDepth(uint2 corner, int2 base,
     return (samples[index] + samples[index + 1] + samples[index + 3] + samples[index + 4]) * 0.25;
 }
 
-static float qualifiedCornerDepth(uint2 corner, constant GameWorldUniforms &u,
+static float qualifiedCornerDepthInNeighborhood(uint2 corner, int2 base,
+                                  constant GameWorldUniforms &u,
                                   texture2d<float, access::read> depth) {
     const float clearDepth = u.sourceDepthReversed != 0 ? 0.0 : 1.0;
-    if (any(u.sourceSize < 3)) { return -1; }
-    const int2 base = clamp(int2(corner) - 1, int2(0), int2(u.sourceSize) - 3);
     float samples[9];
     float magnitude = 0;
     for (uint y = 0; y < 3; ++y) {
@@ -249,6 +248,34 @@ static float qualifiedCornerDepth(uint2 corner, constant GameWorldUniforms &u,
     if (!isfinite(result) || result < 0 || result > 1 || !all(isfinite(source))
         || source.w <= 1e-7 || source.z >= 0) { return -1; }
     return result;
+}
+
+static float qualifiedCornerDepth(uint2 corner, constant GameWorldUniforms &u,
+                                  texture2d<float, access::read> depth) {
+    if (any(u.sourceSize < 3)) { return -1; }
+    const int2 base = clamp(int2(corner) - 1, int2(0), int2(u.sourceSize) - 3);
+    const float original = qualifiedCornerDepthInNeighborhood(corner, base, u, depth);
+    if (original >= 0 || u.reserved.x != 0 || any(corner == 0) || any(corner >= u.sourceSize)) { return original; }
+    const float4 owners = float4(depth.read(corner - uint2(1, 1)).r,
+        depth.read(corner - uint2(0, 1)).r, depth.read(corner - uint2(1, 0)).r, depth.read(corner).r);
+    const float clearDepth = u.sourceDepthReversed != 0 ? 0.0 : 1.0;
+    if (!all(isfinite(owners)) || any(owners < 0) || any(owners > 1) || any(owners == clearDepth)) { return -1; }
+    // Do not spend three more fits on a corner whose own pixels disagree.
+    // This is an additional conservative gate, not a relaxed plane tolerance.
+    const float magnitude = max(max(owners.x, owners.y), max(owners.z, owners.w));
+    if (abs((owners.x - owners.y) - (owners.z - owners.w))
+        > 4 * (nextafter(magnitude, 2.0f) - magnitude)) { return -1; }
+    // Every stencil contains the same four corner owners. An unrelated edge
+    // in the extra row/column must not break an otherwise continuous plane.
+    // Keep the original successful fit and its exact finite/affine checks.
+    const int2 low = clamp(int2(corner) - 2, int2(0), int2(u.sourceSize) - 3);
+    const int2 alternatives[3] = {int2(low.x, base.y), int2(base.x, low.y), low};
+    for (uint i = 0; i < 3; ++i) {
+        if (all(alternatives[i] == base) || (i == 2 && (low.x == base.x || low.y == base.y))) { continue; }
+        const float result = qualifiedCornerDepthInNeighborhood(corner, alternatives[i], u, depth);
+        if (result >= 0) { return result; }
+    }
+    return -1;
 }
 
 // The corner depth one owning texel uses: the shared qualified depth, or the

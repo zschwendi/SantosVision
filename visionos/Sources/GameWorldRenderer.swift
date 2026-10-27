@@ -454,7 +454,7 @@ final class GameWorldRenderer: @unchecked Sendable {
     private let senseUtilityTrackingLock = NSLock()
     private var senseUtilityTrackingLive = false
     private var senseUtilityTrackingSequence: UInt64 = 0
-    /// Optional exact corner-depth precompute (MUGUET_COMPOSITOR_CORNER_PRECOMPUTE=1); nil keeps the
+    /// Exact corner-depth precompute (opt out with MUGUET_COMPOSITOR_CORNER_PRECOMPUTE=0); nil keeps the
     /// single-pass pipeline above. Off by default.
     private let cornerPrecompute: (kernel: any MTLComputePipelineState, pipeline: any MTLRenderPipelineState,
                                    verticalPipeline: (any MTLRenderPipelineState)?, scratch: CornerScratchPool)?
@@ -564,7 +564,7 @@ final class GameWorldRenderer: @unchecked Sendable {
         reticle = GameWorldReticle(device: layer.device, library: library,
                                    colorFormat: layer.configuration.colorFormat,
                                    depthFormat: layer.configuration.depthFormat)
-        let cornerRequested = environment["MUGUET_COMPOSITOR_CORNER_PRECOMPUTE"] == "1"
+        let cornerRequested = environment["MUGUET_COMPOSITOR_CORNER_PRECOMPUTE"] != "0"
         var precompute: (kernel: any MTLComputePipelineState, pipeline: any MTLRenderPipelineState,
                          verticalPipeline: (any MTLRenderPipelineState)?, scratch: CornerScratchPool)?
         if cornerRequested, let kernelFunction = library.makeFunction(name: "gameWorldCornerDepths"),
