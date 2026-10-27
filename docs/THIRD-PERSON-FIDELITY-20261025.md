@@ -4,6 +4,8 @@
 
 V27.9 fixes a demonstrated native color-input/output binding conflict that invalidated real game render passes. The identical formerly failing shader now reaches the correct persistent-null path; native pixel tests, independent actual-game span replay, a clean bounded game run and 40 signed-package checks pass. Original game bytes, graphics settings, independent eyes and V27.6–V27.8 rollback packages remain preserved. No device or simulator action occurred. See [V27.9 correction, evidence, limits and single headset test](COLOR-BINDING-FIDELITY-20261026.md). This supersedes the older candidate acceptance plans below; full headset image quality remains unaccepted.
 
+Follow-up actual-pixel replay narrows that result: the captured conflicting shader's corrected draw is an alpha-only minimap scratch operation whose initial alpha was already zero. It changes no pixels. Exact replay and historical alias rejection are verified, but visible-improvement acceptance correctly fails. The binding correction remains valid; it is not proof that world shading or the reported grain was repaired. V27.9 remains unchanged, and the linked report preserves this negative result.
+
 ## Preserved V27.8 candidate — October26
 
 V27.8 retains the V27.7 color correction and adds elapsed-time/pair-max source coverage plus depth-qualified planar gap sampling. A separate standalone same-eye density fixture implements the first native-raster step toward a high-density center, with no app integration or runtime publication. See [V27.8 image stability, evidence and acceptance](THIRD-PERSON-IMAGE-STABILITY-20261026.md). The package is local only; hardware quality remains unaccepted. This section and its linked test supersede the historical V27.6 acceptance plans below.
