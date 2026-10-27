@@ -42,6 +42,24 @@ class RunnerBoundaries(unittest.TestCase):
         self.assertTrue(result["byte_admission_passed"])
         self.assertTrue(result["semantic_replay_admission_required"])
 
+    def test_original_manifest_identity_survives_driver_float_roundtrip(self):
+        p = self.root / "capture.json"
+        p.write_bytes(b'{"matrix":[-0.014437142759561539,-0.9598827958106995]}')
+        driver = {"capture": {"matrix": [-0.01443714275956154, -0.9598827958106996]},
+                  "capture_identity": {"sha256": runner.digest(p), "byte_length": p.stat().st_size}}
+        self.assertNotEqual(driver["capture"], runner.load_json(p))  # Prior gate falsely rejected this.
+        runner.validate_capture_identity(driver, p)
+
+    def test_raw_manifest_identity_rejects_tampering_even_with_equal_json(self):
+        p = self.root / "capture.json"; p.write_bytes(b'{"matrix":[1.0]}')
+        driver = {"capture": runner.load_json(p),
+                  "capture_identity": {"sha256": runner.digest(p), "byte_length": p.stat().st_size}}
+        for replacement in (b'{"matrix":[1e0]}', b'{"matrix":[1.0]} '):
+            p.write_bytes(replacement)
+            self.assertEqual(driver["capture"], runner.load_json(p))
+            with self.subTest(raw=replacement), self.assertRaisesRegex(ValueError, "raw manifest identity mismatch"):
+                runner.validate_capture_identity(driver, p)
+
     def test_corrupt_or_truncated_material_rejected(self):
         p, _ = self.capture()
         (p / "payload.bin").write_bytes(b"wrong")

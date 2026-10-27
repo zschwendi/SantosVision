@@ -45,7 +45,8 @@ fn args() -> Result<Args> {
         observe_after_capture: Duration::from_secs(observe) })
 }
 
-struct CompletedCapture { manifest: Value, first_status: Value, at: Instant, elapsed: f64 }
+struct ReadManifest { value: Value, sha256: String, byte_length: usize }
+struct CompletedCapture { manifest: ReadManifest, first_status: Value, at: Instant, elapsed: f64 }
 
 fn observation_stop(requested: Duration, elapsed: Duration, deadline: bool, failed: bool) -> Option<&'static str> {
     if failed { Some("runtime_failed") }
@@ -58,7 +59,8 @@ fn observation_stop(requested: Duration, elapsed: Duration, deadline: bool, fail
 fn capture_result(a: &Args, start: Instant, preparation: &Value, captured: &CompletedCapture,
                   observation_status: &str, final_status: Value) -> Value {
     let feedback = a.capture.parent().unwrap().join("first-color-feedback.json");
-    json!({"schema":1,"outcome":"captured","capture":captured.manifest,
+    json!({"schema":1,"outcome":"captured","capture":captured.manifest.value,
+        "capture_identity":{"sha256":captured.manifest.sha256,"byte_length":captured.manifest.byte_length},
         "elapsed_seconds":start.elapsed().as_secs_f64(),"native_status":final_status,
         "preparation":preparation,"capture_byte_admission_required":true,
         "observation":{"scope":"normal runtime after completed initial capture; not whole-run GPU health acceptance",
@@ -95,13 +97,21 @@ fn status() -> Result<Value> {
     Ok(serde_json::from_slice(unsafe { CStr::from_ptr(bytes.as_ptr()) }.to_bytes())?)
 }
 
-fn read_completion(path: &Path) -> Result<Option<Value>> {
+fn parse_completion(bytes: &[u8]) -> Result<Option<ReadManifest>> {
+    ensure!(bytes.len() as u64 <= MAX_MANIFEST, "capture result exceeds manifest bound");
+    let Ok(value) = serde_json::from_slice(bytes) else { return Ok(None); };
+    // Bind the bytes parsed here, not a reserialized Value: JSON float parsing
+    // can change a matrix decimal by one ULP without any producer-file change.
+    Ok(Some(ReadManifest { value, sha256:muguet::xr_motion_patch::sha256(bytes)?, byte_length:bytes.len() }))
+}
+
+fn read_completion(path: &Path) -> Result<Option<ReadManifest>> {
     if !path.exists() { return Ok(None); }
     exact_path(path)?;
     ensure!(path.metadata()?.len() <= MAX_MANIFEST, "capture result exceeds manifest bound");
     // Exclusive create becomes visible before write_all completes; retry only
     // incomplete JSON until the same bounded deadline, never accept it.
-    Ok(serde_json::from_slice(&std::fs::read(path)?).ok())
+    parse_completion(&std::fs::read(path)?)
 }
 
 fn prepare(a: &Args) -> Result<Value> {
@@ -182,13 +192,13 @@ fn run(a: &Args, preparation: Value) -> Result<Value> {
             next_request = Instant::now() + Duration::from_millis(100);
         }
         if let Some(rejection) = read_completion(&a.capture.join("rejected.json"))? {
-            anyhow::bail!("capture module rejected span: {rejection}");
+            anyhow::bail!("capture module rejected span: {}", rejection.value);
         }
         if captured.is_none() {
             if let Some(manifest) = read_completion(&a.capture.join("capture.json"))? {
                 ensure!(startup_done, "capture completed before startup was acknowledged");
-                ensure!(manifest["schema"] == 2 && manifest["kind"] == "native_draw_span"
-                    && manifest["status"] == "captured" && manifest["closure"]["natural_submission_completed"] == true,
+                ensure!(manifest.value["schema"] == 2 && manifest.value["kind"] == "native_draw_span"
+                    && manifest.value["status"] == "captured" && manifest.value["closure"]["natural_submission_completed"] == true,
                     "capture manifest completion contract absent");
                 captured = Some(CompletedCapture { manifest, first_status:status()?, at:Instant::now(), elapsed:start.elapsed().as_secs_f64() });
                 eprintln!("[native-span-capture] initial capture complete; observing normal runtime up to {}s within original deadline", a.observe_after_capture.as_secs());
@@ -221,6 +231,18 @@ fn run(a: &Args, preparation: Value) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn completion_identity_binds_original_bytes_not_reserialized_floats() {
+        let bytes = br#"{"matrix":[-0.014437142759561539,-0.9598827958106995]}"#;
+        let manifest = parse_completion(bytes).unwrap().unwrap();
+        assert_eq!(manifest.byte_length, bytes.len());
+        assert_eq!(manifest.sha256, muguet::xr_motion_patch::sha256(bytes).unwrap());
+        let mut changed = bytes.to_vec(); changed.push(b' ');
+        let same_value = parse_completion(&changed).unwrap().unwrap();
+        assert_eq!(manifest.value, same_value.value);
+        assert_ne!(manifest.sha256, same_value.sha256);
+        assert!(parse_completion(b"{\"matrix\":").unwrap().is_none());
+    }
     #[test]
     fn observation_never_extends_deadline_and_reports_runtime_failure_separately() {
         let seconds = Duration::from_secs;

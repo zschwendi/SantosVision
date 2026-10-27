@@ -36,6 +36,8 @@ Only the parent-coordinated local run adds `--execute`. It creates the run direc
 
 `capture.json` is published after all original natural-submission readbacks complete. The runner rejects partial/rejected results, unsafe or duplicated payload paths, missing/extra files, hash/length mismatches, source drift, changed seed files or changed disposable graphics semantics. Its successful receipt means **captured bytes verified**. Run the independent semantic/replay admission afterward; the byte manifest alone does not prove the renderer reproduces the game.
 
+The driver's `capture_identity` records SHA-256 and byte length from the exact manifest read used to admit completion. The runner verifies those original bytes. The embedded `capture` object is for inspection only: parsing and reserializing JSON matrix decimals can change the last digit, so it is not the identity comparison. Byte changes still fail even if the parsed JSON is equivalent.
+
 CPU-only boundary tests (fake bytes and one owned Python child, no game):
 
 ```sh

@@ -77,6 +77,18 @@ def load_json(path):
     return json.loads(path.read_text())
 
 
+def validate_capture_identity(driver, path):
+    exact_path(path)
+    need(path.is_file() and 0 < path.stat().st_size <= MAX_JSON, f"bounded JSON file required: {path}")
+    raw = path.read_bytes()
+    need(0 < len(raw) <= MAX_JSON, f"bounded JSON file required: {path}")
+    identity = driver.get("capture_identity", {})
+    need(type(identity.get("byte_length")) is int
+         and identity["byte_length"] == len(raw)
+         and identity.get("sha256") == hashlib.sha256(raw).hexdigest(),
+         "driver/capture raw manifest identity mismatch")
+
+
 def write_new(path, value):
     with path.open("x") as f:
         json.dump(value, f, indent=2, sort_keys=True)
@@ -255,7 +267,7 @@ def execute_owned(args, before, root):
          xml_values(root / "fresh-save/userdata/Documents/Rockstar Games/GTA V/settings.xml"), "disposable graphics XML semantics changed")
     need(digest(root / "fresh-save/native-graphics.json") == GRAPHICS["native-graphics.json"], "disposable Clarity config changed")
     result = validate_capture(root / "capture")
-    need(final.get("capture") == load_json(root / "capture/capture.json"), "driver/capture manifest mismatch")
+    validate_capture_identity(final, root / "capture/capture.json")
     observation = final.get("observation", {})
     need(observation.get("requested_seconds") == args.observe_after_capture
          and observation.get("whole_run_gpu_health_accepted") is False
