@@ -1,7 +1,7 @@
 //! Opt-in Mac capture of a natural game draw span with disposable local state.
 //! No window, scene steering, coherent stereo or finished-world acceptance.
 use anyhow::{ensure, Context, Result};
-use muguet::{native, xr, xr_view};
+use muguet::{native, xr, xr_view, xr_hud};
 use serde_json::{json, Value};
 use std::ffi::{CStr, CString};
 use std::io::Write;
@@ -26,6 +26,7 @@ impl CaptureKind {
         }
     }
     fn name(self) -> &'static str { match self { Self::TwoDraw => "two-draw", Self::ColorNull => "color-null",Self::TargetSpan=>"target-span",Self::Compute=>"compute",Self::Graph=>"graph",Self::Finished=>"finished" } }
+    fn needs_hud_frontend(self) -> bool { self==Self::Finished }
     fn admits(self, value: &Value) -> bool {
         let complete = value["status"] == "captured" && value["closure"]["natural_submission_completed"] == true;
         complete && match self {
@@ -186,13 +187,29 @@ fn prepare(a: &Args) -> Result<Value> {
         "copied_files":GRAPHICS.iter().map(|(name,sha)|json!({"name":name,"sha256":sha})).collect::<Vec<_>>(),
         "scene":"fresh developer-mode natural game; no fixed scene or player-save import",
         "input":"synthetic static head; two eyes separated by 64mm",
+        "requested_frontends":{"world_camera":true,"qualified_hud":a.capture_kind.needs_hud_frontend(),"scope":"pre-start intent; observed flags recorded separately"},
         "finished_world_accepted":false,"coherent_stereo_accepted":false,"hardware_accepted":false}))
+}
+
+fn frontend_receipt(kind:CaptureKind,world:&Value,hud:&Value)->Result<Value> {
+    ensure!(world["world_camera_enabled"]==true,"world camera frontend enable not observed");
+    ensure!(hud["ready"].as_bool()==Some(kind.needs_hud_frontend()),"HUD frontend readiness differs from capture mode");
+    Ok(json!({"schema":1,"capture_kind":kind.name(),"world_camera_enabled_flag":world["world_camera_enabled"],
+        "hud_frontend_ready":hud["ready"],"observation":"existing frontend status APIs immediately before native startup",
+        "runtime_started":false,"finished_world_accepted":false,"coherent_stereo_accepted":false,"hardware_accepted":false}))
 }
 
 fn run(a: &Args, preparation: Value) -> Result<Value> {
     ensure!(native::sv_world_set_frozen_depth_transfer(1) == 0, "frozen depth prestart request");
     ensure!(native::sv_runtime_set_draw_setup_overhead(1) == 0, "draw setup prestart request");
     ensure!(xr_view::sv_xr_world_camera_set_enabled(1) == 0, "world camera enable");
+    if a.capture_kind.needs_hud_frontend() {
+        // The full graph endpoint is the existing frontend's qualified HUD-world
+        // copy. Other private capture modes keep their original unready default.
+        ensure!(xr_hud::sv_xr_set_hud_ready(1)==0,"qualified HUD frontend enable");
+    }
+    let observed=frontend_receipt(a.capture_kind,&xr_view::status_json(),&xr_hud::status_json())?;
+    write_new(&a.save.parent().unwrap().join("driver-frontends.json"),&serde_json::to_vec_pretty(&observed)?)?;
     let game = CString::new(a.game.to_str().context("UTF8 game path")?)?;
     let save = CString::new(a.save.to_str().context("UTF8 save path")?)?;
     let (tx, rx) = mpsc::sync_channel(1);
@@ -271,6 +288,20 @@ fn run(a: &Args, preparation: Value) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn only_finished_requests_hud_and_receipt_requires_observed_mode() {
+        let world=json!({"world_camera_enabled":true});
+        for kind in [CaptureKind::TwoDraw,CaptureKind::ColorNull,CaptureKind::TargetSpan,CaptureKind::Compute,CaptureKind::Graph,CaptureKind::Finished] {
+            let ready=kind==CaptureKind::Finished;
+            assert_eq!(kind.needs_hud_frontend(),ready);
+            let receipt=frontend_receipt(kind,&world,&json!({"ready":ready})).unwrap();
+            assert_eq!(receipt["capture_kind"],kind.name());assert_eq!(receipt["hud_frontend_ready"],ready);
+            assert_eq!(receipt["runtime_started"],false);assert_eq!(receipt["finished_world_accepted"],false);
+            assert!(frontend_receipt(kind,&world,&json!({"ready":!ready})).is_err());
+            assert!(frontend_receipt(kind,&json!({"world_camera_enabled":false}),&json!({"ready":ready})).is_err());
+            assert!(frontend_receipt(kind,&world,&json!({"ready":null})).is_err());
+        }
+    }
     #[test]
     fn capture_kinds_have_distinct_completion_contracts() {
         let two = json!({"schema":2,"kind":"native_draw_span","status":"captured",
