@@ -16,9 +16,29 @@ const GRAPHICS: [(&str, &str); 3] = [
 ];
 const MAX_MANIFEST: u64 = 16 << 20;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CaptureKind { TwoDraw, ColorNull }
+impl CaptureKind {
+    fn parse(name: &str) -> Result<Self> {
+        match name {
+            "two-draw" => Ok(Self::TwoDraw), "color-null" => Ok(Self::ColorNull),
+            _ => anyhow::bail!("capture kind must be two-draw or color-null"),
+        }
+    }
+    fn name(self) -> &'static str { match self { Self::TwoDraw => "two-draw", Self::ColorNull => "color-null" } }
+    fn admits(self, value: &Value) -> bool {
+        let complete = value["status"] == "captured" && value["closure"]["natural_submission_completed"] == true;
+        complete && match self {
+            Self::TwoDraw => value["schema"] == 2 && value["kind"] == "native_draw_span",
+            Self::ColorNull => value["schema"] == 3 && value["kind"] == "native_color_null_draw"
+                && value["closure"]["single_original_draw"] == true && value["draw"].is_object(),
+        }
+    }
+}
+
 struct Args {
     game: PathBuf, save: PathBuf, capture: PathBuf, graphics: PathBuf,
-    aot: PathBuf, deadline: Duration, observe_after_capture: Duration,
+    aot: PathBuf, deadline: Duration, observe_after_capture: Duration, capture_kind: CaptureKind,
 }
 
 fn identity() -> [f32; 16] {
@@ -35,14 +55,15 @@ fn eye(x: f32) -> xr_view::SVXREyeView {
 
 fn args() -> Result<Args> {
     let a: Vec<_> = std::env::args().skip(1).collect();
-    ensure!(a.len() == 7, "usage: native-span-capture GAME FRESH_SAVE NEW_CAPTURE GRAPHICS_SEED MAC_AOT DEADLINE_SECONDS OBSERVE_AFTER_CAPTURE_SECONDS");
+    ensure!((7..=8).contains(&a.len()), "usage: native-span-capture GAME FRESH_SAVE NEW_CAPTURE GRAPHICS_SEED MAC_AOT DEADLINE_SECONDS OBSERVE_AFTER_CAPTURE_SECONDS [two-draw|color-null]");
     let seconds: u64 = a[5].parse().context("integer deadline")?;
     let observe: u64 = a[6].parse().context("integer post-capture observation")?;
     ensure!((1..=180).contains(&seconds), "deadline must be 1..180 seconds");
     ensure!(observe <= 30, "post-capture observation must be 0..30 seconds");
     Ok(Args { game: PathBuf::from(&a[0]), save: PathBuf::from(&a[1]), capture: PathBuf::from(&a[2]),
         graphics: PathBuf::from(&a[3]), aot: PathBuf::from(&a[4]), deadline: Duration::from_secs(seconds),
-        observe_after_capture: Duration::from_secs(observe) })
+        observe_after_capture: Duration::from_secs(observe),
+        capture_kind: CaptureKind::parse(a.get(7).map(String::as_str).unwrap_or("two-draw"))? })
 }
 
 struct ReadManifest { value: Value, sha256: String, byte_length: usize }
@@ -59,7 +80,7 @@ fn observation_stop(requested: Duration, elapsed: Duration, deadline: bool, fail
 fn capture_result(a: &Args, start: Instant, preparation: &Value, captured: &CompletedCapture,
                   observation_status: &str, final_status: Value) -> Value {
     let feedback = a.capture.parent().unwrap().join("first-color-feedback.json");
-    json!({"schema":1,"outcome":"captured","capture":captured.manifest.value,
+    json!({"schema":1,"outcome":"captured","capture_kind":a.capture_kind.name(),"capture":captured.manifest.value,
         "capture_identity":{"sha256":captured.manifest.sha256,"byte_length":captured.manifest.byte_length},
         "elapsed_seconds":start.elapsed().as_secs_f64(),"native_status":final_status,
         "preparation":preparation,"capture_byte_admission_required":true,
@@ -121,6 +142,8 @@ fn prepare(a: &Args) -> Result<Value> {
     ensure!(a.save.file_name().is_some_and(|s| s == "fresh-save") && a.capture.file_name().is_some_and(|s| s == "capture"), "fixed disposable child names required");
     ensure!(!a.save.try_exists()? && !a.capture.try_exists()?, "existing save/capture must be preserved");
     ensure!(std::env::var_os("MUGUET_NATIVE_DRAW_CAPTURE").as_deref() == Some(a.capture.as_os_str()), "explicit capture environment must match new path");
+    let environment_kind = std::env::var("MUGUET_NATIVE_DRAW_CAPTURE_KIND").unwrap_or_else(|_| "two-draw".to_owned());
+    ensure!(CaptureKind::parse(&environment_kind)? == a.capture_kind, "capture kind environment must match selected kind");
     ensure!(std::env::var("MUGUET_TRANSFER_FROZEN_DEPTH_RECEIPT").as_deref() == Ok("1"), "consumed request retention must be enabled before native startup");
     ensure!(std::env::var("MUGUET_MUTE").as_deref() == Ok("1") && std::env::var("MUGUET_MASTER_VOLUME").as_deref() == Ok("0"), "explicit mute required");
     let aot = muguet::native_draw_capture_host::prepare(&a.game.join("b/8b0b5899ed/game.wasm"), &a.aot)?;
@@ -140,7 +163,7 @@ fn prepare(a: &Args) -> Result<Value> {
         write_new(&destination, bytes)?;
     }
     write_new(&a.save.join("native-gameplay.json"), b"{\"developer_mode\":true}\n")?;
-    Ok(json!({"schema":1,"graphics":graphics,"aot":aot,
+    Ok(json!({"schema":1,"capture_kind":a.capture_kind.name(),"graphics":graphics,"aot":aot,
         "copied_files":GRAPHICS.iter().map(|(name,sha)|json!({"name":name,"sha256":sha})).collect::<Vec<_>>(),
         "scene":"fresh developer-mode natural game; no fixed scene or player-save import",
         "input":"synthetic static head; two eyes separated by 64mm",
@@ -197,9 +220,7 @@ fn run(a: &Args, preparation: Value) -> Result<Value> {
         if captured.is_none() {
             if let Some(manifest) = read_completion(&a.capture.join("capture.json"))? {
                 ensure!(startup_done, "capture completed before startup was acknowledged");
-                ensure!(manifest.value["schema"] == 2 && manifest.value["kind"] == "native_draw_span"
-                    && manifest.value["status"] == "captured" && manifest.value["closure"]["natural_submission_completed"] == true,
-                    "capture manifest completion contract absent");
+                ensure!(a.capture_kind.admits(&manifest.value), "selected capture kind completion contract absent");
                 captured = Some(CompletedCapture { manifest, first_status:status()?, at:Instant::now(), elapsed:start.elapsed().as_secs_f64() });
                 eprintln!("[native-span-capture] initial capture complete; observing normal runtime up to {}s within original deadline", a.observe_after_capture.as_secs());
             }
@@ -232,6 +253,22 @@ fn run(a: &Args, preparation: Value) -> Result<Value> {
 mod tests {
     use super::*;
     #[test]
+    fn capture_kinds_have_distinct_completion_contracts() {
+        let two = json!({"schema":2,"kind":"native_draw_span","status":"captured",
+            "closure":{"natural_submission_completed":true}});
+        let color = json!({"schema":3,"kind":"native_color_null_draw","status":"captured","world_view":null,
+            "draw":{},"closure":{"natural_submission_completed":true,"single_original_draw":true}});
+        assert!(CaptureKind::TwoDraw.admits(&two));
+        assert!(!CaptureKind::TwoDraw.admits(&color));
+        assert!(CaptureKind::ColorNull.admits(&color));
+        assert!(!CaptureKind::ColorNull.admits(&two));
+        assert!(CaptureKind::parse("unknown").is_err());
+        let mut bad = color.clone(); bad["schema"] = json!(2);
+        assert!(!CaptureKind::ColorNull.admits(&bad));
+        bad = color; bad["closure"]["natural_submission_completed"] = json!(false);
+        assert!(!CaptureKind::ColorNull.admits(&bad));
+    }
+    #[test]
     fn completion_identity_binds_original_bytes_not_reserialized_floats() {
         let bytes = br#"{"matrix":[-0.014437142759561539,-0.9598827958106995]}"#;
         let manifest = parse_completion(bytes).unwrap().unwrap();
@@ -261,7 +298,7 @@ fn main() {
         let preparation = prepare(&a)?;
         write_new(&a.save.parent().unwrap().join("driver-preparation.json"), &serde_json::to_vec_pretty(&preparation)?)?;
         let result = run(&a, preparation);
-        let receipt = match &result { Ok(v) => v.clone(), Err(e) => json!({"schema":1,"outcome":"failed","error":format!("{e:#}"),"native_status":status().ok()}) };
+        let receipt = match &result { Ok(v) => v.clone(), Err(e) => json!({"schema":1,"outcome":"failed","capture_kind":a.capture_kind.name(),"error":format!("{e:#}"),"native_status":status().ok()}) };
         if let Some(parent) = a.save.parent().filter(|p| p.is_dir()) {
             write_new(&parent.join("driver-result.json"), &serde_json::to_vec_pretty(&receipt)?)?;
         }

@@ -3135,6 +3135,8 @@ impl Gpu {
         let dimension = match b.dim { TextureViewDimension::D3 => TextureDimension::D3, TextureViewDimension::D1 => TextureDimension::D1, _ => TextureDimension::D2 };
         let mut usage = TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST;
         if b.ms { usage |= TextureUsages::RENDER_ATTACHMENT; usage.remove(TextureUsages::COPY_DST); }
+        #[cfg(all(target_os = "macos", feature = "native-draw-capture"))]
+        if self.draw_capture.as_ref().is_some_and(|capture|capture.captures_color_null_dummy(b)) {usage|=TextureUsages::COPY_SRC;}
         let tex = self.device.create_texture(&TextureDescriptor {
             label: Some("dummy"), size: Extent3d { width: 1, height: 1, depth_or_array_layers: if cube { 6 } else { 1 } }, mip_level_count: 1,
             sample_count: if b.ms { 4 } else { 1 }, dimension, format, usage, view_formats: &[],

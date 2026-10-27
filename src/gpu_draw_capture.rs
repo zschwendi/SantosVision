@@ -4,6 +4,18 @@ use super::*;
 use serde_json::{json, Value};
 use std::io::Write;
 
+#[path = "gpu_color_null_capture.rs"]
+mod color_null;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CaptureKind { TwoDraw, ColorNull }
+impl CaptureKind {
+    fn parse(value:Option<&str>)->Option<Self> {
+        match value {None|Some("two-draw")=>Some(Self::TwoDraw),Some("color-null")=>Some(Self::ColorNull),_=>None}
+    }
+    fn draw_count(self)->usize {if self==Self::TwoDraw {2}else{1}}
+}
+
 const VS: &str = "6a6a0898a51cf403";
 const PS: &str = "75cf2d53bf9497c9";
 const VS_TEXT: &str = "04f353256b2a27c7141076f68c572d451f551a0b8370bafd6f521fc8dc90cb94";
@@ -28,8 +40,9 @@ enum Source {
 }
 struct Plan { name: String, source: Source, row: u32, rows: u32, pitch: u32, bytes: u64 }
 struct Readback { plan: Plan, buffer: Buffer }
-struct Prepared { draw: Value, view: Value, domain: Value, targets: Vec<(Texture, TextureAspect, String)>, plans: Vec<Plan> }
+struct Prepared { draw: Value, view: Value, domain: Value, targets: Vec<(Texture, TextureAspect, String)>, plans: Vec<Plan>, alias:Option<Value> }
 struct Pending {
+    kind:CaptureKind, alias:Option<Value>,
     epoch: u64, errors: u64, view: Value, domain: Value, draws: Vec<Value>,
     attachments: Vec<Value>, targets: Vec<(Texture, TextureAspect, String)>,
     readbacks: Vec<Readback>, bytes: u64, final_bytes: u64, finished: bool,
@@ -45,6 +58,7 @@ struct ColorNullBinding {
 }
 
 pub(super) struct Capture {
+    kind:CaptureKind,
     directory: PathBuf, pipelines: HashMap<Vec<i64>, Value>, pending: Option<Pending>,
     done: bool, attempts: u32, sequence: u64, epoch_bytes: u64,
     rejected: BTreeMap<String, u64>, pipeline_bytes: usize,
@@ -145,8 +159,13 @@ fn enqueue(gpu: &mut Gpu, plans: Vec<Plan>) -> Vec<Readback> {
 }
 
 impl Capture {
+    fn tracks_color_null_cause(&self)->bool {
+        // The original two-draw export may finish before the later faulty
+        // shader path. Its bounded diagnostic observation must continue.
+        match self.kind {CaptureKind::TwoDraw=>!self.color_null_recorded,CaptureKind::ColorNull=>!self.done}
+    }
     pub(super) fn color_srv_binding(&self,gpu:&Gpu,opcode:u32,stage:usize,slot:usize,input:u32,resolved:u32) {
-        if self.color_null_recorded || stage!=1 || slot!=5 {return;}
+        if !self.tracks_color_null_cause() || stage!=1 || slot!=5 {return;}
         // An explicit later bind (including guest NULL) supersedes the cause.
         // OM unbinding visits only non-null slots, so persistent NULL retains
         // its original cause until the guest explicitly binds this slot again.
@@ -208,7 +227,7 @@ impl Capture {
             "scope":"exact previously failing PS_BlitDepthToAlpha native 2D t5 path; resolved before pass binding, GPU success is separately checked"});
         drop(prior);
         self.color_null_recorded=true;
-        self.color_null_binding.borrow_mut().take();
+        if self.kind==CaptureKind::TwoDraw {self.color_null_binding.borrow_mut().take();}
         if let Ok(bytes)=serde_json::to_vec_pretty(&value) {if bytes.len()<=16*1024 {if let Some(parent)=self.directory.parent(){
             if let Err(e)=publish_new(&parent.join("first-color-null-draw.json"),&bytes){log(&format!("first corrected color null draw record failed: {e}"));}
             else {log("first corrected PS_BlitDepthToAlpha null draw recorded; diagnostic changed no commands");}
@@ -422,15 +441,23 @@ impl Capture {
             "vertex_buffers":vertices,"index_buffer":{"blob":ib_name,"format":format,"offset":offset,"guest_id":id},
             "bindings":bindings,"viewport":d.viewport,"scissor":d.scissor,"blend_constant":d.blend,
             "stencil_reference":d.stencil,"world_view":view,"target_domain":domain});
-        Ok(Prepared{draw,view,domain,targets,plans})
+        Ok(Prepared{draw,view,domain,targets,plans,alias:None})
+    }
+    pub(super) fn captures_color_null_dummy(&self,b:&Binding)->bool {
+        self.kind==CaptureKind::ColorNull && color_null::dummy_copyable(b.dim,b.sample,b.ms)
     }
     pub(super) fn from_env() -> Option<Self> {
         let path = std::env::var_os("MUGUET_NATIVE_DRAW_CAPTURE")?;
+        let selected=match std::env::var("MUGUET_NATIVE_DRAW_CAPTURE_KIND") {
+            Ok(value)=>Some(value),Err(std::env::VarError::NotPresent)=>None,
+            Err(_)=>{log("native draw capture kind is not UTF-8");return None;}
+        };
+        let Some(kind)=CaptureKind::parse(selected.as_deref()) else {log("invalid native draw capture kind");return None;};
         let directory = PathBuf::from(path);
         if !directory.is_absolute() || std::fs::create_dir(&directory).is_err() {
             log("native draw capture requires an absolute NEW directory with existing parent"); return None;
         }
-        Some(Self { directory, pipelines: HashMap::new(), pending: None, done: false,
+        Some(Self { kind,directory, pipelines: HashMap::new(), pending: None, done: false,
             attempts: 0, sequence: 0, epoch_bytes: 0, rejected: BTreeMap::new(), pipeline_bytes: 0,
             rejected_starts: Default::default(), live_bytes: Arc::new(AtomicU64::new(0)), feedback_recorded:false,
             color_null_binding:RefCell::new(None),color_null_recorded:false })
@@ -476,8 +503,9 @@ impl Capture {
         self.record_color_null_draw(gpu,draw);
         self.record_color_feedback(gpu,draw);
         if self.done || self.pending.as_ref().is_some_and(|p| p.finished) || self.attempts >= 128 { return; }
+        let (vertex,pixel)=if self.kind==CaptureKind::TwoDraw {(VS,PS)}else{(color_null::VS,color_null::PS)};
         let matching = matches!((gpu.obj(gpu.s.shader[0]),gpu.obj(gpu.s.shader[1])),
-            (Some(Obj::Shader(v)),Some(Obj::Shader(p))) if v.hash==VS && p.hash==PS);
+            (Some(Obj::Shader(v)),Some(Obj::Shader(p))) if v.hash==vertex && p.hash==pixel);
         if !matching { if self.pending.is_some() { self.reject("next draw has a different shader family"); } return; }
         let ordinal = self.pending.as_ref().map(|p| p.draws.len()).unwrap_or(0);
         // A failed first draw need not consume the bounded export allocation on
@@ -487,7 +515,7 @@ impl Capture {
         for (slot,_,offset,id) in draw.vertices {candidate_key.extend([*slot as u64,*offset,*id]);}
         candidate_key.extend(gpu.s.rt.iter().map(|r|r.tex as u64));candidate_key.push(gpu.s.ds.tex as u64);
         if ordinal==0 && self.rejected_starts.contains(&candidate_key) {return;}
-        let prepared = match self.prepare(gpu, draw, ordinal) {
+        let prepared = match if self.kind==CaptureKind::TwoDraw {self.prepare(gpu,draw,ordinal)}else{self.prepare_color_null(gpu,draw)} {
             Ok(value) => value, Err(reason) => { self.reject(&reason); return; }
         };
         if let Some(p) = &self.pending {
@@ -526,7 +554,7 @@ impl Capture {
         if let Some(pending) = &mut self.pending {
             pending.draws.push(prepared.draw); pending.readbacks.extend(readbacks); pending.bytes += new_bytes;
         } else {
-            self.pending = Some(Pending { epoch: gpu.enc_epoch, errors: errors_before_encoding,
+            self.pending = Some(Pending { kind:self.kind,alias:prepared.alias,epoch: gpu.enc_epoch, errors: errors_before_encoding,
                 view: prepared.view, domain: prepared.domain, draws: vec![prepared.draw], attachments,
                 targets: prepared.targets, readbacks, bytes: new_bytes, final_bytes, finished: false,
                 intervening_commands: Vec::new(), candidate_key });
@@ -534,7 +562,7 @@ impl Capture {
     }
     pub(super) fn after(&mut self, gpu: &mut Gpu) {
         let Some(pending) = &mut self.pending else { return; };
-        if pending.finished || pending.draws.len() != 2 { return; }
+        if pending.finished || pending.draws.len() != pending.kind.draw_count() { return; }
         let plans = pending.targets.iter().map(|(t,a,r)| texture_plan(format!("final-{r}.bin"),t,0,*a)).collect::<Result<Vec<_>,_>>();
         let Ok(plans) = plans else { self.reject("final snapshot preflight failed"); return; };
         gpu.end_pass(); pending.readbacks.extend(enqueue(gpu,plans));
@@ -560,6 +588,7 @@ impl Capture {
             self.reject("natural submission before span closure"); return;
         }
         self.done = true;
+        if self.kind==CaptureKind::ColorNull {self.color_null_binding.borrow_mut().take();}
         let directory = self.directory.clone(); let rejected = self.rejected.clone();
         let errors = gpu.errors.clone(); let inflight = gpu.inflight.clone();
         let backend = format!("{:?}",gpu.adapter.get_info().backend);
@@ -621,7 +650,7 @@ fn complete(pending: Pending, rx: std::sync::mpsc::Receiver<(usize,Result<(),Str
         blobs.push(json!({"path":rb.plan.name,"byte_length":rb.plan.row as u64*rb.plan.rows as u64,"sha256":hash.finish(),
             "packed_row_bytes":rb.plan.row,"row_count":rb.plan.rows,"readback_pitch":rb.plan.pitch}));
     }
-    let manifest = json!({"schema":2,"kind":"native_draw_span","status":"captured",
+    let manifest = if pending.kind==CaptureKind::TwoDraw {json!({"schema":2,"kind":"native_draw_span","status":"captured",
         "source":{"method":"Gpu::do_draw resolved bindings","backend":backend,"encoder_epoch":pending.epoch},
         "world_view":pending.view,"target_domain":pending.domain,"draws":pending.draws,
         "attachments":pending.attachments,"blobs":blobs,"allocated_readback_bytes":pending.bytes,
@@ -629,7 +658,17 @@ fn complete(pending: Pending, rx: std::sync::mpsc::Receiver<(usize,Result<(),Str
         "closure":{"ordered_two_draws":true,"unmodelled_commands":0,"resource_mutation_rejections":0,
             "initial_contents_captured":true,"original_final_captured":true,"natural_submission_completed":true},
         "prior_rejected_candidates":rejected,"normal_frame_publication_changed":false,
-        "uniform_binding_normalization":"exact selected GPU range copied to immutable offset-zero static binding; original dynamic offset separately recorded"});
+        "uniform_binding_normalization":"exact selected GPU range copied to immutable offset-zero static binding; original dynamic offset separately recorded"})}
+    else {json!({"schema":3,"kind":"native_color_null_draw","status":"captured",
+        "source":{"method":"Gpu::do_draw resolved bindings","backend":backend,"encoder_epoch":pending.epoch},
+        "world_view":pending.view,"target_domain":pending.domain,"draw":pending.draws.into_iter().next().ok_or("color-null draw missing")?,
+        "alias":pending.alias.ok_or("color-null alias proof missing")?,"attachments":pending.attachments,"blobs":blobs,
+        "allocated_readback_bytes":pending.bytes,"prior_rejected_candidates":rejected,
+        "closure":{"single_original_draw":true,"unmodelled_commands":0,"initial_contents_captured":true,
+            "original_final_captured":true,"natural_submission_completed":true,"queries_inactive":true,"gpu_errors":0},
+        "normal_frame_publication_changed":false,
+        "capture_only_usage":"COPY_SRC added only to existing dummy allocations when explicit valid color-null capture is enabled; actual native dummy bytes are read back",
+        "uniform_binding_normalization":"exact selected GPU range copied to immutable offset-zero static binding; original dynamic offset separately recorded"})};
     publish_new(&directory.join("capture.json"),&serde_json::to_vec_pretty(&manifest).map_err(|e|e.to_string())?)
 }
 
@@ -637,14 +676,22 @@ fn complete(pending: Pending, rx: std::sync::mpsc::Receiver<(usize,Result<(),Str
 mod tests {
     use super::*;
     fn capture() -> Capture {
-        Capture { directory:PathBuf::new(),pipelines:HashMap::new(),pending:None,done:false,attempts:0,sequence:0,
+        Capture { kind:CaptureKind::TwoDraw,directory:PathBuf::new(),pipelines:HashMap::new(),pending:None,done:false,attempts:0,sequence:0,
             epoch_bytes:0,rejected:BTreeMap::new(),pipeline_bytes:0,rejected_starts:Default::default(),
             live_bytes:Arc::new(AtomicU64::new(0)),feedback_recorded:false,
             color_null_binding:RefCell::new(None),color_null_recorded:false }
     }
     fn pending() -> Pending {
-        Pending {epoch:1,errors:0,view:Value::Null,domain:Value::Null,draws:vec![Value::Null],attachments:vec![],
+        Pending {kind:CaptureKind::TwoDraw,alias:None,epoch:1,errors:0,view:Value::Null,domain:Value::Null,draws:vec![Value::Null],attachments:vec![],
             targets:vec![],readbacks:vec![],bytes:0,final_bytes:0,finished:false,intervening_commands:vec![],candidate_key:vec![23,42]}
+    }
+    #[test]
+    fn original_two_draw_completion_keeps_later_null_diagnostic_alive() {
+        let mut c=capture();c.done=true;
+        assert!(c.tracks_color_null_cause(),"completed two-draw export still observes the later shader");
+        c.color_null_recorded=true;assert!(!c.tracks_color_null_cause(),"only one original diagnostic");
+        c.kind=CaptureKind::ColorNull;assert!(!c.tracks_color_null_cause(),"finished single-draw capture releases cause");
+        c.done=false;assert!(c.tracks_color_null_cause(),"single-draw capture may qualify a later cause after first diagnostic");
     }
     #[test]
     fn state_only_span_rejects_every_write_query_copy_dispatch_and_unknown() {

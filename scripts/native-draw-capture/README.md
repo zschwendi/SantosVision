@@ -2,6 +2,10 @@
 
 This diagnostic feature runs the actual game without a desktop window, using a fresh developer-mode save and synthetic static two-eye input. It captures a natural two-draw span for material/state replay. It does not reproduce the current bad headset scene, steer an airport fixture, or establish finished-world/stereo/hardware quality.
 
+`--capture-kind two-draw` is the unchanged default: schema 2, `native_draw_span`, exactly two original draws. Explicit `--capture-kind color-null` selects the feature-only corrected color-binding capture: schema 3, `native_color_null_draw`, one original draw with its resolved resources and initial/final attachments. Its `world_view` may be null; it establishes neither a same-eye world span nor a finished scene. Both kinds still require independent semantic replay after byte admission.
+
+The selected kind is passed as `MUGUET_NATIVE_DRAW_CAPTURE_KIND`, checked against the driver's optional eighth argument, and recorded in preparation, invocation and result receipts. A missing eighth driver argument selects `two-draw`; unknown choices or a mismatched manifest schema/kind fail. The runner supplies the argument and environment explicitly, so parent-shell variables cannot switch capture kinds. The `color-null` byte gate also requires a single original draw, inactive queries and zero reported GPU errors at capture; this does not assert whole-run GPU health.
+
 The synthetic eyes use the geometry fixture's fixed projection and a **1.3 source guard**. That is an explicitly recorded diagnostic field-of-view choice, not a change to production coverage policy or evidence that this guard is sufficient on hardware.
 
 `MUGUET_TRANSFER_FROZEN_DEPTH_RECEIPT=1` retains the exact consumed request in the existing bounded history before camera/GPU work; the driver requires it. Geometry capture stays disabled. Camera tracing alone does not enable request retention. A stopped or rejected run writes a failed runner receipt and preserves its original logs; no partial output is accepted.

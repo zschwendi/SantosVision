@@ -30,6 +30,7 @@ GRAPHICS = {
 MAX_BLOBS = 256 << 20
 MAX_JSON = 16 << 20
 MAX_LOG = 128 << 20
+CAPTURE_KINDS = ("two-draw", "color-null")
 FLAGS = {
     "MUGUET_MUTE": "1", "MUGUET_MASTER_VOLUME": "0",
     "MUGUET_XR_MOTION_AIM": "0", "MUGUET_XR_MOTION_ARMS": "0",
@@ -129,6 +130,7 @@ def admission(args, require_new_run=True):
         need(not root.exists() and not root.is_symlink(), "existing run must be preserved")
     need(1 <= args.deadline <= 180, "deadline must be 1..180 seconds")
     need(0 <= args.observe_after_capture <= 30, "post-capture observation must be 0..30 seconds")
+    need(args.capture_kind in CAPTURE_KINDS, "unsupported capture kind")
     inventory = source_inventory(checkout)
     bound_binary(load_json(build), inventory, binary, Path(__file__).resolve())
     records = {}
@@ -138,19 +140,21 @@ def admission(args, require_new_run=True):
         records[str(path)] = {"sha256": wanted, "bytes": path.stat().st_size}
     need(load_json(graphics / "native-graphics.json") ==
          {"width": 2560, "height": 1440, "fps_limit": 60, "graphics_preset": "clarity"}, "Clarity seed differs")
-    return {"schema": 1, "source_sha256": inventory, "binary_sha256": digest(binary),
+    return {"schema": 1, "capture_kind": args.capture_kind, "source_sha256": inventory, "binary_sha256": digest(binary),
             "binary_bytes": binary.stat().st_size, "build_receipt_sha256": digest(build),
             "runner_sha256": digest(Path(__file__).resolve()), "inputs": records}
 
 
-def child_env(root):
+def child_env(root, capture_kind="two-draw"):
     # Host HOME/TMP/cache are disposable as well. No arbitrary MUGUET, loader,
     # graphics or Python environment variables leak from the parent shell.
+    need(capture_kind in CAPTURE_KINDS, "unsupported capture kind")
     env = {k: os.environ[k] for k in ("PATH", "LANG", "LC_ALL", "LC_CTYPE", "USER", "LOGNAME") if k in os.environ}
     env.update(FLAGS)
     env.update({"HOME": str(root / "host-home"), "TMPDIR": str(root / "tmp"),
                 "XDG_CACHE_HOME": str(root / "host-cache"),
-                "MUGUET_NATIVE_DRAW_CAPTURE": str(root / "capture")})
+                "MUGUET_NATIVE_DRAW_CAPTURE": str(root / "capture"),
+                "MUGUET_NATIVE_DRAW_CAPTURE_KIND": capture_kind})
     return env
 
 
@@ -161,18 +165,29 @@ def xml_values(path):
     return normalized(ET.parse(path).getroot())
 
 
-def validate_capture(directory):
+def validate_capture(directory, capture_kind="two-draw"):
+    need(capture_kind in CAPTURE_KINDS, "unsupported capture kind")
     need(not (directory / "rejected.json").exists(), "capture module rejected the span")
     capture = load_json(directory / "capture.json")
+    expected = (2, "native_draw_span") if capture_kind == "two-draw" else (3, "native_color_null_draw")
     need((capture.get("schema"), capture.get("kind"), capture.get("status")) ==
-         (2, "native_draw_span", "captured"), "unsupported or incomplete capture")
+         (*expected, "captured"), "unsupported or incomplete capture for selected kind")
     closure = capture.get("closure", {})
-    for name in ("ordered_two_draws", "initial_contents_captured", "original_final_captured", "natural_submission_completed"):
+    for name in ("initial_contents_captured", "original_final_captured", "natural_submission_completed"):
         need(closure.get(name) is True, f"missing capture closure: {name}")
-    need(closure.get("unmodelled_commands") == 0 and closure.get("resource_mutation_rejections") == 0,
-         "span has unmodelled commands or resource mutation")
+    need(type(closure.get("unmodelled_commands")) is int and closure["unmodelled_commands"] == 0,
+         "span has unmodelled commands or an invalid command count")
     need(capture.get("normal_frame_publication_changed") is False, "frame publication changed")
-    need(isinstance(capture.get("draws"), list) and len(capture["draws"]) == 2, "exact two-draw span required")
+    if capture_kind == "two-draw":
+        need(closure.get("ordered_two_draws") is True, "missing capture closure: ordered_two_draws")
+        need(closure.get("resource_mutation_rejections") == 0, "span has resource mutation")
+        need(isinstance(capture.get("draws"), list) and len(capture["draws"]) == 2, "exact two-draw span required")
+    else:
+        for name in ("single_original_draw", "queries_inactive"):
+            need(closure.get(name) is True, f"missing capture closure: {name}")
+        need(type(closure.get("gpu_errors")) is int and closure["gpu_errors"] == 0,
+             "color-null capture reports GPU errors or an invalid error count")
+        need(isinstance(capture.get("draw"), dict) and "draws" not in capture, "single original draw required")
     blobs = capture.get("blobs")
     need(isinstance(blobs, list) and 0 < len(blobs) <= 4096, "bounded nonempty blob list required")
     names = set(); total = 0
@@ -187,17 +202,17 @@ def validate_capture(directory):
         need(path.is_file() and path.stat().st_size == size and digest(path) == blob.get("sha256"),
              f"payload absent or differs: {name}")
     need({p.name for p in directory.iterdir()} == names | {"capture.json"}, "unmanifested capture contents")
-    return {"capture_sha256": digest(directory / "capture.json"), "blob_count": len(blobs),
+    return {"capture_kind": capture_kind, "capture_sha256": digest(directory / "capture.json"), "blob_count": len(blobs),
             "payload_bytes": total, "byte_admission_passed": True,
             "semantic_replay_admission_required": True}
 
 
-def run_child(command, checkout, root, deadline):
+def run_child(command, checkout, root, deadline, capture_kind="two-draw"):
     start = time.monotonic(); proc = None
     record = {"schema": 1, "timed_out": False, "termination_reason": None}
     try:
         with (root / "stdout.log").open("xb") as out, (root / "stderr.log").open("xb") as err:
-            proc = subprocess.Popen(command, cwd=checkout, env=child_env(root), stdout=out, stderr=err, start_new_session=True)
+            proc = subprocess.Popen(command, cwd=checkout, env=child_env(root, capture_kind), stdout=out, stderr=err, start_new_session=True)
             record["pid"] = proc.pid
             write_new(root / "child-pid.json", {"pid": proc.pid, "process_group": proc.pid, "owned_by_runner": True})
             while proc.poll() is None:
@@ -232,7 +247,7 @@ def execute(args, before):
     except (Exception, KeyboardInterrupt) as error:
         # Retain failed runs and their original logs. A missing driver result
         # (for example, a terminated child) is never a successful capture.
-        failure = {"schema": 1, "status": "failed", "error_type": type(error).__name__,
+        failure = {"schema": 1, "status": "failed", "capture_kind": args.capture_kind, "error_type": type(error).__name__,
                    "error": str(error), "captured_bytes_accepted": False,
                    "finished_world_accepted": False, "hardware_accepted": False,
                    "original_inputs_unchanged": None,
@@ -250,23 +265,25 @@ def execute_owned(args, before, root):
     for name in ("host-home", "tmp", "host-cache"): (root / name).mkdir()
     write_new(root / "source-before.json", before)
     command = [args.binary, args.game_root, str(root / "fresh-save"), str(root / "capture"),
-               args.graphics_seed, args.aot, str(args.deadline), str(args.observe_after_capture)]
+               args.graphics_seed, args.aot, str(args.deadline), str(args.observe_after_capture), args.capture_kind]
     write_new(root / "invocation.json", {"argv": command, "cwd": args.checkout,
-        "environment": child_env(root), "fixture": "fresh developer-mode natural game with synthetic static two-eye input",
+        "environment": child_env(root, args.capture_kind), "capture_kind": args.capture_kind,
+        "fixture": "fresh developer-mode natural game with synthetic static two-eye input",
         "source_guard_band": 1.3, "source_guard_policy": "fixed diagnostic fixture FOV; not production coverage tuning",
         "observe_after_capture_seconds": args.observe_after_capture,
         "scene_steered": False, "finished_world_accepted": False, "hardware_accepted": False})
-    lifecycle = run_child(command, Path(args.checkout), root, args.deadline)
+    lifecycle = run_child(command, Path(args.checkout), root, args.deadline, args.capture_kind)
     after = admission(args, require_new_run=False); write_new(root / "source-after.json", after)
     need(before == after, "source, executable, build receipt, runner or original seeds changed during run")
     need(lifecycle.get("return_code") == 0 and lifecycle["termination_reason"] is None,
          f"child stopped or failed before accepted capture: {lifecycle}")
     final = load_json(root / "driver-result.json")
     need(final.get("outcome") == "captured", "driver did not finish a bounded capture")
+    need(final.get("capture_kind") == args.capture_kind, "driver capture kind differs from selected kind")
     need(xml_values(Path(args.graphics_seed) / "settings.xml") ==
          xml_values(root / "fresh-save/userdata/Documents/Rockstar Games/GTA V/settings.xml"), "disposable graphics XML semantics changed")
     need(digest(root / "fresh-save/native-graphics.json") == GRAPHICS["native-graphics.json"], "disposable Clarity config changed")
-    result = validate_capture(root / "capture")
+    result = validate_capture(root / "capture", args.capture_kind)
     validate_capture_identity(final, root / "capture/capture.json")
     observation = final.get("observation", {})
     need(observation.get("requested_seconds") == args.observe_after_capture
@@ -285,13 +302,16 @@ def main():
     for name in ("checkout", "binary", "build-receipt", "game-root", "graphics-seed", "aot", "run-root"):
         p.add_argument("--" + name, required=True)
     p.add_argument("--deadline", type=int, default=180)
+    p.add_argument("--capture-kind", choices=CAPTURE_KINDS, default="two-draw",
+                   help="two-draw preserves the original span; color-null captures one corrected draw with nullable world provenance")
     p.add_argument("--observe-after-capture", type=observation_seconds, default=0,
                    help="observe normal runtime for 0..30 seconds after capture within the original deadline; no whole-run health claim")
     p.add_argument("--execute", action="store_true", help="run one reviewed native game process; otherwise read-only admission")
     args = p.parse_args()
     before = admission(args)
     if args.execute: execute(args, before)
-    else: print(json.dumps({"status": "inputs_admitted_no_execution", "binary_sha256": before["binary_sha256"], "source_files": len(before["source_sha256"])}))
+    else: print(json.dumps({"status": "inputs_admitted_no_execution", "capture_kind": args.capture_kind,
+                           "binary_sha256": before["binary_sha256"], "source_files": len(before["source_sha256"])}))
 
 
 if __name__ == "__main__":

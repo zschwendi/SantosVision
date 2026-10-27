@@ -36,11 +36,58 @@ class RunnerBoundaries(unittest.TestCase):
         (p / "capture.json").write_text(json.dumps(value))
         return p, value
 
+    def color_null_capture(self):
+        p, value = self.capture()
+        value.update(schema=3, kind="native_color_null_draw", world_view=None, draw={"kind": 0, "count": 6})
+        del value["draws"]
+        value["closure"] = {"single_original_draw": True, "initial_contents_captured": True,
+            "original_final_captured": True, "natural_submission_completed": True,
+            "queries_inactive": True, "unmodelled_commands": 0, "gpu_errors": 0}
+        (p / "capture.json").write_text(json.dumps(value))
+        return p, value
+
     def test_complete_bytes_require_separate_semantic_admission(self):
         p, _ = self.capture()
         result = runner.validate_capture(p)
         self.assertTrue(result["byte_admission_passed"])
         self.assertTrue(result["semantic_replay_admission_required"])
+
+    def test_color_null_capture_allows_null_world_view_but_requires_explicit_kind(self):
+        p, _ = self.color_null_capture()
+        with self.assertRaisesRegex(ValueError, "selected kind"):
+            runner.validate_capture(p)  # Default remains the original two-draw kind.
+        result = runner.validate_capture(p, "color-null")
+        self.assertEqual(result["capture_kind"], "color-null")
+        self.assertTrue(result["byte_admission_passed"])
+        self.assertTrue(result["semantic_replay_admission_required"])
+
+    def test_color_null_wrong_schema_kind_or_closure_is_rejected(self):
+        p, original = self.color_null_capture()
+        invalid = []
+        for key, replacement in [("schema", 2), ("kind", "native_draw_span"), ("draw", None), ("draws", [{}]),
+                                  ("normal_frame_publication_changed", True)]:
+            value = copy.deepcopy(original); value[key] = replacement; invalid.append(value)
+        for key in ("single_original_draw", "initial_contents_captured", "original_final_captured",
+                    "natural_submission_completed", "queries_inactive"):
+            value = copy.deepcopy(original); value["closure"][key] = False; invalid.append(value)
+        for key in ("unmodelled_commands", "gpu_errors"):
+            for count in (1, False, 0.0, None):
+                value = copy.deepcopy(original); value["closure"][key] = count; invalid.append(value)
+        for index, value in enumerate(invalid):
+            (p / "capture.json").write_text(json.dumps(value))
+            with self.subTest(case=index), self.assertRaises(ValueError):
+                runner.validate_capture(p, "color-null")
+
+    def test_two_draw_cannot_be_admitted_as_color_null(self):
+        p, _ = self.capture()
+        with self.assertRaisesRegex(ValueError, "selected kind"):
+            runner.validate_capture(p, "color-null")
+
+    def test_color_null_retains_general_payload_byte_admission(self):
+        p, _ = self.color_null_capture()
+        (p / "payload.bin").write_bytes(b"wrong")
+        with self.assertRaisesRegex(ValueError, "payload absent or differs"):
+            runner.validate_capture(p, "color-null")
 
     def test_original_manifest_identity_survives_driver_float_roundtrip(self):
         p = self.root / "capture.json"
@@ -121,23 +168,33 @@ class RunnerBoundaries(unittest.TestCase):
             runner.bound_binary(receipt, source, binary, script)
 
     def test_environment_rejects_loader_or_graphics_override(self):
-        with patch.dict(os.environ, {"DYLD_INSERT_LIBRARIES": "unwanted", "MUGUET_MUTE": "0", "MUGUET_FSROOT": "/old-save"}):
+        with patch.dict(os.environ, {"DYLD_INSERT_LIBRARIES": "unwanted", "MUGUET_MUTE": "0", "MUGUET_FSROOT": "/old-save",
+                                    "MUGUET_NATIVE_DRAW_CAPTURE_KIND": "color-null"}):
             env = runner.child_env(self.root)
         self.assertNotIn("DYLD_INSERT_LIBRARIES", env)
         self.assertNotIn("MUGUET_FSROOT", env)
         self.assertEqual(env["MUGUET_MUTE"], "1")
         self.assertEqual(env["MUGUET_TRANSFER_FROZEN_DEPTH_RECEIPT"], "1")
         self.assertEqual(env["MUGUET_GEOMETRY_STEREO_CAPTURE"], "0")
+        self.assertEqual(env["MUGUET_NATIVE_DRAW_CAPTURE_KIND"], "two-draw")
         self.assertEqual(env["HOME"], str(self.root / "host-home"))
+
+    def test_capture_kind_environment_is_an_explicit_bounded_choice(self):
+        self.assertEqual(runner.child_env(self.root, "color-null")["MUGUET_NATIVE_DRAW_CAPTURE_KIND"], "color-null")
+        for invalid in ("", "unknown", "native_color_null_draw"):
+            with self.subTest(kind=invalid), self.assertRaisesRegex(ValueError, "unsupported capture kind"):
+                runner.child_env(self.root, invalid)
 
     def test_failed_child_records_failure_and_preserves_logs_without_driver_result(self):
         root = self.root / "failed-run"
         args = argparse.Namespace(run_root=str(root), binary="unused", game_root="unused",
-                                  graphics_seed="unused", aot="unused", deadline=1, observe_after_capture=20, checkout=str(self.root))
+                                  graphics_seed="unused", aot="unused", deadline=1, observe_after_capture=20,
+                                  capture_kind="color-null", checkout=str(self.root))
         before = {"schema": 1, "test": "unchanged inputs"}
         lifecycle = {"return_code": -15, "termination_reason": None, "timed_out": False}
         def stopped(command, *unused):
-            self.assertEqual(command[-1], "20")
+            self.assertEqual(command[-2:], ["20", "color-null"])
+            self.assertEqual(unused[-1], "color-null")
             runner.write_new(root / "child-lifecycle.json", lifecycle)
             (root / "stderr.log").write_bytes(b"preserve failure evidence")
             return lifecycle
@@ -146,6 +203,7 @@ class RunnerBoundaries(unittest.TestCase):
                 runner.execute(args, before)
         receipt = json.loads((root / "receipt.json").read_text())
         self.assertEqual(receipt["status"], "failed")
+        self.assertEqual(receipt["capture_kind"], "color-null")
         self.assertFalse(receipt["captured_bytes_accepted"])
         self.assertEqual(receipt["child_lifecycle"]["return_code"], -15)
         self.assertTrue(receipt["original_inputs_unchanged"])
