@@ -1,5 +1,9 @@
 # Third-person immersive fidelity on the27 baseline
 
+## Review checkpoint — October 27
+
+**No new visible-quality improvement has been proved over the already-signed V28 during the latest replay-tool work.** App title V and the front-glass icon are complete; V28 is unchanged and uninstalled. The latest actual capture remains rejected, and the following prepared run was refused before launch because disk headroom fell below its fixed floor. See the [concise checkpoint, commits, evidence and single acceptance test](LOCAL-CHECKPOINT-20261027.md). The overall visual-quality goal remains incomplete.
+
 ## Current local verification checkpoint — October 27
 
 The app title is **V**; the signed front-glass **build28** remains unchanged and uninstalled. Finished HUD-free graph capture/replay now implements exact auxiliary operations, natural-submission spooling and the accepted same-eye/HUD-sidecar publication certificate. Authored Metal operations pass 52 initial, 52 final and 11 checkpoint byte comparisons. Actual full-game attempts remain rejected, most recently for a skipped draw; no broader finished-image, density or hardware acceptance is claimed. See [implementation, exact evidence and next local boundary](NATIVE-FINISHED-GRAPH-20261027.md).
