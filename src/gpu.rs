@@ -18,6 +18,13 @@ use crate::xr_view::foreground_depth as fg;
 mod render_prepare;
 use render_prepare::{PassKey, RenderPrepare};
 
+#[path = "gpu_color_binding_hazards.rs"]
+mod color_binding_hazards;
+
+#[cfg(all(test,target_os="macos"))]
+#[path="gpu_color_binding_hazards_tests.rs"]
+mod color_binding_hazards_tests;
+
 #[path = "uniform_pack.rs"]
 mod uniform_pack;
 use uniform_pack::UniformPack;
@@ -1941,7 +1948,12 @@ impl Gpu {
             }
             24 => {
                 let (st, s, c) = (u(0) as usize, u(1) as usize, u(2) as usize);
-                for i in 0..c { if s + i < 128 && st < 3 { self.s.srv[st][s + i] = u(3 + i as u64); } }
+                for i in 0..c { if s + i < 128 && st < 3 {
+                    let id=u(3+i as u64);
+                    self.s.srv[st][s+i]=self.color_safe_srv(id);
+                    #[cfg(all(target_os = "macos", feature = "native-draw-capture"))]
+                    if let Some(capture)=&self.draw_capture {capture.color_srv_binding(self,24,st,s+i,id,self.s.srv[st][s+i]);}
+                } }
             }
             25 => {
                 let (st, s, c) = (u(0) as usize, u(1) as usize, u(2) as usize);
@@ -1953,6 +1965,7 @@ impl Gpu {
                     self.s.rt[i] = Rt { tex: u(q), mip: u(q + 1), slice: u(q + 2), fmt: u(q + 3) };
                 }
                 self.s.ds = Ds { tex: u(32), mip: u(33), slice: u(34), fmt: u(35), flags: u(36) };
+                self.unbind_color_target_srvs();
                 self.pdirty = true;
             }
             27 => {

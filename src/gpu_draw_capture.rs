@@ -37,6 +37,13 @@ struct Pending {
     candidate_key: Vec<u64>,
 }
 
+// One retained native parent ties the demonstrated PS t5 null transition to a
+// later resolved draw. This diagnostic is compiled only with private capture.
+struct ColorNullBinding {
+    sequence:u64, opcode:u32, view:u32, resource:u32, parent:Texture,
+    raw:[u32;6], mips:[u32;2], layers:[u32;2],
+}
+
 pub(super) struct Capture {
     directory: PathBuf, pipelines: HashMap<Vec<i64>, Value>, pending: Option<Pending>,
     done: bool, attempts: u32, sequence: u64, epoch_bytes: u64,
@@ -44,6 +51,8 @@ pub(super) struct Capture {
     rejected_starts: std::collections::HashSet<Vec<u64>>,
     live_bytes: Arc<AtomicU64>,
     feedback_recorded: bool,
+    color_null_binding: RefCell<Option<ColorNullBinding>>,
+    color_null_recorded: bool,
 }
 
 fn sha(bytes: &[u8]) -> String {
@@ -136,6 +145,75 @@ fn enqueue(gpu: &mut Gpu, plans: Vec<Plan>) -> Vec<Readback> {
 }
 
 impl Capture {
+    pub(super) fn color_srv_binding(&self,gpu:&Gpu,opcode:u32,stage:usize,slot:usize,input:u32,resolved:u32) {
+        if self.color_null_recorded || stage!=1 || slot!=5 {return;}
+        // An explicit later bind (including guest NULL) supersedes the cause.
+        // OM unbinding visits only non-null slots, so persistent NULL retains
+        // its original cause until the guest explicitly binds this slot again.
+        let mut prior=self.color_null_binding.borrow_mut();
+        *prior=None;
+        if input==0 || resolved!=0 {return;}
+        let Some(view)=gpu.view_obj(input).filter(|v|!v.is_buf && v.vdim==4) else{return;};
+        let Some(source)=gpu.tex(view.res) else{return;};
+        if source.desc.dim!=TextureDimension::D2 || source.desc.mips==0 || source.desc.d==0 {return;}
+        let (mips,layers)=sampled_ranges(source.desc,view,TextureViewDimension::D2);
+        *prior=Some(ColorNullBinding{sequence:self.sequence,opcode,view:input,resource:view.res,parent:source.tex.clone(),
+            raw:[view.fmt,view.vdim,view.a,view.b,view.c,view.d],mips,layers});
+    }
+    fn record_color_null_draw(&mut self,gpu:&Gpu,d:&Resolved<'_>) {
+        if self.color_null_recorded || !gpu.bind_group_prepare.enabled || gpu.s.srv[1][5]!=0 {return;}
+        let Some(Obj::Shader(shader))=gpu.obj(gpu.s.shader[1]) else{return;};
+        if shader.hash!="7f531ca66548aefe" {return;}
+        let Some(ps)=d.ps else{return;};
+        let Some(bindings)=ps.group_bindings.get(&1) else{return;};
+        // Real texture key entries also end in zero, so a trailing zero alone
+        // cannot certify a dummy. Pin this shader's complete binding/key shape:
+        // prefix3 + packed uniform1 + samplers2 + real t2 pair2 + null t5 word1.
+        let contract=[(0,Kind::Uniform),(18,Kind::Sampler),(21,Kind::Sampler),(34,Kind::Texture),(37,Kind::Texture)];
+        if bindings.len()!=contract.len() || !bindings.iter().zip(contract).all(|(b,(number,kind))|b.binding==number && b.kind==kind) {return;}
+        let binding=&bindings[4];
+        if binding.dim!=TextureViewDimension::D2 {return;}
+        let Some(group)=d.groups[1] else{return;};
+        let Some((key,_))=gpu.bind_groups.iter().find(|(_,(_,uid))|*uid==group.uid) else{return;};
+        if key.len()!=9 || key[1]!=ps.uid || key[2]!=1 || gpu.s.srv[1][2]==0
+            || key[6]!=gpu.s.srv[1][2] as u64 || key[7]!=0 || key[8]!=0 {return;}
+        let Some(pass)=gpu.pass_info.as_ref() else{return;};
+        let prior=self.color_null_binding.borrow();
+        let Some(cause)=prior.as_ref() else{return;};
+        let dummy_key=format!("{:?}|{:?}|{}",binding.dim,binding.sample,binding.ms);
+        let Some(dummy)=gpu.dummy_tex.get(&dummy_key) else{return;};
+        if dummy.texture()==&cause.parent {return;}
+        let mut targets=Vec::new();
+        for (slot,target) in gpu.s.rt.iter().enumerate() {
+            let Some(format)=pass.rt_formats.get(slot).copied().flatten() else{continue;};
+            let Some(texture)=gpu.tex(target.tex) else{continue;};
+            let Some(attached)=texture.views.get(&(format,target.mip,target.slice)) else{continue;};
+            if attached.texture()!=&cause.parent || !contains_subresource(cause.mips,cause.layers,target.mip,target.slice) {continue;}
+            targets.push(json!({"slot":slot,"resource":target.tex,"format":format,"mip":target.mip,"layer":target.slice,
+                "extent":[texture.desc.w,texture.desc.h,texture.desc.d],"native_parent_matches_retained_null_cause":true}));
+        }
+        if targets.is_empty(){return;}
+        let value=json!({"schema":1,"kind":"first_corrected_color_null_draw","command_sequence":self.sequence,
+            "errors_before":gpu.errors.load(Ordering::SeqCst),"presents":gpu.presents,"draws_before":gpu.draws,
+            "null_cause":{"command_sequence":cause.sequence,"opcode":cause.opcode,"stage":1,"slot":5,
+                "input_view":cause.view,"input_resource":cause.resource,"resolved_view":0,"view_raw":cause.raw,
+                "mips":cause.mips,"layers":cause.layers,"recorded_after_actual_production_binding_mutation":true},
+            "pixel_shader":{"guest_id":gpu.s.shader[1],"guest_hash":shader.hash,"label":ps.label,"wgsl_sha256":sha(ps.text.as_bytes())},
+            "resolved_binding":{"group_uid":group.uid,"group_key":key,"binding":37,"slot_state":0,
+                "binding_contract":[0,18,21,34,37],"exact_key_words":9,"texture2_key_words":[key[6],key[7]],
+                "texture5_key_words":[key[8]],"dummy_parent_differs_from_output":true},
+            "targets":targets,"pipeline_uid":d.pipeline.uid,
+            "draw":{"kind":d.kind,"count":d.count,"instances":d.instances,"start":d.start,"base_vertex":d.base_vertex},
+            "native_commands_changed_by_diagnostic":false,
+            "scope":"exact previously failing PS_BlitDepthToAlpha native 2D t5 path; resolved before pass binding, GPU success is separately checked"});
+        drop(prior);
+        self.color_null_recorded=true;
+        self.color_null_binding.borrow_mut().take();
+        if let Ok(bytes)=serde_json::to_vec_pretty(&value) {if bytes.len()<=16*1024 {if let Some(parent)=self.directory.parent(){
+            if let Err(e)=publish_new(&parent.join("first-color-null-draw.json"),&bytes){log(&format!("first corrected color null draw record failed: {e}"));}
+            else {log("first corrected PS_BlitDepthToAlpha null draw recorded; diagnostic changed no commands");}
+        }}}
+    }
     fn record_color_feedback(&mut self,gpu:&Gpu,d:&Resolved<'_>) {
         if self.feedback_recorded || !gpu.bind_group_prepare.enabled {return;}
         let Some(pass)=gpu.pass_info.as_ref() else{return;};
@@ -354,7 +432,8 @@ impl Capture {
         }
         Some(Self { directory, pipelines: HashMap::new(), pending: None, done: false,
             attempts: 0, sequence: 0, epoch_bytes: 0, rejected: BTreeMap::new(), pipeline_bytes: 0,
-            rejected_starts: Default::default(), live_bytes: Arc::new(AtomicU64::new(0)), feedback_recorded:false })
+            rejected_starts: Default::default(), live_bytes: Arc::new(AtomicU64::new(0)), feedback_recorded:false,
+            color_null_binding:RefCell::new(None),color_null_recorded:false })
     }
     pub(super) fn remember_pipeline(&mut self, key: &[i64], job: &PipeJob) {
         if self.done || self.pipelines.len() >= MAX_PIPELINES { return; }
@@ -376,6 +455,9 @@ impl Capture {
     }
     pub(super) fn command(&mut self, op: u32) {
         self.sequence = self.sequence.saturating_add(1);
+        // ClearState supplies its own NULL bindings; a later draw must not
+        // attribute those to an earlier color conflict.
+        if op==33 {self.color_null_binding.borrow_mut().take();}
         // Only binding/state commands may intervene. Resource writes, including
         // uniform uploads, are rejected even though inputs are snapshotted.
         if self.pending.as_ref().is_some_and(|p| !p.finished)
@@ -391,6 +473,7 @@ impl Capture {
         if self.pending.as_ref().is_some_and(|p| !p.finished) { self.reject("intervening skipped draw"); }
     }
     pub(super) fn before(&mut self, gpu: &mut Gpu, draw: &Resolved<'_>) {
+        self.record_color_null_draw(gpu,draw);
         self.record_color_feedback(gpu,draw);
         if self.done || self.pending.as_ref().is_some_and(|p| p.finished) || self.attempts >= 128 { return; }
         let matching = matches!((gpu.obj(gpu.s.shader[0]),gpu.obj(gpu.s.shader[1])),
@@ -556,7 +639,8 @@ mod tests {
     fn capture() -> Capture {
         Capture { directory:PathBuf::new(),pipelines:HashMap::new(),pending:None,done:false,attempts:0,sequence:0,
             epoch_bytes:0,rejected:BTreeMap::new(),pipeline_bytes:0,rejected_starts:Default::default(),
-            live_bytes:Arc::new(AtomicU64::new(0)),feedback_recorded:false }
+            live_bytes:Arc::new(AtomicU64::new(0)),feedback_recorded:false,
+            color_null_binding:RefCell::new(None),color_null_recorded:false }
     }
     fn pending() -> Pending {
         Pending {epoch:1,errors:0,view:Value::Null,domain:Value::Null,draws:vec![Value::Null],attachments:vec![],
