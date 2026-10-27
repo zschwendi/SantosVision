@@ -96,6 +96,9 @@ impl HostState {
 
 pub static RT: OnceLock<Arc<Runtime>> = OnceLock::new();
 
+#[cfg(all(target_os = "macos", feature = "jit", feature = "native-draw-capture"))]
+pub mod native_draw_capture_host;
+
 pub fn footprint_mb() -> u64 {
     extern "C" {
         fn proc_pid_rusage(pid: i32, flavor: i32, buffer: *mut u64) -> i32;
@@ -364,6 +367,12 @@ impl CustomCodeMemory for SignedCode {
 
 #[cfg(feature = "jit")]
 pub(crate) fn load_module(engine: &Engine, startup: &config::Startup) -> Result<Module> {
+    #[cfg(all(target_os = "macos", feature = "native-draw-capture"))]
+    if std::env::var_os("MUGUET_NATIVE_DRAW_CAPTURE").is_some() {
+        // A private capture must execute its explicitly admitted immutable AOT.
+        // A cache miss or incompatibility must never compile a different game.
+        return native_draw_capture_host::load(engine, startup);
+    }
     let wasm_path = startup.wasm_path.clone();
     let meta = std::fs::metadata(&wasm_path).with_context(|| format!("{}", wasm_path.display()))?;
     let stamp = meta.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_secs()).unwrap_or(0);

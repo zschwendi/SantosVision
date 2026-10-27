@@ -24,6 +24,10 @@ use uniform_pack::UniformPack;
 
 #[path = "uniform_snapshot.rs"]
 mod uniform_snapshot;
+
+#[cfg(all(target_os = "macos", feature = "native-draw-capture"))]
+#[path = "gpu_draw_capture.rs"]
+mod draw_capture;
 use uniform_snapshot::UniformSnapshot;
 
 #[path = "bind_group_prepare.rs"]
@@ -1115,6 +1119,8 @@ struct Gpu {
     last_submit: Option<SubmissionIndex>,
     vb_avail: [u64; 16],
     dbg_idx: u64,
+    #[cfg(all(target_os = "macos", feature = "native-draw-capture"))]
+    draw_capture: Option<draw_capture::Capture>,
     geometry_stereo_capture: bool,
     geometry_stereo_capture_done: bool,
     geometry_capture_diagnostics: GeometryCaptureDiagnostics,
@@ -1264,6 +1270,8 @@ impl Gpu {
             pending_resolve: Vec::new(), pending_events: Vec::new(), pending_maps: Vec::new(), counter_src: None, counter_slot: 0,
             frame_slot_done: (0..FRAME_SLOTS).map(|_| None).collect(), last_submit: None, vb_avail: [0; 16],
             dbg_idx: if dbg != 0 { dbg + 424 } else { 0 },
+            #[cfg(all(target_os = "macos", feature = "native-draw-capture"))]
+            draw_capture: draw_capture::Capture::from_env(),
             geometry_stereo_capture: std::env::var("MUGUET_GEOMETRY_STEREO_CAPTURE").as_deref() == Ok("1"),
             geometry_stereo_capture_done: false,
             geometry_capture_diagnostics: GeometryCaptureDiagnostics::default(),
@@ -1754,6 +1762,10 @@ impl Gpu {
             self.last_submit = Some(idx);
             self.submits += 1;
             self.on_submitted();
+            #[cfg(all(target_os = "macos", feature = "native-draw-capture"))]
+            if let Some(mut capture) = self.draw_capture.take() {
+                capture.submitted(self, self.enc_epoch); self.draw_capture = Some(capture);
+            }
             self.counter_slot = 0;
         }
         if let Some(r) = resolves {
@@ -1865,6 +1877,8 @@ impl Gpu {
     }
 
     fn exec(&mut self, op: u32, p: u64, n: u64) {
+        #[cfg(all(target_os = "macos", feature = "native-draw-capture"))]
+        if let Some(capture) = &mut self.draw_capture { capture.command(op); }
         let mb = self.base;
         let u = move |w: u64| unsafe { std::ptr::read_volatile(mb.add(((p + w) * 4) as usize) as *const u32) };
         self.hud_non_draw_command(op,p,n);
@@ -2407,6 +2421,10 @@ impl Gpu {
     }
 
     fn make_sampler(&self, w: &[u32]) -> Sampler {
+        self.device.create_sampler(&Self::sampler_descriptor(w))
+    }
+
+    fn sampler_descriptor(w: &[u32]) -> SamplerDescriptor<'static> {
         let g = |i: usize| w.get(i).copied().unwrap_or(0);
         let filter = g(0);
         let aniso = (filter & 0x7f) == 0x55;
@@ -2429,7 +2447,7 @@ impl Gpu {
             d.mipmap_filter = MipmapFilterMode::Linear;
             d.anisotropy_clamp = g(5).clamp(1, 16) as u16;
         }
-        self.device.create_sampler(&d)
+        d
     }
 
     fn create_view(&mut self, p: u64, uav: bool) {
@@ -3006,6 +3024,13 @@ impl Gpu {
         Some(v)
     }
 
+    #[inline]
+    fn draw_capture_usage(&self, usage: BufferUsages) -> BufferUsages {
+        #[cfg(all(target_os = "macos", feature = "native-draw-capture"))]
+        if self.draw_capture.is_some() { return usage | BufferUsages::COPY_SRC; }
+        usage
+    }
+
     fn uniform_alloc(&mut self, size: u64) -> (usize, u64) {
         let size = (size + 255) & !255;
         let slot = self.ubo_slot;
@@ -3014,7 +3039,7 @@ impl Gpu {
             if self.ubo_slots[slot].get(self.ubo_chunk).is_some() { self.ubo_chunk += 1; self.ubo_off = 0; }
             if self.ubo_slots[slot].get(self.ubo_chunk).is_none() {
                 while self.ubo_shared.len() <= self.ubo_chunk {
-                    let buf = self.device.create_buffer(&BufferDescriptor { label: Some("uniform ring"), size: RING_CHUNK * FRAME_SLOTS as u64, usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST, mapped_at_creation: false });
+                    let buf = self.device.create_buffer(&BufferDescriptor { label: Some("uniform ring"), size: RING_CHUNK * FRAME_SLOTS as u64, usage: self.draw_capture_usage(BufferUsages::UNIFORM | BufferUsages::COPY_DST), mapped_at_creation: false });
                     let id = self.uid();
                     self.ubo_shared.push((buf, id));
                 }
@@ -3308,6 +3333,8 @@ impl Gpu {
             self.pipelines.insert(key, PipeEntry::Done(None));
             return None;
         };
+        #[cfg(all(target_os = "macos", feature = "native-draw-capture"))]
+        if let Some(capture) = &mut self.draw_capture { capture.remember_pipeline(&key, &job); }
         if let Some(tx) = self.pipe_jobs.clone() {
             let id = self.uid();
             self.pipe_pending.insert(id, (key.clone(), vb_req, job.label.clone()));
@@ -3416,6 +3443,8 @@ impl Gpu {
     }
 
     fn skip(&mut self) {
+        #[cfg(all(target_os = "macos", feature = "native-draw-capture"))]
+        if let Some(capture) = &mut self.draw_capture { capture.skipped_draw(); }
         if let Some(hud)=&mut self.hud_capture { hud.rejected.get_or_insert_with(||"draw skipped after final postFX".into()); }
         self.skipped += 1;
     }
@@ -3832,7 +3861,8 @@ impl Gpu {
             match self.buf(vb.buf).and_then(|b| b.gpu.clone().map(|g| (g, b.bytes))) {
                 None => {
                     let dev = self.device.clone();
-                    let z = self.zero_vb.get_or_insert_with(|| dev.create_buffer(&BufferDescriptor { label: Some("zero vb"), size: ZERO_VB_SIZE, usage: BufferUsages::VERTEX, mapped_at_creation: false })).clone();
+                    let usage = self.draw_capture_usage(BufferUsages::VERTEX);
+                    let z = self.zero_vb.get_or_insert_with(|| dev.create_buffer(&BufferDescriptor { label: Some("zero vb"), size: ZERO_VB_SIZE, usage, mapped_at_creation: false })).clone();
                     self.vb_avail[slot as usize] = ZERO_VB_SIZE;
                     vb_binds.push((slot, z, 0, u64::MAX));
                 }
@@ -3895,6 +3925,19 @@ impl Gpu {
             match self.buf(u(1)).and_then(|b| b.gpu.clone()) { Some(g) => { self.use_buf(u(1)); Some((g, u(2) as u64)) } None => { self.skip(); return } }
         } else { None };
 
+        #[cfg(all(target_os = "macos", feature = "native-draw-capture"))]
+        if let Some(mut capture) = self.draw_capture.take() {
+            capture.before(self, &draw_capture::Resolved {
+                kind, count: d_count as u32, instances: d_inst as u32, start,
+                base_vertex, start_instance, unclamped: d_count == count as i64 && d_inst == inst as i64,
+                vs: &vs, ps: ps.as_deref(), pipeline: &pl, vertices: &vb_binds, index: ib_bind.as_ref(),
+                groups: [g0.as_ref(),g1.as_ref()],
+                viewport: viewport.unwrap_or([0.,0.,pass_width as f32,pass_height as f32,0.,1.]),
+                scissor, blend: bf, stencil: sref,
+            });
+            self.draw_capture = Some(capture);
+            if self.pass.is_none() && !self.ensure_pass() { self.skip(); return; }
+        }
         let st = &mut self.pass_st;
         let pass = self.pass.as_mut().unwrap();
         if st.pl != Some(pl.uid) { pass.set_pipeline(&pl.pipeline); st.pl = Some(pl.uid); }
@@ -4032,6 +4075,10 @@ impl Gpu {
         }
         self.trace_color_draw(&vs, ps.as_deref(), actual_viewport, scissor, writes_depth,
             full_world_viewport, ui_depth_clear, p, d_count as u32, d_inst as u32);
+        #[cfg(all(target_os = "macos", feature = "native-draw-capture"))]
+        if let Some(mut capture) = self.draw_capture.take() {
+            capture.after(self); self.draw_capture = Some(capture);
+        }
         if self.geometry_stereo_capture && !self.geometry_stereo_capture_done
             && d_count == count as i64 && d_inst == inst as i64 {
             self.capture_geometry_stereo_draw(kind, count, inst, start, base_vertex, start_instance, &layout, &vs,

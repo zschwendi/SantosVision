@@ -15,6 +15,11 @@ name = "inspect-game"
 path = "src/bin/inspect-game.rs"
 required-features = ["jit"]
 
+[[bin]]
+name = "native-span-capture"
+path = "src/bin/native-span-capture.rs"
+required-features = ["jit", "native-draw-capture"]
+
 [dependencies]
 wasmtime = { version = "49", default-features = false, features = ["runtime", "threads", "profiling", "anyhow"] }
 anyhow = "1"
@@ -38,6 +43,7 @@ winit = "0.30.13"
 [features]
 default = ["jit"]
 jit = ["wasmtime/cranelift", "wasmtime/parallel-compilation", "dep:wasmparser", "dep:wasm-encoder"]
+native-draw-capture = ["wgpu/serde"]
 
 [profile.release]
 opt-level = 2
