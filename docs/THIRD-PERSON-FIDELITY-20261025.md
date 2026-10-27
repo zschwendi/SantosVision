@@ -1,5 +1,10 @@
 # Third-person immersive fidelity on the27 baseline
 
+## Current local verification checkpoint — October 27
+
+The app title is **V**; the signed front-glass **build28** remains unchanged and uninstalled. Finished HUD-free graph capture/replay now implements exact auxiliary operations, natural-submission spooling and the accepted same-eye/HUD-sidecar publication certificate. Authored Metal operations pass 52 initial, 52 final and 11 checkpoint byte comparisons. Actual full-game attempts remain rejected, most recently for a skipped draw; no broader finished-image, density or hardware acceptance is claimed. See [implementation, exact evidence and next local boundary](NATIVE-FINISHED-GRAPH-20261027.md).
+
+
 ## Latest local candidate — V28, October26
 
 The new correction admits exact same-eye camera-coordinate aliases that the former callback-ID rule rejected. In actual comparable20-second local observation windows, GPU-complete source publications increased from46 to972; genuine camera changes still reject. Resolution, graphics effects, source pixels and independent-eye rendering are preserved. V28 is signed and frozen from `823fa3b` at `target/fidelity-v28/SantosVision.app`, reusing the verified `dc83856` native archive;40 CPU tests and41 package checks pass. Actual bundle build is28. It is uninstalled. This does not establish repaired headset grain/shading or remove the guard3 detail limit. See [V28 source publication evidence and acceptance boundary](WORLD-PROVENANCE-FIDELITY-20261026.md). V28 supersedes the next headset acceptance plan below; V27.6–V27.10 remain preserved.
