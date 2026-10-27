@@ -7,6 +7,18 @@ use texture_ledger::{Aspect, Subresource, VersionRef};
 const MAX_DRAWS:usize=4096;
 const MAX_COMMANDS:usize=65536;
 
+struct TargetContext {view:Value,domain:Value,targets:Vec<(Texture,TextureAspect,String)>}
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+enum ContextBoundary {Continue,Split,Reject}
+fn context_boundary(kind:CaptureKind,same_present:bool,domain_same:bool,view_same:bool,parents_same:bool)->ContextBoundary {
+    if !domain_same || !parents_same || (kind.is_finished() && !same_present) {return ContextBoundary::Reject;}
+    if view_same {return ContextBoundary::Continue;}
+    if kind.is_finished() && same_present {ContextBoundary::Split}else{ContextBoundary::Reject}
+}
+fn retained_targets_equal<T:PartialEq>(old:&[T],new:&[T])->bool {
+    old.len()==new.len() && old.iter().zip(new).all(|(a,b)|a==b)
+}
+
 #[derive(Default)]
 pub(super) struct SpanState {
     boundary:Option<u64>,
@@ -20,6 +32,8 @@ pub(super) struct SpanState {
     next_buffer:u64,
     next_snapshot:u64,
     before:Vec<VersionRef>,
+    context_transition_recorded:bool,
+    context_mismatch_recorded:bool,
 }
 impl SpanState {
     pub(super) fn clear_interval(&mut self) {*self=Self::default();}
@@ -245,7 +259,7 @@ impl Capture {
         Ok(refs)
     }
 
-    fn prepare_target_span(&mut self,gpu:&Gpu,d:&Resolved<'_>,ordinal:usize)->Result<Prepared,String> {
+    fn target_context(&mut self,gpu:&Gpu,d:&Resolved<'_>)->Result<TargetContext,String> {
         if !gpu.bind_group_prepare.enabled || gpu.errors.load(Ordering::SeqCst)!=0 || gpu.hud_draw.is_some()
             || (!self.kind.is_finished() && (gpu.occlusion_active.is_some() || gpu.occlusion_pass_slot.is_some() || !gpu.pending_resolve.is_empty())) {
             return Err("span requires valid ordinary bindings, no errors, HUD or queries".into());
@@ -265,10 +279,6 @@ impl Capture {
             gpu.world_view.map(raw_world).transpose()?.unwrap_or(Value::Null)
         }else{world(gpu.world_view.ok_or("first or later span draw has no exact world identity")?)?};
         if self.kind.is_graph() {self.graph_start_or_check(gpu,&view)?;}
-        let (key,_)=gpu.pipelines.iter().find(|(_,e)|matches!(e,PipeEntry::Done(Some(p)) if p.uid==d.pipeline.uid)).ok_or("span pipeline absent")?;
-        let pipeline=self.pipelines.get(key).ok_or("span final pipeline metadata missing")?.clone();
-        let (_,failure)=shader_sources::selected_pipeline_hashes(&[json!({"pipeline":pipeline})]);
-        if let Some(failure)=failure {return Err(failure);}
         let mut targets=Vec::new();let mut domain=Vec::new();
         for (slot,format) in pi.rt_formats.iter().enumerate() {
             let Some(format)=format else {continue;};
@@ -294,9 +304,36 @@ impl Capture {
         }
         if targets.is_empty() {return Err("span has no bound target".into());}
         let domain=json!({"width":pi.width,"height":pi.height,"attachments":domain,"depth_flags":gpu.s.ds.flags,"retained_native_parents_compared":true});
-        if let Some(p)=&self.pending {
-            if p.domain!=domain || p.view!=view || p.targets.iter().zip(&targets).any(|(a,b)|a!=b) {return Err("span eye, camera or native target changed".into());}
-        }
+        Ok(TargetContext{view,domain,targets})
+    }
+    /// Preserve raw context independently of pixel/target identity. The first
+    /// diagnostic is outside the capture payload namespace and never replaced.
+    fn record_context_boundary(&mut self,gpu:&Gpu,context:&TargetContext,boundary:ContextBoundary) {
+        let recorded=if boundary==ContextBoundary::Split {&mut self.span.context_transition_recorded}else{&mut self.span.context_mismatch_recorded};
+        if *recorded {return;}*recorded=true;
+        let Some(p)=&self.pending else{return;};
+        let comparisons=p.targets.iter().zip(&context.targets).enumerate().map(|(index,(old,new))|json!({
+            "index":index,"native_parent_equal":old.0==new.0,"aspect_equal":old.1==new.1,"role_equal":old.2==new.2,
+            "old_role":old.2,"new_role":new.2,"old_aspect":old.1,"new_aspect":new.1})).collect::<Vec<_>>();
+        let value=json!({"schema":1,"capture_id":self.graph.capture_id,"command_sequence":self.sequence,
+            "action":if boundary==ContextBoundary::Split {"split_context_only"}else{"reject_mismatch"},
+            "capture_schema":self.kind.schema(),"native_present":gpu.presents.checked_add(1),"anchor_present":self.graph.present,
+            "same_present":self.graph.present==gpu.presents.checked_add(1),"old_interval_start":p.alias.as_ref().map(|a|&a["interval_start_command"]),
+            "old_world_view":p.view,"new_world_view":context.view,"old_target_domain":p.domain,"new_target_domain":context.domain,
+            "domain_equal":p.domain==context.domain,"old_retained_target_count":p.targets.len(),"new_retained_target_count":context.targets.len(),
+            "retained_targets_equal":retained_targets_equal(&p.targets,&context.targets),"retained_target_comparisons":comparisons,
+            "normal_rendering_changed":false,"world_identity_reassigned":false});
+        if let Ok(bytes)=serde_json::to_vec_pretty(&value) {if bytes.len()<=65536 {if let Some(parent)=self.directory.parent(){
+            let name=if boundary==ContextBoundary::Split {"first-span-context-transition.json"}else{"first-span-context-mismatch.json"};
+            if let Err(error)=publish_new(&parent.join(name),&bytes){log(&format!("span context diagnostic: {error}"));}
+        }}}
+    }
+    fn prepare_target_span(&mut self,gpu:&Gpu,d:&Resolved<'_>,ordinal:usize,context:TargetContext)->Result<Prepared,String> {
+        let TargetContext{view,domain,targets}=context;
+        let (key,_)=gpu.pipelines.iter().find(|(_,e)|matches!(e,PipeEntry::Done(Some(p)) if p.uid==d.pipeline.uid)).ok_or("span pipeline absent")?;
+        let pipeline=self.pipelines.get(key).ok_or("span final pipeline metadata missing")?.clone();
+        let (_,failure)=shader_sources::selected_pipeline_hashes(&[json!({"pipeline":pipeline})]);
+        if let Some(failure)=failure {return Err(failure);}
         self.span.before=self.target_versions(&domain)?;
         let mut plans=Vec::new();let mut vertices=Vec::new();
         for (slot,buffer,offset,guest_id) in d.vertices {
@@ -350,11 +387,26 @@ impl Capture {
             || (self.attempts>=128 && self.pending.is_none() && self.graph.stages.is_empty()) {return;}
         if self.kind.is_finished() && self.graph.anchor.is_none() && gpu.presents<500 {return;}
         if self.pending.is_none() && (self.span.boundary.is_none() || self.span.started) {return;}
+        if self.kind.is_finished() && self.graph.event>=8190 {self.reject("finished graph event bound");return;}
+        let context=match self.target_context(gpu,d){Ok(v)=>v,Err(e)=>{self.reject(&e);return;}};
+        if let Some(p)=&self.pending {
+            let boundary=context_boundary(self.kind,self.graph.present==gpu.presents.checked_add(1),
+                p.domain==context.domain,p.view==context.view,retained_targets_equal(&p.targets,&context.targets));
+            if boundary!=ContextBoundary::Continue {self.record_context_boundary(gpu,&context,boundary);}
+            match boundary {
+                ContextBoundary::Reject=>{self.reject("span context mismatch: native domain/retained target changed or context split not admitted");return;},
+                ContextBoundary::Split=>{
+                    self.close_target_span(gpu);
+                    if self.done || self.pending.is_some() {return;}
+                    self.span.resume_at(self.sequence);
+                },
+                ContextBoundary::Continue=>{},
+            }
+        }
         let ordinal=self.pending.as_ref().map_or(0,|p|p.draws.len());
         self.span.started=true;
-        if self.kind.is_finished() && self.graph.event>=8190 {self.reject("finished graph event bound");return;}
         if ordinal>=MAX_DRAWS {self.reject("complete span draw limit");return;}
-        let mut prepared=match self.prepare_target_span(gpu,d,ordinal){Ok(v)=>v,Err(e)=>{self.reject(&e);return;}};
+        let mut prepared=match self.prepare_target_span(gpu,d,ordinal,context){Ok(v)=>v,Err(e)=>{self.reject(&e);return;}};
         if self.kind.is_graph() {prepared.draw["event_index"]=self.graph_next_event().into();}
         let mut initial=Vec::new();let mut attachments=Vec::new();let mut final_bytes=0;
         if ordinal==0 {
@@ -446,6 +498,32 @@ impl Capture {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn context_only_split_is_finished_same_present_and_exact_native_targets_only() {
+        for kind in [CaptureKind::Finished,CaptureKind::ExecutedFinished] {
+            assert_eq!(context_boundary(kind,true,true,false,true),ContextBoundary::Split);
+            assert_eq!(context_boundary(kind,true,true,true,true),ContextBoundary::Continue);
+            assert_eq!(context_boundary(kind,false,true,true,true),ContextBoundary::Reject);
+            for (present,domain,targets) in [(false,true,true),(true,false,true),(true,true,false)] {
+                assert_eq!(context_boundary(kind,present,domain,false,targets),ContextBoundary::Reject);
+            }
+        }
+        for kind in [CaptureKind::TwoDraw,CaptureKind::ColorNull,CaptureKind::TargetSpan,CaptureKind::Compute,CaptureKind::Graph] {
+            assert_eq!(context_boundary(kind,true,true,false,true),ContextBoundary::Reject);
+        }
+        assert!(!retained_targets_equal(&[1,2],&[1]));
+        assert!(!retained_targets_equal(&[1],&[1,2]));
+        assert!(!retained_targets_equal(&[(1,"color0")],&[(1,"color1")]));
+        assert!(!retained_targets_equal(&[(1,"depth")],&[(2,"depth")]));
+        assert!(retained_targets_equal(&[(1,"depth"),(1,"stencil")],&[(1,"depth"),(1,"stencil")]));
+        let mut span=SpanState::default();span.texture_blobs.insert((1,0,0,Aspect::Color,2),"actual.bin".into());
+        span.before.push(VersionRef{allocation_id:1,content_version:2,subresource:Subresource{mip:0,layer:0,aspect:Aspect::Color}});
+        span.resume_at(45);assert_eq!(span.boundary,Some(45));assert!(!span.started);assert!(span.before.is_empty());
+        assert_eq!(span.texture_blobs.len(),1);
+        let raw=Value::Null;assert_ne!(raw,json!({"eye_index":0}));
+        assert_eq!(context_boundary(CaptureKind::ExecutedFinished,true,true,false,true),ContextBoundary::Split);
+    }
 
     #[test]
     fn upload_revisions_retain_only_already_captured_native_identities() {
