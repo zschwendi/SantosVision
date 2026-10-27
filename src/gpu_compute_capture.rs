@@ -40,7 +40,7 @@ impl Capture {
     fn prepare_compute(&mut self,gpu:&Gpu,program:&Program,group:&CapturedGroup,groups:[u32;3])->Result<ComputePrepared,String> {
         dispatch_extent(groups)?;
         if gpu.errors.load(Ordering::SeqCst)!=0 || !gpu.bind_group_prepare.enabled
-            || (self.kind!=CaptureKind::Finished && (gpu.occlusion_active.is_some() || gpu.occlusion_pass_slot.is_some() || !gpu.pending_resolve.is_empty())) {
+            || (!self.kind.is_finished() && (gpu.occlusion_active.is_some() || gpu.occlusion_pass_slot.is_some() || !gpu.pending_resolve.is_empty())) {
             return Err("compute requires ordinary resolved bindings and no GPU errors or active queries".into());
         }
         let (present,world)=self.compute_state.main_world.as_ref().ok_or("compute has no preceding main-world draw")?;
@@ -110,7 +110,7 @@ impl Capture {
         Ok(ComputePrepared{dispatch,context,attachments,initial,finals,shaders})
     }
     pub(in super::super) fn before_compute(&mut self,gpu:&mut Gpu,program:&Program,group:&BgResult,groups:[u32;3]) {
-        if !matches!(self.kind,CaptureKind::Compute|CaptureKind::Graph|CaptureKind::Finished) || self.done || self.finished.postlude
+        if !matches!(self.kind,CaptureKind::Compute|CaptureKind::Graph|CaptureKind::Finished|CaptureKind::ExecutedFinished) || self.done || self.finished.postlude
             || self.pending.as_ref().is_some_and(|p|p.finished) {return;}
         if self.kind.is_graph() {
             if self.graph.anchor.is_none() {return;}
@@ -145,7 +145,7 @@ impl Capture {
             targets:vec![],readbacks,bytes:initial_bytes,final_bytes,finished:false,intervening_commands:vec![],candidate_key:vec![]});
     }
     pub(in super::super) fn after_compute(&mut self,gpu:&mut Gpu) {
-        if !matches!(self.kind,CaptureKind::Compute|CaptureKind::Graph|CaptureKind::Finished) || !self.pending.as_ref().is_some_and(|p|p.kind==CaptureKind::Compute && !p.finished) {return;}
+        if !matches!(self.kind,CaptureKind::Compute|CaptureKind::Graph|CaptureKind::Finished|CaptureKind::ExecutedFinished) || !self.pending.as_ref().is_some_and(|p|p.kind==CaptureKind::Compute && !p.finished) {return;}
         let versions=(||->Result<Vec<(VersionRef,VersionRef)>,String>{
             let ledger=self.texture_ledger.as_ref().ok_or("compute output ledger absent")?;
             if !ledger.active(){return Err("compute output ledger inactive".into());}
@@ -163,14 +163,14 @@ impl Capture {
         for (attachment,(_,after)) in p.attachments.iter_mut().zip(&versions) {attachment["final_version"]=json!(after);}
         p.draws[0]["writes"]=json!(versions.iter().map(|(before,after)|json!({"before":before,"after":after})).collect::<Vec<_>>());
         p.finished=true;p.epoch=gpu.enc_epoch;
-        if self.kind==CaptureKind::Finished {
+        if self.kind.is_finished() {
             if let Err(e)=self.finished_retain_compute(gpu){self.reject(&e);return;}
         } else if self.kind==CaptureKind::Graph {
             if let Err(e)=self.graph_finish_compute(gpu) {self.reject(&e);return;}
         }
         // Later finished-graph stages can reuse already cached native views;
         // their exact descriptors remain in this registry across dispatches.
-        if self.kind!=CaptureKind::Finished {gpu.capture_bindings.take();}
+        if !self.kind.is_finished() {gpu.capture_bindings.take();}
     }
 }
 

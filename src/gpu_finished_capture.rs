@@ -9,12 +9,13 @@ pub(super) struct FinishedState {
     pub(super) operations:Vec<Value>,
     pub(super) postlude:bool,
     pub(super) peak_live_staging:u64,
+    pub(super) original_omission_count:usize,
     hud_boundary:Option<HudBoundary>,
 }
 
 impl Capture {
     pub(in super::super) fn captures_finished_publication(&self)->bool {
-        self.kind==CaptureKind::Finished && !self.done && self.finished.postlude
+        self.kind.is_finished() && !self.done && self.finished.postlude
     }
     pub(super) fn finished_command(&mut self,op:u32) {
         if !self.captures_finished_graph() || self.graph.anchor.is_none(){return;}
@@ -44,7 +45,7 @@ impl Capture {
         Ok(())
     }
     pub(in super::super) fn captures_finished_graph(&self)->bool {
-        self.kind==CaptureKind::Finished && !self.done && !self.finished.postlude
+        self.kind.is_finished() && !self.done && !self.finished.postlude
     }
     pub(in super::super) fn finished_before_aux(&mut self,gpu:&mut Gpu)->Result<(),String> {
         if !self.captures_finished_graph() || self.graph.anchor.is_none(){return Ok(());}
@@ -83,7 +84,7 @@ impl Capture {
         self.span.texture_blobs.insert(key,name.clone());Ok(name)
     }
     pub(super) fn finished_begin_spool(&mut self,gpu:&Gpu)->Result<(),String>{
-        if self.finished.spool.is_none(){self.finished.spool=Some(capture_spool::Spool::new(self.directory.clone(),gpu.errors.clone(),gpu.errors.load(Ordering::SeqCst),gpu.inflight.clone())?);}
+        if self.finished.spool.is_none(){self.finished.spool=Some(capture_spool::Spool::new(self.directory.clone(),gpu.errors.clone(),gpu.errors.load(Ordering::SeqCst),gpu.inflight.clone(),self.staging_limit())?);}
         Ok(())
     }
     /// Called only from the existing natural-submission callback seam.
@@ -131,7 +132,7 @@ impl Capture {
     }
     pub(in super::super) fn finished_publication(&mut self,gpu:&mut Gpu,color:&Texture,color_id:u64,world:&Texture,world_id:u64,depth:&Texture,depth_id:u64,view:crate::xr_view::WorldView,hud_draw_count:u64)
         ->Result<Option<Arc<super::super::finished_endpoint::PublicationToken>>,String> {
-        if self.kind!=CaptureKind::Finished || self.done || !self.finished.postlude{return Ok(None);}
+        if !self.kind.is_finished() || self.done || !self.finished.postlude{return Ok(None);}
         if self.epoch_bytes!=0 || !self.epoch_reservations.is_empty(){return Err("finished publication preceded original natural snapshot submission".into());}
         let boundary=self.finished.hud_boundary.as_ref().ok_or("finished publication lacks original HUD boundary")?;
         if &boundary.source!=color || boundary.source_id!=color_id || &boundary.world!=world || boundary.world_id!=world_id {
@@ -152,6 +153,7 @@ impl Capture {
         let manifest=self.finished_manifest(gpu,endpoint)?;
         let spool=self.finished.spool.take().ok_or("finished original spool absent")?;
         let directory=self.directory.clone();let errors=gpu.errors.clone();let peak=self.finished.peak_live_staging;
+        let schema=self.kind.schema();
         let writer_token=token.clone();self.done=true;self.texture_ledger.take();self.span.clear_interval();
         std::thread::Builder::new().name("private-finished-capture".into()).spawn(move||{
             let result=(||->Result<(),String>{
@@ -167,7 +169,7 @@ impl Capture {
                 if bytes.len()>16<<20{return Err(format!("finished manifest {} exceeds16MiB",bytes.len()));}
                 publish_new(&directory.join("capture.json"),&bytes)
             })();
-            if let Err(reason)=result {let _=publish_new(&directory.join("rejected.json"),&serde_json::to_vec_pretty(&json!({"schema":7,"status":"rejected","reason":reason})).unwrap());log(&format!("finished native graph rejected: {reason}"));}
+            if let Err(reason)=result {let _=publish_new(&directory.join("rejected.json"),&serde_json::to_vec_pretty(&json!({"schema":schema,"status":"rejected","reason":reason})).unwrap());log(&format!("finished native graph rejected: {reason}"));}
         }).map_err(|e|format!("finished writer: {e}"))?;
         Ok(Some(token))
     }
@@ -219,15 +221,24 @@ impl Capture {
         if stages.is_empty() || stages.len()>8192 || stages.iter().any(|s|index(s).is_none()){return Err("finished stage event index absent/bound".into());}
         stages.sort_by_key(|s|index(s).unwrap());
         if stages.last().is_none_or(|s|s["kind"]!="finished_endpoint"){return Err("finished endpoint is not last".into());}
+        let executed=self.kind==CaptureKind::ExecutedFinished;
+        let omissions=stages.iter().filter(|s|s["kind"]=="original_omission").count();
+        if omissions!=self.finished.original_omission_count || (executed && !(1..=1024).contains(&omissions))
+            || (!executed && omissions!=0) {return Err("finished original omission contract mismatch".into());}
         let queries_inactive=!stages.iter().any(|s|s["kind"]=="query");
-        let manifest=json!({"schema":7,"kind":"native_finished_graph","status":"captured",
-            "source":{"method":"single native finished graph","backend":backend,"capture_id":self.graph.capture_id,
+        let mut manifest=json!({"schema":if executed{8}else{7},"kind":if executed{"native_executed_finished_graph"}else{"native_finished_graph"},"status":"captured",
+            "source":{"method":if executed{"single native executed finished graph"}else{"single native finished graph"},"backend":backend,"capture_id":self.graph.capture_id,
                 "native_namespace":self.graph.capture_id,"native_present":self.graph.present,"encoder_epoch":gpu.enc_epoch},
             "world_view":self.graph.anchor,"stages":stages,"prior_rejected_candidates":self.rejected,
             "closure":{"same_capture":true,"same_native_namespace":true,"same_present":true,"continuous_command_interval":true,
                 "unmodelled_commands":0,"initial_contents_captured":true,"original_final_captured":true,"natural_submission_completed":true,
                 "queries_inactive":queries_inactive,"queries_original_only":true,"gpu_errors":0},
             "normal_frame_publication_changed":false,"finished_frame_or_density_accepted":false,"coherent_stereo_accepted":false});
+        if executed {
+            manifest["all_requested_draws_executed"]=false.into();
+            manifest["original_omission_count"]=omissions.into();
+            manifest["execution_contract"]="executed_original_image_with_recorded_omissions".into();
+        }
         json_size_bounded(&manifest,128<<20)?;Ok(manifest)
     }
 }

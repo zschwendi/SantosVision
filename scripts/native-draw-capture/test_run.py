@@ -80,6 +80,42 @@ class RunnerBoundaries(unittest.TestCase):
             (p/"capture.json").write_text(json.dumps(x))
             with self.subTest(case=i),self.assertRaises(ValueError):runner.validate_capture(p,"finished")
 
+    def test_executed_image_requires_explicit_schema_and_exact_omission_disclosure(self):
+        p, value = self.finished_capture()
+        with self.assertRaises(ValueError): runner.validate_capture(p, "executed-finished")
+        value.update(schema=8, kind="native_executed_finished_graph", all_requested_draws_executed=False,
+                     original_omission_count=1, execution_contract="executed_original_image_with_recorded_omissions")
+        value["source"]["method"] = "single native executed finished graph"
+        value["spool"]["live_staging_bound"] = runner.MAX_EXECUTED_STAGING
+        value["stages"].insert(1, {"kind": "original_omission", "operation": {"event_index": 2}})
+        (p/"capture.json").write_text(json.dumps(value))
+        self.assertTrue(runner.validate_capture(p,"executed-finished")["semantic_replay_admission_required"])
+        with self.assertRaises(ValueError): runner.validate_capture(p,"finished")
+        mutations = []
+        for k,v in [("all_requested_draws_executed", True),("original_omission_count",0),
+                    ("original_omission_count",2),("original_omission_count",True),("original_omission_count",1025),
+                    ("execution_contract","complete"),("schema",7),("kind","native_finished_graph"),
+                    ("peak_live_staging_bytes",runner.MAX_EXECUTED_STAGING+1)]:
+            x=copy.deepcopy(value);x[k]=v;mutations.append(x)
+        x=copy.deepcopy(value);x["source"]["method"]="single native finished graph";mutations.append(x)
+        x=copy.deepcopy(value);x["stages"][1]["kind"]="raster";mutations.append(x)
+        x=copy.deepcopy(value);x["stages"][-1]["operation"]["publication"]["accepted"]=False;mutations.append(x)
+        for i,x in enumerate(mutations):
+            (p/"capture.json").write_text(json.dumps(x))
+            with self.subTest(case=i),self.assertRaises(ValueError): runner.validate_capture(p,"executed-finished")
+
+    def test_strict_finished_rejects_relabelled_executed_image_metadata(self):
+        p, value = self.finished_capture()
+        mutations=[]
+        for key,extra in [("all_requested_draws_executed",False),("original_omission_count",1),
+                          ("execution_contract","executed_original_image_with_recorded_omissions")]:
+            altered=copy.deepcopy(value);altered[key]=extra;mutations.append(altered)
+        altered=copy.deepcopy(value);altered["stages"].insert(1,{"kind":"original_omission"});mutations.append(altered)
+        for i,altered in enumerate(mutations):
+            (p/"capture.json").write_text(json.dumps(altered))
+            with self.subTest(case=i),self.assertRaisesRegex(ValueError,"strict finished graph"):
+                runner.validate_capture(p,"finished")
+
     def test_finished_cumulative_budget_does_not_raise_old_mode_or_single_blob_cap(self):
         p,value=self.finished_capture();size=value["blobs"][0]["byte_length"]
         (p/"second.bin").write_bytes((p/"payload.bin").read_bytes())
@@ -95,6 +131,25 @@ class RunnerBoundaries(unittest.TestCase):
             old["closure"].update(ordered_two_draws=True,resource_mutation_rejections=0)
             (p/"capture.json").write_text(json.dumps(old))
             with self.assertRaisesRegex(ValueError,"payload budget"):runner.validate_capture(p,"two-draw")
+
+    def test_host_admission_has_fixed_floors_and_does_not_count_speculative_pages(self):
+        gib=1<<30
+        good=runner.host_admission_policy(16*gib,1,2*gib,4*gib,0,6*gib)
+        self.assertTrue(good["admitted"])
+        for values in [(16*gib-1,1,2*gib,4*gib,0,6*gib),(16*gib,2,2*gib,4*gib,0,6*gib),
+                       (16*gib,1,2*gib,4*gib-1,8*gib,6*gib),(16*gib,1,2*gib,4*gib,0,6*gib-1)]:
+            self.assertFalse(runner.host_admission_policy(*values)["admitted"])
+        with self.assertRaises(ValueError):runner.host_admission_policy(16*gib,True,2*gib,4*gib,0,6*gib)
+        with patch.object(runner.subprocess,"run",side_effect=OSError("metric unavailable")):
+            self.assertFalse(runner.host_admission_snapshot(self.root)["admitted"])
+
+    def test_output_monitor_uses_cumulative_payload_bound_without_raising_old_modes(self):
+        for kind in runner.CAPTURE_KINDS:
+            expected=runner.MAX_FINISHED_PAYLOAD if kind in ("finished","executed-finished") else runner.MAX_BLOBS
+            self.assertEqual(runner.capture_payload_limit(kind),expected)
+        self.assertEqual(runner.MAX_EXECUTED_STAGING,1<<30)
+        self.assertEqual(runner.MAX_FINISHED_STAGING,512<<20)
+        self.assertEqual(runner.MAX_BLOBS,256<<20)
 
     def test_complete_bytes_require_separate_semantic_admission(self):
         p, _ = self.capture()

@@ -8,6 +8,8 @@ import argparse
 import hashlib
 import json
 import os
+import re
+import shutil
 from pathlib import Path
 import signal
 import subprocess
@@ -30,9 +32,10 @@ GRAPHICS = {
 MAX_BLOBS = 256 << 20
 MAX_JSON = 16 << 20
 MAX_LOG = 128 << 20
-CAPTURE_KINDS = ("two-draw", "color-null", "target-span", "compute", "graph", "finished")
+CAPTURE_KINDS = ("two-draw", "color-null", "target-span", "compute", "graph", "finished", "executed-finished")
 MAX_FINISHED_PAYLOAD = 1 << 30
 MAX_FINISHED_STAGING = 512 << 20
+MAX_EXECUTED_STAGING = 1 << 30
 FLAGS = {
     "MUGUET_MUTE": "1", "MUGUET_MASTER_VOLUME": "0",
     "MUGUET_XR_MOTION_AIM": "0", "MUGUET_XR_MOTION_ARMS": "0",
@@ -182,7 +185,8 @@ def validate_capture(directory, capture_kind="two-draw"):
     need(not (directory / "rejected.json").exists(), "capture module rejected the span")
     capture = load_json(directory / "capture.json")
     expected = {"two-draw": (2,"native_draw_span"), "color-null": (3,"native_color_null_draw"),
-                "target-span": (4,"native_target_span"), "compute": (5,"native_compute_dispatch"), "graph": (6,"native_connected_graph"), "finished": (7,"native_finished_graph")}[capture_kind]
+                "target-span": (4,"native_target_span"), "compute": (5,"native_compute_dispatch"), "graph": (6,"native_connected_graph"), "finished": (7,"native_finished_graph"),
+                "executed-finished": (8,"native_executed_finished_graph")}[capture_kind]
     need((capture.get("schema"), capture.get("kind"), capture.get("status")) ==
          (*expected, "captured"), "unsupported or incomplete capture for selected kind")
     closure = capture.get("closure", {})
@@ -209,7 +213,7 @@ def validate_capture(directory, capture_kind="two-draw"):
         need(type(closure.get("gpu_errors")) is int and closure["gpu_errors"] == 0, "graph capture GPU errors")
         need(isinstance(capture.get("stages"), list) and 3 <= len(capture["stages"]) <= 25, "bounded connected stages required")
         need(capture.get("finished_frame_or_density_accepted") is False, "graph cannot certify finished image")
-    elif capture_kind == "finished":
+    elif capture_kind in ("finished", "executed-finished"):
         for name in ("same_capture", "same_native_namespace", "same_present", "continuous_command_interval", "queries_original_only"):
             need(closure.get(name) is True, f"missing finished graph closure: {name}")
         need(type(closure.get("queries_inactive")) is bool and type(closure.get("gpu_errors")) is int and closure["gpu_errors"] == 0,
@@ -228,6 +232,19 @@ def validate_capture(directory, capture_kind="two-draw"):
             need(publication.get(name) is True, f"missing finished publication: {name}")
         need(capture.get("finished_frame_or_density_accepted") is False and capture.get("coherent_stereo_accepted") is False,
              "finished HUD-free capture cannot certify density/stereo")
+        if capture_kind == "finished":
+            need(all(name not in capture for name in ("all_requested_draws_executed", "original_omission_count", "execution_contract"))
+                 and all(stage.get("kind") != "original_omission" for stage in stages),
+                 "strict finished graph cannot contain original omission disclosure")
+        if capture_kind == "executed-finished":
+            count = capture.get("original_omission_count")
+            need(capture.get("all_requested_draws_executed") is False
+                 and capture.get("execution_contract") == "executed_original_image_with_recorded_omissions"
+                 and source.get("method") == "single native executed finished graph",
+                 "executed image must disclose original omissions")
+            need(type(count) is int and 0 < count <= 1024
+                 and sum(stage.get("kind") == "original_omission" for stage in stages) == count,
+                 "executed image requires exact bounded original omission count")
     elif capture_kind == "compute":
         for name in ("single_original_dispatch", "queries_inactive"):
             need(closure.get(name) is True, f"missing capture closure: {name}")
@@ -242,7 +259,7 @@ def validate_capture(directory, capture_kind="two-draw"):
              "color-null capture reports GPU errors or an invalid error count")
         need(isinstance(capture.get("draw"), dict) and "draws" not in capture, "single original draw required")
     blobs = capture.get("blobs")
-    finished = capture_kind == "finished"
+    finished = capture_kind in ("finished", "executed-finished")
     limit = MAX_FINISHED_PAYLOAD if finished else MAX_BLOBS
     need(isinstance(blobs, list) and 0 < len(blobs) <= (32768 if finished else 16384), "bounded nonempty blob list required")
     names = set(); total = 0; padded_total = 0
@@ -262,6 +279,7 @@ def validate_capture(directory, capture_kind="two-draw"):
         need(path.is_file() and path.stat().st_size == size and digest(path) == blob.get("sha256"),
              f"payload absent or differs: {name}")
     if finished:
+        live_limit = MAX_EXECUTED_STAGING if capture_kind == "executed-finished" else MAX_FINISHED_STAGING
         spool = capture.get("spool", {})
         epochs = spool.get("natural_submission_epochs")
         need(isinstance(epochs, list) and 0 < len(epochs) <= 8192
@@ -269,17 +287,66 @@ def validate_capture(directory, capture_kind="two-draw"):
              and all(a < b for a, b in zip(epochs, epochs[1:])), "finished natural submission epochs")
         exact = {"submitted_batches": len(epochs), "completed_batches": len(epochs), "raw_payload_bytes": total,
                  "cumulative_padded_staging_bytes": padded_total, "payload_bound": MAX_FINISHED_PAYLOAD,
-                 "live_staging_bound": MAX_FINISHED_STAGING, "capture_forced_submissions": 0}
+                 "live_staging_bound": live_limit, "capture_forced_submissions": 0}
         need(all(type(spool.get(k)) is int and spool[k] == v for k, v in exact.items()), "finished spool accounting")
         need(type(capture.get("allocated_readback_bytes")) is int and capture["allocated_readback_bytes"] == padded_total,
              "finished cumulative staging accounting")
-        need(type(capture.get("peak_live_staging_bytes")) is int and 0 < capture["peak_live_staging_bytes"] <= MAX_FINISHED_STAGING
-             and type(spool.get("peak_completed_map_bytes")) is int and 0 <= spool["peak_completed_map_bytes"] <= MAX_FINISHED_STAGING,
+        need(type(capture.get("peak_live_staging_bytes")) is int and 0 < capture["peak_live_staging_bytes"] <= live_limit
+             and type(spool.get("peak_completed_map_bytes")) is int and 0 <= spool["peak_completed_map_bytes"] <= live_limit,
              "finished live/map staging bound")
     need({p.name for p in directory.iterdir()} == names | {"capture.json"}, "unmanifested capture contents")
     return {"capture_kind": capture_kind, "capture_sha256": digest(directory / "capture.json"), "blob_count": len(blobs),
             "payload_bytes": total, "byte_admission_passed": True,
             "semantic_replay_admission_required": True}
+
+
+def capture_payload_limit(capture_kind):
+    return MAX_FINISHED_PAYLOAD if capture_kind in ("finished", "executed-finished") else MAX_BLOBS
+
+
+def host_admission_policy(physical_bytes, pressure_level, free_bytes, inactive_bytes, speculative_bytes, disk_available_bytes):
+    values = (physical_bytes, pressure_level, free_bytes, inactive_bytes, speculative_bytes, disk_available_bytes)
+    need(all(type(value) is int and value >= 0 for value in values), "invalid host admission metrics")
+    available_proxy = free_bytes + inactive_bytes
+    checks = {"physical_memory_floor": physical_bytes >= 16 << 30,
+              "normal_memory_pressure": pressure_level == 1,
+              "free_plus_inactive_floor": available_proxy >= 6 << 30,
+              "disk_floor": disk_available_bytes >= 6 << 30}
+    return {"schema": 1, "capture_kind": "executed-finished", "admitted": all(checks.values()), "checks": checks,
+            "observed": {"physical_bytes": physical_bytes, "memorystatus_pressure_level": pressure_level,
+                         "free_bytes": free_bytes, "inactive_bytes": inactive_bytes,
+                         "speculative_bytes_not_counted": speculative_bytes,
+                         "free_plus_inactive_proxy_bytes": available_proxy, "disk_available_bytes": disk_available_bytes},
+            "policy": {"physical_bytes_min": 16 << 30, "pressure_level_required": 1,
+                       "free_plus_inactive_bytes_min": 6 << 30, "disk_available_bytes_min": 6 << 30,
+                       "fixed_live_staging_bound": MAX_EXECUTED_STAGING},
+            "scope": "pre-run snapshot; free+inactive is a reclaimability proxy, not guaranteed available RAM; original native resources, game and metadata are outside the staging bound"}
+
+
+def host_admission_snapshot(root):
+    observed = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    try:
+        def read(command):
+            result = subprocess.run(command, text=True, capture_output=True, timeout=10, check=True)
+            need(len(result.stdout) <= 65536, "unbounded host metric output")
+            return result.stdout
+        physical = int(read(["/usr/sbin/sysctl", "-n", "hw.memsize"]).strip())
+        pressure = int(read(["/usr/sbin/sysctl", "-n", "kern.memorystatus_vm_pressure_level"]).strip())
+        vm = read(["/usr/bin/vm_stat"])
+        page_match = re.search(r"page size of (\d+) bytes", vm)
+        need(page_match is not None, "vm_stat page size absent")
+        page = int(page_match[1]); need(page > 0, "invalid vm_stat page size")
+        def pages(label):
+            match = re.search(r"^" + re.escape(label) + r":\s+(\d+)\.", vm, re.MULTILINE)
+            need(match is not None, f"vm_stat {label} absent")
+            return int(match[1]) * page
+        result = host_admission_policy(physical, pressure, pages("Pages free"), pages("Pages inactive"),
+                                       pages("Pages speculative"), shutil.disk_usage(root).free)
+        result["observed_utc"] = observed; result["vm_stat_page_bytes"] = page
+        return result
+    except (OSError, ValueError, subprocess.SubprocessError) as error:
+        return {"schema": 1, "capture_kind": "executed-finished", "observed_utc": observed,
+                "admitted": False, "error": str(error), "scope": "pre-run host measurement failed closed"}
 
 
 def run_child(command, checkout, root, deadline, capture_kind="two-draw", scene_provenance=False, same_ray_alias=False, exact_viewport_match=False):
@@ -294,7 +361,7 @@ def run_child(command, checkout, root, deadline, capture_kind="two-draw", scene_
                 elapsed = time.monotonic() - start
                 logs = sum((root / n).stat().st_size for n in ("stdout.log", "stderr.log"))
                 captured = sum(p.stat().st_size for p in (root / "capture").iterdir() if p.is_file()) if (root / "capture").is_dir() else 0
-                if elapsed > deadline + 20 or logs > MAX_LOG or captured > MAX_BLOBS + MAX_JSON:
+                if elapsed > deadline + 20 or logs > MAX_LOG or captured > capture_payload_limit(capture_kind) + MAX_JSON:
                     record["termination_reason"] = "outer deadline" if elapsed > deadline + 20 else "output bound exceeded"
                     record["timed_out"] = elapsed > deadline + 20
                     break
@@ -353,6 +420,10 @@ def execute_owned(args, before, root):
         "source_guard_band": 1.3, "source_guard_policy": "fixed diagnostic fixture FOV; not production coverage tuning",
         "observe_after_capture_seconds": args.observe_after_capture,
         "scene_steered": False, "finished_world_accepted": False, "hardware_accepted": False})
+    if args.capture_kind == "executed-finished":
+        host = host_admission_snapshot(root)
+        write_new(root / "host-admission.json", host)
+        need(host["admitted"] is True, "executed-image capture host memory/disk admission failed")
     lifecycle = run_child(command, Path(args.checkout), root, args.deadline, args.capture_kind, scene_provenance, same_ray_alias, exact_viewport_match)
     after = admission(args, require_new_run=False); write_new(root / "source-after.json", after)
     need(before == after, "source, executable, build receipt, runner or original seeds changed during run")

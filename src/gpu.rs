@@ -3509,8 +3509,14 @@ impl Gpu {
         })
     }
 
-    fn get_pipeline(&mut self, vs_id: u32, ps_id: u32, vs: &Rc<Program>, ps: Option<&Rc<Program>>, layout: &Rc<LayoutObj>) -> Option<Rc<Pl>> {
-        let pi = self.pass_info.clone()?;
+    fn get_pipeline(&mut self, vs_id: u32, ps_id: u32, vs: &Rc<Program>, ps: Option<&Rc<Program>>, layout: &Rc<LayoutObj>,
+        #[cfg(all(target_os = "macos", feature = "native-draw-capture"))] skip_reason: &mut &'static str,
+    ) -> Option<Rc<Pl>> {
+        let Some(pi) = self.pass_info.clone() else {
+            #[cfg(all(target_os = "macos", feature = "native-draw-capture"))]
+            { *skip_reason = "pipeline_pass_unavailable"; }
+            return None;
+        };
         let (topo, strip) = topology(self.s.topo);
         let strip_fmt = if strip && self.s.ib.0 != 0 { Some(if self.s.ib.1 == 57 { IndexFormat::Uint16 } else { IndexFormat::Uint32 }) } else { None };
         let mut key: Vec<i64> = vec![vs.uid as i64, ps.map(|p| p.uid as i64).unwrap_or(0), self.s.layout as i64];
@@ -3522,13 +3528,23 @@ impl Gpu {
         key.extend([-7, pi.ds_format.map(format_id).unwrap_or(-1), pi.samples as i64, pi.ro_depth as i64, pi.ro_stencil as i64]);
         let _ = (vs_id, ps_id);
         match self.pipelines.get(&key) {
-            Some(PipeEntry::Done(p)) => return p.clone(),
-            Some(PipeEntry::Pending) => { self.pending_skips += 1; return None; }
+            Some(PipeEntry::Done(p)) => {
+                #[cfg(all(target_os = "macos", feature = "native-draw-capture"))]
+                if p.is_none() { *skip_reason = "pipeline_failed_cached"; }
+                return p.clone();
+            }
+            Some(PipeEntry::Pending) => {
+                #[cfg(all(target_os = "macos", feature = "native-draw-capture"))]
+                { *skip_reason = "pipeline_pending_cached"; }
+                self.pending_skips += 1; return None;
+            }
             None => {}
         }
         self.pipe_creates += 1;
         let Some((job, vb_req)) = self.create_pipeline(vs, ps, layout, &strides, topo, strip_fmt, &pi) else {
             self.pipelines.insert(key, PipeEntry::Done(None));
+            #[cfg(all(target_os = "macos", feature = "native-draw-capture"))]
+            { *skip_reason = "pipeline_preparation_failed"; }
             return None;
         };
         #[cfg(all(target_os = "macos", feature = "native-draw-capture"))]
@@ -3539,10 +3555,14 @@ impl Gpu {
             self.pipelines.insert(key, PipeEntry::Pending);
             let _ = tx.send((id, job));
             self.pending_skips += 1;
+            #[cfg(all(target_os = "macos", feature = "native-draw-capture"))]
+            { *skip_reason = "pipeline_pending_new"; }
             return None;
         }
         let pl = compile_pipeline(&self.device, &job).map(|pipeline| { let uid = self.uid(); Rc::new(Pl { pipeline, uid, vb_req, label: job.label }) });
         self.pipelines.insert(key, PipeEntry::Done(pl.clone()));
+        #[cfg(all(target_os = "macos", feature = "native-draw-capture"))]
+        if pl.is_none() { *skip_reason = "pipeline_compilation_failed"; }
         pl
     }
 
@@ -3640,9 +3660,12 @@ impl Gpu {
         match self.obj(self.s.shader[0]) { Some(Obj::Shader(s)) => Some(s.sig.clone()), _ => None }
     }
 
-    fn skip(&mut self) {
+    fn skip(&mut self, _reason: &'static str) {
         #[cfg(all(target_os = "macos", feature = "native-draw-capture"))]
-        if let Some(capture) = &mut self.draw_capture { capture.skipped_draw(); }
+        if let Some(mut capture) = self.draw_capture.take() {
+            capture.skipped_draw_with_reason(self, _reason);
+            self.draw_capture = Some(capture);
+        }
         if let Some(hud)=&mut self.hud_capture { hud.rejected.get_or_insert_with(||"draw skipped after final postFX".into()); }
         self.skipped += 1;
     }
@@ -3971,19 +3994,30 @@ impl Gpu {
         let mb = self.base;
         let u = move |w: u64| unsafe { std::ptr::read_volatile(mb.add(((p + w) * 4) as usize) as *const u32) };
         let (mut kind, mut count, mut inst, mut start, mut base_vertex, mut start_instance) = (u(0), u(1), u(2), u(3), u(4) as i32, u(5));
+        #[cfg(all(target_os = "macos", feature = "native-draw-capture"))]
+        let requested_draw_arguments = [kind, count, inst, start, base_vertex as u32, start_instance];
+        #[cfg(all(target_os = "macos", feature = "native-draw-capture"))]
+        if let Some(capture) = &mut self.draw_capture {
+            capture.record_draw_skip_context(requested_draw_arguments, (kind < 4).then_some(requested_draw_arguments));
+        }
         if kind >= 4 && !self.adapter.get_downlevel_capabilities().flags.contains(DownlevelFlags::INDIRECT_EXECUTION) {
             let indexed = kind == 4;
-            let Some(arguments) = self.read_indirect_arguments(u(1), u(2) as u64, indexed) else { self.skip(); return };
+            let Some(arguments) = self.read_indirect_arguments(u(1), u(2) as u64, indexed) else { self.skip("indirect_argument_readback_unavailable"); return };
             count = arguments[0]; inst = arguments[1]; start = arguments[2];
             base_vertex = if indexed { arguments[3] as i32 } else { 0 };
             start_instance = arguments[if indexed { 4 } else { 3 }];
             kind = if indexed { 1 } else { 0 };
+            #[cfg(all(target_os = "macos", feature = "native-draw-capture"))]
+            if let Some(capture) = &mut self.draw_capture {
+                capture.record_draw_skip_context(requested_draw_arguments,
+                    Some([kind, count, inst, start, base_vertex as u32, start_instance]));
+            }
         }
         self.collect_pipelines();
         let vs_id = self.s.shader[0];
         let ps_id = self.s.shader[1];
-        let Some(vs) = self.shader_program(vs_id).and_then(|program| self.float_sampling_program(program, 0)) else { self.skip(); return };
-        let ps = if ps_id != 0 { match self.shader_program(ps_id).and_then(|program| self.float_sampling_program(program, 1)) { Some(p) => Some(p), None => { self.skip(); return } } } else { None };
+        let Some(vs) = self.shader_program(vs_id).and_then(|program| self.float_sampling_program(program, 0)) else { self.skip("vertex_shader_unavailable"); return };
+        let ps = if ps_id != 0 { match self.shader_program(ps_id).and_then(|program| self.float_sampling_program(program, 1)) { Some(p) => Some(p), None => { self.skip("pixel_shader_unavailable"); return } } } else { None };
         // Before encoding: an attributed first-person depth write is accounted
         // for here; anything else closes an open overlay on its target first.
         let foreground_accepted = self.foreground_pre_draw(&vs, ps.as_deref());
@@ -4008,17 +4042,26 @@ impl Gpu {
             self.pdirty = true;
             self.last_program_uids = Some(program_uids);
         }
-        let layout = match self.obj(self.s.layout) { Some(Obj::Layout(l)) => l.clone(), _ => { self.skip(); return } };
+        let layout = match self.obj(self.s.layout) { Some(Obj::Layout(l)) => l.clone(), _ => { self.skip("input_layout_unavailable"); return } };
         self.prepare_depth_proxies(&vs, 0);
         if let Some(p) = &ps { self.prepare_depth_proxies(p, 1); }
         if !self.ensure_pass() {
             if self.hud_draw.is_some(){self.hud_reject("auxiliary HUD render pass unavailable");self.end_pass();self.hud_draw=None;self.pdirty=true;}
-            if !self.ensure_pass(){self.skip();return;}
+            if !self.ensure_pass(){self.skip("native_pass_unavailable");return;}
         }
+        // Every None return below supplies its own observed failure branch.
+        // The diagnostic state and extra get_pipeline argument compile out normally.
+        #[cfg(all(target_os = "macos", feature = "native-draw-capture"))]
+        let mut pipeline_skip_reason = "pipeline_unavailable_unclassified";
+        #[cfg(not(all(target_os = "macos", feature = "native-draw-capture")))]
+        let pipeline_skip_reason = "pipeline_unavailable";
         let mut pl = if !self.pdirty && self.last_pl.is_some() {
             self.last_pl.clone()
         } else {
-            let pl = self.get_pipeline(vs_id, ps_id, &vs, ps.as_ref(), &layout);
+            let pl = self.get_pipeline(vs_id, ps_id, &vs, ps.as_ref(), &layout,
+                #[cfg(all(target_os = "macos", feature = "native-draw-capture"))]
+                &mut pipeline_skip_reason,
+            );
             self.last_pl = pl.clone();
             self.pdirty = false;
             pl
@@ -4028,25 +4071,28 @@ impl Gpu {
             // result) must never suppress an original flat-screen game draw.
             self.hud_reject("auxiliary HUD pipeline unavailable; original draw retained");
             self.end_pass();self.hud_draw=None;self.pdirty=true;
-            if !self.ensure_pass(){self.skip();return;}
-            pl=self.get_pipeline(vs_id,ps_id,&vs,ps.as_ref(),&layout);
+            if !self.ensure_pass(){self.skip("native_pass_unavailable_after_hud_fallback");return;}
+            pl=self.get_pipeline(vs_id,ps_id,&vs,ps.as_ref(),&layout,
+                #[cfg(all(target_os = "macos", feature = "native-draw-capture"))]
+                &mut pipeline_skip_reason,
+            );
             self.last_pl=pl.clone();self.pdirty=false;
         }
-        let Some(pl) = pl else { self.skip(); return };
+        let Some(pl) = pl else { self.skip(pipeline_skip_reason); return };
 
         let g0 = if vs.group_bindings.contains_key(&0) {
             let bgl = self.bgl_for(&vs, 0, 0);
-            match self.stage_bind_group(0, &vs, 0, &bgl) { Some(g) => Some(g), None => { self.skip(); return } }
+            match self.stage_bind_group(0, &vs, 0, &bgl) { Some(g) => Some(g), None => { self.skip("vertex_bind_group_unavailable"); return } }
         } else { None };
         let g1 = match &ps {
             Some(p) if p.group_bindings.contains_key(&1) => {
                 let bgl = self.bgl_for(p, 1, 1);
-                match self.stage_bind_group(1, p, 1, &bgl) { Some(g) => Some(g), None => { self.skip(); return } }
+                match self.stage_bind_group(1, p, 1, &bgl) { Some(g) => Some(g), None => { self.skip("pixel_bind_group_unavailable"); return } }
             }
             _ => None,
         };
 
-        if self.pass.is_none() && !self.ensure_pass() { self.skip(); return; }
+        if self.pass.is_none() && !self.ensure_pass() { self.skip("native_pass_unavailable_after_bind_groups"); return; }
 
         let indexed = kind == 4 || (kind < 4 && (kind & 1) != 0);
         let (fold_v, fold_i) = (vs.vid, vs.iid);
@@ -4077,7 +4123,7 @@ impl Gpu {
         let mut ib_bind = None;
         if indexed && kind < 4 {
             let (ibid, ifmt, ioff) = self.s.ib;
-            let Some((g, bytes)) = self.buf(ibid).and_then(|b| b.gpu.clone().map(|g| (g, b.bytes))) else { self.skip(); return };
+            let Some((g, bytes)) = self.buf(ibid).and_then(|b| b.gpu.clone().map(|g| (g, b.bytes))) else { self.skip("index_buffer_unavailable"); return };
             let fmt = if ifmt == 57 { IndexFormat::Uint16 } else { IndexFormat::Uint32 };
             let isz = if fmt == IndexFormat::Uint16 { 2 } else { 4 };
             ib_max = (bytes.saturating_sub(ioff as u64) / isz).saturating_sub(start as u64);
@@ -4116,11 +4162,26 @@ impl Gpu {
             if indexed { d_count = d_count.min(ib_max as i64); }
             if d_count != count as i64 || d_inst != inst as i64 {
                 log_once(&format!("clamp{}", pl.label), &format!("draw clamped to its buffers ({}): {count} x {inst} -> {d_count} x {d_inst}", pl.label));
-                if d_count <= 0 || d_inst <= 0 { self.skip(); return; }
+                if d_count <= 0 || d_inst <= 0 {
+                    #[cfg(all(target_os = "macos", feature = "native-draw-capture"))]
+                    if let Some(capture) = &mut self.draw_capture {
+                        capture.record_draw_skip_arguments(serde_json::json!({
+                            "requested_raw_words":requested_draw_arguments,
+                            "resolved":{"kind":kind,"count":count,"instances":inst,"start":start,
+                                "base_vertex":base_vertex,"start_instance":start_instance,
+                                "clamped_count":d_count,"clamped_instances":d_inst},
+                            "vertex_first":v_first,"instance_first":i_first,"index_capacity_after_start":ib_max,
+                            "required_vertex_buffers":pl.vb_req.iter().map(|r|serde_json::json!({
+                                "slot":r.slot,"instance":r.instance,"stride":r.stride,"last":r.last,
+                                "available":self.vb_avail[r.slot as usize]})).collect::<Vec<_>>()
+                        }));
+                    }
+                    self.skip("clamped_empty_draw"); return;
+                }
             }
         }
         let args = if kind >= 4 {
-            match self.buf(u(1)).and_then(|b| b.gpu.clone()) { Some(g) => { self.use_buf(u(1)); Some((g, u(2) as u64)) } None => { self.skip(); return } }
+            match self.buf(u(1)).and_then(|b| b.gpu.clone()) { Some(g) => { self.use_buf(u(1)); Some((g, u(2) as u64)) } None => { self.skip("indirect_buffer_unavailable"); return } }
         } else { None };
 
         #[cfg(all(target_os = "macos", feature = "native-draw-capture"))]
@@ -4138,7 +4199,7 @@ impl Gpu {
                     .unwrap_or([0.,0.,pass_width as f32,pass_height as f32,0.,1.]),
             });
             self.draw_capture = Some(capture);
-            if self.pass.is_none() && !self.ensure_pass() { self.skip(); return; }
+            if self.pass.is_none() && !self.ensure_pass() { self.skip("capture_pass_reopen_failed"); return; }
         }
         let st = &mut self.pass_st;
         let pass = self.pass.as_mut().unwrap();

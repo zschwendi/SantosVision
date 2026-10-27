@@ -25,7 +25,7 @@ pub(super) struct GraphState {
 
 fn proxy_contract(kind: CaptureKind, stencil: bool) -> Result<(Aspect, TextureFormat), String> {
     if stencil {
-        if kind != CaptureKind::Finished {
+        if !kind.is_finished() {
             return Err("graph stencil proxy requires explicit Finished capture mode".into());
         }
         Ok((Aspect::Stencil, TextureFormat::Rg8Uint))
@@ -135,7 +135,7 @@ impl Capture {
             .presents
             .checked_add(1)
             .ok_or("graph present overflow")?;
-        if self.kind == CaptureKind::Finished && self.graph.anchor.is_some() {
+        if self.kind.is_finished() && self.graph.anchor.is_some() {
             if self.graph.present != Some(present) {
                 return Err("finished graph crossed original present".into());
             }
@@ -163,7 +163,7 @@ impl Capture {
     }
     pub(super) fn graph_retain_stage(&mut self, mut p: Pending) -> Result<(), String> {
         if self.graph.stages.len()
-            >= if self.kind == CaptureKind::Finished {
+            >= if self.kind.is_finished() {
                 1024
             } else {
                 MAX_STAGES
@@ -174,7 +174,7 @@ impl Capture {
         {
             return Err("graph requires a bounded complete raster stage".into());
         }
-        if self.kind != CaptureKind::Finished {
+        if !self.kind.is_finished() {
             anchor_matches(
                 self.graph.anchor.as_ref(),
                 self.graph.present,
@@ -223,14 +223,14 @@ impl Capture {
         // Once a complete main interval exists, every dirty proxy is an edge.
         if !self.kind.is_graph()
             || self.done
-            || (self.kind == CaptureKind::Finished
+            || (self.kind.is_finished()
                 && (self.graph.anchor.is_none() || self.finished.postlude))
             || (self.kind == CaptureKind::Graph && self.graph.stages.is_empty())
         {
             return Ok(());
         }
         let (source_aspect, destination_format) = proxy_contract(self.kind, stencil)?;
-        let limit = if self.kind == CaptureKind::Finished {
+        let limit = if self.kind.is_finished() {
             1024
         } else {
             MAX_PROXIES
@@ -269,7 +269,7 @@ impl Capture {
                 gpu.errors.load(Ordering::SeqCst)
             ));
         }
-        if self.kind != CaptureKind::Finished
+        if !self.kind.is_finished()
             && (gpu.occlusion_active.is_some()
                 || gpu.occlusion_pass_slot.is_some()
                 || !gpu.pending_resolve.is_empty())
@@ -346,7 +346,7 @@ impl Capture {
                 },
             )
             .ok_or("graph proxy before version absent")?;
-        if self.kind != CaptureKind::Finished
+        if !self.kind.is_finished()
             && !self.graph.stages.iter().any(|stage| {
                 stage
                     .attachments
@@ -467,7 +467,7 @@ impl Capture {
             return Err("graph proxy checkpoint exceeded live snapshot bound".into());
         }
         let bytes = plan.bytes;
-        let proxy_bytes = if self.kind == CaptureKind::Finished {
+        let proxy_bytes = if self.kind.is_finished() {
             self.graph
                 .proxy_bytes
                 .checked_add(bytes)
@@ -496,7 +496,7 @@ impl Capture {
             || self.graph.proxy_pending.is_some()
             || self.graph.present != gpu.presents.checked_add(1)
             || gpu.errors.load(Ordering::SeqCst) != 0
-            || (self.kind != CaptureKind::Finished
+            || (!self.kind.is_finished()
                 && (gpu.occlusion_active.is_some()
                     || gpu.occlusion_pass_slot.is_some()
                     || !gpu.pending_resolve.is_empty()))

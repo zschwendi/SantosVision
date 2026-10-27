@@ -17,16 +17,17 @@ const GRAPHICS: [(&str, &str); 3] = [
 const MAX_MANIFEST: u64 = 16 << 20;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum CaptureKind { TwoDraw, ColorNull, TargetSpan, Compute, Graph, Finished }
+enum CaptureKind { TwoDraw, ColorNull, TargetSpan, Compute, Graph, Finished, ExecutedFinished }
 impl CaptureKind {
     fn parse(name: &str) -> Result<Self> {
         match name {
-            "two-draw" => Ok(Self::TwoDraw), "color-null" => Ok(Self::ColorNull), "target-span"=>Ok(Self::TargetSpan), "compute"=>Ok(Self::Compute), "graph"=>Ok(Self::Graph), "finished"=>Ok(Self::Finished),
-            _ => anyhow::bail!("capture kind must be two-draw, color-null, target-span, compute, graph or finished"),
+            "two-draw" => Ok(Self::TwoDraw), "color-null" => Ok(Self::ColorNull), "target-span"=>Ok(Self::TargetSpan), "compute"=>Ok(Self::Compute), "graph"=>Ok(Self::Graph), "finished"=>Ok(Self::Finished), "executed-finished"=>Ok(Self::ExecutedFinished),
+            _ => anyhow::bail!("capture kind must be two-draw, color-null, target-span, compute, graph, finished or executed-finished"),
         }
     }
-    fn name(self) -> &'static str { match self { Self::TwoDraw => "two-draw", Self::ColorNull => "color-null",Self::TargetSpan=>"target-span",Self::Compute=>"compute",Self::Graph=>"graph",Self::Finished=>"finished" } }
-    fn needs_hud_frontend(self) -> bool { self==Self::Finished }
+    fn name(self) -> &'static str { match self { Self::TwoDraw => "two-draw", Self::ColorNull => "color-null",Self::TargetSpan=>"target-span",Self::Compute=>"compute",Self::Graph=>"graph",Self::Finished=>"finished",Self::ExecutedFinished=>"executed-finished" } }
+    fn is_finished(self) -> bool { matches!(self,Self::Finished|Self::ExecutedFinished) }
+    fn needs_hud_frontend(self) -> bool { self.is_finished() }
     fn admits(self, value: &Value) -> bool {
         let complete = value["status"] == "captured" && value["closure"]["natural_submission_completed"] == true;
         complete && match self {
@@ -38,9 +39,20 @@ impl CaptureKind {
             Self::Graph => value["schema"]==6 && value["kind"]=="native_connected_graph"
                 && value["closure"]["continuous_command_interval"]==true && value["stages"].is_array(),
             Self::Finished => value["schema"]==7 && value["kind"]=="native_finished_graph"
+                && ["all_requested_draws_executed","original_omission_count","execution_contract"].iter().all(|key|value.get(*key).is_none())
+                && value["stages"].as_array().is_some_and(|stages|stages.iter().all(|stage|stage["kind"]!="original_omission"))
                 && value["closure"]["continuous_command_interval"]==true && value["closure"]["queries_original_only"]==true
                 && value["stages"].as_array().and_then(|s|s.last()).is_some_and(|e| e["kind"]=="finished_endpoint"
                     && e["operation"]["publication"]["accepted"]==true),
+            Self::ExecutedFinished => value["schema"]==8 && value["kind"]=="native_executed_finished_graph"
+                && value["source"]["method"]=="single native executed finished graph"
+                && value["all_requested_draws_executed"]==false
+                && value["execution_contract"]=="executed_original_image_with_recorded_omissions"
+                && value["closure"]["continuous_command_interval"]==true && value["closure"]["queries_original_only"]==true
+                && value["original_omission_count"].as_u64().is_some_and(|count|count>0 && count<=1024
+                    && value["stages"].as_array().is_some_and(|stages|
+                        stages.iter().filter(|stage|stage["kind"]=="original_omission").count() as u64==count
+                        && stages.last().is_some_and(|e| e["kind"]=="finished_endpoint" && e["operation"]["publication"]["accepted"]==true))),
             Self::Compute => value["schema"]==5 && value["kind"]=="native_compute_dispatch"
                 && value["closure"]["single_original_dispatch"]==true && value["dispatch"].is_object(),
         }
@@ -66,7 +78,7 @@ fn eye(x: f32) -> xr_view::SVXREyeView {
 
 fn args() -> Result<Args> {
     let a: Vec<_> = std::env::args().skip(1).collect();
-    ensure!((7..=8).contains(&a.len()), "usage: native-span-capture GAME FRESH_SAVE NEW_CAPTURE GRAPHICS_SEED MAC_AOT DEADLINE_SECONDS OBSERVE_AFTER_CAPTURE_SECONDS [two-draw|color-null|target-span|compute|graph|finished]");
+    ensure!((7..=8).contains(&a.len()), "usage: native-span-capture GAME FRESH_SAVE NEW_CAPTURE GRAPHICS_SEED MAC_AOT DEADLINE_SECONDS OBSERVE_AFTER_CAPTURE_SECONDS [two-draw|color-null|target-span|compute|graph|finished|executed-finished]");
     let seconds: u64 = a[5].parse().context("integer deadline")?;
     let observe: u64 = a[6].parse().context("integer post-capture observation")?;
     ensure!((1..=180).contains(&seconds), "deadline must be 1..180 seconds");
@@ -91,7 +103,7 @@ fn observation_stop(requested: Duration, elapsed: Duration, deadline: bool, fail
 fn capture_result(a: &Args, start: Instant, preparation: &Value, captured: &CompletedCapture,
                   observation_status: &str, final_status: Value) -> Value {
     let feedback = a.capture.parent().unwrap().join("first-color-feedback.json");
-    let payload=if matches!(a.capture_kind,CaptureKind::TargetSpan|CaptureKind::Graph|CaptureKind::Finished) {
+    let payload=if matches!(a.capture_kind,CaptureKind::TargetSpan|CaptureKind::Graph|CaptureKind::Finished|CaptureKind::ExecutedFinished) {
         // The immutable raw manifest is already bound below by SHA and length.
         // Do not duplicate thousands of draw/resource records into a second,
         // pretty-printed driver report with a separate size/deadline budget.
@@ -291,8 +303,8 @@ mod tests {
     #[test]
     fn only_finished_requests_hud_and_receipt_requires_observed_mode() {
         let world=json!({"world_camera_enabled":true});
-        for kind in [CaptureKind::TwoDraw,CaptureKind::ColorNull,CaptureKind::TargetSpan,CaptureKind::Compute,CaptureKind::Graph,CaptureKind::Finished] {
-            let ready=kind==CaptureKind::Finished;
+        for kind in [CaptureKind::TwoDraw,CaptureKind::ColorNull,CaptureKind::TargetSpan,CaptureKind::Compute,CaptureKind::Graph,CaptureKind::Finished,CaptureKind::ExecutedFinished] {
+            let ready=kind.is_finished();
             assert_eq!(kind.needs_hud_frontend(),ready);
             let receipt=frontend_receipt(kind,&world,&json!({"ready":ready})).unwrap();
             assert_eq!(receipt["capture_kind"],kind.name());assert_eq!(receipt["hud_frontend_ready"],ready);
@@ -320,6 +332,37 @@ mod tests {
         assert!(!CaptureKind::ColorNull.admits(&bad));
         bad = color; bad["closure"]["natural_submission_completed"] = json!(false);
         assert!(!CaptureKind::ColorNull.admits(&bad));
+    }
+    #[test]
+    fn executed_image_contract_cannot_be_mistaken_for_complete_requested_draws() {
+        let value=json!({"schema":8,"kind":"native_executed_finished_graph","status":"captured",
+            "source":{"method":"single native executed finished graph"},
+            "all_requested_draws_executed":false,"original_omission_count":1,
+            "execution_contract":"executed_original_image_with_recorded_omissions",
+            "closure":{"natural_submission_completed":true,"continuous_command_interval":true,"queries_original_only":true},
+            "stages":[{"kind":"original_omission"},{"kind":"finished_endpoint","operation":{"publication":{"accepted":true}}}]});
+        assert!(CaptureKind::ExecutedFinished.admits(&value));assert!(!CaptureKind::Finished.admits(&value));
+        assert_eq!(CaptureKind::parse("executed-finished").unwrap(),CaptureKind::ExecutedFinished);
+        for (key,bad) in [("all_requested_draws_executed",json!(true)),("original_omission_count",json!(0)),
+            ("original_omission_count",json!(2)),("original_omission_count",json!(true)),("original_omission_count",json!(1025)),
+            ("execution_contract",json!("complete")),("schema",json!(7)),("kind",json!("native_finished_graph"))] {
+            let mut altered=value.clone();altered[key]=bad;assert!(!CaptureKind::ExecutedFinished.admits(&altered),"{key}");
+        }
+        let mut altered=value;altered["source"]["method"]="single native finished graph".into();
+        assert!(!CaptureKind::ExecutedFinished.admits(&altered));
+    }
+    #[test]
+    fn strict_finished_rejects_relabelled_executed_image_metadata() {
+        let value=json!({"schema":7,"kind":"native_finished_graph","status":"captured",
+            "closure":{"natural_submission_completed":true,"continuous_command_interval":true,"queries_original_only":true},
+            "stages":[{"kind":"finished_endpoint","operation":{"publication":{"accepted":true}}}]});
+        assert!(CaptureKind::Finished.admits(&value));
+        for (key,extra) in [("all_requested_draws_executed",json!(false)),("original_omission_count",json!(1)),
+            ("execution_contract",json!("executed_original_image_with_recorded_omissions"))] {
+            let mut forged=value.clone();forged[key]=extra;assert!(!CaptureKind::Finished.admits(&forged),"{key}");
+        }
+        let mut forged=value;forged["stages"].as_array_mut().unwrap().insert(0,json!({"kind":"original_omission"}));
+        assert!(!CaptureKind::Finished.admits(&forged));
     }
     #[test]
     fn completion_identity_binds_original_bytes_not_reserialized_floats() {
