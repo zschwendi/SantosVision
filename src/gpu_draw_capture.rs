@@ -7,6 +7,9 @@ use std::io::Write;
 #[path = "gpu_color_null_capture.rs"]
 mod color_null;
 
+#[path = "gpu_shader_capture.rs"]
+mod shader_sources;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CaptureKind { TwoDraw, ColorNull }
 impl CaptureKind {
@@ -43,6 +46,8 @@ struct Readback { plan: Plan, buffer: Buffer }
 struct Prepared { draw: Value, view: Value, domain: Value, targets: Vec<(Texture, TextureAspect, String)>, plans: Vec<Plan>, alias:Option<Value> }
 struct Pending {
     kind:CaptureKind, alias:Option<Value>,
+    initialization_ledger:Option<Value>,
+    shader_sources:Option<Value>,
     epoch: u64, errors: u64, view: Value, domain: Value, draws: Vec<Value>,
     attachments: Vec<Value>, targets: Vec<(Texture, TextureAspect, String)>,
     readbacks: Vec<Readback>, bytes: u64, final_bytes: u64, finished: bool,
@@ -67,6 +72,8 @@ pub(super) struct Capture {
     feedback_recorded: bool,
     color_null_binding: RefCell<Option<ColorNullBinding>>,
     color_null_recorded: bool,
+    pub(super) texture_ledger: Option<texture_ledger::Ledger>,
+    shader_sources: Option<RefCell<shader_sources::Registry<ShaderModule>>>,
 }
 
 fn sha(bytes: &[u8]) -> String {
@@ -443,6 +450,9 @@ impl Capture {
             "stencil_reference":d.stencil,"world_view":view,"target_domain":domain});
         Ok(Prepared{draw,view,domain,targets,plans,alias:None})
     }
+    pub(super) fn texture_ledger_active(&self)->bool {
+        !self.done && self.texture_ledger.as_ref().is_some_and(texture_ledger::Ledger::active)
+    }
     pub(super) fn captures_color_null_dummy(&self,b:&Binding)->bool {
         self.kind==CaptureKind::ColorNull && color_null::dummy_copyable(b.dim,b.sample,b.ms)
     }
@@ -460,15 +470,27 @@ impl Capture {
         Some(Self { kind,directory, pipelines: HashMap::new(), pending: None, done: false,
             attempts: 0, sequence: 0, epoch_bytes: 0, rejected: BTreeMap::new(), pipeline_bytes: 0,
             rejected_starts: Default::default(), live_bytes: Arc::new(AtomicU64::new(0)), feedback_recorded:false,
-            color_null_binding:RefCell::new(None),color_null_recorded:false })
+            color_null_binding:RefCell::new(None),color_null_recorded:false,
+            texture_ledger: (std::env::var("MUGUET_NATIVE_TEXTURE_LEDGER").as_deref()==Ok("1")).then(texture_ledger::Ledger::new),
+            shader_sources: (std::env::var("MUGUET_NATIVE_SHADER_SOURCES").as_deref()==Ok("1"))
+                .then(||RefCell::new(shader_sources::Registry::new())) })
+    }
+    pub(super) fn remember_shader(&self, module:&ShaderModule, text:&str, origin:&str) {
+        if self.done {return;}
+        if let Some(sources)=&self.shader_sources {sources.borrow_mut().remember(module,text,origin);}
     }
     pub(super) fn remember_pipeline(&mut self, key: &[i64], job: &PipeJob) {
         if self.done || self.pipelines.len() >= MAX_PIPELINES { return; }
         let vertex_layouts: Vec<_> = job.vbs.iter().map(|v| v.as_ref().map(|(stride, step, attributes)|
             json!({"array_stride":stride,"step_mode":step,"attributes":attributes}))).collect();
-        let value=json!({"primitive":job.primitive,
+        let mut value=json!({"primitive":job.primitive,
             "depth_stencil":job.depth_stencil,"multisample":job.multisample,
             "targets":job.targets,"vertex_layouts":vertex_layouts});
+        if let Some(sources)=&self.shader_sources {
+            let sources=sources.borrow();
+            value["effective_shaders"]=json!({"vertex":sources.module(&job.vmod),
+                "fragment":job.fmod.as_ref().map(|module|sources.module(module))});
+        }
         let size=value.to_string().len();
         if size>65536 || self.pipeline_bytes.checked_add(size).is_none_or(|n|n>MAX_PIPELINE_BYTES) {return;}
         if self.pipelines.contains_key(key) {return;}
@@ -482,6 +504,7 @@ impl Capture {
     }
     pub(super) fn command(&mut self, op: u32) {
         self.sequence = self.sequence.saturating_add(1);
+        if self.texture_ledger_active(){if let Some(ledger)=&mut self.texture_ledger {ledger.command();}}
         // ClearState supplies its own NULL bindings; a later draw must not
         // attribute those to an earlier color conflict.
         if op==33 {self.color_null_binding.borrow_mut().take();}
@@ -554,7 +577,9 @@ impl Capture {
         if let Some(pending) = &mut self.pending {
             pending.draws.push(prepared.draw); pending.readbacks.extend(readbacks); pending.bytes += new_bytes;
         } else {
-            self.pending = Some(Pending { kind:self.kind,alias:prepared.alias,epoch: gpu.enc_epoch, errors: errors_before_encoding,
+            let initialization_ledger=self.texture_ledger.as_ref().map(texture_ledger::Ledger::capture_evidence);
+            self.pending = Some(Pending { kind:self.kind,alias:prepared.alias,initialization_ledger,
+                shader_sources:None,epoch: gpu.enc_epoch, errors: errors_before_encoding,
                 view: prepared.view, domain: prepared.domain, draws: vec![prepared.draw], attachments,
                 targets: prepared.targets, readbacks, bytes: new_bytes, final_bytes, finished: false,
                 intervening_commands: Vec::new(), candidate_key });
@@ -582,12 +607,21 @@ impl Capture {
                 inflight.fetch_sub(1,Ordering::SeqCst);
             });
         }
-        let Some(pending) = self.pending.take() else { return; };
+        let Some(mut pending) = self.pending.take() else { return; };
         if !pending.finished || pending.epoch != epoch {
             self.rejected_starts.insert(pending.candidate_key);
             self.reject("natural submission before span closure"); return;
         }
+        pending.shader_sources=self.shader_sources.as_ref().map(|sources| {
+            let (hashes,stage_failure)=shader_sources::selected_pipeline_hashes(&pending.draws);
+            let mut export=sources.borrow().snapshot(&hashes);
+            if let Some(reason)=stage_failure {export["complete"]=false.into();export["failure"]=reason.into();}
+            export
+        });
         self.done = true;
+        // Immutable pending evidence has already been detached. Retire private
+        // history now; postcapture observation only needs the original probes.
+        self.texture_ledger.take();
         if self.kind==CaptureKind::ColorNull {self.color_null_binding.borrow_mut().take();}
         let directory = self.directory.clone(); let rejected = self.rejected.clone();
         let errors = gpu.errors.clone(); let inflight = gpu.inflight.clone();
@@ -650,7 +684,7 @@ fn complete(pending: Pending, rx: std::sync::mpsc::Receiver<(usize,Result<(),Str
         blobs.push(json!({"path":rb.plan.name,"byte_length":rb.plan.row as u64*rb.plan.rows as u64,"sha256":hash.finish(),
             "packed_row_bytes":rb.plan.row,"row_count":rb.plan.rows,"readback_pitch":rb.plan.pitch}));
     }
-    let manifest = if pending.kind==CaptureKind::TwoDraw {json!({"schema":2,"kind":"native_draw_span","status":"captured",
+    let mut manifest = if pending.kind==CaptureKind::TwoDraw {json!({"schema":2,"kind":"native_draw_span","status":"captured",
         "source":{"method":"Gpu::do_draw resolved bindings","backend":backend,"encoder_epoch":pending.epoch},
         "world_view":pending.view,"target_domain":pending.domain,"draws":pending.draws,
         "attachments":pending.attachments,"blobs":blobs,"allocated_readback_bytes":pending.bytes,
@@ -669,7 +703,11 @@ fn complete(pending: Pending, rx: std::sync::mpsc::Receiver<(usize,Result<(),Str
         "normal_frame_publication_changed":false,
         "capture_only_usage":"COPY_SRC added only to existing dummy allocations when explicit valid color-null capture is enabled; actual native dummy bytes are read back",
         "uniform_binding_normalization":"exact selected GPU range copied to immutable offset-zero static binding; original dynamic offset separately recorded"})};
-    publish_new(&directory.join("capture.json"),&serde_json::to_vec_pretty(&manifest).map_err(|e|e.to_string())?)
+    if let Some(ledger)=pending.initialization_ledger {manifest["initialization_ledger"]=ledger;}
+    if let Some(sources)=pending.shader_sources {manifest["effective_shader_sources"]=sources;}
+    let bytes=serde_json::to_vec_pretty(&manifest).map_err(|e|e.to_string())?;
+    if bytes.len()>16<<20 {return Err("serialized capture manifest exceeds 16 MiB bound".into());}
+    publish_new(&directory.join("capture.json"),&bytes)
 }
 
 #[cfg(test)]
@@ -679,10 +717,10 @@ mod tests {
         Capture { kind:CaptureKind::TwoDraw,directory:PathBuf::new(),pipelines:HashMap::new(),pending:None,done:false,attempts:0,sequence:0,
             epoch_bytes:0,rejected:BTreeMap::new(),pipeline_bytes:0,rejected_starts:Default::default(),
             live_bytes:Arc::new(AtomicU64::new(0)),feedback_recorded:false,
-            color_null_binding:RefCell::new(None),color_null_recorded:false }
+            color_null_binding:RefCell::new(None),color_null_recorded:false,texture_ledger:None,shader_sources:None }
     }
     fn pending() -> Pending {
-        Pending {kind:CaptureKind::TwoDraw,alias:None,epoch:1,errors:0,view:Value::Null,domain:Value::Null,draws:vec![Value::Null],attachments:vec![],
+        Pending {kind:CaptureKind::TwoDraw,alias:None,initialization_ledger:None,shader_sources:None,epoch:1,errors:0,view:Value::Null,domain:Value::Null,draws:vec![Value::Null],attachments:vec![],
             targets:vec![],readbacks:vec![],bytes:0,final_bytes:0,finished:false,intervening_commands:vec![],candidate_key:vec![23,42]}
     }
     #[test]
@@ -757,4 +795,13 @@ mod tests {
         assert_eq!(sampled_ranges(desc,&view,TextureViewDimension::Cube),([6,7],[6,12]));
         assert_eq!(sampled_ranges(desc,&view,TextureViewDimension::D2),([6,7],[6,7]));
     }
+    #[test]
+    fn completed_capture_stops_ledger_but_keeps_original_feedback_observation() {
+        let mut c=capture();c.texture_ledger=Some(texture_ledger::Ledger::new());
+        assert!(c.texture_ledger_active());c.done=true;
+        assert!(!c.texture_ledger_active());assert!(c.tracks_color_null_cause());
+        c.texture_ledger.take();c.done=false;
+        assert!(!c.texture_ledger_active(),"retired metadata cannot accidentally resume");
+    }
+
 }

@@ -1368,6 +1368,7 @@ dependencies = [
  "objc2-game-controller",
  "pollster",
  "regex",
+ "serde",
  "serde_json",
  "wasm-encoder",
  "wasmparser",

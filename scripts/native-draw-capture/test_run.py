@@ -169,7 +169,9 @@ class RunnerBoundaries(unittest.TestCase):
 
     def test_environment_rejects_loader_or_graphics_override(self):
         with patch.dict(os.environ, {"DYLD_INSERT_LIBRARIES": "unwanted", "MUGUET_MUTE": "0", "MUGUET_FSROOT": "/old-save",
-                                    "MUGUET_NATIVE_DRAW_CAPTURE_KIND": "color-null"}):
+                                    "MUGUET_NATIVE_DRAW_CAPTURE_KIND": "color-null",
+                                    "MUGUET_NATIVE_TEXTURE_LEDGER": "1", "MUGUET_NATIVE_SHADER_SOURCES": "1",
+                                    "MUGUET_XR_SAME_RAY_ALIAS": "1", "MUGUET_XR_EXACT_VIEWPORT_MATCH": "1"}):
             env = runner.child_env(self.root)
         self.assertNotIn("DYLD_INSERT_LIBRARIES", env)
         self.assertNotIn("MUGUET_FSROOT", env)
@@ -177,6 +179,10 @@ class RunnerBoundaries(unittest.TestCase):
         self.assertEqual(env["MUGUET_TRANSFER_FROZEN_DEPTH_RECEIPT"], "1")
         self.assertEqual(env["MUGUET_GEOMETRY_STEREO_CAPTURE"], "0")
         self.assertEqual(env["MUGUET_NATIVE_DRAW_CAPTURE_KIND"], "two-draw")
+        self.assertEqual(env["MUGUET_NATIVE_TEXTURE_LEDGER"], "0")
+        self.assertEqual(env["MUGUET_NATIVE_SHADER_SOURCES"], "0")
+        self.assertEqual(env["MUGUET_XR_SAME_RAY_ALIAS"], "0")
+        self.assertEqual(env["MUGUET_XR_EXACT_VIEWPORT_MATCH"], "0")
         self.assertEqual(env["HOME"], str(self.root / "host-home"))
 
     def test_capture_kind_environment_is_an_explicit_bounded_choice(self):
@@ -184,6 +190,26 @@ class RunnerBoundaries(unittest.TestCase):
         for invalid in ("", "unknown", "native_color_null_draw"):
             with self.subTest(kind=invalid), self.assertRaisesRegex(ValueError, "unsupported capture kind"):
                 runner.child_env(self.root, invalid)
+
+    def test_scene_provenance_requires_explicit_choice(self):
+        env = runner.child_env(self.root, scene_provenance=True)
+        self.assertEqual(env["MUGUET_NATIVE_TEXTURE_LEDGER"], "1")
+        self.assertEqual(env["MUGUET_NATIVE_SHADER_SOURCES"], "1")
+        for invalid in (1, "1", None):
+            with self.subTest(value=invalid), self.assertRaisesRegex(ValueError, "explicit boolean"):
+                runner.child_env(self.root, scene_provenance=invalid)
+
+    def test_same_ray_alias_requires_explicit_choice(self):
+        self.assertEqual(runner.child_env(self.root, same_ray_alias=True)["MUGUET_XR_SAME_RAY_ALIAS"], "1")
+        for invalid in (1, "1", None):
+            with self.subTest(value=invalid), self.assertRaisesRegex(ValueError, "explicit boolean"):
+                runner.child_env(self.root, same_ray_alias=invalid)
+
+    def test_exact_viewport_match_requires_explicit_choice(self):
+        self.assertEqual(runner.child_env(self.root, exact_viewport_match=True)["MUGUET_XR_EXACT_VIEWPORT_MATCH"], "1")
+        for invalid in (1, "1", None):
+            with self.subTest(value=invalid), self.assertRaisesRegex(ValueError, "explicit boolean"):
+                runner.child_env(self.root, exact_viewport_match=invalid)
 
     def test_failed_child_records_failure_and_preserves_logs_without_driver_result(self):
         root = self.root / "failed-run"
@@ -194,7 +220,7 @@ class RunnerBoundaries(unittest.TestCase):
         lifecycle = {"return_code": -15, "termination_reason": None, "timed_out": False}
         def stopped(command, *unused):
             self.assertEqual(command[-2:], ["20", "color-null"])
-            self.assertEqual(unused[-1], "color-null")
+            self.assertEqual(unused[-4:], ("color-null", False, False, False))
             runner.write_new(root / "child-lifecycle.json", lifecycle)
             (root / "stderr.log").write_bytes(b"preserve failure evidence")
             return lifecycle

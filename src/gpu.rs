@@ -35,6 +35,9 @@ mod uniform_snapshot;
 #[cfg(all(target_os = "macos", feature = "native-draw-capture"))]
 #[path = "gpu_draw_capture.rs"]
 mod draw_capture;
+#[cfg(all(target_os = "macos", feature = "native-draw-capture"))]
+#[path = "gpu_texture_ledger.rs"]
+mod texture_ledger;
 use uniform_snapshot::UniformSnapshot;
 
 #[path = "bind_group_prepare.rs"]
@@ -1681,6 +1684,8 @@ impl Gpu {
         if self.occlusion_active == Some(id) { self.end_active_occlusion(); }
         // A replaced buffer's lifetime ends here, and its op47 record with it.
         if let Some(Obj::Buf(old)) = self.objs[i].as_ref() { self.upload_dedup.forget(old.dedup); }
+        #[cfg(all(target_os = "macos", feature = "native-draw-capture"))]
+        self.texture_ledger_replace(id, Some(&o));
         self.objs[i] = Some(o);
     }
     fn tex(&self, id: u32) -> Option<&Tex> {
@@ -2241,6 +2246,8 @@ impl Gpu {
             }
         }
         if self.occlusion_active == Some(id) { self.end_active_occlusion(); }
+        #[cfg(all(target_os = "macos", feature = "native-draw-capture"))]
+        self.texture_ledger_replace(id, None);
         if let Some(o) = self.objs.get_mut(id as usize).and_then(|o| o.take()) {
             match o {
                 Obj::Tex(t) => t.tex.destroy(),
@@ -2284,7 +2291,10 @@ impl Gpu {
             label: None, size, mip_level_count: mips.max(1), sample_count: samples, dimension, format: m.format, usage, view_formats: &views,
         };
         let tex = match self.scoped(&format!("createTexture id={id} dim={dim} {}x{}x{} mips={mips} dxgi={dxgi} bind=0x{bind:x} samples={samples} -> {:?} usage {:?}", size.width, size.height, size.depth_or_array_layers, m.format, usage), |d| d.create_texture(&desc)) { Some(t) => t, None => return };
-        let trace_native_identity=crate::world_command_trace::native_texture_tag(self.command_trace.captures_native_identities());
+        let trace_identities=self.command_trace.captures_native_identities();
+        #[cfg(all(target_os = "macos", feature = "native-draw-capture"))]
+        let trace_identities=trace_identities || self.texture_ledger_enabled();
+        let trace_native_identity=crate::world_command_trace::native_texture_tag(trace_identities);
         self.set_obj(id, Obj::Tex(Tex {
             tex, trace_native_identity, desc: TexDesc { w: size.width, h: size.height, d: size.depth_or_array_layers, mips: mips.max(1), samples, dim: dimension },
             format: m.format, bc_source, views: HashMap::new(), a8: m.a8, enc: 0, in_bg: false, proxy_depth: None, proxy_stencil: None,
@@ -2394,6 +2404,9 @@ impl Gpu {
             TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(bpr), rows_per_image: Some(rows.max(1)) },
             Extent3d { width: w, height: h, depth_or_array_layers: d.max(1) },
         );
+        #[cfg(all(target_os = "macos", feature = "native-draw-capture"))]
+        if three {self.texture_ledger_write(id,Some(mip),Some(0),"queue_texture_upload");}
+        else {for layer in slice..slice.saturating_add(d.max(1)){self.texture_ledger_write(id,Some(mip),Some(layer),"queue_texture_upload");}}
     }
 
     fn create_shader(&mut self, p: u64) {
@@ -2499,6 +2512,8 @@ impl Gpu {
         };
         let (text, pack) = pack_uniforms(&source);
         let module = self.scoped(&format!("shader {label}"), |d| d.create_shader_module(ShaderModuleDescriptor { label: Some(&label), source: ShaderSource::Wgsl(text.as_str().into()) }))?;
+        #[cfg(all(target_os = "macos", feature = "native-draw-capture"))]
+        if let Some(capture)=&self.draw_capture {capture.remember_shader(&module,&text,"packed guest source");}
         let info = parse_wgsl(&text);
         let mut consts = None;
         if rec.as_ref().and_then(|r| r.get("consts")).map(|c| !c.is_null() && c != &serde_json::Value::Bool(false)).unwrap_or(false) {
@@ -2533,6 +2548,8 @@ impl Gpu {
         let text = make(&prog.text);
         let label = format!("{} [{key}]", prog.label);
         let m = self.scoped(&format!("shader variant {label}"), |d| d.create_shader_module(ShaderModuleDescriptor { label: Some(&label), source: ShaderSource::Wgsl(text.as_str().into()) }));
+        #[cfg(all(target_os = "macos", feature = "native-draw-capture"))]
+        if let (Some(capture),Some(module))=(&self.draw_capture,&m) {capture.remember_shader(module,&text,"final render variant");}
         prog.variants.borrow_mut().insert(key.to_string(), m.clone());
         m
     }
@@ -2586,6 +2603,8 @@ impl Gpu {
             let module = self.scoped(&format!("shader variant {label}"), |device| device.create_shader_module(ShaderModuleDescriptor {
                 label: Some(&label), source: ShaderSource::Wgsl(rewritten.text.as_str().into()),
             }))?;
+            #[cfg(all(target_os = "macos", feature = "native-draw-capture"))]
+            if let Some(capture)=&self.draw_capture {capture.remember_shader(&module,&rewritten.text,"float32 sampling rewrite");}
             let mut info = parse_wgsl(&rewritten.text);
             info.bindings.retain(|binding| !rewritten.removed_samplers.contains(&(binding.group, binding.binding)));
             for binding in &mut info.bindings {
@@ -2824,6 +2843,18 @@ impl Gpu {
             occlusion_query_set: occ.as_ref(), multiview_mask: None,
         }).forget_lifetime();
         self.pass = Some(pass);
+        #[cfg(all(target_os = "macos", feature = "native-draw-capture"))]
+        if self.texture_ledger_enabled() {
+            for (i,load) in color_loads.iter().enumerate().take(8) {
+                if let (LoadOp::Clear(c),Some((_,format)))=(load,&colors[i]) {let r=self.s.rt[i].clone();
+                    self.texture_ledger_clear(r.tex,r.mip,r.slice,*format,texture_ledger::ClearValue::Color{bits:[c.r.to_bits(),c.g.to_bits(),c.b.to_bits(),c.a.to_bits()]});}
+            }
+            if let Some((_,format))=&ds_att {if let Some(c)=ds_clear {
+                if !ro_d {if let Some(d)=c.depth{self.texture_ledger_clear(ds.tex,ds.mip,ds.slice,*format,texture_ledger::ClearValue::Depth{bits:d.to_bits()});}}
+                if !ro_s && has_stencil(*format) {if let Some(s)=c.stencil{self.texture_ledger_clear(ds.tex,ds.mip,ds.slice,*format,texture_ledger::ClearValue::Stencil{value:s});}}
+            }}
+            self.texture_ledger_pass_start();
+        }
         self.passes += 1;
         self.pass_key = Some(key);
         self.pdirty = true;
@@ -2874,6 +2905,8 @@ impl Gpu {
         let (desc, tex) = { let t = self.tex(id)?; (t.desc, t.tex.clone()) };
         let dev = self.device.clone();
         let trace_identities=self.command_trace.captures_native_identities();
+        #[cfg(all(target_os = "macos", feature = "native-draw-capture"))]
+        let trace_identities=trace_identities || self.texture_ledger_enabled();
         let t = self.tex_mut(id).unwrap();
         let slot = if stencil { &mut t.proxy_stencil } else { &mut t.proxy_depth };
         if slot.is_none() {
@@ -2899,6 +2932,8 @@ impl Gpu {
         }
         let px = slot.as_mut().unwrap();
         let out = (px.tex.clone(), px.format);
+        #[cfg(all(target_os = "macos", feature = "native-draw-capture"))]
+        let ledger_written=px.dirty;
         if px.dirty {
             px.dirty = false;
             let passes: Vec<_> = px.passes.iter().map(|(v, b)| (v.clone(), b.clone())).collect();
@@ -2916,6 +2951,8 @@ impl Gpu {
             }
             self.use_tex(id);
         }
+        #[cfg(all(target_os = "macos", feature = "native-draw-capture"))]
+        self.texture_ledger_proxy(id,if stencil {"stencil"}else{"depth"},ledger_written);
         Some(out)
     }
 
@@ -2933,6 +2970,8 @@ impl Gpu {
         let (desc, tex) = { let t = self.tex(id)?; (t.desc, t.tex.clone()) };
         let dev = self.device.clone();
         let trace_identities=self.command_trace.captures_native_identities();
+        #[cfg(all(target_os = "macos", feature = "native-draw-capture"))]
+        let trace_identities=trace_identities || self.texture_ledger_enabled();
         let t = self.tex_mut(id).unwrap();
         if t.proxy_fdepth.is_none() {
             let ptex = dev.create_texture(&TextureDescriptor {
@@ -2953,6 +2992,8 @@ impl Gpu {
         }
         let px = t.proxy_fdepth.as_mut().unwrap();
         let out = (px.tex.clone(), px.format);
+        #[cfg(all(target_os = "macos", feature = "native-draw-capture"))]
+        let ledger_written=px.dirty;
         if px.dirty {
             px.dirty = false;
             let passes: Vec<_> = px.passes.iter().map(|(v, b)| (v.clone(), b.clone())).collect();
@@ -2970,6 +3011,8 @@ impl Gpu {
             }
             self.use_tex(id);
         }
+        #[cfg(all(target_os = "macos", feature = "native-draw-capture"))]
+        self.texture_ledger_proxy(id,"float_to_depth",ledger_written);
         Some(out)
     }
 
@@ -4000,6 +4043,8 @@ impl Gpu {
             }
         }
         self.draws += 1;
+        #[cfg(all(target_os = "macos", feature = "native-draw-capture"))]
+        self.texture_ledger_draw();
         self.finish_hud_draw(&vs,ps.as_deref());
         // Camera context arrives with this exact GPU command, not from a newer
         // game-thread camera. Only record the qualified world's real depth.
@@ -4127,6 +4172,8 @@ impl Gpu {
                 let label = format!("{} [uav formats]", prog.label);
                 match self.scoped("compute variant", |d| d.create_shader_module(ShaderModuleDescriptor { label: Some(&label), source: ShaderSource::Wgsl(text.as_str().into()) })) {
                     Some(module) => {
+                        #[cfg(all(target_os = "macos", feature = "native-draw-capture"))]
+                        if let Some(capture)=&self.draw_capture {capture.remember_shader(&module,&text,"compute storage format rewrite");}
                         let mut info = parse_wgsl(&text);
                         for binding in &mut info.bindings {
                             if prog.info.bindings.iter().any(|original| original.group == binding.group
@@ -4160,6 +4207,9 @@ impl Gpu {
         cp.set_pipeline(&pl);
         match g0.dyn_off { Some(o) => cp.set_bind_group(0, &g0.bg, &[o]), None => cp.set_bind_group(0, &g0.bg, &[]) }
         cp.dispatch_workgroups(x, y, z);
+        drop(cp);
+        #[cfg(all(target_os = "macos", feature = "native-draw-capture"))]
+        self.texture_ledger_dispatch();
     }
 
     fn clear_view(&mut self, id: u32, mip: u32, slice: u32) -> Option<TextureView> {
@@ -4222,6 +4272,8 @@ impl Gpu {
             color_attachments: &[Some(RenderPassColorAttachment { view: &view, depth_slice: None, resolve_target: None, ops: Operations { load: LoadOp::Clear(color), store: StoreOp::Store } })],
             depth_stencil_attachment: None, timestamp_writes: None, occlusion_query_set: None, multiview_mask: None,
         });
+        #[cfg(all(target_os = "macos", feature = "native-draw-capture"))]
+        if let Some(format)=self.tex(id).map(|t|t.format) {self.texture_ledger_clear(id,mip,slice,format,texture_ledger::ClearValue::Color{bits:[color.r.to_bits(),color.g.to_bits(),color.b.to_bits(),color.a.to_bits()]});}
     }
     fn clear_ds_now(&mut self, id: u32, mip: u32, slice: u32, depth: Option<f32>, stencil: Option<u32>) {
         let Some(fmt) = self.tex(id).map(|t| t.format) else { return };
@@ -4238,6 +4290,11 @@ impl Gpu {
             }),
             timestamp_writes: None, occlusion_query_set: None, multiview_mask: None,
         });
+        #[cfg(all(target_os = "macos", feature = "native-draw-capture"))]
+        {
+            if let Some(d)=depth{self.texture_ledger_clear(id,mip,slice,fmt,texture_ledger::ClearValue::Depth{bits:d.to_bits()});}
+            if has_stencil(fmt){if let Some(s)=stencil{self.texture_ledger_clear(id,mip,slice,fmt,texture_ledger::ClearValue::Stencil{value:s});}}
+        }
         // The invalidation above can have refreshed the proxy before this clear.
         self.mark_depth_dirty(id);
     }
@@ -4282,6 +4339,8 @@ impl Gpu {
             }
             self.use_tex(res);
             self.mark_color_dirty(res);
+            #[cfg(all(target_os = "macos", feature = "native-draw-capture"))]
+            self.texture_ledger_write(res,Some(a),None,"clear_uav_zero_bytes");
             return;
         }
         self.flush();
@@ -4298,6 +4357,8 @@ impl Gpu {
                 Extent3d { width: w, height: h, depth_or_array_layers: 1 },
             );
         }
+        #[cfg(all(target_os = "macos", feature = "native-draw-capture"))]
+        self.texture_ledger_write(res,Some(a),None,"clear_uav_bytes");
     }
 
     fn sub_of(desc: &TexDesc, sub: u32) -> (u32, u32) {
@@ -4356,6 +4417,8 @@ impl Gpu {
                 Extent3d { width: w, height: h, depth_or_array_layers: if three { dep } else { 1 } },
             );
         }
+        #[cfg(all(target_os = "macos", feature = "native-draw-capture"))]
+        self.texture_ledger_copy(dst,src,Some((ds.0,if d3 {0}else{ds.1})),Some((ss.0,if three {0}else{ss.1})),false,"copy_region");
         self.mark_depth_dirty(dst);
         self.mark_color_dirty(dst);
         self.use_tex(src);
@@ -4379,6 +4442,13 @@ impl Gpu {
                 Extent3d { width: w, height: h, depth_or_array_layers: layers },
             );
         }
+        #[cfg(all(target_os = "macos", feature = "native-draw-capture"))]
+        for mip in 0..sd.mips.min(dd.mips) {
+            let source_layers=if sd.dim==TextureDimension::D3 {1}else{sd.d};
+            let whole=(sd.w>>mip).max(1)==(dd.w>>mip).max(1) && (sd.h>>mip).max(1)==(dd.h>>mip).max(1)
+                && (sd.dim!=TextureDimension::D3 || dd.dim==TextureDimension::D3 && (sd.d>>mip).max(1)==(dd.d>>mip).max(1));
+            for layer in 0..source_layers {self.texture_ledger_copy(dst,src,Some((mip,layer)),Some((mip,layer)),whole,"copy_resource");}
+        }
         self.mark_depth_dirty(dst);
         self.mark_color_dirty(dst);
         self.use_tex(src);
@@ -4398,6 +4468,8 @@ impl Gpu {
             color_attachments: &[Some(RenderPassColorAttachment { view: &sv, depth_slice: None, resolve_target: Some(&dv), ops: Operations { load: LoadOp::Load, store: StoreOp::Discard } })],
             depth_stencil_attachment: None, timestamp_writes: None, occlusion_query_set: None, multiview_mask: None,
         });
+        #[cfg(all(target_os = "macos", feature = "native-draw-capture"))]
+        {self.texture_ledger_copy(dst,src,Some(ds),Some(ss),true,"multisample_resolve");self.texture_ledger_discard(src,ss.0,ss.1);}
         self.mark_color_dirty(dst);
         self.use_tex(src);
         self.use_tex(dst);
@@ -4451,6 +4523,8 @@ impl Gpu {
             p.set_bind_group(0, bg, &[]);
             p.draw(0..3, 0..1);
         }
+        #[cfg(all(target_os = "macos", feature = "native-draw-capture"))]
+        for mip in 1..desc.mips {self.texture_ledger_write(res,Some(mip),None,"generate_mips");}
         self.use_tex(res);
         self.mark_color_dirty(res);
     }

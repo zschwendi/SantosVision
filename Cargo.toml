@@ -24,6 +24,7 @@ required-features = ["jit", "native-draw-capture"]
 wasmtime = { version = "49", default-features = false, features = ["runtime", "threads", "profiling", "anyhow"] }
 anyhow = "1"
 serde_json = "1.0.151"
+serde = { version = "1", features = ["derive"], optional = true }
 wgpu = "30.0.1"
 pollster = "1.0.1"
 regex = "1.13.1"
@@ -43,7 +44,7 @@ winit = "0.30.13"
 [features]
 default = ["jit"]
 jit = ["wasmtime/cranelift", "wasmtime/parallel-compilation", "dep:wasmparser", "dep:wasm-encoder"]
-native-draw-capture = ["wgpu/serde"]
+native-draw-capture = ["wgpu/serde", "dep:serde"]
 
 [profile.release]
 opt-level = 2

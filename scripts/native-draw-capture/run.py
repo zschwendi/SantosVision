@@ -140,21 +140,31 @@ def admission(args, require_new_run=True):
         records[str(path)] = {"sha256": wanted, "bytes": path.stat().st_size}
     need(load_json(graphics / "native-graphics.json") ==
          {"width": 2560, "height": 1440, "fps_limit": 60, "graphics_preset": "clarity"}, "Clarity seed differs")
-    return {"schema": 1, "capture_kind": args.capture_kind, "source_sha256": inventory, "binary_sha256": digest(binary),
+    return {"schema": 1, "capture_kind": args.capture_kind, "scene_provenance": getattr(args, "scene_provenance", False),
+            "same_ray_alias": getattr(args, "same_ray_alias", False),
+            "exact_viewport_match": getattr(args, "exact_viewport_match", False),
+            "source_sha256": inventory, "binary_sha256": digest(binary),
             "binary_bytes": binary.stat().st_size, "build_receipt_sha256": digest(build),
             "runner_sha256": digest(Path(__file__).resolve()), "inputs": records}
 
 
-def child_env(root, capture_kind="two-draw"):
+def child_env(root, capture_kind="two-draw", scene_provenance=False, same_ray_alias=False, exact_viewport_match=False):
     # Host HOME/TMP/cache are disposable as well. No arbitrary MUGUET, loader,
     # graphics or Python environment variables leak from the parent shell.
     need(capture_kind in CAPTURE_KINDS, "unsupported capture kind")
+    need(type(scene_provenance) is bool, "scene provenance must be an explicit boolean")
+    need(type(same_ray_alias) is bool, "same-ray alias must be an explicit boolean")
+    need(type(exact_viewport_match) is bool, "exact viewport match must be an explicit boolean")
     env = {k: os.environ[k] for k in ("PATH", "LANG", "LC_ALL", "LC_CTYPE", "USER", "LOGNAME") if k in os.environ}
     env.update(FLAGS)
     env.update({"HOME": str(root / "host-home"), "TMPDIR": str(root / "tmp"),
                 "XDG_CACHE_HOME": str(root / "host-cache"),
                 "MUGUET_NATIVE_DRAW_CAPTURE": str(root / "capture"),
-                "MUGUET_NATIVE_DRAW_CAPTURE_KIND": capture_kind})
+                "MUGUET_NATIVE_DRAW_CAPTURE_KIND": capture_kind,
+                "MUGUET_NATIVE_TEXTURE_LEDGER": "1" if scene_provenance else "0",
+                "MUGUET_NATIVE_SHADER_SOURCES": "1" if scene_provenance else "0",
+                "MUGUET_XR_SAME_RAY_ALIAS": "1" if same_ray_alias else "0",
+                "MUGUET_XR_EXACT_VIEWPORT_MATCH": "1" if exact_viewport_match else "0"})
     return env
 
 
@@ -207,12 +217,12 @@ def validate_capture(directory, capture_kind="two-draw"):
             "semantic_replay_admission_required": True}
 
 
-def run_child(command, checkout, root, deadline, capture_kind="two-draw"):
+def run_child(command, checkout, root, deadline, capture_kind="two-draw", scene_provenance=False, same_ray_alias=False, exact_viewport_match=False):
     start = time.monotonic(); proc = None
     record = {"schema": 1, "timed_out": False, "termination_reason": None}
     try:
         with (root / "stdout.log").open("xb") as out, (root / "stderr.log").open("xb") as err:
-            proc = subprocess.Popen(command, cwd=checkout, env=child_env(root, capture_kind), stdout=out, stderr=err, start_new_session=True)
+            proc = subprocess.Popen(command, cwd=checkout, env=child_env(root, capture_kind, scene_provenance, same_ray_alias, exact_viewport_match), stdout=out, stderr=err, start_new_session=True)
             record["pid"] = proc.pid
             write_new(root / "child-pid.json", {"pid": proc.pid, "process_group": proc.pid, "owned_by_runner": True})
             while proc.poll() is None:
@@ -262,17 +272,23 @@ def execute(args, before):
 
 
 def execute_owned(args, before, root):
+    scene_provenance = getattr(args, "scene_provenance", False)
+    same_ray_alias = getattr(args, "same_ray_alias", False)
+    exact_viewport_match = getattr(args, "exact_viewport_match", False)
     for name in ("host-home", "tmp", "host-cache"): (root / name).mkdir()
     write_new(root / "source-before.json", before)
     command = [args.binary, args.game_root, str(root / "fresh-save"), str(root / "capture"),
                args.graphics_seed, args.aot, str(args.deadline), str(args.observe_after_capture), args.capture_kind]
     write_new(root / "invocation.json", {"argv": command, "cwd": args.checkout,
-        "environment": child_env(root, args.capture_kind), "capture_kind": args.capture_kind,
+        "environment": child_env(root, args.capture_kind, scene_provenance, same_ray_alias, exact_viewport_match), "capture_kind": args.capture_kind,
+        "scene_provenance": scene_provenance,
+        "same_ray_alias": same_ray_alias,
+        "exact_viewport_match": exact_viewport_match,
         "fixture": "fresh developer-mode natural game with synthetic static two-eye input",
         "source_guard_band": 1.3, "source_guard_policy": "fixed diagnostic fixture FOV; not production coverage tuning",
         "observe_after_capture_seconds": args.observe_after_capture,
         "scene_steered": False, "finished_world_accepted": False, "hardware_accepted": False})
-    lifecycle = run_child(command, Path(args.checkout), root, args.deadline, args.capture_kind)
+    lifecycle = run_child(command, Path(args.checkout), root, args.deadline, args.capture_kind, scene_provenance, same_ray_alias, exact_viewport_match)
     after = admission(args, require_new_run=False); write_new(root / "source-after.json", after)
     need(before == after, "source, executable, build receipt, runner or original seeds changed during run")
     need(lifecycle.get("return_code") == 0 and lifecycle["termination_reason"] is None,
@@ -304,6 +320,12 @@ def main():
     p.add_argument("--deadline", type=int, default=180)
     p.add_argument("--capture-kind", choices=CAPTURE_KINDS, default="two-draw",
                    help="two-draw preserves the original span; color-null captures one corrected draw with nullable world provenance")
+    p.add_argument("--scene-provenance", action="store_true",
+                   help="include bounded native allocation/version and exact final shader source metadata; does not certify full scene closure")
+    p.add_argument("--same-ray-alias", action="store_true",
+                   help="qualify the private exact same-eye emission candidate; default off and unavailable in production builds")
+    p.add_argument("--exact-viewport-match", action="store_true",
+                   help="qualify exact stored viewport selection before legacy approximate fallback; no ray or identity canonicalization")
     p.add_argument("--observe-after-capture", type=observation_seconds, default=0,
                    help="observe normal runtime for 0..30 seconds after capture within the original deadline; no whole-run health claim")
     p.add_argument("--execute", action="store_true", help="run one reviewed native game process; otherwise read-only admission")
