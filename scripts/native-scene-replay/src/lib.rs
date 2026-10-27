@@ -27,3 +27,5 @@ pub mod compute_import;
 pub mod depth_proxy_fixture;
 
 pub mod graph_import;
+
+pub mod finished_ops_fixture;

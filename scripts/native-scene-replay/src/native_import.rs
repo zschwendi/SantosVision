@@ -227,7 +227,7 @@ fn shader(registry: &Value, reference: &Value) -> Result<Shader> {
         exact_final_variant: true,
     })
 }
-fn world(v: &Value) -> Result<EyeIdentity> {
+pub(crate) fn world(v: &Value) -> Result<EyeIdentity> {
     for key in ["game_from_eye", "game_from_stage", "projection_from_eye"] {
         let a = array(v, key)?;
         require(
@@ -420,6 +420,15 @@ fn expand_metadata(m: &Value) -> Result<Cow<'_, Value>> {
 }
 
 pub(crate) fn convert(m: &Value, source_hash: String) -> Result<Scene> {
+    convert_inner(m, source_hash, None, false)
+}
+/// Only the strict schema7 graph importer can request unqualified native raster context.
+pub(crate) fn convert_graph_context(m:&Value,source_hash:String,native_present:u64)->Result<Scene> {
+    require(native_present>0,"graph context native present absent")?;
+    convert_inner(m,source_hash,Some(native_present),true)
+}
+pub(crate) fn convert_graph_qualified(m:&Value,source_hash:String)->Result<Scene>{convert_inner(m,source_hash,None,true)}
+fn convert_inner(m: &Value, source_hash: String, context_present:Option<u64>,graph_queries:bool) -> Result<Scene> {
     let normalized = expand_metadata(m)?;
     let m = normalized.as_ref();
     require(
@@ -434,17 +443,21 @@ pub(crate) fn convert(m: &Value, source_hash: String) -> Result<Scene> {
         "initial_contents_captured",
         "original_final_captured",
         "natural_submission_completed",
-        "queries_inactive",
     ] {
         require(c[key] == true, &format!("native closure missing {key}"))?;
     }
+    require(c["queries_inactive"]==true || (graph_queries && c["queries_inactive"]==false && c["queries_original_only"]==true), "native query closure absent")?;
     require(
         c["unmodelled_commands"] == 0 && c["gpu_errors"] == 0,
         "native interval omissions/errors",
     )?;
     let start = num(c, "interval_start_command")?;
     let end = num(c, "interval_end_command")?;
-    require(start > 0 && end > start, "native interval command order")?;
+    // Finished capture can split before/after helpers within the same guest
+    // command. Its real global event IDs establish order; do not invent a
+    // different guest ordinal to describe those seams. Legacy spans retain
+    // exclusive command boundaries.
+    require(start > 0 && if graph_queries {end >= start} else {end > start}, "native interval command order")?;
     require(
         m["source"]["backend"] == "Metal"
             && m["source"]["method"] == "Gpu::do_draw resolved bindings"
@@ -458,7 +471,7 @@ pub(crate) fn convert(m: &Value, source_hash: String) -> Result<Scene> {
         "final shader registry incomplete",
     )?;
     let w = get(m, "world_view")?;
-    let eye = world(w)?;
+    let eye = if context_present.is_some() {if !w.is_null(){world(w)?;} None} else {Some(world(w)?)};
     let domain = get(m, "target_domain")?;
     let domain_attachments = array(domain, "attachments")?;
     let mut s = Scene {
@@ -466,7 +479,7 @@ pub(crate) fn convert(m: &Value, source_hash: String) -> Result<Scene> {
         provenance: Provenance::Native {
             source_sha256: source_hash,
         },
-        eye: Some(eye),
+        eye,
         blobs: vec![],
         textures: vec![],
         buffers: vec![],
@@ -629,19 +642,21 @@ pub(crate) fn convert(m: &Value, source_hash: String) -> Result<Scene> {
         !draws.is_empty() && draws.len() <= 4096,
         "native draw bound",
     )?;
-    let mut sequence = start;
+    let mut sequence = None;
     let mut pipeline_cache = BTreeMap::<String, usize>::new();
     for d in draws {
         let seq = num(d, "command_sequence")?;
         require(
-            seq > sequence && seq < end,
+            sequence.is_none_or(|previous| seq > previous)
+                && if graph_queries {seq >= start && seq <= end} else {seq > start && seq < end},
             "native draw sequence outside interval",
         )?;
-        sequence = seq;
+        sequence = Some(seq);
         require(
-            get(d, "world_view")? == w && get(d, "target_domain")? == domain,
+            (context_present.is_some() || get(d, "world_view")? == w) && get(d, "target_domain")? == domain,
             "native target/eye/ray identity changed",
         )?;
+        if context_present.is_some() && !get(d,"world_view")?.is_null(){world(get(d,"world_view")?)?;}
         let p = get(d, "pipeline")?;
         let refs = get(p, "effective_shaders")?;
         let vs = shader(registry, get(refs, "vertex")?)?;
@@ -860,6 +875,10 @@ pub(crate) fn convert(m: &Value, source_hash: String) -> Result<Scene> {
                 writes,
             },
         });
+        if let Some(native_present)=context_present {
+            let Command::Draw{draw}=s.commands.pop().unwrap() else{unreachable!()};
+            s.commands.push(Command::ContextDraw{draw,context:OriginalRasterContext{native_present,world_view:get(d,"world_view")?.clone()}});
+        }
     }
     s.expected = finals;
     Ok(s)
@@ -1028,6 +1047,29 @@ mod tests {
         encoded["shared_draw_metadata"] = json!({"pipelines":pipelines,"bindings":bindings,"world_views":worlds,"target_domains":domains});
         encoded
     }
+    #[test]
+    fn finished_split_intervals_keep_real_guest_ordinals() -> Result<()> {
+        let (m, _) = fixture();
+        for (start,end) in [(100,101),(101,102),(101,101)] {
+            let mut seam=m.clone();
+            seam["closure"]["interval_start_command"]=start.into();
+            seam["closure"]["interval_end_command"]=end.into();
+            require(convert(&seam,"0".repeat(64)).is_err(),"legacy interval admitted inclusive seam")?;
+            convert_graph_qualified(&seam,"0".repeat(64))?;
+            convert_graph_context(&seam,"0".repeat(64),7)?;
+        }
+        for (start,end) in [(102,102),(100,100),(102,100)] {
+            let mut bad=m.clone();
+            bad["closure"]["interval_start_command"]=start.into();
+            bad["closure"]["interval_end_command"]=end.into();
+            require(convert_graph_qualified(&bad,"0".repeat(64)).is_err(),"finished draw outside real ordinal interval admitted")?;
+        }
+        let mut duplicate=m;
+        let row=duplicate["draws"][0].clone();duplicate["draws"].as_array_mut().unwrap().push(row);
+        require(convert_graph_qualified(&duplicate,"0".repeat(64)).is_err(),"duplicate original draw ordinal admitted")?;
+        Ok(())
+    }
+
     #[test]
     fn shared_metadata_roundtrip_and_adverse_references() -> Result<()> {
         let (inline, _) = fixture();

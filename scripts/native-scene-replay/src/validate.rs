@@ -6,6 +6,8 @@ use std::{
 };
 use wgpu_types::*;
 pub const MAX_BYTES: u64 = 256 << 20;
+pub const MAX_FINISHED_PAYLOAD_BYTES:u64=1<<30;
+pub fn payload_bound(p:&Provenance)->u64{if matches!(p,Provenance::NativeFinishedGraph{..}){MAX_FINISHED_PAYLOAD_BYTES}else{MAX_BYTES}}
 pub struct Input {
     pub scene: Scene,
     pub bytes: BTreeMap<String, Vec<u8>>,
@@ -58,7 +60,7 @@ impl Input {
             require(p.starts_with(&root), "blob escaped capture")?;
             total = total.checked_add(b.bytes).ok_or("size overflow")?;
             require(
-                total <= MAX_BYTES && fs::metadata(&p)?.len() == b.bytes,
+                total <= payload_bound(&scene.provenance) && fs::metadata(&p)?.len() == b.bytes,
                 "immutable payload bound",
             )?;
             let data = fs::read(p)?;
@@ -124,8 +126,8 @@ impl Input {
                 && s.omitted_commands == 0,
             "original closure missing",
         )?;
-        let native_graph = matches!(s.provenance, Provenance::NativeGraph { .. });
-        let native = matches!(s.provenance, Provenance::Native { .. } | Provenance::NativeGraph { .. });
+        let native_graph = matches!(s.provenance, Provenance::NativeGraph { .. } | Provenance::NativeFinishedGraph { .. });
+        let native = matches!(s.provenance, Provenance::Native { .. } | Provenance::NativeGraph { .. } | Provenance::NativeFinishedGraph { .. });
         let isolated_compute = !s.commands.is_empty()
             && s.pipelines.is_empty()
             && s.commands.iter().all(|c| matches!(c, Command::Dispatch { .. } | Command::DepthToColor { .. } | Command::Checkpoint { .. }))
@@ -144,6 +146,10 @@ impl Input {
                 "native same-eye identity",
             )?;
         }
+        if matches!(s.provenance, Provenance::NativeFinishedGraph{..}) {
+            require(s.commands.iter().filter(|c|matches!(c,Command::FinishedEndpoint{..})).count()==1
+                && matches!(s.commands.last(),Some(Command::FinishedEndpoint{..})), "finished graph endpoint missing/duplicated")?;
+        } else {require(!s.commands.iter().any(|c|matches!(c,Command::FinishedEndpoint{..})), "finished endpoint requires native finished graph")?;}
         let mut ids = BTreeSet::new();
         let mut allocation_bytes = 0u64;
         let mut native_textures = BTreeSet::new();
@@ -233,7 +239,7 @@ impl Input {
                             | TextureFormat::R32Float
                             | TextureFormat::Depth32Float
                             | TextureFormat::Depth32FloatStencil8
-                    ),
+                    ) || (d.format==TextureFormat::Rg8Uint && matches!(s.provenance,Provenance::NativeFinishedGraph{..}|Provenance::Authored{..})),
                 "unsupported persistent target format",
             )?;
             for i in &t.initial {
@@ -444,6 +450,52 @@ impl Input {
                     advance(destination, &mut versions, &mut last_write)?;
                     initialized.insert(destination.slice.clone());
                 }
+                Command::CopyRegion { sources, destinations, source_origin, destination_origin, extent } => {
+                    require(!sources.is_empty() && sources.len() == destinations.len(), "copy aspect arity")?;
+                    let a = self.texture(&sources[0].slice.resource)?;
+                    let b = self.texture(&destinations[0].slice.resource)?;
+                    let sa = &sources[0].slice;
+                    let sb = &destinations[0].slice;
+                    let expected = aspects(a.descriptor.format).into_iter().collect::<BTreeSet<_>>();
+                    require(a.descriptor.dimension == TextureDimension::D2 && b.descriptor.dimension == TextureDimension::D2
+                        && a.descriptor.format == b.descriptor.format && a.descriptor.format.block_dimensions() == (1,1)
+                        && sa.mip < a.descriptor.mips && sb.mip < b.descriptor.mips
+                        && sa.layer < a.descriptor.layers && sb.layer < b.descriptor.layers
+                        && a.id != b.id && b.mutable_target && *extent != [0,0,0] && extent.iter().all(|x|*x>0)
+                        && extent[2] == 1 && source_origin[2] == 0 && destination_origin[2] == 0
+                        && sources.iter().all(|v| v.slice.resource == sa.resource && v.slice.mip == sa.mip && v.slice.layer == sa.layer)
+                        && destinations.iter().all(|v|v.slice.resource == sb.resource && v.slice.mip == sb.mip && v.slice.layer == sb.layer)
+                        && sources.iter().map(|v|v.slice.aspect.clone()).collect::<BTreeSet<_>>() == expected
+                        && destinations.iter().map(|v|v.slice.aspect.clone()).collect::<BTreeSet<_>>() == expected
+                        && sources.len() == expected.len(), "unsupported copy region/aspects")?;
+                    let aw=(a.descriptor.width>>sa.mip).max(1); let ah=(a.descriptor.height>>sa.mip).max(1);
+                    let bw=(b.descriptor.width>>sb.mip).max(1); let bh=(b.descriptor.height>>sb.mip).max(1);
+                    require(source_origin[0].checked_add(extent[0]).is_some_and(|n|n<=aw)
+                        && source_origin[1].checked_add(extent[1]).is_some_and(|n|n<=ah)
+                        && destination_origin[0].checked_add(extent[0]).is_some_and(|n|n<=bw)
+                        && destination_origin[1].checked_add(extent[1]).is_some_and(|n|n<=bh), "copy region outside subresource")?;
+                    let full = *destination_origin == [0,0,0] && extent[..2] == [bw,bh];
+                    require(expected == BTreeSet::from([Aspect::Color]) || (full && *source_origin == [0,0,0] && extent[..2] == [aw,ah]),
+                        "depth stencil copy requires full equal subresources")?;
+                    for source in sources {check_version(source,&versions,&initialized)?;}
+                    for t in destinations {
+                        require(full || initialized.contains(&t.slice), "partial copy requires initialized destination")?;
+                        require(!native || !native_initial_versions.contains(&t.after), "native copy reused initial content version")?;
+                        advance(t,&mut versions,&mut last_write)?; initialized.insert(t.slice.clone());
+                    }
+                }
+                Command::GenerateMip { source, destination } => {
+                    check_version(source, &versions, &initialized)?;
+                    let t=self.texture(&source.slice.resource)?; let d=&t.descriptor;
+                    require(t.mutable_target && d.dimension==TextureDimension::D2
+                        && source.slice.resource==destination.slice.resource && source.slice.layer==destination.slice.layer
+                        && source.slice.mip.checked_add(1)==Some(destination.slice.mip)
+                        && source.slice.aspect==Aspect::Color && destination.slice.aspect==Aspect::Color
+                        && matches!(d.format, TextureFormat::Rgba8Unorm|TextureFormat::Rgba8UnormSrgb|TextureFormat::Bgra8Unorm|TextureFormat::Bgra8UnormSrgb|TextureFormat::Rgba16Float|TextureFormat::R32Float|TextureFormat::Rg32Float|TextureFormat::Rgba32Float),
+                        "unsupported native mip pass")?;
+                    require(!native || !native_initial_versions.contains(&destination.after), "native mip reused initial content version")?;
+                    advance(destination,&mut versions,&mut last_write)?; initialized.insert(destination.slice.clone());
+                }
                 Command::DepthToColor { source, destination } => {
                     check_version(source, &versions, &initialized)?;
                     let a = self.texture(&source.slice.resource)?;
@@ -466,6 +518,42 @@ impl Input {
                     // resolution-independent producer. Graph closure is separate.
                     independent = false;
                 }
+                Command::StencilToColor { source, destination } => {
+                    require(matches!(s.provenance,Provenance::NativeFinishedGraph{..}|Provenance::Authored{..}),"stencil proxy requires finished graph")?;
+                    check_version(source,&versions,&initialized)?;
+                    let a=self.texture(&source.slice.resource)?;let b=self.texture(&destination.slice.resource)?;
+                    require(a.descriptor.dimension==TextureDimension::D2 && b.descriptor.dimension==TextureDimension::D2
+                        && a.descriptor.format==TextureFormat::Depth32FloatStencil8 && b.descriptor.format==TextureFormat::Rg8Uint
+                        && source.slice.aspect==Aspect::Stencil && destination.slice.aspect==Aspect::Color
+                        && a.id!=b.id && b.mutable_target,"stencil proxy requires distinct D32S8 stencil and RG8Uint targets")?;
+                    let (sw,sh,_,_)=slice_bytes(&a.descriptor,source.slice.mip,&source.slice.aspect)?;
+                    let (dw,dh,_,_)=slice_bytes(&b.descriptor,destination.slice.mip,&destination.slice.aspect)?;
+                    require(sw==dw && sh==dh,"stencil proxy extent mismatch")?;
+                    require(!native || !native_initial_versions.contains(&destination.after),"native stencil proxy reused initial version")?;
+                    advance(destination,&mut versions,&mut last_write)?;initialized.insert(destination.slice.clone());independent=false;
+                }
+                Command::OriginalOnly{operation_kind:kind,expected,metadata} => {
+                    require(matches!(s.provenance,Provenance::NativeFinishedGraph{..}|Provenance::Authored{..}),"original-only event requires finished graph")?;
+                    validate_original_only(self,kind,expected,metadata)?;
+                    for e in expected {check_version(&e.version,&versions,&initialized)?;
+                        let t=self.texture(&e.version.slice.resource)?;let(_,_,row,rows)=slice_bytes(&t.descriptor,e.version.slice.mip,&e.version.slice.aspect)?;
+                        let bytes=u64::from(row)*u64::from(rows);require(self.data(&e.blob)?.len()as u64==bytes,"original-only source byte extent")?;
+                        output_bytes=output_bytes.checked_add(bytes).ok_or("original-only reference bound")?;require(output_bytes<=payload_bound(&s.provenance),"output readback bound")?;}
+                }
+                Command::FinishedEndpoint{hud_free_source,hud_world,depth_source,depth_world,publication} => {
+                    validate_finished_endpoint(s,c,depth_world,publication)?;
+                    require(std::ptr::eq(c,s.commands.last().ok_or("finished endpoint missing")?), "finished endpoint is not last")?;
+                    require(self.data(&hud_free_source.blob)?==self.data(&hud_world.blob)?,"endpoint HUD copy reference bytes differ")?;
+                    for e in [hud_free_source,hud_world,depth_source] {
+                        check_version(&e.version,&versions,&initialized)?;
+                        let t=self.texture(&e.version.slice.resource)?;
+                        let (_,_,row,rows)=slice_bytes(&t.descriptor,e.version.slice.mip,&e.version.slice.aspect)?;
+                        let bytes=u64::from(row)*u64::from(rows);
+                        require(self.data(&e.blob)?.len() as u64==bytes,"finished endpoint byte extent")?;
+                        output_bytes=output_bytes.checked_add(bytes).ok_or("endpoint readback size overflow")?;
+                        require(output_bytes<=payload_bound(&s.provenance),"output readback bound")?;
+                    }
+                }
                 Command::Checkpoint { expected } => {
                     require(!expected.is_empty(), "empty ordered checkpoint")?;
                     checkpoint_count = checkpoint_count.checked_add(expected.len()).ok_or("checkpoint count overflow")?;
@@ -479,7 +567,7 @@ impl Input {
                         let bytes = (row as u64).checked_mul(rows as u64).ok_or("checkpoint byte overflow")?;
                         require(self.data(&e.blob)?.len() as u64 == bytes, "checkpoint bytes extent")?;
                         output_bytes = output_bytes.checked_add(bytes).ok_or("checkpoint size overflow")?;
-                        require(output_bytes <= MAX_BYTES, "output readback bound")?;
+                        require(output_bytes <= payload_bound(&s.provenance), "output readback bound")?;
                     }
                 }
                 Command::Dispatch { dispatch } => {
@@ -489,10 +577,25 @@ impl Input {
                         advance(t, &mut versions, &mut last_write)?;
                     }
                 }
-                Command::Draw { draw: d } => {
+                Command::Draw { draw: d } | Command::ContextDraw {draw:d,..} => {
+                    if let Command::ContextDraw{context,..}=c {
+                        require(d.eye.is_none(), "context draw fabricated eye ownership")?;
+                        match &s.provenance {
+                            Provenance::NativeFinishedGraph{native_present,..} => {
+                                require(context.native_present==*native_present && *native_present>0, "context draw belongs to another native present")?;
+                                if !context.world_view.is_null() {
+                                    let e=crate::native_import::world(&context.world_view)?;
+                                    let anchor=s.eye.as_ref().ok_or("context draw lacks world anchor")?;
+                                    require(e.eye==anchor.eye && e.epoch==anchor.epoch, "context draw contradicts frame eye/epoch")?;
+                                }
+                            },
+                            Provenance::Authored{..} => require(context.native_present>0 && context.world_view.is_null(), "authored context scope")?,
+                            _=>return Err("context draw requires native finished graph".into()),
+                        }
+                    }
                     draws += 1;
                     require(
-                        draws <= 4096 && d.eye == s.eye,
+                        draws <= 4096 && (matches!(c,Command::ContextDraw{..}) || d.eye == s.eye),
                         "draw count/same-eye changed",
                     )?;
                     let p = self.pipeline(&d.pipeline)?;
@@ -827,7 +930,7 @@ impl Input {
             output_bytes = output_bytes
                 .checked_add(row as u64 * rows as u64)
                 .ok_or("output size overflow")?;
-            require(output_bytes <= MAX_BYTES, "output readback bound")?;
+            require(output_bytes <= payload_bound(&s.provenance), "output readback bound")?;
         }
         self.targets_have_resolution_independent_initialization = independent;
         Ok(())
@@ -839,7 +942,7 @@ impl Input {
         initialized: &BTreeSet<Slice>,
     ) -> Result<()> {
         require(d.eye == self.scene.eye
-            || (matches!(self.scene.provenance, Provenance::NativeGraph { .. }) && d.eye.is_none()),
+            || (matches!(self.scene.provenance, Provenance::NativeGraph { .. } | Provenance::NativeFinishedGraph { .. }) && d.eye.is_none()),
             "compute eye changed")?;
         require(d.workgroups.iter().all(|n| *n > 0 && *n <= 65535)
             && d.workgroups.iter().try_fold(1u64, |n, v| n.checked_mul(*v as u64)).is_some_and(|n| n <= 1 << 20),
@@ -1032,6 +1135,121 @@ fn validate_view_format(d: &TextureDesc, f: TextureFormat) -> Result<()> {
         f == d.format || d.view_formats.contains(&f),
         "unregistered reinterpretation",
     )
+}
+pub(crate) fn validate_original_only(input:&Input,kind:&str,expected:&[Expected],m:&serde_json::Value)->Result<()> {
+    let num=|k:&str|m[k].as_u64().ok_or_else(||format!("original-only invalid {k}"));
+    require(m["original_only"]==true&&m["replay_side_effects"]==false&&m["result_completion_recorded"]==false
+        &&num("event_index")?>0&&num("command_sequence")?>0,"original-only side-effect scope")?;
+    let object=m.as_object().ok_or("original-only object")?;
+    match kind {
+        "query"=>{
+            let fields=["event_index","command_sequence","original_only","replay_side_effects","action","native_query_identity","qtype","sequence","slots","live","result_completion_recorded"];
+            require(object.len()==fields.len()&&object.keys().all(|k|fields.contains(&k.as_str()))&&expected.is_empty(),"original query fields")?;
+            require(matches!(m["action"].as_str(),Some("begin"|"end"|"resolve"|"pass_slot"))&&num("native_query_identity")?>0
+                &&num("qtype")?<=u32::MAX as u64&&num("sequence")?<=u32::MAX as u64&&m["live"].is_boolean(),"original query identity/action")?;
+            let slots=m["slots"].as_array().ok_or("query slots")?.iter().map(|s|s.as_u64().ok_or("query slot")).collect::<std::result::Result<Vec<_>,_>>()?;
+            require(slots.len()<=2048&&slots.iter().all(|s|*s<2048)&&slots.windows(2).all(|w|w[0]<w[1])
+                &&(matches!(num("qtype")?,1|5)||slots.is_empty()),"original query slot range")?;
+        },
+        "readback"=>{
+            let fields=["event_index","command_sequence","original_only","replay_side_effects","sources","source_blobs","source_descriptors","source_origin","extent","row_bytes","rows","destination_row_pitch","destination_depth_pitch","destination_size","result_completion_recorded"];
+            require(object.len()==fields.len()&&object.keys().all(|k|fields.contains(&k.as_str()))&&expected.len()==1,"original readback fields")?;
+            let e=&expected[0];let t=input.texture(&e.version.slice.resource)?;let d=&t.descriptor;let s=&e.version.slice;
+            require(t.native_allocation_id.is_some_and(|n|n>0)&&e.version.content_version>0
+                &&d.dimension==TextureDimension::D2&&s.aspect==Aspect::Color&&d.format.block_dimensions()==(1,1)&&s.mip<d.mips&&s.layer<d.layers,"original readback source shape")?;
+            let refs=m["sources"].as_array().ok_or("readback sources")?;let blobs=m["source_blobs"].as_array().ok_or("readback blobs")?;let descriptors=m["source_descriptors"].as_array().ok_or("readback descriptors")?;
+            require(refs.len()==1&&blobs.len()==1&&descriptors.len()==1&&blobs[0]==e.blob,"original readback source arity")?;
+            let r=&refs[0];require(r["allocation_id"].as_u64()==t.native_allocation_id&&r["content_version"].as_u64()==Some(e.version.content_version)
+                &&r["subresource"]["mip"].as_u64()==Some(s.mip as u64)&&r["subresource"]["layer"].as_u64()==Some(s.layer as u64)&&r["subresource"]["aspect"]=="color","original readback source version differs")?;
+            require(descriptors[0]==serde_json::json!({"width":d.width,"height":d.height,"depth_or_array_layers":d.layers,"mip_level_count":d.mips,"sample_count":1,"dimension":d.dimension,"format":d.format}),"original readback descriptor differs")?;
+            let origin:[u32;3]=serde_json::from_value(m["source_origin"].clone())?;let extent:[u32;3]=serde_json::from_value(m["extent"].clone())?;
+            let row=u64::from(d.format.block_copy_size(None).ok_or("readback format")?).checked_mul(u64::from(extent[0])).ok_or("readback row overflow")?;
+            let pitch=num("destination_row_pitch")?;num("destination_depth_pitch")?;
+            require(origin[2]==0&&extent[2]==1&&extent[0]>0&&extent[1]>0
+                &&origin[0].checked_add(extent[0]).is_some_and(|n|n<=(d.width>>s.mip).max(1))
+                &&origin[1].checked_add(extent[1]).is_some_and(|n|n<=(d.height>>s.mip).max(1))
+                &&num("row_bytes")?==row&&num("rows")?==u64::from(extent[1])&&pitch>=row
+                &&pitch.checked_mul(u64::from(extent[1]-1)).and_then(|n|n.checked_add(row)).is_some_and(|n|n<=num("destination_size").unwrap_or(0)),"original readback range differs")?;
+        },_=>return Err("unsupported original-only operation".into()),
+    }Ok(())
+}
+/// Production ownership predicate; projection Z is deliberately not substituted.
+pub(crate) fn same_screen_rays(a:&serde_json::Value,b:&serde_json::Value)->Result<bool>{
+    crate::native_import::world(a)?; crate::native_import::world(b)?;
+    for k in ["provenance_epoch","optics","camera_sequence","request_frame","head_pose_frame","eye_index","view_count"] {
+        if a.get(k)!=b.get(k){return Ok(false);}
+    }
+    for k in ["game_from_eye","game_from_stage","projection_from_eye"] {
+        let aa=a[k].as_array().ok_or("world matrix")?;let bb=b[k].as_array().ok_or("world matrix")?;
+        for (i,(x,y)) in aa.iter().zip(bb).enumerate(){
+            if k=="projection_from_eye"&&i%4==2{continue;}
+            let x=x.as_f64().ok_or("world matrix value")? as f32;let y=y.as_f64().ok_or("world matrix value")? as f32;
+            if !x.is_finite()||!y.is_finite()||(x-y).abs()>0.00002{return Ok(false);}
+        }
+    }Ok(true)
+}
+fn native_id(scene:&Scene,s:&Slice)->Result<u64>{
+    let t=scene.textures.iter().find(|t|t.id==s.resource).ok_or("endpoint texture missing")?;
+    let id=t.native_allocation_id.ok_or("endpoint native texture identity")?;
+    require(id>0&&s.resource==format!("native-texture:{id}"),"endpoint native texture identity")?;Ok(id)
+}
+pub(crate) fn validate_finished_endpoint(scene:&Scene,command:&Command,depth_world:&serde_json::Value,p:&serde_json::Value)->Result<()> {
+    let Provenance::NativeFinishedGraph{capture_id,native_present,..}=&scene.provenance else{return Err("endpoint provenance".into())};
+    require(!capture_id.is_empty()&&*native_present>0,"endpoint source identity")?;
+    let Command::FinishedEndpoint{hud_free_source,hud_world,depth_source,..}=command else{return Err("endpoint command".into())};
+    let obj=p.as_object().ok_or("endpoint publication object")?;
+    let fields=["capture_id","native_present","accepted","source_id","source_generation","provenance_epoch","eye_index","request_frame_sequence","head_sequence","camera_sequence","world_view","graph_end_before_hud","postlude_original_only","hud_world_is_ready_hud_world","ready_hud_world_allocation_id","final_color_parent_allocation_id","hud_draw_count","hud_rejected","slot_color","slot_depth"];
+    require(obj.len()==fields.len()&&obj.keys().all(|k|fields.contains(&k.as_str())),"endpoint publication fields")?;
+    require(p["capture_id"].as_str()==Some(capture_id)&&p["native_present"].as_u64()==Some(*native_present),"endpoint callback capture/present changed")?;
+    for k in ["accepted","graph_end_before_hud","postlude_original_only","hud_world_is_ready_hud_world"] {require(p[k]==true,"endpoint original publication proof missing")?;}
+    require(p["hud_rejected"]==false,"endpoint HUD rejected")?;
+    let num=|k:&str|p[k].as_u64().ok_or_else(||format!("endpoint numeric {k}"));
+    require(num("source_id")?>0&&num("hud_draw_count")?>0,"endpoint accepted source/HUD count absent")?;num("source_generation")?;
+    let published=crate::native_import::world(&p["world_view"])?;let depth=crate::native_import::world(depth_world)?;
+    require(scene.eye.as_ref()==Some(&published)&&published==depth && p["world_view"]==*depth_world,"endpoint actual published depth world differs")?;
+    require(num("provenance_epoch")?==published.epoch&&num("eye_index")?==u64::from(published.eye)
+        && num("request_frame_sequence")?==published.request&&num("head_sequence")?==published.head&&num("camera_sequence")?==published.camera,
+        "endpoint callback identity differs")?;
+    let source=native_id(scene,&hud_free_source.version.slice)?;let world=native_id(scene,&hud_world.version.slice)?;let depth=native_id(scene,&depth_source.version.slice)?;
+    require(source!=world&&hud_free_source.version.slice.aspect==Aspect::Color&&hud_world.version.slice.aspect==Aspect::Color
+        &&num("ready_hud_world_allocation_id")?==world&&num("final_color_parent_allocation_id")?==source,"endpoint HUD world native ownership differs")?;
+    for (name,source_id) in [("slot_color",source),("slot_depth",depth)] {
+        let r=p[name].as_object().ok_or("endpoint slot copy receipt")?;
+        require(r.len()==4&&["kind","source_allocation_id","destination_allocation_id","source_version"].iter().all(|k|r.contains_key(*k)),"endpoint slot receipt fields")?;
+        let from=r["source_allocation_id"].as_u64().ok_or("endpoint copy source")?;let to=r["destination_allocation_id"].as_u64().ok_or("endpoint copy destination")?;
+        require(from==source_id&&to>0&&match r["kind"].as_str(){Some("same_native_handle")=>from==to,Some("original_copy")=>from!=to,_=>false},"endpoint slot source identity differs")?;
+        if name=="slot_depth" {
+            let v=&r["source_version"];let expected=&depth_source.version;
+            require(v["allocation_id"].as_u64()==Some(depth)&&v["content_version"].as_u64()==Some(expected.content_version)
+                &&v["subresource"]["mip"].as_u64()==Some(u64::from(expected.slice.mip))
+                &&v["subresource"]["layer"].as_u64()==Some(u64::from(expected.slice.layer))
+                &&v["subresource"]["aspect"]==serde_json::to_value(&expected.slice.aspect)?,"endpoint slot depth selected another version")?;
+        } else {require(r["source_version"].is_null() || r["source_version"].is_object(),"endpoint slot source version shape")?;}
+    }
+    let a=scene.textures.iter().find(|t|t.id==hud_free_source.version.slice.resource).ok_or("endpoint source texture")?;
+    let b=scene.textures.iter().find(|t|t.id==hud_world.version.slice.resource).ok_or("endpoint HUD texture")?;
+    let sa=&hud_free_source.version.slice;let sb=&hud_world.version.slice;
+    require(sa.mip<a.descriptor.mips&&sb.mip<b.descriptor.mips,"endpoint mip outside allocation")?;
+    let aw=(a.descriptor.width>>sa.mip).max(1);let ah=(a.descriptor.height>>sa.mip).max(1);
+    let bw=(b.descriptor.width>>sb.mip).max(1);let bh=(b.descriptor.height>>sb.mip).max(1);
+    require(a.descriptor.dimension==TextureDimension::D2&&b.descriptor.dimension==TextureDimension::D2
+        &&sa.mip==0&&sa.layer==0&&a.descriptor.layers==1
+        &&matches!(a.descriptor.format,TextureFormat::Bgra8Unorm|TextureFormat::Rgba8Unorm)
+        &&a.descriptor.format==b.descriptor.format&&aw==bw&&ah==bh,"endpoint HUD copy extent/format")?;
+    let depth_texture=scene.textures.iter().find(|t|t.id==depth_source.version.slice.resource).ok_or("endpoint selected depth texture")?;
+    let ds=&depth_source.version.slice;let dd=&depth_texture.descriptor;
+    require(sb.mip==0&&sb.layer==0&&b.descriptor.mips==1&&b.descriptor.layers==1
+        &&ds.mip==0&&ds.layer==0&&dd.layers==1&&ds.mip<dd.mips&&dd.dimension==TextureDimension::D2&&dd.format==TextureFormat::R32Float
+        &&ds.aspect==Aspect::Color&&(dd.width>>ds.mip).max(1)==aw&&(dd.height>>ds.mip).max(1)==ah,
+        "endpoint HUD world/published depth shape")?;
+    require(scene.commands.iter().any(|c|match c {
+        Command::CopyRegion{sources,destinations,source_origin,destination_origin,extent}=>*source_origin==[0,0,0]&&*destination_origin==[0,0,0]&&*extent==[aw,ah,1]
+            &&sources.len()==1&&destinations.len()==1
+            &&sources.iter().any(|v|v.slice==*sa&&v.content_version==hud_free_source.version.content_version)
+            &&destinations.iter().any(|v|v.slice==*sb&&v.after==hud_world.version.content_version),
+        Command::Copy{source,destination}=>source.slice==*sa&&source.content_version==hud_free_source.version.content_version&&destination.slice==*sb&&destination.after==hud_world.version.content_version,
+        _=>false}),"endpoint HUD world lacks original full copy lineage")?;
+    Ok(())
 }
 fn validate_clear(v: &ClearValue, a: &Aspect) -> Result<()> {
     require(

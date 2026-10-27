@@ -30,7 +30,7 @@ def main():
     frozen.mkdir()
     (frozen / "scene.json").write_bytes(raw)
     checked = [(manifest, digest(raw)), (frozen / "scene.json", digest(raw))]
-    if metadata.get("provenance", {}).get("kind") in ("native", "native_graph"):
+    if metadata.get("provenance", {}).get("kind") in ("native", "native_graph", "native_finished_graph"):
         native = root / "native-capture.json"
         imported = root / "native-import.json"
         if native.stat().st_size > 32 << 20 or imported.stat().st_size > 64 << 10:
@@ -45,6 +45,7 @@ def main():
             copied = frozen / original.name
             copied.write_bytes(data)
             checked.extend(((original, digest(data)), (copied, digest(data))))
+    payload_limit = (1 << 30) if metadata.get("provenance", {}).get("kind") == "native_finished_graph" else (256 << 20)
     total = 0
     seen = set()
     for item in metadata["blobs"]:
@@ -55,7 +56,7 @@ def main():
         source = (root / rel).resolve()
         source.relative_to(root)
         total += item["bytes"]
-        if total > 256 << 20 or source.stat().st_size != item["bytes"]:
+        if total > payload_limit or source.stat().st_size != item["bytes"]:
             raise ValueError("input budget/length")
         data = source.read_bytes()
         if len(data) != item["bytes"] or digest(data) != item["sha256"]:

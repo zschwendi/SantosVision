@@ -21,7 +21,7 @@ fn exact_ref(a: &Value, b: &Value) -> bool {
 
 /// CPU verification deliberately supports only unambiguous 8-bit UNORM endpoints,
 /// Float32 depth and 8-bit stencil. Other formats/fractional UNORM remain captured.
-fn clear_pattern(
+pub(crate) fn clear_pattern(
     content: &Value,
     format: TextureFormat,
     aspect: &Aspect,

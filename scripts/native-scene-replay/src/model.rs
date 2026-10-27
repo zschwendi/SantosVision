@@ -8,6 +8,8 @@ pub enum Provenance {
     Native { source_sha256: String },
     /// One captured graph with a raster anchor; compute eye ownership is not inferred.
     NativeGraph { source_sha256: String },
+    /// One native frame with a qualified endpoint; context draws remain unattributed.
+    NativeFinishedGraph { source_sha256: String, capture_id: String, native_present: u64 },
     LegacyCaptured { manifest_sha256: String },
     Authored { description: String },
 }
@@ -260,6 +262,12 @@ pub struct Draw {
     pub writes: Vec<Transition>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct OriginalRasterContext {
+    pub native_present: u64,
+    /// Exact native per-draw marker, including null. This never assigns eye ownership.
+    pub world_view: serde_json::Value,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Command {
     Clear {
@@ -270,6 +278,10 @@ pub enum Command {
     Draw {
         draw: Draw,
     },
+    ContextDraw {
+        draw: Draw,
+        context: OriginalRasterContext,
+    },
     Dispatch {
         dispatch: Dispatch,
     },
@@ -277,10 +289,42 @@ pub enum Command {
         source: Version,
         destination: Transition,
     },
+    /// One original D2 copy command; combined depth/stencil aspects stay one copy.
+    CopyRegion {
+        sources: Vec<Version>,
+        destinations: Vec<Transition>,
+        source_origin: [u32; 3],
+        destination_origin: [u32; 3],
+        extent: [u32; 3],
+    },
+    /// One native GenerateMips fullscreen pass, preserving its exact linear filter.
+    GenerateMip {
+        source: Version,
+        destination: Transition,
+    },
     /// Native depth-proxy operation; no color transform or resampling.
     DepthToColor {
         source: Version,
         destination: Transition,
+    },
+    /// Exact native integer stencil proxy: stencil byte s becomes RG8Uint (s,s).
+    StencilToColor {
+        source: Version,
+        destination: Transition,
+    },
+    /// Original query/readback side effects stay in the guest; only captured source bytes are checked.
+    OriginalOnly {
+        operation_kind: String,
+        expected: Vec<Expected>,
+        metadata: serde_json::Value,
+    },
+    /// Last replay boundary; original HUD/postlude publication remains certificate-only.
+    FinishedEndpoint {
+        hud_free_source: Expected,
+        hud_world: Expected,
+        depth_source: Expected,
+        depth_world: serde_json::Value,
+        publication: serde_json::Value,
     },
     /// Verify historical output before subsequent commands can overwrite it.
     Checkpoint {

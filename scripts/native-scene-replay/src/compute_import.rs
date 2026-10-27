@@ -308,7 +308,10 @@ fn version_identity(seen: &mut BTreeMap<u64, Slice>, v: &Version) -> Result<()> 
     }
     Ok(())
 }
-pub(crate) fn convert(m: &Value, source_hash: String) -> Result<Scene> {
+pub(crate) fn convert(m: &Value, source_hash: String) -> Result<Scene> {convert_inner(m,source_hash,false)}
+/// Only schema7 retains the original query events around this captured dispatch.
+pub(crate) fn convert_graph_qualified(m:&Value,source_hash:String)->Result<Scene>{convert_inner(m,source_hash,true)}
+fn convert_inner(m: &Value, source_hash: String, graph_queries:bool) -> Result<Scene> {
     shape(
         m,
         &[
@@ -345,6 +348,7 @@ pub(crate) fn convert(m: &Value, source_hash: String) -> Result<Scene> {
             "original_final_captured",
             "natural_submission_completed",
             "queries_inactive",
+            "queries_original_only",
             "gpu_errors",
         ],
     )?;
@@ -353,10 +357,11 @@ pub(crate) fn convert(m: &Value, source_hash: String) -> Result<Scene> {
         "initial_contents_captured",
         "original_final_captured",
         "natural_submission_completed",
-        "queries_inactive",
     ] {
         require(closure[k] == true, "compute original closure incomplete")?;
     }
+    require(closure["queries_inactive"]==true || (graph_queries&&closure["queries_inactive"]==false&&closure["queries_original_only"]==true), "compute original query closure incomplete")?;
+    require(graph_queries||closure.get("queries_original_only").is_none(),"original-only query scope requires schema7")?;
     require(
         num(closure, "unmodelled_commands")? == 0 && num(closure, "gpu_errors")? == 0,
         "compute omissions or GPU errors",
@@ -1040,6 +1045,14 @@ mod tests {
             "effective_shader_sources":{"schema":1,"method":"successful actual ShaderModule creation","complete":true,"failure":null,"sources":{hash:{"wgsl":text}}}}),
             payload,
         )
+    }
+    #[test]
+    fn original_query_events_require_finished_graph_conversion() -> Result<()> {
+        let(mut m,_)=fixture();m["closure"]["queries_inactive"]=false.into();m["closure"]["queries_original_only"]=true.into();
+        assert!(convert(&m,"a".repeat(64)).is_err());
+        assert!(convert_graph_qualified(&m,"a".repeat(64))?.eye.is_none());
+        m["closure"]["queries_original_only"]=false.into();assert!(convert_graph_qualified(&m,"a".repeat(64)).is_err());
+        Ok(())
     }
     #[test]
     fn compute_import_keeps_actual_mip_versions_and_never_assigns_context_eye() -> Result<()> {

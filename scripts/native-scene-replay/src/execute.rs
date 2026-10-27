@@ -148,34 +148,64 @@ fn clear(
 pub(crate) const DEPTH_TO_COLOR_WGSL: &str = "@group(0) @binding(0) var src: texture_depth_2d;
              @vertex fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4f { var p = array<vec2f, 3>(vec2f(-1, -1), vec2f(3, -1), vec2f(-1, 3)); return vec4f(p[i], 0, 1); }
              @fragment fn fs(@builtin(position) pos: vec4f) -> @location(0) vec4f { return vec4f(textureLoad(src, vec2i(pos.xy), 0), 0, 0, 1); }";
-fn depth_to_color(device: &w::Device, q: &w::Queue, r: &Resources,
-    source: &Version, destination: &Transition) {
+pub(crate) const STENCIL_TO_COLOR_WGSL: &str = "@group(0) @binding(0) var src: texture_2d<u32>;
+             @vertex fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4f { var p = array<vec2f, 3>(vec2f(-1, -1), vec2f(3, -1), vec2f(-1, 3)); return vec4f(p[i], 0, 1); }
+             @fragment fn fs(@builtin(position) pos: vec4f) -> @location(0) vec4<u32> { let s = textureLoad(src, vec2i(pos.xy), 0).x; return vec4<u32>(s, s, 0u, 1u); }";
+fn depth_stencil_to_color(device: &w::Device, q: &w::Queue, r: &Resources,
+    source: &Version, destination: &Transition, stencil:bool) {
+    let format=if stencil{w::TextureFormat::Rg8Uint}else{w::TextureFormat::R32Float};
+    let shader=if stencil{STENCIL_TO_COLOR_WGSL}else{DEPTH_TO_COLOR_WGSL};
     let module = device.create_shader_module(w::ShaderModuleDescriptor {
-        label: Some("native Float32 depth proxy"), source: w::ShaderSource::Wgsl(DEPTH_TO_COLOR_WGSL.into()) });
+        label: Some("native depth/stencil proxy"), source: w::ShaderSource::Wgsl(shader.into()) });
     let pipeline = device.create_render_pipeline(&w::RenderPipelineDescriptor {
-        label: Some("native depth proxy operation"), layout: None,
+        label: Some("native depth/stencil proxy operation"), layout: None,
         vertex: w::VertexState { module: &module, entry_point: Some("vs"), compilation_options: Default::default(), buffers: &[] },
         primitive: Default::default(), depth_stencil: None, multisample: Default::default(),
         fragment: Some(w::FragmentState { module: &module, entry_point: Some("fs"), compilation_options: Default::default(),
-            targets: &[Some(w::ColorTargetState { format: w::TextureFormat::R32Float, blend: None, write_mask: w::ColorWrites::ALL })] }),
+            targets: &[Some(w::ColorTargetState { format, blend: None, write_mask: w::ColorWrites::ALL })] }),
         multiview_mask: None, cache: None });
     let src = r.textures[&source.slice.resource].create_view(&w::TextureViewDescriptor {
         dimension: Some(w::TextureViewDimension::D2), base_mip_level: source.slice.mip, mip_level_count: Some(1),
-        base_array_layer: source.slice.layer, array_layer_count: Some(1), aspect: w::TextureAspect::DepthOnly,
+        base_array_layer: source.slice.layer, array_layer_count: Some(1), aspect: if stencil{w::TextureAspect::StencilOnly}else{w::TextureAspect::DepthOnly},
         ..Default::default() });
     let dst = view(&r.textures[&destination.slice.resource], &Attachment {
         resource: destination.slice.resource.clone(), mip: destination.slice.mip, layer: destination.slice.layer,
-        view_format: w::TextureFormat::R32Float });
+        view_format: format });
     let bg = device.create_bind_group(&w::BindGroupDescriptor { label: None, layout: &pipeline.get_bind_group_layout(0),
         entries: &[w::BindGroupEntry { binding: 0, resource: w::BindingResource::TextureView(&src) }] });
     let mut encoder = device.create_command_encoder(&Default::default());
     {
-        let mut pass = encoder.begin_render_pass(&w::RenderPassDescriptor { label: Some("native selected depth-to-R32 copy"),
+        let mut pass = encoder.begin_render_pass(&w::RenderPassDescriptor { label: Some("native selected depth/stencil conversion"),
             color_attachments: &[Some(w::RenderPassColorAttachment { view: &dst, depth_slice: None, resolve_target: None,
                 ops: w::Operations { load: w::LoadOp::Clear(w::Color::BLACK), store: w::StoreOp::Store } })],
             depth_stencil_attachment: None, timestamp_writes: None, occlusion_query_set: None, multiview_mask: None });
         pass.set_pipeline(&pipeline); pass.set_bind_group(0, &bg, &[]); pass.draw(0..3, 0..1);
     }
+    q.submit([encoder.finish()]);
+}
+// Byte-for-byte shader text from native Gpu::generate_mips.
+pub(crate) const GENERATE_MIP_WGSL: &str = "@group(0) @binding(0) var src: texture_2d<f32>;
+                 @group(0) @binding(1) var smp: sampler;
+                 @vertex fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4f { var p = array<vec2f, 3>(vec2f(-1, -1), vec2f(3, -1), vec2f(-1, 3)); return vec4f(p[i], 0, 1); }
+                 @fragment fn fs(@builtin(position) pos: vec4f) -> @location(0) vec4f {
+                   let dst = max(vec2f(1.0), floor(vec2f(textureDimensions(src, 0)) * 0.5));
+                   return textureSampleLevel(src, smp, pos.xy / dst, 0.0);
+                 }";
+fn generate_mip(device:&w::Device,q:&w::Queue,r:&Resources,source:&Version,destination:&Transition) {
+    let texture=&r.textures[&source.slice.resource]; let format=texture.format();
+    let module=device.create_shader_module(w::ShaderModuleDescriptor{label:Some("exact native mip shader"),source:w::ShaderSource::Wgsl(GENERATE_MIP_WGSL.into())});
+    let pipeline=device.create_render_pipeline(&w::RenderPipelineDescriptor{label:Some("native GenerateMips pass"),layout:None,
+        vertex:w::VertexState{module:&module,entry_point:Some("vs"),compilation_options:Default::default(),buffers:&[]},
+        primitive:Default::default(),depth_stencil:None,multisample:Default::default(),
+        fragment:Some(w::FragmentState{module:&module,entry_point:Some("fs"),compilation_options:Default::default(),targets:&[Some(w::ColorTargetState{format,blend:None,write_mask:w::ColorWrites::ALL})]}),multiview_mask:None,cache:None});
+    let src=view(texture,&Attachment{resource:source.slice.resource.clone(),mip:source.slice.mip,layer:source.slice.layer,view_format:format});
+    let dst=view(texture,&Attachment{resource:destination.slice.resource.clone(),mip:destination.slice.mip,layer:destination.slice.layer,view_format:format});
+    let sampler=device.create_sampler(&w::SamplerDescriptor{mag_filter:w::FilterMode::Linear,min_filter:w::FilterMode::Linear,..Default::default()});
+    let bg=device.create_bind_group(&w::BindGroupDescriptor{label:None,layout:&pipeline.get_bind_group_layout(0),entries:&[
+        w::BindGroupEntry{binding:0,resource:w::BindingResource::TextureView(&src)},w::BindGroupEntry{binding:1,resource:w::BindingResource::Sampler(&sampler)}]});
+    let mut encoder=device.create_command_encoder(&Default::default());
+    {let mut pass=encoder.begin_render_pass(&w::RenderPassDescriptor{label:Some("native selected mip"),color_attachments:&[Some(w::RenderPassColorAttachment{view:&dst,depth_slice:None,resolve_target:None,ops:w::Operations{load:w::LoadOp::Clear(w::Color::BLACK),store:w::StoreOp::Store}})],depth_stencil_attachment:None,timestamp_writes:None,occlusion_query_set:None,multiview_mask:None});
+        pass.set_pipeline(&pipeline);pass.set_bind_group(0,&bg,&[]);pass.draw(0..3,0..1);}
     q.submit([encoder.finish()]);
 }
 fn restore_depth(
@@ -835,7 +865,29 @@ pub fn run(input: &Input) -> Result<Output> {
                 value,
                 *view_format,
             ),
-            Command::DepthToColor { source, destination } => depth_to_color(&device, &q, &r, source, destination),
+            Command::GenerateMip {source,destination} => generate_mip(&device,&q,&r,source,destination),
+            Command::CopyRegion {sources,destinations,source_origin,destination_origin,extent} => {
+                let a=&sources[0].slice;let b=&destinations[0].slice;
+                let mut e=device.create_command_encoder(&Default::default());
+                e.copy_texture_to_texture(w::TexelCopyTextureInfo{texture:&r.textures[&a.resource],mip_level:a.mip,origin:w::Origin3d{x:source_origin[0],y:source_origin[1],z:a.layer},aspect:w::TextureAspect::All},
+                    w::TexelCopyTextureInfo{texture:&r.textures[&b.resource],mip_level:b.mip,origin:w::Origin3d{x:destination_origin[0],y:destination_origin[1],z:b.layer},aspect:w::TextureAspect::All},
+                    w::Extent3d{width:extent[0],height:extent[1],depth_or_array_layers:1});
+                q.submit([e.finish()]);
+            }
+            Command::DepthToColor { source, destination } => depth_stencil_to_color(&device, &q, &r, source, destination,false),
+            Command::StencilToColor { source,destination } => depth_stencil_to_color(&device,&q,&r,source,destination,true),
+            Command::OriginalOnly{operation_kind:kind,expected,..} => {
+                for ex in expected {let bytes=read(&device,&q,&r.textures[&ex.version.slice.resource],&ex.version.slice,input)?;let reference=input.data(&ex.blob)?;
+                    let count=bytes.iter().zip(reference).filter(|(a,b)|a!=b).count();
+                    checkpoint_comparisons.push(serde_json::json!({"command_index":command_index,"original_only_reference":kind,"replayed_guest_side_effects":false,"version":ex.version,"sha256":sha(&bytes),"expected_sha256":sha(reference),"different_bytes":count}));}
+            }
+            Command::FinishedEndpoint{hud_free_source,hud_world,depth_source,..} => {
+                for ex in [hud_free_source,hud_world,depth_source] {
+                    let bytes=read(&device,&q,&r.textures[&ex.version.slice.resource],&ex.version.slice,input)?;
+                    let reference=input.data(&ex.blob)?;let count=bytes.iter().zip(reference).filter(|(a,b)|a!=b).count();
+                    checkpoint_comparisons.push(serde_json::json!({"command_index":command_index,"finished_hud_free_endpoint":true,"version":ex.version,"sha256":sha(&bytes),"expected_sha256":sha(reference),"different_bytes":count}));
+                }
+            }
             Command::Checkpoint { expected } => {
                 for ex in expected {
                     let bytes = read(&device, &q, &r.textures[&ex.version.slice.resource], &ex.version.slice, input)?;
@@ -845,7 +897,7 @@ pub fn run(input: &Input) -> Result<Output> {
                         "sha256":sha(&bytes),"expected_sha256":sha(reference),"different_bytes":count}));
                 }
             }
-            Command::Draw { draw: d } => draw(&device, &q, &r, d)?,
+            Command::Draw { draw: d } | Command::ContextDraw {draw:d,..} => draw(&device, &q, &r, d)?,
             Command::Dispatch { dispatch: d } => dispatch(&device, &q, &r, d)?,
             Command::Copy {
                 source,
@@ -908,6 +960,6 @@ pub fn run(input: &Input) -> Result<Output> {
     let exact = comparisons.iter().chain(&checkpoint_comparisons).all(|v| v["different_bytes"] == 0);
     Ok(Output {
         aspect_bytes: output,
-        report: serde_json::json!({"schema":1,"gpu_executed":true,"manifest_sha256":input.manifest_sha256,"provenance":input.scene.provenance,"eye":input.scene.eye,"eye_scope":if matches!(input.scene.provenance,Provenance::NativeGraph{..}) {"world_raster_anchor_compute_unattributed"} else {"scene_identity_as_declared"},"initial_subresources_byte_exact":initial_checks,"uniform_clear_initial_subresources_byte_exact":clear_reference_checks,"all_expected_bytes_equal":exact,"comparisons":comparisons,"checkpoint_comparisons":checkpoint_comparisons,"depth_to_color_count":input.scene.commands.iter().filter(|c|matches!(c,Command::DepthToColor{..})).count(),"heterogeneous_pipeline_count":r.pipelines.len(),"compute_pipeline_count":r.compute_pipelines.len(),"dispatch_count":input.scene.commands.iter().filter(|c| matches!(c, Command::Dispatch { .. })).count(),"command_count":input.scene.commands.len(),"targets_have_resolution_independent_initialization":input.targets_have_resolution_independent_initialization,"finished_frame_or_density_accepted":false,"scope":"Generic original-density ordered replay. External dependency and complete finished-frame closure remain separate gates.","adapter":format!("{:?}",adapter.get_info())}),
+        report: serde_json::json!({"schema":1,"gpu_executed":true,"manifest_sha256":input.manifest_sha256,"provenance":input.scene.provenance,"eye":input.scene.eye,"eye_scope":if matches!(input.scene.provenance,Provenance::NativeFinishedGraph{..}) {"qualified_endpoint_context_draws_and_compute_unattributed"} else if matches!(input.scene.provenance,Provenance::NativeGraph{..}) {"world_raster_anchor_compute_unattributed"} else {"scene_identity_as_declared"},"initial_subresources_byte_exact":initial_checks,"uniform_clear_initial_subresources_byte_exact":clear_reference_checks,"all_expected_bytes_equal":exact,"comparisons":comparisons,"checkpoint_comparisons":checkpoint_comparisons,"depth_to_color_count":input.scene.commands.iter().filter(|c|matches!(c,Command::DepthToColor{..})).count(),"stencil_to_color_count":input.scene.commands.iter().filter(|c|matches!(c,Command::StencilToColor{..})).count(),"heterogeneous_pipeline_count":r.pipelines.len(),"compute_pipeline_count":r.compute_pipelines.len(),"dispatch_count":input.scene.commands.iter().filter(|c| matches!(c, Command::Dispatch { .. })).count(),"command_count":input.scene.commands.len(),"targets_have_resolution_independent_initialization":input.targets_have_resolution_independent_initialization,"finished_hud_free_graph_byte_parity":exact&&matches!(input.scene.provenance,Provenance::NativeFinishedGraph{..}),"original_only_event_count":input.scene.commands.iter().filter(|c|matches!(c,Command::OriginalOnly{..})).count(),"original_only_side_effects_replayed":false,"finished_frame_or_density_accepted":false,"scope":"Generic original-density ordered replay. External dependency and complete finished-frame closure remain separate gates.","adapter":format!("{:?}",adapter.get_info())}),
     })
 }
