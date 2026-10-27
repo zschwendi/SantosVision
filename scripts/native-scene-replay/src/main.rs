@@ -2,6 +2,10 @@ use native_scene_replay::{execute, import, require, sha, validate::Input, Result
 use std::{fs, path::Path};
 fn main() -> Result<()> {
     let a = std::env::args().collect::<Vec<_>>();
+    if a.len() == 3 && a[1] == "make-compute" {
+        native_scene_replay::compute_fixture::make(Path::new(&a[2]))?;
+        return Ok(());
+    }
     if a.len() == 3 && a[1] == "make-volume" {
         native_scene_replay::volume_fixture::make(Path::new(&a[2]))?;
         return Ok(());
@@ -12,10 +16,15 @@ fn main() -> Result<()> {
     }
     require(
         a.len() == 4,
-        "usage: native-scene-replay import-legacy|import-native|validate|run INPUT NEW_OUTPUT",
+        "usage: native-scene-replay import-legacy|import-native|import-native-compute|validate|run INPUT NEW_OUTPUT",
     )?;
     let input = Path::new(&a[2]);
     let out = Path::new(&a[3]);
+    if a[1] == "import-native-compute" {
+        native_scene_replay::compute_import::native(input, out)?;
+        println!("Imported isolated original compute dispatch; no finished-world or eye claim");
+        return Ok(());
+    }
     if a[1] == "import-native" {
         native_scene_replay::native_import::native(input, out)?;
         println!("Imported native complete target interval; original-density parity only");

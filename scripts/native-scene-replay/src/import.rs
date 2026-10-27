@@ -140,6 +140,7 @@ pub fn legacy(path: &Path, out: &Path) -> Result<()> {
         buffers: vec![],
         blobs: vec![],
         pipelines: vec![],
+        compute_pipelines: vec![],
         commands: vec![],
         expected: vec![],
         original_submission_completed: true,

@@ -1,7 +1,7 @@
 # Generic immutable native scene replay
 
 This standalone Mac Metal consumer executes an ordered scene of original clears,
-heterogeneous draws and full color copies on persistent attachments. It is the
+heterogeneous draws, supported compute dispatches and full color copies on persistent attachments. It is the
 consumer seam for a complete captured source pass. It does **not** supply a complete
 game capture, establish finished-frame dependency closure, increase game resolution,
 or change the production renderer.
@@ -26,25 +26,30 @@ schemas. `fixture.rs` authors a small independent API oracle.
   feedback fail CPU admission, with legal read-only depth/stencil distinguished.
 - Native scenes require one identical eye/epoch/camera/request/head identity on
   every draw, completed original submission, no omitted commands and zero original
-  GPU errors. Pipeline shader text must be the **actual final compiled variant**,
+  GPU errors. An isolated native compute capture has no eye attribution; its
+  preceding world observation cannot certify a later raster scene. Pipeline shader text must be the **actual final compiled variant**,
   not a guest program before rewrites. Root's native shader registry supplies the
-  future effective shader references; the legacy adapter accepts only its pinned
+  effective shader references; the legacy adapter accepts only its pinned
   previously reviewed shader families.
 - Producer ledger `VersionRef { allocation_id, content_version, subresource }`
-  maps directly to texture allocation identity and IR `Version`. A future native
-  adapter must reject missing/evicted predecessors, allocations, inputs or disabled
-  ledgers; preserve clear bits; and resolve the exact final shader references.
-  Debug-format spellings require an explicit enum mapping. This crate does not yet
-  claim that adapter or the 997-draw historical span has been captured.
+  maps directly to texture allocation identity and IR `Version`. Native adapters
+  preserve captured initial contents when earlier producers are unavailable;
+  they do not infer a closed dependency graph. Direct clear promotion requires
+  exact native provenance and whole-image byte verification. The complete actual
+  1,277-draw interval and a separate actual compute dispatch have been replayed;
+  they are different captures, not one joined frame.
 
 Supported runtime behavior includes vertex/fragment sampled textures, exact static
 uniform/read-only storage buffer bindings, samplers, optional vertex slots,
 indexed/nonindexed/instanced draws, color write masks and blends, depth/stencil,
 viewport/scissor, sRGB views, 2D arrays/cubes and selected mip/layer views, BC raw
 mips, ordered clears and equal-format full-color copies. Inputs are capped at
-256 MiB and persistent allocation estimates/readbacks are also bounded. No compute,
-queries, storage writes, dynamic binding offsets, binding arrays, multisampling,
-3D textures, indirect draws, depth copies or omitted operations are silently
+256 MiB and persistent allocation estimates/readbacks are also bounded. Selected
+D1/D3 sampled textures retain their real dimensions. Compute supports readonly
+buffers and distinct write-only D2 color storage views, with one selected mip/layer
+per output and explicit before/after versions. Queries, writable storage buffers,
+other storage access modes, dynamic binding offsets, binding arrays, multisampling,
+indirect draws, depth copies or omitted operations are not silently
 emulated. These require explicit new IR/executor support before admission.
 
 The executor splits draws into serial Load/Store passes. This preserves the tested
@@ -105,3 +110,23 @@ Schema 4 uses `import-native`, with real native allocation/version identities an
 actual final shader sources. See [NATIVE-TARGET-SPAN.md](NATIVE-TARGET-SPAN.md) for
 its strict producer contract, emitted draw arguments, selected views and complete
 interval requirements. Imported target bytes remain original-density evidence.
+
+## Native compute and compute-to-raster oracle
+
+`import-native-compute` admits schema 5 with an exact successful final module,
+actual dispatch dimensions, resolved binding layouts and immutable selected
+resource ranges. It preserves the original capture as `native-capture.json` and
+uses the same hash-bound `native-import.json` contract as the wrapper. Unknown
+operations, writable buffers, unsupported views, sampled/output parent aliases,
+stale or reused native versions, and missing output transitions reject admission.
+The original output's initial bytes are required even for a write-only shader,
+because a shader may preserve unwritten texels. Workgroups are bounded to 65,535
+per axis and 1,048,576 total.
+
+`make-compute` authors an independent 13×7 CPU oracle. A compute shader reads a
+sampled image and offset-256 uniform, writes mip1/layer1, preserves a border and
+unselected subresources, then a raster pass consumes that exact produced version.
+Five final comparisons and all six initial subresources match on Metal. A separate
+actual game dispatch also matches all 115,200 RGBA16Float output bytes; see
+`docs/NATIVE-COMPUTE-REPLAY-20261026.md` in the checkout for identities and limits.
+Neither result establishes a complete finished frame or permits a density change.

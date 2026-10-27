@@ -171,7 +171,7 @@ fn draw(pipeline: &str) -> Draw {
 pub fn make(out: &Path) -> Result<()> {
     let mut scene = Scene { schema: 1,
         provenance: Provenance::Authored { description: "8x4 independent CPU oracle: D1 vertex/fragment texel loads, selected D3 mip whole-volume restore, linear3D eight-voxel blend, then valid depth-only/no-color pass. No native game proof.".into() },
-        eye: None, blobs: vec![], textures: vec![], buffers: vec![], pipelines: vec![], commands: vec![], expected: vec![],
+        eye: None, blobs: vec![], textures: vec![], buffers: vec![], pipelines: vec![], compute_pipelines: vec![], commands: vec![], expected: vec![],
         original_submission_completed: true, original_gpu_errors: Some(0), omitted_commands: 0 };
     let mut files = BTreeMap::new();
     for (id, format, aspect) in [

@@ -14,10 +14,15 @@ struct Pipeline {
     gpu: w::RenderPipeline,
     layouts: Vec<w::BindGroupLayout>,
 }
+struct ComputePipeline {
+    gpu: w::ComputePipeline,
+    layouts: Vec<w::BindGroupLayout>,
+}
 struct Resources {
     textures: BTreeMap<String, w::Texture>,
     buffers: BTreeMap<String, w::Buffer>,
     pipelines: BTreeMap<String, Pipeline>,
+    compute_pipelines: BTreeMap<String, ComputePipeline>,
 }
 pub struct Output {
     pub aspect_bytes: Vec<Vec<u8>>,
@@ -328,6 +333,81 @@ enum Bound {
     Texture(w::TextureView),
     Sampler(w::Sampler),
 }
+fn compile_compute(device: &w::Device, p: &crate::model::ComputePipeline) -> ComputePipeline {
+    let layouts = p.layouts.iter().map(|l| device.create_bind_group_layout(
+        &w::BindGroupLayoutDescriptor { label: None, entries: l })).collect::<Vec<_>>();
+    let pl = device.create_pipeline_layout(&w::PipelineLayoutDescriptor {
+        label: Some(&p.id), bind_group_layouts: &layouts.iter().map(Some).collect::<Vec<_>>(), immediate_size: 0 });
+    let shader = device.create_shader_module(w::ShaderModuleDescriptor {
+        label: Some("exact final compute variant"), source: w::ShaderSource::Wgsl(p.shader.wgsl.clone().into()) });
+    let gpu = device.create_compute_pipeline(&w::ComputePipelineDescriptor {
+        label: Some(&p.id), layout: Some(&pl), module: &shader, entry_point: Some(&p.shader.entry),
+        compilation_options: Default::default(), cache: None });
+    ComputePipeline { gpu, layouts }
+}
+fn dispatch(device: &w::Device, q: &w::Queue, r: &Resources, d: &Dispatch) -> Result<()> {
+    let pipe = &r.compute_pipelines[&d.pipeline];
+    let mut groups = Vec::new();
+    for (g, l) in pipe.layouts.iter().enumerate() {
+        let items = d
+            .bindings
+            .iter()
+            .filter(|b| b.group as usize == g)
+            .collect::<Vec<_>>();
+        let values = items
+            .iter()
+            .map(|b| match &b.value {
+                BindingValue::Buffer {
+                    buffer,
+                    offset,
+                    size,
+                } => Bound::Buffer(
+                    r.buffers[buffer].clone(),
+                    *offset,
+                    NonZeroU64::new(*size).unwrap(),
+                ),
+                BindingValue::Texture { texture, view, .. } => Bound::Texture(
+                    r.textures[texture].create_view(&view.map_label(|s| s.as_deref())),
+                ),
+                BindingValue::Sampler { descriptor } => {
+                    Bound::Sampler(device.create_sampler(&descriptor.map_label(|s| s.as_deref())))
+                }
+            })
+            .collect::<Vec<_>>();
+        let entries = items
+            .iter()
+            .zip(&values)
+            .map(|(b, v)| w::BindGroupEntry {
+                binding: b.binding,
+                resource: match v {
+                    Bound::Buffer(b, o, s) => w::BindingResource::Buffer(w::BufferBinding {
+                        buffer: b,
+                        offset: *o,
+                        size: Some(*s),
+                    }),
+                    Bound::Texture(t) => w::BindingResource::TextureView(t),
+                    Bound::Sampler(s) => w::BindingResource::Sampler(s),
+                },
+            })
+            .collect::<Vec<_>>();
+        groups.push(device.create_bind_group(&w::BindGroupDescriptor {
+            label: Some("immutable versioned compute inputs"),
+            layout: l,
+            entries: &entries,
+        }));
+    }
+    let mut e = device.create_command_encoder(&w::CommandEncoderDescriptor {
+        label: Some("ordered original compute dispatch") });
+    {
+        let mut pass = e.begin_compute_pass(&w::ComputePassDescriptor {
+            label: Some("persistent original compute resources"), timestamp_writes: None });
+        pass.set_pipeline(&pipe.gpu);
+        for (g, group) in groups.iter().enumerate() { pass.set_bind_group(g as u32, group, &[]); }
+        pass.dispatch_workgroups(d.workgroups[0], d.workgroups[1], d.workgroups[2]);
+    }
+    q.submit([e.finish()]);
+    Ok(())
+}
 fn draw(device: &w::Device, q: &w::Queue, r: &Resources, d: &Draw) -> Result<()> {
     let pipe = &r.pipelines[&d.pipeline];
     let mut groups = Vec::new();
@@ -578,6 +658,7 @@ pub fn run(input: &Input) -> Result<Output> {
         textures: BTreeMap::new(),
         buffers: BTreeMap::new(),
         pipelines: BTreeMap::new(),
+        compute_pipelines: BTreeMap::new(),
     };
     for t in &input.scene.textures {
         let d = &t.descriptor;
@@ -591,6 +672,20 @@ pub fn run(input: &Input) -> Result<Output> {
             )
         {
             usage |= w::TextureUsages::RENDER_ATTACHMENT;
+        }
+        let storage_bound = input.scene.commands.iter().any(|c| {
+            let Command::Dispatch { dispatch } = c else { return false; };
+            let p = input.scene.compute_pipelines.iter().find(|p| p.id == dispatch.pipeline).unwrap();
+            dispatch.bindings.iter().any(|b| {
+                matches!(&b.value, BindingValue::Texture { texture, .. } if texture == &t.id)
+                    && p.layouts.get(b.group as usize).and_then(|l| l.iter().find(|e| e.binding == b.binding))
+                        .is_some_and(|e| matches!(e.ty, w::BindingType::StorageTexture { .. }))
+            })
+        });
+        if storage_bound {
+            require(adapter.get_texture_format_features(d.format).allowed_usages.contains(w::TextureUsages::STORAGE_BINDING),
+                "adapter does not support captured storage format")?;
+            usage |= w::TextureUsages::STORAGE_BINDING;
         }
         let tex = device.create_texture(&w::TextureDescriptor {
             label: Some(&t.id),
@@ -688,6 +783,9 @@ pub fn run(input: &Input) -> Result<Output> {
     for p in &input.scene.pipelines {
         r.pipelines.insert(p.id.clone(), compile(&device, p));
     }
+    for p in &input.scene.compute_pipelines {
+        r.compute_pipelines.insert(p.id.clone(), compile_compute(&device, p));
+    }
     for c in &input.scene.commands {
         match c {
             Command::Clear {
@@ -703,6 +801,7 @@ pub fn run(input: &Input) -> Result<Output> {
                 *view_format,
             ),
             Command::Draw { draw: d } => draw(&device, &q, &r, d)?,
+            Command::Dispatch { dispatch: d } => dispatch(&device, &q, &r, d)?,
             Command::Copy {
                 source,
                 destination,
@@ -764,6 +863,6 @@ pub fn run(input: &Input) -> Result<Output> {
     let exact = comparisons.iter().all(|v| v["different_bytes"] == 0);
     Ok(Output {
         aspect_bytes: output,
-        report: serde_json::json!({"schema":1,"gpu_executed":true,"manifest_sha256":input.manifest_sha256,"provenance":input.scene.provenance,"eye":input.scene.eye,"initial_subresources_byte_exact":initial_checks,"uniform_clear_initial_subresources_byte_exact":clear_reference_checks,"all_expected_bytes_equal":exact,"comparisons":comparisons,"heterogeneous_pipeline_count":r.pipelines.len(),"command_count":input.scene.commands.len(),"targets_have_resolution_independent_initialization":input.targets_have_resolution_independent_initialization,"finished_frame_or_density_accepted":false,"scope":"Generic original-density ordered replay. External dependency and complete finished-frame closure remain separate gates.","adapter":format!("{:?}",adapter.get_info())}),
+        report: serde_json::json!({"schema":1,"gpu_executed":true,"manifest_sha256":input.manifest_sha256,"provenance":input.scene.provenance,"eye":input.scene.eye,"initial_subresources_byte_exact":initial_checks,"uniform_clear_initial_subresources_byte_exact":clear_reference_checks,"all_expected_bytes_equal":exact,"comparisons":comparisons,"heterogeneous_pipeline_count":r.pipelines.len(),"compute_pipeline_count":r.compute_pipelines.len(),"dispatch_count":input.scene.commands.iter().filter(|c| matches!(c, Command::Dispatch { .. })).count(),"command_count":input.scene.commands.len(),"targets_have_resolution_independent_initialization":input.targets_have_resolution_independent_initialization,"finished_frame_or_density_accepted":false,"scope":"Generic original-density ordered replay. External dependency and complete finished-frame closure remain separate gates.","adapter":format!("{:?}",adapter.get_info())}),
     })
 }

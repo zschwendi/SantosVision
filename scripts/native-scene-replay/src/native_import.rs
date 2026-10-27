@@ -471,6 +471,7 @@ fn convert(m: &Value, source_hash: String) -> Result<Scene> {
         textures: vec![],
         buffers: vec![],
         pipelines: vec![],
+        compute_pipelines: vec![],
         commands: vec![],
         expected: vec![],
         original_submission_completed: true,

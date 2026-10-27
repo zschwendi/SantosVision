@@ -163,6 +163,20 @@ pub struct Pipeline {
     pub targets: Vec<Option<ColorTargetState>>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ComputePipeline {
+    pub id: String,
+    pub shader: Shader,
+    pub layouts: Vec<Vec<BindGroupLayoutEntry>>,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Dispatch {
+    pub eye: Option<EyeIdentity>,
+    pub pipeline: String,
+    pub bindings: Vec<Binding>,
+    pub workgroups: [u32; 3],
+    pub writes: Vec<Transition>,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum BindingValue {
     Buffer {
@@ -254,6 +268,9 @@ pub enum Command {
     Draw {
         draw: Draw,
     },
+    Dispatch {
+        dispatch: Dispatch,
+    },
     Copy {
         source: Version,
         destination: Transition,
@@ -273,6 +290,8 @@ pub struct Scene {
     pub textures: Vec<Texture>,
     pub buffers: Vec<Buffer>,
     pub pipelines: Vec<Pipeline>,
+    #[serde(default)]
+    pub compute_pipelines: Vec<ComputePipeline>,
     pub commands: Vec<Command>,
     pub expected: Vec<Expected>,
     pub original_submission_completed: bool,

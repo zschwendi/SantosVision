@@ -114,7 +114,8 @@ impl Input {
                 && s.commands.len() <= 8192
                 && s.textures.len() <= 4096
                 && s.buffers.len() <= 8192
-                && s.pipelines.len() <= 4096,
+                && s.pipelines.len() <= 4096
+                && s.compute_pipelines.len() <= 4096,
             "scene bounds",
         )?;
         require(
@@ -124,13 +125,16 @@ impl Input {
             "original closure missing",
         )?;
         let native = matches!(s.provenance, Provenance::Native { .. });
+        let isolated_compute = !s.commands.is_empty()
+            && s.pipelines.is_empty()
+            && s.commands.iter().all(|c| matches!(c, Command::Dispatch { .. }));
         if native {
             require(
                 s.original_gpu_errors == Some(0),
                 "native original GPU errors unobserved",
             )?;
             require(
-                s.eye.as_ref().is_some_and(|e| {
+                (isolated_compute && s.eye.is_none()) || s.eye.as_ref().is_some_and(|e| {
                     e.eye < 2 && e.epoch > 0 && e.camera > 0 && e.request > 0 && e.head > 0
                 }),
                 "native same-eye identity",
@@ -220,6 +224,7 @@ impl Input {
                             | TextureFormat::Bgra8UnormSrgb
                             | TextureFormat::Rgba8Unorm
                             | TextureFormat::Rgba8UnormSrgb
+                            | TextureFormat::Rgba32Float
                             | TextureFormat::Rgba16Float
                             | TextureFormat::R32Float
                             | TextureFormat::Depth32Float
@@ -360,6 +365,34 @@ impl Input {
                 }
             }
         }
+        for p in &s.compute_pipelines {
+            require(pids.insert(&p.id) && p.layouts.len() <= 4, "compute pipeline bounds/identity")?;
+            let x = &p.shader;
+            shader_bytes += x.wgsl.len();
+            require(shader_bytes <= 8 << 20 && x.exact_final_variant
+                && sha(x.wgsl.as_bytes()) == x.sha256 && !x.entry.is_empty(),
+                "final compute shader variant source contract")?;
+            for l in &p.layouts {
+                require(l.len() <= 256, "compute layout entry bound")?;
+                let mut slots = BTreeSet::new();
+                for e in l {
+                    require(slots.insert(e.binding) && e.count.is_none()
+                        && e.visibility == ShaderStages::COMPUTE, "compute layout slot/visibility")?;
+                    let supported = match e.ty {
+                        BindingType::Buffer { ty: BufferBindingType::Uniform
+                            | BufferBindingType::Storage { read_only: true }, has_dynamic_offset: false, .. }
+                        | BindingType::Texture { multisampled: false, .. }
+                        | BindingType::Sampler(_) => true,
+                        BindingType::StorageTexture { access: StorageTextureAccess::WriteOnly,
+                            format, view_dimension: TextureViewDimension::D2 } => matches!(format,
+                                TextureFormat::Rgba32Float | TextureFormat::Rgba16Float
+                                | TextureFormat::Rgba8Unorm | TextureFormat::R32Float),
+                        _ => false,
+                    };
+                    require(supported, "unsupported compute layout/access/format")?;
+                }
+            }
+        }
         let mut draws = 0;
         // Immutable input snapshots can have an independent native version
         // namespace (e.g. dummy material allocations). Only ordered attachment
@@ -404,6 +437,13 @@ impl Input {
                     )?;
                     advance(destination, &mut versions, &mut last_write)?;
                     initialized.insert(destination.slice.clone());
+                }
+                Command::Dispatch { dispatch } => {
+                    self.validate_dispatch(dispatch, &versions, &initialized)?;
+                    for t in &dispatch.writes {
+                        require(!native || !native_initial_versions.contains(&t.after), "native compute reused initial content version")?;
+                        advance(t, &mut versions, &mut last_write)?;
+                    }
                 }
                 Command::Draw { draw: d } => {
                     draws += 1;
@@ -749,6 +789,98 @@ impl Input {
         self.targets_have_resolution_independent_initialization = independent;
         Ok(())
     }
+    fn validate_dispatch(
+        &self,
+        d: &Dispatch,
+        versions: &BTreeMap<Slice, u64>,
+        initialized: &BTreeSet<Slice>,
+    ) -> Result<()> {
+        require(d.eye == self.scene.eye, "compute eye changed")?;
+        require(d.workgroups.iter().all(|n| *n > 0 && *n <= 65535)
+            && d.workgroups.iter().try_fold(1u64, |n, v| n.checked_mul(*v as u64)).is_some_and(|n| n <= 1 << 20),
+            "dispatch workgroup bounds")?;
+        let p = self.scene.compute_pipelines.iter().find(|p| p.id == d.pipeline)
+            .ok_or("missing compute pipeline")?;
+        let mut bound = BTreeSet::new();
+        let mut sampled = BTreeSet::new();
+        let mut storage = BTreeSet::new();
+        let mut writable = BTreeSet::new();
+        for b in &d.bindings {
+            require(bound.insert((b.group, b.binding)), "duplicate compute binding")?;
+            let e = p.layouts.get(b.group as usize)
+                .and_then(|l| l.iter().find(|e| e.binding == b.binding))
+                .ok_or("unexpected compute binding")?;
+            match &b.value {
+                BindingValue::Buffer { buffer, offset, size } => {
+                    let BindingType::Buffer { min_binding_size, .. } = e.ty else {
+                        return Err("compute buffer layout".into());
+                    };
+                    require(*size > 0 && *size % 4 == 0 && *offset % 256 == 0
+                        && min_binding_size.is_none_or(|n| *size >= n.get())
+                        && offset.checked_add(*size).is_some_and(|n| self.buffer(buffer)
+                            .and_then(|b| self.data(&b.blob)).is_ok_and(|b| n <= b.len() as u64)),
+                        "compute buffer bound range/alignment")?;
+                }
+                BindingValue::Sampler { descriptor } => {
+                    let BindingType::Sampler(kind) = e.ty else { return Err("compute sampler layout".into()); };
+                    require((kind == SamplerBindingType::Comparison) == descriptor.compare.is_some(),
+                        "compute comparison sampler mismatch")?;
+                    if kind == SamplerBindingType::NonFiltering {
+                        require(descriptor.mag_filter == FilterMode::Nearest
+                            && descriptor.min_filter == FilterMode::Nearest
+                            && descriptor.mipmap_filter == MipmapFilterMode::Nearest
+                            && descriptor.anisotropy_clamp == 1, "compute nonfiltering sampler mismatch")?;
+                    }
+                }
+                BindingValue::Texture { texture, view, versions: reads } => {
+                    let t = self.texture(texture)?;
+                    let selected = self.view_slices(t, view)?;
+                    match e.ty {
+                        BindingType::Texture { sample_type, view_dimension, multisampled: false } => {
+                            require(view_dimension == resolved_view_dimension(&t.descriptor, view)
+                                && view.usage.is_none_or(|u| u.contains(TextureUsages::TEXTURE_BINDING)),
+                                "compute sampled view dimension")?;
+                            let format = view.format.unwrap_or(t.descriptor.format);
+                            let actual = format.sample_type(Some(view.aspect), Some(Features::FLOAT32_FILTERABLE));
+                            require(actual == Some(sample_type)
+                                || matches!((actual, sample_type), (Some(TextureSampleType::Float { .. }), TextureSampleType::Float { filterable: false })),
+                                "compute sampled view type")?;
+                            sampled.insert(texture.clone());
+                        }
+                        BindingType::StorageTexture { access: StorageTextureAccess::WriteOnly,
+                            format, view_dimension: TextureViewDimension::D2 } => {
+                            require(t.mutable_target && t.descriptor.dimension == TextureDimension::D2
+                                && resolved_view_dimension(&t.descriptor, view) == TextureViewDimension::D2
+                                && selected.len() == 1 && view.aspect == TextureAspect::All
+                                && view.usage.is_none_or(|u| u.contains(TextureUsages::STORAGE_BINDING))
+                                && view.format.unwrap_or(t.descriptor.format) == format
+                                && t.descriptor.format == format && storage.insert(texture.clone()),
+                                "compute storage view/duplicate allocation")?;
+                            for s in &selected {
+                                require(s.aspect == Aspect::Color && writable.insert(s.clone()), "compute storage aspect")?;
+                            }
+                        }
+                        _ => return Err("unsupported compute texture binding".into()),
+                    }
+                    require(reads.len() == selected.len(), "compute view versions incomplete")?;
+                    let mut observed = BTreeSet::new();
+                    for r in reads {
+                        require(selected.contains(&r.slice) && observed.insert(r.slice.clone()), "compute view version mismatch")?;
+                        // Even a write-only shader can preserve texels; full original initialization is required.
+                        check_version(r, versions, initialized)?;
+                    }
+                }
+            }
+        }
+        require(sampled.is_disjoint(&storage), "compute sampled/storage allocation alias")?;
+        for (g, l) in p.layouts.iter().enumerate() {
+            for e in l { require(bound.contains(&(g as u32, e.binding)), "required compute binding absent")?; }
+        }
+        let writes = d.writes.iter().map(|w| w.slice.clone()).collect::<BTreeSet<_>>();
+        require(!writable.is_empty() && writes.len() == d.writes.len() && writes == writable,
+            "compute storage writes missing/extraneous/duplicate")?;
+        Ok(())
+    }
     pub fn attachment(
         &self,
         a: &Attachment,
@@ -939,6 +1071,109 @@ pub fn written_slices(d: &Draw, p: &Pipeline) -> BTreeSet<Slice> {
 mod tests {
     use super::*;
     #[test]
+    fn compute_binding_versions_writes_and_dispatch_boundaries() -> Result<()> {
+        let dir = std::env::temp_dir().join(format!("compute-admission-{}", std::process::id()));
+        crate::compute_fixture::make(&dir)?;
+        let base = Input::load(&dir.join("scene.json"))?;
+        fn dispatch(s: &mut Scene) -> &mut Dispatch {
+            match &mut s.commands[0] { Command::Dispatch { dispatch } => dispatch, _ => unreachable!() }
+        }
+        let reject = |name: &str, change: &dyn Fn(&mut Scene)| -> Result<()> {
+            let mut i = Input { scene: base.scene.clone(), bytes: base.bytes.clone(),
+                manifest_sha256: base.manifest_sha256.clone(), targets_have_resolution_independent_initialization: true };
+            change(&mut i.scene);
+            assert!(i.validate().is_err(), "accepted {name}");
+            Ok(())
+        };
+        reject("zero workgroups", &|s| dispatch(s).workgroups[0] = 0)?;
+        reject("oversized axis", &|s| dispatch(s).workgroups[0] = 65536)?;
+        reject("oversized total dispatch", &|s| dispatch(s).workgroups = [65535, 65535, 1])?;
+        reject("missing compute pipeline", &|s| dispatch(s).pipeline = "absent".into())?;
+        reject("changed shader hash", &|s| s.compute_pipelines[0].shader.wgsl.push(' '))?;
+        reject("nonfinal shader", &|s| s.compute_pipelines[0].shader.exact_final_variant = false)?;
+        reject("wrong stage visibility", &|s| s.compute_pipelines[0].layouts[0][0].visibility = ShaderStages::FRAGMENT)?;
+        reject("writable storage buffer", &|s| s.compute_pipelines[0].layouts[0][1].ty = BindingType::Buffer {
+            ty: BufferBindingType::Storage { read_only: false }, has_dynamic_offset: false, min_binding_size: None })?;
+        reject("dynamic buffer", &|s| s.compute_pipelines[0].layouts[0][1].ty = BindingType::Buffer {
+            ty: BufferBindingType::Uniform, has_dynamic_offset: true, min_binding_size: None })?;
+        reject("readwrite storage texture", &|s| s.compute_pipelines[0].layouts[0][2].ty = BindingType::StorageTexture {
+            access: StorageTextureAccess::ReadWrite, format: TextureFormat::Rgba32Float, view_dimension: TextureViewDimension::D2 })?;
+        reject("unsupported storage dimension", &|s| s.compute_pipelines[0].layouts[0][2].ty = BindingType::StorageTexture {
+            access: StorageTextureAccess::WriteOnly, format: TextureFormat::Rgba32Float, view_dimension: TextureViewDimension::D3 })?;
+        reject("missing binding", &|s| { dispatch(s).bindings.pop(); })?;
+        reject("duplicate binding", &|s| { let b = dispatch(s).bindings[0].clone(); dispatch(s).bindings.push(b); })?;
+        reject("unaligned binding offset", &|s| if let BindingValue::Buffer { offset, .. } = &mut dispatch(s).bindings[1].value { *offset = 1; })?;
+        reject("outside immutable range", &|s| if let BindingValue::Buffer { size, .. } = &mut dispatch(s).bindings[1].value { *size = 32; })?;
+        reject("less than minimum binding size", &|s| if let BindingValue::Buffer { size, .. } = &mut dispatch(s).bindings[1].value { *size = 4; })?;
+        reject("stale source version", &|s| if let BindingValue::Texture { versions, .. } = &mut dispatch(s).bindings[0].value { versions[0].content_version = 0; })?;
+        reject("missing output before version", &|s| if let BindingValue::Texture { versions, .. } = &mut dispatch(s).bindings[2].value { versions.clear(); })?;
+        reject("multiple output mips", &|s| if let BindingValue::Texture { view, .. } = &mut dispatch(s).bindings[2].value { view.base_mip_level = 0; view.mip_level_count = Some(2); })?;
+        reject("output view usage incompatible", &|s| if let BindingValue::Texture { view, .. } = &mut dispatch(s).bindings[2].value { view.usage = Some(TextureUsages::TEXTURE_BINDING); })?;
+        reject("sampled-output alias", &|s| { let output = dispatch(s).bindings[2].value.clone(); dispatch(s).bindings[0].value = output; })?;
+        reject("unknown output initial bytes", &|s| s.textures[1].initial[3].origin = Initial::Unknown { reason: "unretained".into() })?;
+        reject("immutable storage output", &|s| s.textures[1].mutable_target = false)?;
+        reject("missing transition", &|s| dispatch(s).writes.clear())?;
+        reject("extraneous transition", &|s| { let mut x = dispatch(s).writes[0].clone(); x.slice.resource = "compute-source".into(); dispatch(s).writes.push(x); })?;
+        reject("duplicate transition", &|s| { let x = dispatch(s).writes[0].clone(); dispatch(s).writes.push(x); })?;
+        reject("stale transition", &|s| dispatch(s).writes[0].before = 0)?;
+        reject("nonadvancing transition", &|s| dispatch(s).writes[0].after = 1)?;
+        reject("stale following raster", &|s| if let Command::Draw { draw } = &mut s.commands[1] {
+            if let BindingValue::Texture { versions, .. } = &mut draw.bindings[0].value { versions[0].content_version = 1; }
+        })?;
+        reject("eye attribution changed", &|s| dispatch(s).eye = Some(EyeIdentity { epoch: 1, camera: 1, request: 1, head: 1, eye: 0 }))?;
+        // Older raster manifests remain readable with the new field absent.
+        let mut legacy = serde_json::to_value(&base.scene)?;
+        legacy.as_object_mut().unwrap().remove("compute_pipelines");
+        assert!(serde_json::from_value::<Scene>(legacy)?.compute_pipelines.is_empty());
+        fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+    #[test]
+    fn native_unattributed_compute_never_establishes_raster_eye() -> Result<()> {
+        let dir = std::env::temp_dir().join(format!("native-compute-admission-{}", std::process::id()));
+        crate::compute_fixture::make(&dir)?;
+        let mut input = Input::load(&dir.join("scene.json"))?;
+        input.scene.provenance = Provenance::Native { source_sha256: "0".repeat(64) };
+        input.scene.pipelines.clear();
+        input.scene.commands.truncate(1);
+        input.scene.expected.retain(|e| e.version.slice.resource == "compute-storage");
+        let mut versions = BTreeMap::new();
+        let mut generation = 0;
+        for (n, t) in input.scene.textures.iter_mut().enumerate() {
+            t.native_allocation_id = Some(n as u64 + 1);
+            for i in &mut t.initial {
+                generation += 1; i.content_version = generation;
+                versions.insert(Slice { resource: t.id.clone(), mip: i.mip, layer: i.layer, aspect: i.aspect.clone() }, generation);
+            }
+        }
+        input.scene.buffers[0].native_allocation_id = Some(100);
+        if let Command::Dispatch { dispatch } = &mut input.scene.commands[0] {
+            for b in &mut dispatch.bindings {
+                if let BindingValue::Texture { versions: refs, .. } = &mut b.value {
+                    for r in refs { r.content_version = versions[&r.slice]; }
+                }
+            }
+            for t in &mut dispatch.writes { t.before = versions[&t.slice]; generation += 1; t.after = generation; versions.insert(t.slice.clone(), generation); }
+        }
+        for e in &mut input.scene.expected { e.version.content_version = versions[&e.version.slice]; }
+        input.validate()?;
+        assert!(input.scene.eye.is_none());
+        let prior_after = if let Command::Dispatch { dispatch } = &mut input.scene.commands[0] {
+            let old = dispatch.writes[0].after;
+            dispatch.writes[0].after = generation - 1;
+            old
+        } else { unreachable!() };
+        assert!(input.validate().unwrap_err().to_string().contains("native compute reused initial content version"));
+        if let Command::Dispatch { dispatch } = &mut input.scene.commands[0] { dispatch.writes[0].after = prior_after; }
+
+        input.scene.commands.push(Command::Clear { transition: Transition { slice: input.scene.expected[0].version.slice.clone(),
+            before: 1, after: 100 }, value: ClearValue::Color { rgba_bits: [0; 4] }, view_format: TextureFormat::Rgba32Float });
+        assert!(input.validate().unwrap_err().to_string().contains("native same-eye identity"));
+        fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[test]
     fn clear_reference_is_optional_but_has_exact_original_extent() -> Result<()> {
         let origin = Initial::UniformClear {
             value: ClearValue::Color { rgba_bits: [0; 4] },
@@ -1098,6 +1333,7 @@ mod tests {
                 textures: vec![],
                 buffers: vec![],
                 pipelines: vec![],
+                compute_pipelines: vec![],
                 commands: vec![],
                 expected: vec![],
                 original_submission_completed: true,
