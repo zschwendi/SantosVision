@@ -83,6 +83,29 @@ class RunnerBoundaries(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "selected kind"):
             runner.validate_capture(p, "color-null")
 
+    def test_compute_requires_one_actual_dispatch_exact_sources_and_complete_gpu_closure(self):
+        p, value = self.color_null_capture()
+        value.update(schema=5, kind="native_compute_dispatch", dispatch={"workgroups": [40, 23, 1]},
+                     effective_shader_sources={"complete": True})
+        del value["draw"]
+        del value["closure"]["single_original_draw"]
+        value["closure"]["single_original_dispatch"] = True
+        (p / "capture.json").write_text(json.dumps(value))
+        self.assertTrue(runner.validate_capture(p, "compute")["byte_admission_passed"])
+        with self.assertRaises(ValueError):
+            runner.validate_capture(p, "target-span")
+        invalid = []
+        for key, replacement in [("dispatch", None), ("draw", {}), ("draws", []),
+                                 ("effective_shader_sources", {"complete": False})]:
+            bad = copy.deepcopy(value); bad[key] = replacement; invalid.append(bad)
+        for key, replacement in [("single_original_dispatch", False), ("queries_inactive", False),
+                                 ("gpu_errors", 1), ("gpu_errors", False), ("natural_submission_completed", False)]:
+            bad = copy.deepcopy(value); bad["closure"][key] = replacement; invalid.append(bad)
+        for bad in invalid:
+            (p / "capture.json").write_text(json.dumps(bad))
+            with self.assertRaises(ValueError):
+                runner.validate_capture(p, "compute")
+
     def test_complete_target_interval_requires_every_boundary_and_exact_sources(self):
         p, value = self.capture()
         value.update(schema=4, kind="native_target_span", effective_shader_sources={"complete": True})

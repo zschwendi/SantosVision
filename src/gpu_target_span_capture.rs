@@ -35,7 +35,7 @@ fn advance_captured_revision<K:Eq+std::hash::Hash+Clone>(
     *value=value.saturating_add(1);
 }
 
-fn subresource_plan(name:String,t:&Texture,mip:u32,layer:u32,aspect:TextureAspect)->Result<Plan,String> {
+pub(super) fn subresource_plan(name:String,t:&Texture,mip:u32,layer:u32,aspect:TextureAspect)->Result<Plan,String> {
     if t.sample_count()!=1 || mip>=t.mip_level_count()
         || (t.dimension()!=TextureDimension::D2 && layer!=0)
         || layer>=t.depth_or_array_layers() || !t.usage().contains(TextureUsages::COPY_SRC) {
@@ -54,7 +54,7 @@ fn subresource_plan(name:String,t:&Texture,mip:u32,layer:u32,aspect:TextureAspec
         width:w.div_ceil(bw)*bw,height:h.div_ceil(bh)*bh},row,rows,image_rows,pitch,bytes})
 }
 
-fn world(view:crate::xr_view::WorldView)->Result<Value,String> {
+pub(super) fn world(view:crate::xr_view::WorldView)->Result<Value,String> {
     if !view.headset_applied || view.view_count!=2 || view.eye_index>=2 || !view.depth_reverse_z {
         return Err("span requires ordinary same-eye reverse-Z world".into());
     }
@@ -86,7 +86,7 @@ impl Capture {
             }
         }
     }
-    fn enqueue_span(&mut self,gpu:&mut Gpu,plans:Vec<Plan>)->Vec<Readback> {
+    pub(super) fn enqueue_span(&mut self,gpu:&mut Gpu,plans:Vec<Plan>)->Vec<Readback> {
         enqueue(gpu,plans).into_iter().map(|mut rb|{
             self.live_bytes.fetch_add(rb.plan.bytes,Ordering::SeqCst);
             let reservation=Arc::new(SnapshotReservation{bytes:rb.plan.bytes,live:self.live_bytes.clone()});
@@ -143,7 +143,7 @@ impl Capture {
         Err("span sampled parent is not a retained native allocation".into())
     }
 
-    fn span_group(&mut self,gpu:&Gpu,group:usize,captured:&CapturedGroup,ordinal:usize,plans:&mut Vec<Plan>)->Result<Vec<Value>,String> {
+    pub(super) fn span_group(&mut self,gpu:&Gpu,group:usize,captured:&CapturedGroup,ordinal:usize,plans:&mut Vec<Plan>)->Result<Vec<Value>,String> {
         if let Some(reason)=&captured.unsupported {return Err(format!("span resolved bindings: {reason}"));}
         let mut result=Vec::new();
         for entry in &captured.entries {
@@ -164,6 +164,8 @@ impl Capture {
                 }
                 Resource::Sampler{descriptor,..}=>{out["kind"]="sampler".into();out["descriptor"]=json!(descriptor);}
                 Resource::Texture{view,descriptor,native_dummy}=>{
+                    let storage=matches!(layout.ty,BindingType::StorageTexture{..});
+                    if storage && self.kind!=CaptureKind::Compute {return Err("target-span writable texture binding is unsupported".into());}
                     let texture=view.texture();let id=self.span_texture_identity(gpu,texture,*native_dummy)?;
                     if self.pending.as_ref().is_some_and(|p|p.targets.iter().any(|t|&t.0==texture)) {
                         return Err("span samples current attachment native parent".into());
@@ -201,7 +203,7 @@ impl Capture {
                             "packed_row_bytes":row,"width":(texture.width()>>mip).max(1),"height":(texture.height()>>mip).max(1),
                             "depth":if texture.dimension()==TextureDimension::D3 {(texture.depth_or_array_layers()>>mip).max(1)}else{1},"version":version}));
                     }}
-                    out["kind"]="texture".into();out["native_allocation_id"]=id.into();out["view"]=json!(descriptor);
+                    out["kind"]=if storage {"storage_texture"}else{"texture"}.into();out["native_allocation_id"]=id.into();out["view"]=json!(descriptor);
                     out["descriptor"]=json!({"width":texture.width(),"height":texture.height(),"depth_or_array_layers":texture.depth_or_array_layers(),
                         "mip_level_count":texture.mip_level_count(),"sample_count":texture.sample_count(),"dimension":texture.dimension(),"format":texture.format()});
                     out["subresources"]=json!(subs);out["immutable_native_dummy"]=json!(native_dummy);

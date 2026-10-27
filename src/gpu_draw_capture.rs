@@ -12,12 +12,14 @@ mod shader_sources;
 
 #[path = "gpu_target_span_capture.rs"]
 mod target_span;
+#[path = "gpu_compute_capture.rs"]
+mod compute_capture;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum CaptureKind { TwoDraw, ColorNull, TargetSpan }
+enum CaptureKind { TwoDraw, ColorNull, TargetSpan, Compute }
 impl CaptureKind {
     fn parse(value:Option<&str>)->Option<Self> {
-        match value {None|Some("two-draw")=>Some(Self::TwoDraw),Some("color-null")=>Some(Self::ColorNull),Some("target-span")=>Some(Self::TargetSpan),_=>None}
+        match value {None|Some("two-draw")=>Some(Self::TwoDraw),Some("color-null")=>Some(Self::ColorNull),Some("target-span")=>Some(Self::TargetSpan),Some("compute")=>Some(Self::Compute),_=>None}
     }
     fn draw_count(self)->usize {if self==Self::TwoDraw {2}else{1}}
 }
@@ -86,6 +88,7 @@ pub(super) struct Capture {
     pub(super) texture_ledger: Option<texture_ledger::Ledger>,
     shader_sources: Option<RefCell<shader_sources::Registry<ShaderModule>>>,
     span: target_span::SpanState,
+    compute_state:compute_capture::ComputeState,
     epoch_reservations:Vec<Arc<SnapshotReservation>>,
 }
 
@@ -182,7 +185,7 @@ impl Capture {
     fn tracks_color_null_cause(&self)->bool {
         // The original two-draw export may finish before the later faulty
         // shader path. Its bounded diagnostic observation must continue.
-        match self.kind {CaptureKind::TwoDraw=>!self.color_null_recorded,CaptureKind::ColorNull=>!self.done,CaptureKind::TargetSpan=>false}
+        match self.kind {CaptureKind::TwoDraw=>!self.color_null_recorded,CaptureKind::ColorNull=>!self.done,CaptureKind::TargetSpan|CaptureKind::Compute=>false}
     }
     pub(super) fn color_srv_binding(&self,gpu:&Gpu,opcode:u32,stage:usize,slot:usize,input:u32,resolved:u32) {
         if !self.tracks_color_null_cause() || stage!=1 || slot!=5 {return;}
@@ -472,6 +475,9 @@ impl Capture {
     pub(super) fn captures_target_span(&self)->bool {
         self.kind==CaptureKind::TargetSpan && !self.done && !self.pending.as_ref().is_some_and(|p|p.finished)
     }
+    pub(super) fn captures_resolved_bindings(&self)->bool {
+        matches!(self.kind,CaptureKind::TargetSpan|CaptureKind::Compute) && !self.done && !self.pending.as_ref().is_some_and(|p|p.finished)
+    }
     pub(super) fn from_env() -> Option<Self> {
         let path = std::env::var_os("MUGUET_NATIVE_DRAW_CAPTURE")?;
         let selected=match std::env::var("MUGUET_NATIVE_DRAW_CAPTURE_KIND") {
@@ -487,16 +493,16 @@ impl Capture {
             attempts: 0, sequence: 0, epoch_bytes: 0, rejected: BTreeMap::new(), pipeline_bytes: 0,
             rejected_starts: Default::default(), live_bytes: Arc::new(AtomicU64::new(0)), feedback_recorded:false,
             color_null_binding:RefCell::new(None),color_null_recorded:false,
-            texture_ledger: (kind==CaptureKind::TargetSpan || std::env::var("MUGUET_NATIVE_TEXTURE_LEDGER").as_deref()==Ok("1")).then(texture_ledger::Ledger::new),
-            shader_sources: (kind==CaptureKind::TargetSpan || std::env::var("MUGUET_NATIVE_SHADER_SOURCES").as_deref()==Ok("1"))
-                .then(||RefCell::new(shader_sources::Registry::new())), span:Default::default(),epoch_reservations:Vec::new() })
+            texture_ledger: (matches!(kind,CaptureKind::TargetSpan|CaptureKind::Compute) || std::env::var("MUGUET_NATIVE_TEXTURE_LEDGER").as_deref()==Ok("1")).then(texture_ledger::Ledger::new),
+            shader_sources: (matches!(kind,CaptureKind::TargetSpan|CaptureKind::Compute) || std::env::var("MUGUET_NATIVE_SHADER_SOURCES").as_deref()==Ok("1"))
+                .then(||RefCell::new(shader_sources::Registry::new())), span:Default::default(),compute_state:Default::default(),epoch_reservations:Vec::new() })
     }
     pub(super) fn remember_shader(&self, module:&ShaderModule, text:&str, origin:&str) {
         if self.done {return;}
         if let Some(sources)=&self.shader_sources {sources.borrow_mut().remember(module,text,origin);}
     }
     pub(super) fn remember_pipeline(&mut self, key: &[i64], job: &PipeJob) {
-        if self.done || self.pipelines.len() >= MAX_PIPELINES { return; }
+        if self.done || self.kind==CaptureKind::Compute || self.pipelines.len() >= MAX_PIPELINES { return; }
         let vertex_layouts: Vec<_> = job.vbs.iter().map(|v| v.as_ref().map(|(stride, step, attributes)|
             json!({"array_stride":stride,"step_mode":step,"attributes":attributes}))).collect();
         let mut value=json!({"primitive":job.primitive,
@@ -517,11 +523,12 @@ impl Capture {
         if *count==0 {log(&format!("native draw capture candidate rejected: {reason}"));}
         *count+=1;
         if let Some(p)=self.pending.take() {self.rejected_starts.insert(p.candidate_key);}
-        if self.kind==CaptureKind::TargetSpan {self.span.clear_interval();}
+        if matches!(self.kind,CaptureKind::TargetSpan|CaptureKind::Compute) {self.span.clear_interval();}
     }
     pub(super) fn command(&mut self, op: u32) {
         self.sequence = self.sequence.saturating_add(1);
         if self.texture_ledger_active(){if let Some(ledger)=&mut self.texture_ledger {ledger.command();}}
+        if self.kind==CaptureKind::Compute {self.compute_command(op);return;}
         if self.kind==CaptureKind::TargetSpan {self.span_command(op);return;}
         // ClearState supplies its own NULL bindings; a later draw must not
         // attribute those to an earlier color conflict.
@@ -542,6 +549,7 @@ impl Capture {
         if self.kind==CaptureKind::TargetSpan {self.span.clear_interval();}
     }
     pub(super) fn before(&mut self, gpu: &mut Gpu, draw: &Resolved<'_>) {
+        if self.kind==CaptureKind::Compute {self.observe_compute_world(gpu,draw);return;}
         if self.kind==CaptureKind::TargetSpan {self.before_target_span(gpu,draw);return;}
         self.record_color_null_draw(gpu,draw);
         self.record_color_feedback(gpu,draw);
@@ -606,6 +614,7 @@ impl Capture {
         }
     }
     pub(super) fn after(&mut self, gpu: &mut Gpu) {
+        if self.kind==CaptureKind::Compute {return;}
         if self.kind==CaptureKind::TargetSpan {self.after_target_span(gpu);return;}
         let Some(pending) = &mut self.pending else { return; };
         if pending.finished || pending.draws.len() != pending.kind.draw_count() { return; }
@@ -617,7 +626,7 @@ impl Capture {
     }
     pub(super) fn submitted(&mut self, gpu: &Gpu, epoch: u64) {
         let submitted_bytes=std::mem::take(&mut self.epoch_bytes);
-        if self.kind==CaptureKind::TargetSpan {
+        if matches!(self.kind,CaptureKind::TargetSpan|CaptureKind::Compute) {
             let reservations=std::mem::take(&mut self.epoch_reservations);
             if !reservations.is_empty() {
                 let inflight=gpu.inflight.clone();inflight.fetch_add(1,Ordering::SeqCst);
@@ -642,17 +651,17 @@ impl Capture {
             self.rejected_starts.insert(pending.candidate_key);
             self.reject("natural submission before span closure"); return;
         }
-        pending.shader_sources=self.shader_sources.as_ref().map(|sources| {
+        if pending.kind!=CaptureKind::Compute {pending.shader_sources=self.shader_sources.as_ref().map(|sources| {
             let (hashes,stage_failure)=shader_sources::selected_pipeline_hashes(&pending.draws);
             let mut export=sources.borrow().snapshot(&hashes);
             if let Some(reason)=stage_failure {export["complete"]=false.into();export["failure"]=reason.into();}
             export
-        });
+        });}
         self.done = true;
         // Immutable pending evidence has already been detached. Retire private
         // history now; postcapture observation only needs the original probes.
         self.texture_ledger.take();
-        if self.kind==CaptureKind::TargetSpan {self.span.clear_interval();}
+        if matches!(self.kind,CaptureKind::TargetSpan|CaptureKind::Compute) {self.span.clear_interval();}
         if self.kind==CaptureKind::ColorNull {self.color_null_binding.borrow_mut().take();}
         let directory = self.directory.clone(); let rejected = self.rejected.clone();
         let errors = gpu.errors.clone(); let inflight = gpu.inflight.clone();
@@ -814,6 +823,15 @@ fn complete(pending: Pending, rx: std::sync::mpsc::Receiver<(usize,Result<(),Str
         "normal_frame_publication_changed":false,"finished_frame_or_density_accepted":false,
         "artifact_publication":"close every payload, then publish one synced atomic manifest; every payload must pass hash admission; interrupted or crash-damaged bundles are not accepted",
         "initialization_scope":"exact captured original-density contents; no complete earlier dependency or high-density initialization claim"})}
+    else if pending.kind==CaptureKind::Compute {json!({"schema":5,"kind":"native_compute_dispatch","status":"captured",
+        "source":{"method":"Gpu::do_dispatch actual final pipeline and resolved bindings","backend":backend,"encoder_epoch":pending.epoch},
+        "context":pending.domain,"dispatch":pending.draws.into_iter().next().ok_or("compute dispatch missing")?,
+        "attachments":pending.attachments,"blobs":blobs,"allocated_readback_bytes":pending.bytes,
+        "prior_rejected_candidates":rejected,
+        "closure":{"single_original_dispatch":true,"unmodelled_commands":0,"initial_contents_captured":true,
+            "original_final_captured":true,"natural_submission_completed":true,"queries_inactive":true,"gpu_errors":0},
+        "normal_frame_publication_changed":false,"finished_frame_or_density_accepted":false,"coherent_stereo_accepted":false,
+        "uniform_binding_normalization":"exact selected native range copied into an immutable offset-zero binding; actual layout and original dynamic offset retained"})}
     else {json!({"schema":3,"kind":"native_color_null_draw","status":"captured",
         "source":{"method":"Gpu::do_draw resolved bindings","backend":backend,"encoder_epoch":pending.epoch},
         "world_view":pending.view,"target_domain":pending.domain,"draw":pending.draws.into_iter().next().ok_or("color-null draw missing")?,
@@ -839,7 +857,7 @@ mod tests {
         Capture { kind:CaptureKind::TwoDraw,directory:PathBuf::new(),pipelines:HashMap::new(),pending:None,done:false,attempts:0,sequence:0,
             epoch_bytes:0,rejected:BTreeMap::new(),pipeline_bytes:0,rejected_starts:Default::default(),
             live_bytes:Arc::new(AtomicU64::new(0)),feedback_recorded:false,
-            color_null_binding:RefCell::new(None),color_null_recorded:false,texture_ledger:None,shader_sources:None,span:Default::default(),epoch_reservations:Vec::new() }
+            color_null_binding:RefCell::new(None),color_null_recorded:false,texture_ledger:None,shader_sources:None,span:Default::default(),compute_state:Default::default(),epoch_reservations:Vec::new() }
     }
     fn pending() -> Pending {
         Pending {kind:CaptureKind::TwoDraw,alias:None,initialization_ledger:None,shader_sources:None,epoch:1,errors:0,view:Value::Null,domain:Value::Null,draws:vec![Value::Null],attachments:vec![],

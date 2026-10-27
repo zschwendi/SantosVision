@@ -30,7 +30,7 @@ GRAPHICS = {
 MAX_BLOBS = 256 << 20
 MAX_JSON = 16 << 20
 MAX_LOG = 128 << 20
-CAPTURE_KINDS = ("two-draw", "color-null", "target-span")
+CAPTURE_KINDS = ("two-draw", "color-null", "target-span", "compute")
 FLAGS = {
     "MUGUET_MUTE": "1", "MUGUET_MASTER_VOLUME": "0",
     "MUGUET_XR_MOTION_AIM": "0", "MUGUET_XR_MOTION_ARMS": "0",
@@ -180,7 +180,7 @@ def validate_capture(directory, capture_kind="two-draw"):
     need(not (directory / "rejected.json").exists(), "capture module rejected the span")
     capture = load_json(directory / "capture.json")
     expected = {"two-draw": (2,"native_draw_span"), "color-null": (3,"native_color_null_draw"),
-                "target-span": (4,"native_target_span")}[capture_kind]
+                "target-span": (4,"native_target_span"), "compute": (5,"native_compute_dispatch")}[capture_kind]
     need((capture.get("schema"), capture.get("kind"), capture.get("status")) ==
          (*expected, "captured"), "unsupported or incomplete capture for selected kind")
     closure = capture.get("closure", {})
@@ -201,6 +201,13 @@ def validate_capture(directory, capture_kind="two-draw"):
              and 0 < closure["interval_start_command"] < closure["interval_end_command"], "target interval boundary")
         need(isinstance(capture.get("draws"), list) and 2 <= len(capture["draws"]) <= 4096, "bounded complete draw list required")
         need(capture.get("effective_shader_sources", {}).get("complete") is True, "exact final shader sources required")
+    elif capture_kind == "compute":
+        for name in ("single_original_dispatch", "queries_inactive"):
+            need(closure.get(name) is True, f"missing capture closure: {name}")
+        need(type(closure.get("gpu_errors")) is int and closure["gpu_errors"] == 0, "compute capture GPU errors")
+        need(isinstance(capture.get("dispatch"), dict) and "draws" not in capture and "draw" not in capture,
+             "single original compute dispatch required")
+        need(capture.get("effective_shader_sources", {}).get("complete") is True, "exact final compute source required")
     else:
         for name in ("single_original_draw", "queries_inactive"):
             need(closure.get(name) is True, f"missing capture closure: {name}")
@@ -328,7 +335,7 @@ def main():
         p.add_argument("--" + name, required=True)
     p.add_argument("--deadline", type=int, default=180)
     p.add_argument("--capture-kind", choices=CAPTURE_KINDS, default="two-draw",
-                   help="two-draw captures the original pair; color-null captures one corrected draw; target-span captures a complete heterogeneous target interval")
+                   help="two-draw captures the original pair; color-null captures one corrected draw; target-span captures a complete target interval; compute captures one actual post-world dispatch")
     p.add_argument("--scene-provenance", action="store_true",
                    help="include bounded native allocation/version and exact final shader source metadata; does not certify full scene closure")
     p.add_argument("--same-ray-alias", action="store_true",

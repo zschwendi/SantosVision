@@ -1,4 +1,4 @@
-//! Exact resolved native binding metadata for private target-span capture.
+//! Exact resolved native binding metadata for private draw/compute capture.
 //! This module is absent from ordinary builds; unsupported input is evidence,
 //! never permission to change or suppress the original binding.
 use super::*;
@@ -66,7 +66,53 @@ impl CapturedGroup {
         dynamic: Option<u32>,
         native_dummy: bool,
     ) {
-        match effective_buffer_range(&layout, buffer.size(), binding_offset, size, dynamic) {
+        self.buffer_with_access(
+            layout,
+            buffer,
+            binding_offset,
+            size,
+            dynamic,
+            native_dummy,
+            false,
+        );
+    }
+    pub(super) fn compute_buffer(
+        &mut self,
+        layout: BindGroupLayoutEntry,
+        buffer: &Buffer,
+        binding_offset: u64,
+        size: Option<u64>,
+        dynamic: Option<u32>,
+        native_dummy: bool,
+    ) {
+        self.buffer_with_access(
+            layout,
+            buffer,
+            binding_offset,
+            size,
+            dynamic,
+            native_dummy,
+            true,
+        );
+    }
+    fn buffer_with_access(
+        &mut self,
+        layout: BindGroupLayoutEntry,
+        buffer: &Buffer,
+        binding_offset: u64,
+        size: Option<u64>,
+        dynamic: Option<u32>,
+        native_dummy: bool,
+        compute_writable: bool,
+    ) {
+        match effective_buffer_range_with_access(
+            &layout,
+            buffer.size(),
+            binding_offset,
+            size,
+            dynamic,
+            compute_writable,
+        ) {
             Ok((offset, size)) => self.push(
                 layout,
                 Resource::Buffer {
@@ -89,6 +135,16 @@ fn effective_buffer_range(
     size: Option<u64>,
     dynamic: Option<u32>,
 ) -> Result<(u64, u64), &'static str> {
+    effective_buffer_range_with_access(layout, total, offset, size, dynamic, false)
+}
+fn effective_buffer_range_with_access(
+    layout: &BindGroupLayoutEntry,
+    total: u64,
+    offset: u64,
+    size: Option<u64>,
+    dynamic: Option<u32>,
+    compute_writable: bool,
+) -> Result<(u64, u64), &'static str> {
     let BindingType::Buffer {
         ty,
         has_dynamic_offset,
@@ -97,7 +153,9 @@ fn effective_buffer_range(
     else {
         return Err("buffer metadata has non-buffer layout");
     };
-    if matches!(ty, BufferBindingType::Storage { read_only: false }) {
+    if matches!(ty, BufferBindingType::Storage { read_only: false })
+        && !(compute_writable && layout.visibility == ShaderStages::COMPUTE)
+    {
         return Err("writable buffer binding is unsupported");
     }
     if has_dynamic_offset != dynamic.is_some() {
@@ -111,6 +169,24 @@ fn effective_buffer_range(
         return Err("resolved buffer range is outside actual allocation");
     }
     Ok((effective, size))
+}
+fn storage_texture_layout_matches(
+    layout: &BindGroupLayoutEntry,
+    descriptor: &TextureViewDescriptor<'_>,
+    allocation_format: TextureFormat,
+) -> bool {
+    let BindingType::StorageTexture {
+        format,
+        view_dimension,
+        ..
+    } = layout.ty
+    else {
+        return false;
+    };
+    layout.visibility == ShaderStages::COMPUTE
+        && descriptor.dimension == Some(view_dimension)
+        && descriptor.format.unwrap_or(allocation_format) == format
+        && descriptor.mip_level_count == Some(1)
 }
 pub(super) fn supported_texture_view(
     allocation: TextureDimension,
@@ -276,6 +352,14 @@ impl Registry {
             return;
         };
         let texture = view.texture();
+        if matches!(layout.ty, BindingType::StorageTexture { .. })
+            && !storage_texture_layout_matches(&layout, descriptor, texture.format())
+        {
+            group.fail(
+                "storage texture capture requires exact compute layout, view format and one mip",
+            );
+            return;
+        }
         if !supported_texture_view(
             texture.dimension(),
             descriptor.dimension,
@@ -349,7 +433,7 @@ impl Gpu {
     pub(super) fn target_span_bindings_active(&self) -> bool {
         self.draw_capture
             .as_ref()
-            .is_some_and(draw_capture::Capture::captures_target_span)
+            .is_some_and(draw_capture::Capture::captures_resolved_bindings)
     }
     pub(super) fn capture_binding_view(
         &mut self,
@@ -562,6 +646,109 @@ mod tests {
             effective_buffer_range(&layout, 1024, 256, Some(128), None),
             Ok((256, 128))
         );
+    }
+    #[test]
+    fn compute_storage_ranges_preserve_native_counter_and_selected_view_extent() {
+        let mut layout = uniform(false);
+        layout.binding = 176;
+        layout.visibility = ShaderStages::COMPUTE;
+        layout.ty = BindingType::Buffer {
+            ty: BufferBindingType::Storage { read_only: false },
+            has_dynamic_offset: false,
+            min_binding_size: None,
+        };
+        assert_eq!(
+            effective_buffer_range_with_access(&layout, 16, 0, None, None, true),
+            Ok((0, 16))
+        );
+        assert_eq!(
+            effective_buffer_range_with_access(&layout, 1024, 256, Some(128), None, true),
+            Ok((256, 128))
+        );
+        assert!(effective_buffer_range_with_access(&layout, 16, 0, Some(20), None, true).is_err());
+        assert!(effective_buffer_range(&layout, 16, 0, None, None).is_err());
+        for stage in [
+            ShaderStages::VERTEX,
+            ShaderStages::FRAGMENT,
+            ShaderStages::COMPUTE | ShaderStages::VERTEX,
+        ] {
+            layout.visibility = stage;
+            assert!(effective_buffer_range_with_access(&layout, 16, 0, None, None, true).is_err());
+        }
+    }
+    #[test]
+    fn compute_storage_texture_metadata_requires_actual_format_dimension_and_single_mip() {
+        for dimension in [
+            TextureViewDimension::D1,
+            TextureViewDimension::D2,
+            TextureViewDimension::D2Array,
+            TextureViewDimension::D3,
+        ] {
+            for access in [
+                StorageTextureAccess::WriteOnly,
+                StorageTextureAccess::ReadOnly,
+                StorageTextureAccess::ReadWrite,
+            ] {
+                let layout = BindGroupLayoutEntry {
+                    binding: 160,
+                    visibility: ShaderStages::COMPUTE,
+                    count: None,
+                    ty: BindingType::StorageTexture {
+                        access,
+                        format: TextureFormat::R32Float,
+                        view_dimension: dimension,
+                    },
+                };
+                let descriptor = TextureViewDescriptor {
+                    dimension: Some(dimension),
+                    base_mip_level: 3,
+                    mip_level_count: Some(1),
+                    ..Default::default()
+                };
+                assert!(storage_texture_layout_matches(
+                    &layout,
+                    &descriptor,
+                    TextureFormat::R32Float
+                ));
+                assert!(!storage_texture_layout_matches(
+                    &layout,
+                    &descriptor,
+                    TextureFormat::R32Uint
+                ));
+                assert!(!storage_texture_layout_matches(
+                    &layout,
+                    &TextureViewDescriptor {
+                        mip_level_count: Some(2),
+                        ..descriptor.clone()
+                    },
+                    TextureFormat::R32Float
+                ));
+                assert!(!storage_texture_layout_matches(
+                    &layout,
+                    &TextureViewDescriptor {
+                        dimension: None,
+                        ..descriptor.clone()
+                    },
+                    TextureFormat::R32Float
+                ));
+                assert!(!storage_texture_layout_matches(
+                    &BindGroupLayoutEntry {
+                        visibility: ShaderStages::FRAGMENT,
+                        ..layout
+                    },
+                    &descriptor,
+                    TextureFormat::R32Float
+                ));
+                assert!(!storage_texture_layout_matches(
+                    &layout,
+                    &TextureViewDescriptor {
+                        format: Some(TextureFormat::R32Uint),
+                        ..descriptor.clone()
+                    },
+                    TextureFormat::R32Float
+                ));
+            }
+        }
     }
     #[test]
     fn view_identity_preserves_format_ranges_and_rejects_conflict() {

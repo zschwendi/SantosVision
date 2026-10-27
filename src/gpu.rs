@@ -3367,12 +3367,17 @@ impl Gpu {
                     }
                     key.push(res_off);
                     #[cfg(all(target_os = "macos", feature = "native-draw-capture"))]
-                    if let Some(capture)=&mut captured {capture.buffer(Self::layout_entry(b,stage as u32),&gb,res_off,res_size,None,self.dummy_bufs.values().any(|value|value==&gb));}
+                    if let Some(capture)=&mut captured {
+                        let layout=Self::layout_entry(b,stage as u32);
+                        let dummy=self.dummy_bufs.values().any(|value|value==&gb);
+                        if stage==2 && b.kind==Kind::Storage {capture.compute_buffer(layout,&gb,res_off,res_size,None,dummy);}
+                        else {capture.buffer(layout,&gb,res_off,res_size,None,dummy);}
+                    }
                     entries.push((b.binding, Res::Buf(gb, res_off, res_size)));
                 }
                 Kind::StorageTexture => {
                     #[cfg(all(target_os = "macos", feature = "native-draw-capture"))]
-                    if let Some(capture)=&mut captured {capture.fail("storage texture bindings are unsupported");}
+                    if let Some(capture)=&mut captured {if stage!=2 {capture.fail("draw storage texture bindings are unsupported");}}
                     let uid = *self.s.uav[stage].get((b.binding as usize).wrapping_sub(160)).unwrap_or(&0);
                     let (res, a, bb, c, vdim) = match self.view_obj(uid).filter(|v| !v.is_buf) { Some(v) => (v.res, v.a, v.b, v.c, v.vdim), None => {
                         log_once(&format!("nouavtex{}", prog.label), &format!("{}: storage texture u{} has no UAV bound", prog.label, b.binding - 160));
@@ -3393,6 +3398,8 @@ impl Gpu {
                                 d.array_layer_count = Some(1);
                             }
                             let v = self.scoped("UAV view", |_| tex.create_view(&d))?;
+                            #[cfg(all(target_os = "macos", feature = "native-draw-capture"))]
+                            self.capture_binding_view(&v,&d,false,true);
                             self.view_obj_mut(uid).unwrap().views.insert(k2, v.clone());
                             v
                         }
@@ -3401,6 +3408,8 @@ impl Gpu {
                     self.mark_color_dirty(res);
                     if let Some(t) = self.tex_mut(res) { t.in_bg = true; }
                     key.push(uid as u64);
+                    #[cfg(all(target_os = "macos", feature = "native-draw-capture"))]
+                    if stage==2 {if let Some(capture)=&mut captured {self.capture_binding_texture(capture,Self::layout_entry(b,stage as u32),&v);}}
                     entries.push((b.binding, Res::View(v)));
                 }
             }
@@ -4282,6 +4291,10 @@ impl Gpu {
         }
         let Some((pl, bgl, bgl_uid, cprog)) = self.compute.get(&key).cloned().flatten() else { self.skipped += 1; return };
         let Some(g0) = self.stage_bind_group(2, &cprog, 0, &(bgl, bgl_uid)) else { self.skipped += 1; return };
+        #[cfg(all(target_os = "macos", feature = "native-draw-capture"))]
+        if let Some(mut capture)=self.draw_capture.take() {
+            capture.before_compute(self,&cprog,&g0,[x,y,z]);self.draw_capture=Some(capture);
+        }
         let enc = self.encoder();
         let mut cp = enc.begin_compute_pass(&ComputePassDescriptor::default());
         cp.set_pipeline(&pl);
@@ -4290,6 +4303,10 @@ impl Gpu {
         drop(cp);
         #[cfg(all(target_os = "macos", feature = "native-draw-capture"))]
         self.texture_ledger_dispatch();
+        #[cfg(all(target_os = "macos", feature = "native-draw-capture"))]
+        if let Some(mut capture)=self.draw_capture.take() {
+            capture.after_compute(self);self.draw_capture=Some(capture);
+        }
     }
 
     fn clear_view(&mut self, id: u32, mip: u32, slice: u32) -> Option<TextureView> {
