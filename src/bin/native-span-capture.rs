@@ -17,15 +17,15 @@ const GRAPHICS: [(&str, &str); 3] = [
 const MAX_MANIFEST: u64 = 16 << 20;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum CaptureKind { TwoDraw, ColorNull, TargetSpan, Compute }
+enum CaptureKind { TwoDraw, ColorNull, TargetSpan, Compute, Graph }
 impl CaptureKind {
     fn parse(name: &str) -> Result<Self> {
         match name {
-            "two-draw" => Ok(Self::TwoDraw), "color-null" => Ok(Self::ColorNull), "target-span"=>Ok(Self::TargetSpan), "compute"=>Ok(Self::Compute),
-            _ => anyhow::bail!("capture kind must be two-draw, color-null, target-span or compute"),
+            "two-draw" => Ok(Self::TwoDraw), "color-null" => Ok(Self::ColorNull), "target-span"=>Ok(Self::TargetSpan), "compute"=>Ok(Self::Compute), "graph"=>Ok(Self::Graph),
+            _ => anyhow::bail!("capture kind must be two-draw, color-null, target-span, compute or graph"),
         }
     }
-    fn name(self) -> &'static str { match self { Self::TwoDraw => "two-draw", Self::ColorNull => "color-null",Self::TargetSpan=>"target-span",Self::Compute=>"compute" } }
+    fn name(self) -> &'static str { match self { Self::TwoDraw => "two-draw", Self::ColorNull => "color-null",Self::TargetSpan=>"target-span",Self::Compute=>"compute",Self::Graph=>"graph" } }
     fn admits(self, value: &Value) -> bool {
         let complete = value["status"] == "captured" && value["closure"]["natural_submission_completed"] == true;
         complete && match self {
@@ -34,6 +34,8 @@ impl CaptureKind {
                 && value["closure"]["single_original_draw"] == true && value["draw"].is_object(),
             Self::TargetSpan => value["schema"]==4 && value["kind"]=="native_target_span"
                 && value["closure"]["complete_target_interval"] == true && value["draws"].is_array(),
+            Self::Graph => value["schema"]==6 && value["kind"]=="native_connected_graph"
+                && value["closure"]["continuous_command_interval"]==true && value["stages"].is_array(),
             Self::Compute => value["schema"]==5 && value["kind"]=="native_compute_dispatch"
                 && value["closure"]["single_original_dispatch"]==true && value["dispatch"].is_object(),
         }
@@ -59,7 +61,7 @@ fn eye(x: f32) -> xr_view::SVXREyeView {
 
 fn args() -> Result<Args> {
     let a: Vec<_> = std::env::args().skip(1).collect();
-    ensure!((7..=8).contains(&a.len()), "usage: native-span-capture GAME FRESH_SAVE NEW_CAPTURE GRAPHICS_SEED MAC_AOT DEADLINE_SECONDS OBSERVE_AFTER_CAPTURE_SECONDS [two-draw|color-null|target-span|compute]");
+    ensure!((7..=8).contains(&a.len()), "usage: native-span-capture GAME FRESH_SAVE NEW_CAPTURE GRAPHICS_SEED MAC_AOT DEADLINE_SECONDS OBSERVE_AFTER_CAPTURE_SECONDS [two-draw|color-null|target-span|compute|graph]");
     let seconds: u64 = a[5].parse().context("integer deadline")?;
     let observe: u64 = a[6].parse().context("integer post-capture observation")?;
     ensure!((1..=180).contains(&seconds), "deadline must be 1..180 seconds");
@@ -84,12 +86,13 @@ fn observation_stop(requested: Duration, elapsed: Duration, deadline: bool, fail
 fn capture_result(a: &Args, start: Instant, preparation: &Value, captured: &CompletedCapture,
                   observation_status: &str, final_status: Value) -> Value {
     let feedback = a.capture.parent().unwrap().join("first-color-feedback.json");
-    let payload=if a.capture_kind==CaptureKind::TargetSpan {
+    let payload=if matches!(a.capture_kind,CaptureKind::TargetSpan|CaptureKind::Graph) {
         // The immutable raw manifest is already bound below by SHA and length.
         // Do not duplicate thousands of draw/resource records into a second,
         // pretty-printed driver report with a separate size/deadline budget.
-        json!({"schema":4,"kind":"native_target_span","status":"captured",
+        json!({"schema":captured.manifest.value["schema"],"kind":captured.manifest.value["kind"],"status":"captured",
             "draw_count":captured.manifest.value["draws"].as_array().map(Vec::len),
+            "stage_count":captured.manifest.value["stages"].as_array().map(Vec::len),
             "complete_metadata_path":a.capture.join("capture.json"),"raw_manifest_identity_below":true})
     }else{captured.manifest.value.clone()};
     json!({"schema":1,"outcome":"captured","capture_kind":a.capture_kind.name(),"capture":payload,

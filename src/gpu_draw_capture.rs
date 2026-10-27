@@ -14,12 +14,14 @@ mod shader_sources;
 mod target_span;
 #[path = "gpu_compute_capture.rs"]
 mod compute_capture;
+#[path = "gpu_graph_capture.rs"]
+mod graph_capture;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum CaptureKind { TwoDraw, ColorNull, TargetSpan, Compute }
+enum CaptureKind { TwoDraw, ColorNull, TargetSpan, Compute, Graph }
 impl CaptureKind {
     fn parse(value:Option<&str>)->Option<Self> {
-        match value {None|Some("two-draw")=>Some(Self::TwoDraw),Some("color-null")=>Some(Self::ColorNull),Some("target-span")=>Some(Self::TargetSpan),Some("compute")=>Some(Self::Compute),_=>None}
+        match value {None|Some("two-draw")=>Some(Self::TwoDraw),Some("color-null")=>Some(Self::ColorNull),Some("target-span")=>Some(Self::TargetSpan),Some("compute")=>Some(Self::Compute),Some("graph")=>Some(Self::Graph),_=>None}
     }
     fn draw_count(self)->usize {if self==Self::TwoDraw {2}else{1}}
 }
@@ -89,6 +91,7 @@ pub(super) struct Capture {
     shader_sources: Option<RefCell<shader_sources::Registry<ShaderModule>>>,
     span: target_span::SpanState,
     compute_state:compute_capture::ComputeState,
+    graph:graph_capture::GraphState,
     epoch_reservations:Vec<Arc<SnapshotReservation>>,
 }
 
@@ -185,7 +188,7 @@ impl Capture {
     fn tracks_color_null_cause(&self)->bool {
         // The original two-draw export may finish before the later faulty
         // shader path. Its bounded diagnostic observation must continue.
-        match self.kind {CaptureKind::TwoDraw=>!self.color_null_recorded,CaptureKind::ColorNull=>!self.done,CaptureKind::TargetSpan|CaptureKind::Compute=>false}
+        match self.kind {CaptureKind::TwoDraw=>!self.color_null_recorded,CaptureKind::ColorNull=>!self.done,CaptureKind::TargetSpan|CaptureKind::Compute|CaptureKind::Graph=>false}
     }
     pub(super) fn color_srv_binding(&self,gpu:&Gpu,opcode:u32,stage:usize,slot:usize,input:u32,resolved:u32) {
         if !self.tracks_color_null_cause() || stage!=1 || slot!=5 {return;}
@@ -473,10 +476,10 @@ impl Capture {
         (self.kind==CaptureKind::ColorNull || self.captures_target_span()) && color_null::dummy_copyable(b.dim,b.sample,b.ms)
     }
     pub(super) fn captures_target_span(&self)->bool {
-        self.kind==CaptureKind::TargetSpan && !self.done && !self.pending.as_ref().is_some_and(|p|p.finished)
+        matches!(self.kind,CaptureKind::TargetSpan|CaptureKind::Graph) && !self.done && !self.pending.as_ref().is_some_and(|p|p.finished)
     }
     pub(super) fn captures_resolved_bindings(&self)->bool {
-        matches!(self.kind,CaptureKind::TargetSpan|CaptureKind::Compute) && !self.done && !self.pending.as_ref().is_some_and(|p|p.finished)
+        matches!(self.kind,CaptureKind::TargetSpan|CaptureKind::Compute|CaptureKind::Graph) && !self.done && !self.pending.as_ref().is_some_and(|p|p.finished)
     }
     pub(super) fn from_env() -> Option<Self> {
         let path = std::env::var_os("MUGUET_NATIVE_DRAW_CAPTURE")?;
@@ -493,9 +496,9 @@ impl Capture {
             attempts: 0, sequence: 0, epoch_bytes: 0, rejected: BTreeMap::new(), pipeline_bytes: 0,
             rejected_starts: Default::default(), live_bytes: Arc::new(AtomicU64::new(0)), feedback_recorded:false,
             color_null_binding:RefCell::new(None),color_null_recorded:false,
-            texture_ledger: (matches!(kind,CaptureKind::TargetSpan|CaptureKind::Compute) || std::env::var("MUGUET_NATIVE_TEXTURE_LEDGER").as_deref()==Ok("1")).then(texture_ledger::Ledger::new),
-            shader_sources: (matches!(kind,CaptureKind::TargetSpan|CaptureKind::Compute) || std::env::var("MUGUET_NATIVE_SHADER_SOURCES").as_deref()==Ok("1"))
-                .then(||RefCell::new(shader_sources::Registry::new())), span:Default::default(),compute_state:Default::default(),epoch_reservations:Vec::new() })
+            texture_ledger: (matches!(kind,CaptureKind::TargetSpan|CaptureKind::Compute|CaptureKind::Graph) || std::env::var("MUGUET_NATIVE_TEXTURE_LEDGER").as_deref()==Ok("1")).then(texture_ledger::Ledger::new),
+            shader_sources: (matches!(kind,CaptureKind::TargetSpan|CaptureKind::Compute|CaptureKind::Graph) || std::env::var("MUGUET_NATIVE_SHADER_SOURCES").as_deref()==Ok("1"))
+                .then(||RefCell::new(shader_sources::Registry::new())), span:Default::default(),compute_state:Default::default(),graph:Default::default(),epoch_reservations:Vec::new() })
     }
     pub(super) fn remember_shader(&self, module:&ShaderModule, text:&str, origin:&str) {
         if self.done {return;}
@@ -518,17 +521,45 @@ impl Capture {
         if self.pipelines.contains_key(key) {return;}
         self.pipeline_bytes+=size;self.pipelines.insert(key.to_vec(),value);
     }
+    pub(super) fn reject_graph(&mut self,reason:&str) {self.reject(reason);}
+    pub(super) fn graph_counter_write(&mut self) {
+        if self.kind==CaptureKind::Graph && !self.done && self.graph.anchor.is_some()
+            && !self.pending.as_ref().is_some_and(|p|p.finished) {
+            self.reject("connected graph contains actual UAV counter write (opcode 38)");
+        }
+    }
     fn reject(&mut self, reason: &str) {
         let count=self.rejected.entry(reason.to_owned()).or_default();
-        if *count==0 {log(&format!("native draw capture candidate rejected: {reason}"));}
+        if *count==0 {log(&format!("native draw capture candidate rejected: {reason}; first command_sequence={}",self.sequence));}
         *count+=1;
         if let Some(p)=self.pending.take() {self.rejected_starts.insert(p.candidate_key);}
-        if matches!(self.kind,CaptureKind::TargetSpan|CaptureKind::Compute) {self.span.clear_interval();}
+        if matches!(self.kind,CaptureKind::TargetSpan|CaptureKind::Compute|CaptureKind::Graph) {self.span.clear_interval();}
+        if self.kind==CaptureKind::Graph {self.graph=Default::default();self.compute_state=Default::default();}
     }
     pub(super) fn command(&mut self, op: u32) {
         self.sequence = self.sequence.saturating_add(1);
         if self.texture_ledger_active(){if let Some(ledger)=&mut self.texture_ledger {ledger.command();}}
         if self.kind==CaptureKind::Compute {self.compute_command(op);return;}
+        if self.kind==CaptureKind::Graph {
+            if self.done || self.pending.as_ref().is_some_and(|p|p.finished) {return;}
+            if self.graph.dispatch_pending.take().is_some() {self.reject("connected graph dispatch was not captured");return;}
+            if op==38 {
+                // UAV binding changes are captured with the later resolved
+                // dispatch. Actual buffer-counter writes reject at their native
+                // write seam; NULL/texture UAV initial counts are native no-ops.
+                if self.graph.anchor.is_some() && self.pending.is_some() {
+                    self.reject("connected graph UAV binding inside active raster interval (opcode 38)");
+                }
+                return;
+            }
+            if self.graph.anchor.is_some() && !self.pending.as_ref().is_some_and(|p|p.finished)
+                && !matches!(op,0|1|2|9|10|12|18..=32|39|47) {self.reject(&format!("connected graph contains unmodelled opcode {op}"));return;}
+            if op==39 {
+                if self.graph.anchor.is_some() {self.graph.dispatch_pending=Some(self.sequence);}
+                return;
+            }
+            self.span_command(op);return;
+        }
         if self.kind==CaptureKind::TargetSpan {self.span_command(op);return;}
         // ClearState supplies its own NULL bindings; a later draw must not
         // attribute those to an earlier color conflict.
@@ -545,11 +576,16 @@ impl Capture {
         }
     }
     pub(super) fn skipped_draw(&mut self) {
+        if self.kind==CaptureKind::Graph && (self.done || self.pending.as_ref().is_some_and(|p|p.finished)) {return;}
+        if self.kind==CaptureKind::Graph && self.graph.anchor.is_some() {self.reject("connected graph contains skipped draw");return;}
         if self.pending.as_ref().is_some_and(|p| !p.finished) { self.reject("intervening skipped draw"); }
         if self.kind==CaptureKind::TargetSpan {self.span.clear_interval();}
     }
     pub(super) fn before(&mut self, gpu: &mut Gpu, draw: &Resolved<'_>) {
         if self.kind==CaptureKind::Compute {self.observe_compute_world(gpu,draw);return;}
+        if self.kind==CaptureKind::Graph {
+            self.observe_compute_world(gpu,draw);self.before_target_span(gpu,draw);return;
+        }
         if self.kind==CaptureKind::TargetSpan {self.before_target_span(gpu,draw);return;}
         self.record_color_null_draw(gpu,draw);
         self.record_color_feedback(gpu,draw);
@@ -615,7 +651,7 @@ impl Capture {
     }
     pub(super) fn after(&mut self, gpu: &mut Gpu) {
         if self.kind==CaptureKind::Compute {return;}
-        if self.kind==CaptureKind::TargetSpan {self.after_target_span(gpu);return;}
+        if matches!(self.kind,CaptureKind::TargetSpan|CaptureKind::Graph) {self.after_target_span(gpu);return;}
         let Some(pending) = &mut self.pending else { return; };
         if pending.finished || pending.draws.len() != pending.kind.draw_count() { return; }
         let plans = pending.targets.iter().map(|(t,a,r)| texture_plan(format!("final-{r}.bin"),t,0,*a)).collect::<Result<Vec<_>,_>>();
@@ -626,7 +662,7 @@ impl Capture {
     }
     pub(super) fn submitted(&mut self, gpu: &Gpu, epoch: u64) {
         let submitted_bytes=std::mem::take(&mut self.epoch_bytes);
-        if matches!(self.kind,CaptureKind::TargetSpan|CaptureKind::Compute) {
+        if matches!(self.kind,CaptureKind::TargetSpan|CaptureKind::Compute|CaptureKind::Graph) {
             let reservations=std::mem::take(&mut self.epoch_reservations);
             if !reservations.is_empty() {
                 let inflight=gpu.inflight.clone();inflight.fetch_add(1,Ordering::SeqCst);
@@ -645,13 +681,13 @@ impl Capture {
         }
         // Complete intervals may cross ordinary producer submissions. Their
         // already enqueued snapshots stay retained until the final submission.
-        if self.kind==CaptureKind::TargetSpan && self.pending.as_ref().is_some_and(|p|!p.finished) {return;}
+        if matches!(self.kind,CaptureKind::TargetSpan|CaptureKind::Graph) && self.pending.as_ref().is_some_and(|p|!p.finished) {return;}
         let Some(mut pending) = self.pending.take() else { return; };
         if !pending.finished || pending.epoch != epoch {
             self.rejected_starts.insert(pending.candidate_key);
             self.reject("natural submission before span closure"); return;
         }
-        if pending.kind!=CaptureKind::Compute {pending.shader_sources=self.shader_sources.as_ref().map(|sources| {
+        if !matches!(pending.kind,CaptureKind::Compute|CaptureKind::Graph) {pending.shader_sources=self.shader_sources.as_ref().map(|sources| {
             let (hashes,stage_failure)=shader_sources::selected_pipeline_hashes(&pending.draws);
             let mut export=sources.borrow().snapshot(&hashes);
             if let Some(reason)=stage_failure {export["complete"]=false.into();export["failure"]=reason.into();}
@@ -661,7 +697,7 @@ impl Capture {
         // Immutable pending evidence has already been detached. Retire private
         // history now; postcapture observation only needs the original probes.
         self.texture_ledger.take();
-        if matches!(self.kind,CaptureKind::TargetSpan|CaptureKind::Compute) {self.span.clear_interval();}
+        if matches!(self.kind,CaptureKind::TargetSpan|CaptureKind::Compute|CaptureKind::Graph) {self.span.clear_interval();}
         if self.kind==CaptureKind::ColorNull {self.color_null_binding.borrow_mut().take();}
         let directory = self.directory.clone(); let rejected = self.rejected.clone();
         let errors = gpu.errors.clone(); let inflight = gpu.inflight.clone();
@@ -772,7 +808,7 @@ fn compact_target_span_metadata(manifest:&mut Value)->Result<(),String> {
     manifest["unshared_metadata_bytes"]=json!(original_bytes);
     Ok(())
 }
-fn complete(pending: Pending, rx: std::sync::mpsc::Receiver<(usize,Result<(),String>)>, directory: &std::path::Path,
+fn complete(mut pending: Pending, rx: std::sync::mpsc::Receiver<(usize,Result<(),String>)>, directory: &std::path::Path,
     errors: &AtomicU64, backend: &str, rejected: BTreeMap<String,u64>) -> Result<(),String> {
     let mut mapped = std::collections::HashSet::new();
     for _ in &pending.readbacks {
@@ -795,7 +831,7 @@ fn complete(pending: Pending, rx: std::sync::mpsc::Receiver<(usize,Result<(),Str
         // leave an incomplete bundle; it cannot bypass those hashes. Preserve
         // the older small-capture durability behavior, but avoid thousands of
         // synchronous filesystem barriers in the bounded target-span writer.
-        if pending.kind!=CaptureKind::TargetSpan {file.sync_all().map_err(|e|e.to_string())?;}
+        if !matches!(pending.kind,CaptureKind::TargetSpan|CaptureKind::Graph) {file.sync_all().map_err(|e|e.to_string())?;}
         drop(file);
         drop(view); rb.buffer.unmap();
         blobs.push(json!({"path":rb.plan.name,"byte_length":rb.plan.row as u64*rb.plan.rows as u64,"sha256":hash.finish(),
@@ -823,6 +859,15 @@ fn complete(pending: Pending, rx: std::sync::mpsc::Receiver<(usize,Result<(),Str
         "normal_frame_publication_changed":false,"finished_frame_or_density_accepted":false,
         "artifact_publication":"close every payload, then publish one synced atomic manifest; every payload must pass hash admission; interrupted or crash-damaged bundles are not accepted",
         "initialization_scope":"exact captured original-density contents; no complete earlier dependency or high-density initialization claim"})}
+    else if pending.kind==CaptureKind::Graph {
+        let mut value=pending.alias.take().ok_or("connected graph metadata absent")?;
+        value["blobs"]=json!(blobs);value["allocated_readback_bytes"]=json!(pending.bytes);
+        value["prior_rejected_candidates"]=json!(rejected);
+        for stage in value["stages"].as_array_mut().ok_or("connected graph stages missing")? {
+            if stage["kind"]=="raster" {compact_target_span_metadata(&mut stage["capture"])?;}
+        }
+        value
+    }
     else if pending.kind==CaptureKind::Compute {json!({"schema":5,"kind":"native_compute_dispatch","status":"captured",
         "source":{"method":"Gpu::do_dispatch actual final pipeline and resolved bindings","backend":backend,"encoder_epoch":pending.epoch},
         "context":pending.domain,"dispatch":pending.draws.into_iter().next().ok_or("compute dispatch missing")?,
@@ -845,7 +890,7 @@ fn complete(pending: Pending, rx: std::sync::mpsc::Receiver<(usize,Result<(),Str
     if let Some(ledger)=pending.initialization_ledger {manifest["initialization_ledger"]=ledger;}
     if let Some(sources)=pending.shader_sources {manifest["effective_shader_sources"]=sources;}
     if pending.kind==CaptureKind::TargetSpan {compact_target_span_metadata(&mut manifest)?;}
-    let bytes=if pending.kind==CaptureKind::TargetSpan {serde_json::to_vec(&manifest)}else{serde_json::to_vec_pretty(&manifest)}.map_err(|e|e.to_string())?;
+    let bytes=if matches!(pending.kind,CaptureKind::TargetSpan|CaptureKind::Graph) {serde_json::to_vec(&manifest)}else{serde_json::to_vec_pretty(&manifest)}.map_err(|e|e.to_string())?;
     if bytes.len()>16<<20 {return Err(format!("serialized capture manifest {} bytes exceeds 16 MiB bound",bytes.len()));}
     publish_new(&directory.join("capture.json"),&bytes)
 }
@@ -857,7 +902,7 @@ mod tests {
         Capture { kind:CaptureKind::TwoDraw,directory:PathBuf::new(),pipelines:HashMap::new(),pending:None,done:false,attempts:0,sequence:0,
             epoch_bytes:0,rejected:BTreeMap::new(),pipeline_bytes:0,rejected_starts:Default::default(),
             live_bytes:Arc::new(AtomicU64::new(0)),feedback_recorded:false,
-            color_null_binding:RefCell::new(None),color_null_recorded:false,texture_ledger:None,shader_sources:None,span:Default::default(),compute_state:Default::default(),epoch_reservations:Vec::new() }
+            color_null_binding:RefCell::new(None),color_null_recorded:false,texture_ledger:None,shader_sources:None,span:Default::default(),compute_state:Default::default(),graph:Default::default(),epoch_reservations:Vec::new() }
     }
     fn pending() -> Pending {
         Pending {kind:CaptureKind::TwoDraw,alias:None,initialization_ledger:None,shader_sources:None,epoch:1,errors:0,view:Value::Null,domain:Value::Null,draws:vec![Value::Null],attachments:vec![],
@@ -888,6 +933,50 @@ mod tests {
         c.command(24);assert!(c.pending.is_none());
         c.pending=Some(pending());c.pending.as_mut().unwrap().finished=true;c.command(39);
         assert!(c.pending.as_ref().unwrap().finished,"closed snapshot unaffected by later commands");
+    }
+    #[test]
+    fn graph_uav_binding_is_state_only_between_intervals_but_actual_counters_reject() {
+        let mut c=capture();c.kind=CaptureKind::Graph;c.graph.anchor=Some(json!({"eye_index":1}));
+        c.command(38);
+        assert!(c.graph.anchor.is_some());assert!(c.pending.is_none());assert!(c.rejected.is_empty());
+        c.command(39);assert_eq!(c.graph.dispatch_pending,Some(2),"binding retained until actual dispatch admission");
+
+        let mut c=capture();c.kind=CaptureKind::Graph;c.graph.anchor=Some(json!({"eye_index":1}));
+        c.command(38);c.graph_counter_write();
+        assert!(c.graph.anchor.is_none());
+        assert_eq!(c.rejected.get("connected graph contains actual UAV counter write (opcode 38)"),Some(&1));
+
+        let mut c=capture();c.kind=CaptureKind::Graph;c.graph.anchor=Some(json!({"eye_index":1}));
+        c.pending=Some(pending());c.command(38);
+        assert!(c.pending.is_none());assert!(c.graph.anchor.is_none());
+        assert_eq!(c.rejected.get("connected graph UAV binding inside active raster interval (opcode 38)"),Some(&1));
+
+        let mut c=capture();c.kind=CaptureKind::Graph;c.graph.anchor=Some(json!({"eye_index":1}));
+        c.pending=Some(pending());c.pending.as_mut().unwrap().finished=true;
+        c.command(38);c.graph_counter_write();
+        assert!(c.pending.as_ref().is_some_and(|p|p.finished));assert!(c.rejected.is_empty());
+        c.pending.take();c.done=true;c.graph_counter_write();assert!(c.graph.anchor.is_some());
+    }
+    #[test]
+    fn graph_unmodelled_opcode_diagnostics_keep_stable_bounded_reason_keys() {
+        let mut c=capture();c.kind=CaptureKind::Graph;
+        for _ in 0..3 {c.graph.anchor=Some(json!({"eye_index":1}));c.command(40);}
+        assert_eq!(c.sequence,3);assert_eq!(c.rejected.len(),1);
+        assert_eq!(c.rejected.get("connected graph contains unmodelled opcode 40"),Some(&3));
+    }
+    #[test]
+    fn completed_graph_keeps_immutable_capture_across_later_skipped_draws() {
+        let mut c=capture();c.kind=CaptureKind::Graph;c.graph.anchor=Some(json!({"eye_index":1}));
+        c.pending=Some(pending());c.pending.as_mut().unwrap().kind=CaptureKind::Graph;
+        c.pending.as_mut().unwrap().finished=true;
+        c.skipped_draw();
+        assert!(c.pending.as_ref().is_some_and(|p|p.finished),"finished graph awaits original natural submission");
+        assert!(c.graph.anchor.is_some());assert!(c.rejected.is_empty());
+        c.pending.take();c.done=true;c.skipped_draw();
+        assert!(c.graph.anchor.is_some());assert!(c.rejected.is_empty(),"completed observation cannot invalidate exported evidence");
+        c.done=false;c.pending=Some(pending());c.skipped_draw();
+        assert!(c.pending.is_none());assert!(c.graph.anchor.is_none());
+        assert_eq!(c.rejected.get("connected graph contains skipped draw"),Some(&1));
     }
     #[test]
     fn outstanding_encoders_and_reserved_final_contents_share_one_budget() {

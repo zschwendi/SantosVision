@@ -14,7 +14,7 @@ pub(super) struct SpanState {
     buffers:HashMap<Buffer,u64>,
     revisions:HashMap<Buffer,u64>,
     buffer_blobs:HashMap<(u64,u64,u64,u64),String>,
-    texture_blobs:BTreeMap<(u64,u32,u32,Aspect,u64),String>,
+    pub(super) texture_blobs:BTreeMap<(u64,u32,u32,Aspect,u64),String>,
     material_versions:BTreeMap<(u64,u32,u32,Aspect),u64>,
     dummy_textures:HashMap<Texture,u64>,
     next_buffer:u64,
@@ -70,12 +70,21 @@ pub(super) fn world(view:crate::xr_view::WorldView)->Result<Value,String> {
 }
 
 impl Capture {
+    pub(super) fn capture_blob_name(&self,name:String)->String {
+        if self.kind==CaptureKind::Graph {format!("stage{}-{name}",self.graph.stages.len())} else {name}
+    }
     pub(in super::super) fn before_command(&mut self,gpu:&mut Gpu,op:u32,buffer:Option<&Buffer>) {
         if !self.captures_target_span() {return;}
+        if self.kind==CaptureKind::Graph && self.graph.present.is_some_and(|n|Some(n)!=gpu.presents.checked_add(1)) {
+            self.reject("connected graph crossed native present");
+        }
         if op==26 {
             if self.pending.as_ref().is_some_and(|p|!p.finished) {self.close_target_span(gpu);}
             if self.pending.is_none() {
-                self.span.clear_interval();self.span.boundary=Some(self.sequence.saturating_add(1));
+                if self.kind==CaptureKind::Graph && self.graph.anchor.is_some() {
+                    self.span.started=false;self.span.before.clear();self.span.material_versions.clear();
+                } else {self.span.clear_interval();}
+                self.span.boundary=Some(self.sequence.saturating_add(1));
             }
         }
         if matches!(op,12|47) {
@@ -156,7 +165,7 @@ impl Capture {
                         BindingType::Buffer{ty:BufferBindingType::Storage{read_only:true},..}=>"readonly_storage",
                         _=>return Err("span writable or unsupported buffer binding".into())};
                     let metadata=self.span_buffer(buffer,*offset,*size,original_dynamic_offset.is_some(),
-                        format!("draw{ordinal}-g{group}-b{binding}.bin"),plans)?;
+                        self.capture_blob_name(format!("draw{ordinal}-g{group}-b{binding}.bin")),plans)?;
                     for (k,v) in metadata.as_object().unwrap(){out[k]=v.clone();}
                     out["kind"]=kind.into();out["offset"]=0.into();
                     out["original_dynamic_offset"]=json!(original_dynamic_offset);
@@ -165,7 +174,7 @@ impl Capture {
                 Resource::Sampler{descriptor,..}=>{out["kind"]="sampler".into();out["descriptor"]=json!(descriptor);}
                 Resource::Texture{view,descriptor,native_dummy}=>{
                     let storage=matches!(layout.ty,BindingType::StorageTexture{..});
-                    if storage && self.kind!=CaptureKind::Compute {return Err("target-span writable texture binding is unsupported".into());}
+                    if storage && !matches!(self.kind,CaptureKind::Compute|CaptureKind::Graph) {return Err("target-span writable texture binding is unsupported".into());}
                     let texture=view.texture();let id=self.span_texture_identity(gpu,texture,*native_dummy)?;
                     if self.pending.as_ref().is_some_and(|p|p.targets.iter().any(|t|&t.0==texture)) {
                         return Err("span samples current attachment native parent".into());
@@ -220,7 +229,9 @@ impl Capture {
         let mut refs=Vec::new();
         for a in domain["attachments"].as_array().ok_or("span attachments absent")? {
             let id=a["native_allocation_id"].as_u64().ok_or("span attachment identity missing")?;
-            let aspects=if a["role"]=="depth_stencil" {vec![Aspect::Depth,Aspect::Stencil]}else{vec![Aspect::Color]};
+            let aspects=if a["role"]=="depth_stencil" {
+                if a["format"]==json!(TextureFormat::Depth32FloatStencil8) {vec![Aspect::Depth,Aspect::Stencil]} else {vec![Aspect::Depth]}
+            }else{vec![Aspect::Color]};
             for aspect in aspects {refs.push(ledger.current(id,Subresource{mip:0,layer:0,aspect}).ok_or("span target current version missing")?);}
         }
         Ok(refs)
@@ -233,20 +244,27 @@ impl Capture {
         }
         if d.kind>=4 || d.count==0 || d.instances==0 {return Err("span indirect or empty draw unsupported".into());}
         let pi=gpu.pass_info.as_ref().ok_or("span native pass absent")?;
+        let continuation=self.kind==CaptureKind::Graph && !self.graph.stages.is_empty();
         if pi.width==0 || pi.height==0 || pi.width>4096 || pi.height>4096 || pi.samples!=1
-            || pi.rt_formats!=vec![Some(TextureFormat::Bgra8Unorm);4]
-            || pi.ds_format!=Some(TextureFormat::Depth32FloatStencil8) || pi.ro_depth || pi.ro_stencil || gpu.s.ds.flags!=0 {
-            return Err("span requires full four-MRT D32S8 domain".into());
+            || pi.rt_formats.len()>8 || gpu.s.ds.flags&!3!=0 {
+            return Err("span target extent/sample/flags unsupported".into());
+        }
+        if !continuation && (pi.rt_formats!=vec![Some(TextureFormat::Bgra8Unorm);4]
+            || pi.ds_format!=Some(TextureFormat::Depth32FloatStencil8) || pi.ro_depth || pi.ro_stencil || gpu.s.ds.flags!=0) {
+            return Err("span requires initial full four-MRT D32S8 domain".into());
         }
         let view=world(gpu.world_view.ok_or("first or later span draw has no exact world identity")?)?;
+        if self.kind==CaptureKind::Graph {self.graph_start_or_check(gpu,&view)?;}
         let (key,_)=gpu.pipelines.iter().find(|(_,e)|matches!(e,PipeEntry::Done(Some(p)) if p.uid==d.pipeline.uid)).ok_or("span pipeline absent")?;
         let pipeline=self.pipelines.get(key).ok_or("span final pipeline metadata missing")?.clone();
         let (_,failure)=shader_sources::selected_pipeline_hashes(&[json!({"pipeline":pipeline})]);
         if let Some(failure)=failure {return Err(failure);}
         let mut targets=Vec::new();let mut domain=Vec::new();
-        for (slot,r) in gpu.s.rt.iter().take(4).enumerate() {
-            let t=gpu.tex(r.tex).ok_or("span color target missing")?;
-            if r.mip!=0 || r.slice!=0 || t.desc.d!=1 || t.desc.samples!=1 || t.format!=TextureFormat::Bgra8Unorm
+        for (slot,format) in pi.rt_formats.iter().enumerate() {
+            let Some(format)=format else {continue;};
+            let r=&gpu.s.rt[slot];let t=gpu.tex(r.tex).ok_or("span color target missing")?;
+            if r.mip!=0 || r.slice!=0 || t.desc.d!=1 || t.desc.samples!=1 || t.format!=*format
+                || t.tex.dimension()!=TextureDimension::D2 || t.format.is_depth_stencil_format() || t.format.block_dimensions()!=(1,1)
                 || t.desc.w!=pi.width || t.desc.h!=pi.height || targets.iter().any(|(p,_,_):&(Texture,TextureAspect,String)|p==&t.tex) {
                 return Err("span target shape or alias unsupported".into());
             }
@@ -254,13 +272,18 @@ impl Capture {
             domain.push(json!({"role":format!("color{slot}"),"guest_id":r.tex,"format":t.format,"mip":0,"slice":0,
                 "native_allocation_id":t.trace_native_identity.ok_or("span target native identity absent")?}));
         }
-        let ds=&gpu.s.ds;let t=gpu.tex(ds.tex).ok_or("span depth target absent")?;
-        if ds.mip!=0 || ds.slice!=0 || t.desc.d!=1 || t.desc.w!=pi.width || t.desc.h!=pi.height || t.format!=TextureFormat::Depth32FloatStencil8 {return Err("span depth domain unsupported".into());}
-        targets.push((t.tex.clone(),TextureAspect::DepthOnly,"depth".into()));
-        targets.push((t.tex.clone(),TextureAspect::StencilOnly,"stencil".into()));
-        domain.push(json!({"role":"depth_stencil","guest_id":ds.tex,"format":t.format,"mip":0,"slice":0,
-            "native_allocation_id":t.trace_native_identity.ok_or("span depth native identity absent")?}));
-        let domain=json!({"width":pi.width,"height":pi.height,"attachments":domain,"depth_flags":0,"retained_native_parents_compared":true});
+        if let Some(format)=pi.ds_format {
+            let ds=&gpu.s.ds;let t=gpu.tex(ds.tex).ok_or("span depth target absent")?;
+            if ds.mip!=0 || ds.slice!=0 || t.desc.d!=1 || t.desc.w!=pi.width || t.desc.h!=pi.height || t.format!=format
+                || !matches!(format,TextureFormat::Depth32Float|TextureFormat::Depth32FloatStencil8)
+                || pi.ro_depth!=(ds.flags&1!=0) || pi.ro_stencil!=(ds.flags&2!=0) {return Err("span depth domain unsupported".into());}
+            targets.push((t.tex.clone(),TextureAspect::DepthOnly,"depth".into()));
+            if format==TextureFormat::Depth32FloatStencil8 {targets.push((t.tex.clone(),TextureAspect::StencilOnly,"stencil".into()));}
+            domain.push(json!({"role":"depth_stencil","guest_id":ds.tex,"format":t.format,"mip":0,"slice":0,
+                "native_allocation_id":t.trace_native_identity.ok_or("span depth native identity absent")?}));
+        }
+        if targets.is_empty() {return Err("span has no bound target".into());}
+        let domain=json!({"width":pi.width,"height":pi.height,"attachments":domain,"depth_flags":gpu.s.ds.flags,"retained_native_parents_compared":true});
         if let Some(p)=&self.pending {
             if p.domain!=domain || p.view!=view || p.targets.iter().zip(&targets).any(|(a,b)|a!=b) {return Err("span eye, camera or native target changed".into());}
         }
@@ -282,12 +305,12 @@ impl Capture {
                 let aligned=end.checked_add(3).ok_or("span vertex padding overflow")?&!3;
                 if aligned>available {return Err("span vertex fetched range exceeds native binding".into());}aligned
             }else{available};
-            let mut v=self.span_buffer(buffer,*offset,size,false,format!("draw{ordinal}-vb{slot}.bin"),&mut plans)?;
+            let mut v=self.span_buffer(buffer,*offset,size,false,self.capture_blob_name(format!("draw{ordinal}-vb{slot}.bin")),&mut plans)?;
             v["slot"]=(*slot).into();v["offset"]=0.into();v["guest_id"]=(*guest_id).into();vertices.push(v);
         }
         let index=if d.kind&1!=0 {
             let (buffer,format,offset,id)=d.index.ok_or("span indexed binding absent")?;
-            let mut v=self.span_buffer(buffer,0,buffer.size(),false,format!("draw{ordinal}-ib.bin"),&mut plans)?;
+            let mut v=self.span_buffer(buffer,0,buffer.size(),false,self.capture_blob_name(format!("draw{ordinal}-ib.bin")),&mut plans)?;
             v["format"]=json!(format);v["offset"]=(*offset).into();v["guest_id"]=(*id).into();v
         }else{Value::Null};
         let mut bindings=Vec::new();
@@ -313,22 +336,36 @@ impl Capture {
     }
 
     pub(super) fn before_target_span(&mut self,gpu:&mut Gpu,d:&Resolved<'_>) {
-        if self.done || self.pending.as_ref().is_some_and(|p|p.finished) || self.attempts>=128 {return;}
+        if self.done || self.pending.as_ref().is_some_and(|p|p.finished)
+            || (self.attempts>=128 && self.pending.is_none() && self.graph.stages.is_empty()) {return;}
         if self.pending.is_none() && (self.span.boundary.is_none() || self.span.started) {return;}
         let ordinal=self.pending.as_ref().map_or(0,|p|p.draws.len());
         self.span.started=true;
         if ordinal>=MAX_DRAWS {self.reject("complete span draw limit");return;}
-        let prepared=match self.prepare_target_span(gpu,d,ordinal){Ok(v)=>v,Err(e)=>{self.reject(&e);return;}};
+        let mut prepared=match self.prepare_target_span(gpu,d,ordinal){Ok(v)=>v,Err(e)=>{self.reject(&e);return;}};
+        if self.kind==CaptureKind::Graph {prepared.draw["event_index"]=self.graph_next_event().into();}
         let mut initial=Vec::new();let mut attachments=Vec::new();let mut final_bytes=0;
         if ordinal==0 {
             for ((texture,aspect,role),version) in prepared.targets.iter().zip(&self.span.before) {
-                let first=match texture_plan(format!("initial-{role}.bin"),texture,0,*aspect){Ok(p)=>p,Err(e)=>{self.reject(&e);return;}};
-                final_bytes=match add(final_bytes,first.bytes){Ok(n)=>n,Err(e)=>{self.reject(&e);return;}};
+                let first=match texture_plan(self.capture_blob_name(format!("initial-{role}.bin")),texture,0,*aspect){Ok(p)=>p,Err(e)=>{self.reject(&e);return;}};
+                let key=(version.allocation_id,version.subresource.mip,version.subresource.layer,version.subresource.aspect,version.content_version);
+                let existing=if self.kind==CaptureKind::Graph {self.span.texture_blobs.get(&key).cloned()}else{None};
+                let readonly=match version.subresource.aspect {
+                    Aspect::Depth=>gpu.s.ds.flags&1!=0,Aspect::Stencil=>gpu.s.ds.flags&2!=0,Aspect::Color=>false
+                };
+                if self.kind!=CaptureKind::Graph || !readonly {
+                    final_bytes=match add(final_bytes,first.bytes){Ok(n)=>n,Err(e)=>{self.reject(&e);return;}};
+                }
+                let initial_blob=existing.unwrap_or_else(||first.name.clone());
                 attachments.push(json!({"role":role,"format":texture.format(),"width":texture.width(),"height":texture.height(),
-                    "mip":0,"slice":0,"initial_blob":first.name,"final_blob":format!("final-{role}.bin"),
+                    "mip":0,"slice":0,"initial_blob":initial_blob,"final_blob":self.capture_blob_name(format!("final-{role}.bin")),
                     "descriptor":{"width":texture.width(),"height":texture.height(),"depth_or_array_layers":texture.depth_or_array_layers(),
                         "mip_level_count":texture.mip_level_count(),"sample_count":texture.sample_count(),"dimension":texture.dimension(),"format":texture.format()},
-                    "native_allocation_id":version.allocation_id,"initial_version":version}));initial.push(first);
+                    "native_allocation_id":version.allocation_id,"initial_version":version}));
+                if initial_blob==first.name {
+                    if self.kind==CaptureKind::Graph {self.span.texture_blobs.insert(key,initial_blob);}
+                    initial.push(first);
+                }
             }
         }
         let new_bytes=match plan_bytes(&initial).and_then(|n|add(n,plan_bytes(&prepared.plans)?)){Ok(n)=>n,Err(e)=>{self.reject(&e);return;}};
@@ -342,7 +379,7 @@ impl Capture {
         let mut readbacks=self.enqueue_span(gpu,initial);readbacks.extend(self.enqueue_span(gpu,prepared.plans));
         if let Some(p)=&mut self.pending {p.draws.push(prepared.draw);p.readbacks.extend(readbacks);p.bytes+=new_bytes;p.epoch=gpu.enc_epoch;}
         else {
-            self.attempts+=1;
+            if self.kind!=CaptureKind::Graph || self.graph.stages.is_empty() {self.attempts+=1;}
             self.pending=Some(Pending{kind:CaptureKind::TargetSpan,alias:Some(json!({"interval_start_command":self.span.boundary.unwrap()})),
                 initialization_ledger:self.texture_ledger.as_ref().map(texture_ledger::Ledger::capture_evidence),shader_sources:None,
                 epoch:gpu.enc_epoch,errors,view:prepared.view,domain:prepared.domain,draws:vec![prepared.draw],attachments,
@@ -362,17 +399,33 @@ impl Capture {
     fn close_target_span(&mut self,gpu:&mut Gpu) {
         let Some(p)=self.pending.as_ref().filter(|p|!p.finished) else{return;};
         let unique:std::collections::HashSet<_>=p.draws.iter().map(|d|d["pipeline"]["effective_shaders"].to_string()).collect();
-        if p.draws.len()<2 || unique.len()<2 {self.reject("complete interval is not heterogeneous");return;}
+        if (self.kind!=CaptureKind::Graph || self.graph.stages.is_empty()) && (p.draws.len()<2 || unique.len()<2) {self.reject("complete interval is not heterogeneous");return;}
         if gpu.occlusion_active.is_some() || gpu.occlusion_pass_slot.is_some() || !gpu.pending_resolve.is_empty() {self.reject("span closure has query state");return;}
-        let plans=match p.targets.iter().map(|(t,a,r)|texture_plan(format!("final-{r}.bin"),t,0,*a)).collect::<Result<Vec<_>,_>>() {
-            Ok(v)=>v,Err(e)=>{self.reject(&e);return;}
-        };
+        let mut plans=Vec::new();let mut final_names=Vec::new();
+        for ((t,a,r),attachment) in p.targets.iter().zip(&p.attachments) {
+            let version:VersionRef=match serde_json::from_value(attachment["final_version"].clone()) {Ok(v)=>v,Err(_)=>{self.reject("span final version missing");return;}};
+            let key=(version.allocation_id,version.subresource.mip,version.subresource.layer,version.subresource.aspect,version.content_version);
+            if self.kind==CaptureKind::Graph {if let Some(blob)=self.span.texture_blobs.get(&key) {final_names.push(blob.clone());continue;}}
+            let name=self.capture_blob_name(format!("final-{r}.bin"));
+            match texture_plan(name.clone(),t,0,*a) {Ok(v)=>plans.push(v),Err(e)=>{self.reject(&e);return;}}
+            if self.kind==CaptureKind::Graph {self.span.texture_blobs.insert(key,name.clone());}
+            final_names.push(name);
+        }
+        let bytes=match plan_bytes(&plans){Ok(v)=>v,Err(e)=>{self.reject(&e);return;}};
+        if bytes>p.final_bytes {self.reject("span final snapshots exceed reserved budget");return;}
         gpu.end_pass();let readbacks=self.enqueue_span(gpu,plans);
-        let p=self.pending.as_mut().unwrap();p.readbacks.extend(readbacks);p.bytes+=p.final_bytes;
-        self.epoch_bytes+=p.final_bytes;
+        let checkpoint=if self.kind==CaptureKind::Graph {Some(self.graph_next_event())} else {None};
+        let p=self.pending.as_mut().unwrap();p.readbacks.extend(readbacks);p.bytes+=bytes;
+        self.epoch_bytes+=bytes;
+        for (a,name) in p.attachments.iter_mut().zip(final_names) {a["final_blob"]=name.into();}
         p.finished=true;p.epoch=gpu.enc_epoch;
         p.alias.as_mut().unwrap()["interval_end_command"]=self.sequence.saturating_add(1).into();
-        gpu.capture_bindings.take();
+        if let Some(event)=checkpoint {p.alias.as_mut().unwrap()["checkpoint_event_index"]=event.into();}
+        if self.kind==CaptureKind::Graph {
+            let p=self.pending.take().unwrap();
+            if let Err(e)=self.graph_retain_stage(p) {self.reject(&e);}
+        } else {gpu.capture_bindings.take();}
+
     }
 }
 

@@ -127,6 +127,35 @@ class RunnerBoundaries(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "exact final shader"):
             runner.validate_capture(p, "target-span")
 
+    def test_graph_byte_admission_requires_complete_continuous_capture(self):
+        p, value = self.capture()
+        del value["draws"]
+        value.update(schema=6, kind="native_connected_graph", stages=[{}, {}, {}],
+                     finished_frame_or_density_accepted=False)
+        value["closure"].update(same_capture=True, same_native_namespace=True,
+            same_present=True, continuous_command_interval=True, queries_inactive=True, gpu_errors=0)
+        (p / "capture.json").write_text(json.dumps(value))
+        result = runner.validate_capture(p, "graph")
+        self.assertTrue(result["byte_admission_passed"])
+        self.assertTrue(result["semantic_replay_admission_required"])
+        with self.assertRaises(ValueError):
+            runner.validate_capture(p, "compute")
+        invalid = []
+        for key in ("same_capture", "same_native_namespace", "same_present", "continuous_command_interval",
+                    "queries_inactive", "initial_contents_captured", "original_final_captured", "natural_submission_completed"):
+            bad = copy.deepcopy(value); bad["closure"][key] = False; invalid.append(bad)
+        for key in ("gpu_errors", "unmodelled_commands"):
+            for count in (1, False, 0.0, None):
+                bad = copy.deepcopy(value); bad["closure"][key] = count; invalid.append(bad)
+        for key, replacement in [("stages", []), ("stages", [{}, {}]), ("stages", [{}] * 26),
+                                 ("stages", None), ("finished_frame_or_density_accepted", True),
+                                 ("normal_frame_publication_changed", True)]:
+            bad = copy.deepcopy(value); bad[key] = replacement; invalid.append(bad)
+        for index, bad in enumerate(invalid):
+            (p / "capture.json").write_text(json.dumps(bad))
+            with self.subTest(case=index), self.assertRaises(ValueError):
+                runner.validate_capture(p, "graph")
+
     def test_color_null_retains_general_payload_byte_admission(self):
         p, _ = self.color_null_capture()
         (p / "payload.bin").write_bytes(b"wrong")

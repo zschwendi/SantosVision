@@ -1181,6 +1181,10 @@ pub fn max_msaa() -> u32 {
         .unwrap_or(1)
 }
 
+const DEPTH_PROXY_WGSL:&str = "@group(0) @binding(0) var src: texture_depth_2d;
+             @vertex fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4f { var p = array<vec2f, 3>(vec2f(-1, -1), vec2f(3, -1), vec2f(-1, 3)); return vec4f(p[i], 0, 1); }
+             @fragment fn fs(@builtin(position) pos: vec4f) -> @location(0) vec4f { return vec4f(textureLoad(src, vec2i(pos.xy), 0), 0, 0, 1); }";
+
 impl Gpu {
     fn new(mem: SharedMemory, ring: u64, size: u64, dbg: u64, handoff: Option<SurfaceHandoff>) -> anyhow::Result<Gpu> {
         let (base, _) = mem_base_len(&mem);
@@ -2899,9 +2903,7 @@ impl Gpu {
     fn proxy_pipeline(&mut self, kind: &'static str) -> RenderPipeline {
         if let Some(p) = self.proxy_pipelines.get(kind) { return p.clone(); }
         let code = if kind == "depth" {
-            "@group(0) @binding(0) var src: texture_depth_2d;
-             @vertex fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4f { var p = array<vec2f, 3>(vec2f(-1, -1), vec2f(3, -1), vec2f(-1, 3)); return vec4f(p[i], 0, 1); }
-             @fragment fn fs(@builtin(position) pos: vec4f) -> @location(0) vec4f { return vec4f(textureLoad(src, vec2i(pos.xy), 0), 0, 0, 1); }"
+            DEPTH_PROXY_WGSL
         } else {
             "@group(0) @binding(0) var src: texture_2d<u32>;
              @vertex fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4f { var p = array<vec2f, 3>(vec2f(-1, -1), vec2f(3, -1), vec2f(-1, 3)); return vec4f(p[i], 0, 1); }
@@ -2963,9 +2965,19 @@ impl Gpu {
         let out = (px.tex.clone(), px.format);
         #[cfg(all(target_os = "macos", feature = "native-draw-capture"))]
         let ledger_written=px.dirty;
-        if px.dirty {
-            px.dirty = false;
-            let passes: Vec<_> = px.passes.iter().map(|(v, b)| (v.clone(), b.clone())).collect();
+        let passes=if px.dirty {
+            px.dirty=false;
+            Some(px.passes.iter().map(|(v,b)|(v.clone(),b.clone())).collect::<Vec<_>>())
+        }else{None};
+        #[cfg(all(target_os = "macos", feature = "native-draw-capture"))]
+        if passes.is_some() {
+            self.texture_ledger_proxy(id,if stencil {"stencil"}else{"depth"},false);
+            if let Some(mut capture)=self.draw_capture.take() {
+                if let Err(e)=capture.graph_before_proxy(self,id,stencil) {capture.reject_graph(&e);}
+                self.draw_capture=Some(capture);
+            }
+        }
+        if let Some(passes)=passes {
             self.end_pass();
             let enc = self.encoder();
             for (dst, bg) in &passes {
@@ -2982,6 +2994,11 @@ impl Gpu {
         }
         #[cfg(all(target_os = "macos", feature = "native-draw-capture"))]
         self.texture_ledger_proxy(id,if stencil {"stencil"}else{"depth"},ledger_written);
+        #[cfg(all(target_os = "macos", feature = "native-draw-capture"))]
+        if ledger_written {if let Some(mut capture)=self.draw_capture.take() {
+            if let Err(e)=capture.graph_after_proxy(self,id,stencil) {capture.reject_graph(&e);}
+            self.draw_capture=Some(capture);
+        }}
         Some(out)
     }
 
@@ -4835,6 +4852,8 @@ impl Gpu {
     fn set_uav_counter(&mut self, uav: u32, value: u32) {
         let Some(res) = self.view_obj(uav).filter(|v| v.is_buf).map(|v| v.res) else { return };
         if self.buf(res).is_none() { return; }
+        #[cfg(all(target_os = "macos", feature = "native-draw-capture"))]
+        if let Some(capture)=&mut self.draw_capture {capture.graph_counter_write();}
         if self.counter_src.is_none() {
             self.counter_src = Some(self.device.create_buffer(&BufferDescriptor { label: Some("counter src"), size: 1024 * 4, usage: BufferUsages::COPY_SRC | BufferUsages::COPY_DST, mapped_at_creation: false }));
         }
