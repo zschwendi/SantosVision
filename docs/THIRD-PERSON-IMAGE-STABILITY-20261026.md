@@ -2,6 +2,8 @@
 
 V27.8 retains the verified V27.7 finished-image color corrections and adds two bounded production fixes: stable source-coverage timing and depth-qualified sampling at repaired gaps. It does **not** restore the detail absent from a guard-3 source. Hardware image quality and flicker remain unaccepted. A separate same-eye density fixture implements the first rendering step toward a sharper center; it is outside the app and cannot publish a runtime frame.
 
+Subsequent local work now reproduces two original native game draws with their actual materials, state and inherited targets byte for byte. That private Mac run also exposed a separate sampled/output texture conflict. See [real native span evidence and its quality limits](NATIVE-DRAW-SPAN-20261026.md). The frozen V27.8 package is unchanged.
+
 ## Source coverage
 
 The former source-age peak decayed by 0.98 on every eye callback. Identical ages in a different order produced guard scales 1.612618 versus 1.629063; a duplicate young-eye callback reduced the scale to 1.596714. Over 0.2 seconds, equivalent 30/60/90/120 Hz age observations produced horizons of 0.235415/0.184734/0.144964/0.130000 seconds.
