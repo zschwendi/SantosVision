@@ -31,6 +31,15 @@ Normalization happens before the GPU can consume the draw's ring command. Existi
 
 The separate exact-first viewport lookup remains private and disabled: actual v7 runs observed zero corrected selections. Its synthetic discriminator is not evidence of a live benefit.
 
+## Signed local checkpoint
+
+V27.10 is signed and frozen at `target/fidelity-v27-10/SantosVision.app`, built from `dc838560bb709d5c4cc234b884250ac48bd77ce5`. All41 package checks pass, including strict signatures, original game/AOT bytes and RX protection, technical identities/entitlements, unchanged47 compositor source files, and exclusion of private diagnostic switches. All V27.6–V27.9 rollback files and the V27.9 archive remain exact. No installation occurred.
+
+- Executable SHA256: `b931b65c1a450f8308457fa28253edcf50f0f41d5a1c5f2a0d2ff68937151a8f`.
+- Native archive SHA256: `9b7e4740957f8e8bac39e42a2d17ef88126cd0c674f294a403692472de042bc7`.
+- Package receipt: `target/fidelity-v27-10/candidate-receipt.json`; independent final file checks: `target/fidelity-v27-10/root-verification.json`.
+- Supporting commits: `b8f2d5c` ordered native replay; `6cc8a15` bounded native resource/shader capture.
+
 ## Supporting implementation and verification
 
 The private native capture now records actual texture lifetime/subresource versions and exact successful native shader-module sources. Missing initialization, inputs and evicted predecessors remain explicit. Capture-time dependency expansion is bounded; normal passes retain only a small list of roots, and tracking stops after capture completion. An initial expensive/oversized ledger attempt is preserved as negative evidence in `target/native-draw-capture/v6-provenance-comparison.json`; its timing is not used for the correction's comparison.
@@ -43,4 +52,4 @@ Color correctness remains the independently verified V27.7 correction. This chan
 
 No headset, iPad or simulator action or query was performed. The reported bad headset scene was not reproduced here. HUD publication and compositor presentation were inactive in this local fixture; their strict join predicates were checked in CPU tests, not accepted interactively. The old physical27.3 report recorded zero camera conflicts, so this local defect is not established as the sole cause of the user's grain, shading or flicker complaint. M2 source/compositor contention and the extra valid snapshot-copy workload still need hardware acceptance.
 
-After the local-only hold is lifted, the next single test is the same bad scene at1440 Clarity: window→normal third-person immersive,15 seconds still,15 seconds slow yaw,15 seconds still. Compare texture detail, dark shading, thin edges, HUD and flicker, and retain a matched completed source/output pair with timing scope labeled. Keep experimental cache/common-target/single-source paths off. V27.6–V27.9 remain rollback packages; no save or graphics-setting replacement is required.
+After the local-only hold is lifted, the next single test is V27.10 in the same bad scene at1440 Clarity: window→normal third-person immersive,15 seconds still,15 seconds slow yaw,15 seconds still. Compare texture detail, dark shading, thin edges, HUD and flicker, and retain a matched completed source/output pair with timing scope labeled. Keep experimental cache/common-target/single-source paths off. V27.6–V27.9 remain rollback packages; no save or graphics-setting replacement is required.

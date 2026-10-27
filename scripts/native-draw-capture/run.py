@@ -323,7 +323,7 @@ def main():
     p.add_argument("--scene-provenance", action="store_true",
                    help="include bounded native allocation/version and exact final shader source metadata; does not certify full scene closure")
     p.add_argument("--same-ray-alias", action="store_true",
-                   help="qualify the private exact same-eye emission candidate; default off and unavailable in production builds")
+                   help="select the production same-ray correction for private comparison; this runner defaults to the historical baseline")
     p.add_argument("--exact-viewport-match", action="store_true",
                    help="qualify exact stored viewport selection before legacy approximate fallback; no ray or identity canonicalization")
     p.add_argument("--observe-after-capture", type=observation_seconds, default=0,

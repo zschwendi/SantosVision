@@ -1,8 +1,8 @@
 # Third-person immersive fidelity on the27 baseline
 
-## V27.10 source checkpoint — October26
+## Latest local candidate — V27.10, October26
 
-The new correction admits exact same-eye camera-coordinate aliases that the former callback-ID rule rejected. In actual comparable20-second local observation windows, GPU-complete source publications increased from46 to972; genuine camera changes still reject. Resolution, graphics effects, source pixels and independent-eye rendering are preserved. Source and CPU verification pass; the separate local package is being prepared. This does not establish repaired headset grain/shading or remove the guard3 detail limit. See [V27.10 source publication evidence and acceptance boundary](WORLD-PROVENANCE-FIDELITY-20261026.md).
+The new correction admits exact same-eye camera-coordinate aliases that the former callback-ID rule rejected. In actual comparable20-second local observation windows, GPU-complete source publications increased from46 to972; genuine camera changes still reject. Resolution, graphics effects, source pixels and independent-eye rendering are preserved. V27.10 is signed and frozen from `dc83856` at `target/fidelity-v27-10/SantosVision.app`;40 CPU tests and41 package checks pass. It is uninstalled. This does not establish repaired headset grain/shading or remove the guard3 detail limit. See [V27.10 source publication evidence and acceptance boundary](WORLD-PROVENANCE-FIDELITY-20261026.md). V27.10 supersedes the next headset acceptance plan below; older candidates remain preserved.
 
 ## Preserved local candidate — V27.9, October26
 
