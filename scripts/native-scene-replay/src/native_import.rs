@@ -872,7 +872,7 @@ pub fn native(path: &Path, out: &Path) -> Result<()> {
     let raw = fs::read(path)?;
     require(raw.len() <= 32 << 20, "native manifest bound")?;
     let manifest: Value = serde_json::from_slice(&raw)?;
-    let scene = convert(&manifest, sha(&raw))?;
+    let mut scene = convert(&manifest, sha(&raw))?;
     let root = path
         .parent()
         .ok_or("native manifest parent")?
@@ -907,6 +907,7 @@ pub fn native(path: &Path, out: &Path) -> Result<()> {
         )?;
         payload.push((rel.to_owned(), bytes));
     }
+    let proofs = crate::native_clear::promote(&manifest, &mut scene, &payload)?;
     fs::create_dir(out)?;
     for (rel, bytes) in payload {
         let dest = out.join(rel);
@@ -924,7 +925,9 @@ pub fn native(path: &Path, out: &Path) -> Result<()> {
         serde_json::to_vec_pretty(&serde_json::json!({
             "schema":1,"adapter":"schema4 native complete target interval v1",
             "capture_sha256":sha(&raw),"scene_sha256":sha(&scene_bytes),
-            "native_identifiers_preserved":true,"initial_targets_captured_parity_only":true,
+            "native_identifiers_preserved":true,
+            "uniform_clear_initializers":proofs,
+            "inherited_target_initializers_remain_captured":true,
             "finished_frame_or_density_accepted":false
         }))?,
     )?;

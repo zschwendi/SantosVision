@@ -93,11 +93,21 @@ mips/layers or substitute dummy data. Unselected subresources remain explicitly
 Unknown with version zero meaning *unobserved and unusable*, not a fabricated
 native version. They cannot be sampled until authentic content is supplied.
 
-All initial target bytes are imported as Captured. Even when the original ledger
-contains clear evidence, this first adapter does not infer a high-density
-initializer from incomplete history. Any original applied-clear metadata remains
-in the unchanged `native-capture.json`. The first producer scope rejects later
-clears/texture writes rather than silently omitting them. Complete source-graph
+Initial targets normally remain Captured. A direct `capture_start` ledger root
+may instead become UniformClear only when its exact allocation, version,
+subresource, view format and operation match a live native record, with no
+contradictory missing provenance, and its complete original bytes agree. The
+current byte oracle supports BGRA/RGBA8 UNORM endpoints, Float32 depth and 8-bit
+stencil; unsupported formats or fractional color clears remain Captured. Uniform
+pixels alone, a prior clear ancestor, or missing producer history never qualify.
+
+Every promoted clear retains an optional `reference_blob` at the original extent.
+The executor clears through the real API and reads the entire aspect back before
+draws, preserving the original byte check. No density mode may silently strip this
+reference. The actual v11b fixture promotes color0, depth and stencil; inherited
+color1/2/3 remain Captured and the overall independent-initialization gate stays
+false. Promotion evidence is recorded in `native-import.json`; unchanged original
+ledger and image bytes remain in the frozen capture. Complete source-graph
 initialization and final postprocessing remain separate work.
 
 `native-import.json` binds the exact original capture bytes to the generated

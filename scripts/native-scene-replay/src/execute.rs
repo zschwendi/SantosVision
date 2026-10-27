@@ -643,9 +643,21 @@ pub fn run(input: &Input) -> Result<Output> {
         r.textures.insert(t.id.clone(), tex);
     }
     let mut initial_checks = 0;
+    let mut clear_reference_checks = 0;
     for t in &input.scene.textures {
         for i in &t.initial {
-            if let Initial::Captured { blob } = &i.origin {
+            let reference = match &i.origin {
+                Initial::Captured { blob } => Some(blob),
+                Initial::UniformClear {
+                    reference_blob: Some(blob),
+                    ..
+                } => {
+                    clear_reference_checks += 1;
+                    Some(blob)
+                }
+                _ => None,
+            };
+            if let Some(blob) = reference {
                 let slice = Slice {
                     resource: t.id.clone(),
                     mip: i.mip,
@@ -752,6 +764,6 @@ pub fn run(input: &Input) -> Result<Output> {
     let exact = comparisons.iter().all(|v| v["different_bytes"] == 0);
     Ok(Output {
         aspect_bytes: output,
-        report: serde_json::json!({"schema":1,"gpu_executed":true,"manifest_sha256":input.manifest_sha256,"provenance":input.scene.provenance,"eye":input.scene.eye,"initial_subresources_byte_exact":initial_checks,"all_expected_bytes_equal":exact,"comparisons":comparisons,"heterogeneous_pipeline_count":r.pipelines.len(),"command_count":input.scene.commands.len(),"targets_have_resolution_independent_initialization":input.targets_have_resolution_independent_initialization,"finished_frame_or_density_accepted":false,"scope":"Generic original-density ordered replay. External dependency and complete finished-frame closure remain separate gates.","adapter":format!("{:?}",adapter.get_info())}),
+        report: serde_json::json!({"schema":1,"gpu_executed":true,"manifest_sha256":input.manifest_sha256,"provenance":input.scene.provenance,"eye":input.scene.eye,"initial_subresources_byte_exact":initial_checks,"uniform_clear_initial_subresources_byte_exact":clear_reference_checks,"all_expected_bytes_equal":exact,"comparisons":comparisons,"heterogeneous_pipeline_count":r.pipelines.len(),"command_count":input.scene.commands.len(),"targets_have_resolution_independent_initialization":input.targets_have_resolution_independent_initialization,"finished_frame_or_density_accepted":false,"scope":"Generic original-density ordered replay. External dependency and complete finished-frame closure remain separate gates.","adapter":format!("{:?}",adapter.get_info())}),
     })
 }

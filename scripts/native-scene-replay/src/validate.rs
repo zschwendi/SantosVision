@@ -264,6 +264,7 @@ impl Input {
                         value,
                         view_format,
                         operation,
+                        reference_blob,
                     } => {
                         require(
                             t.mutable_target && *operation > 0,
@@ -271,6 +272,12 @@ impl Input {
                         )?;
                         validate_clear(value, &i.aspect)?;
                         validate_view_format(d, *view_format)?;
+                        if let Some(blob) = reference_blob {
+                            require(
+                                self.data(blob)?.len() as u64 == row as u64 * rows as u64,
+                                "exact clear-reference byte extent",
+                            )?;
+                        }
                         initialized.insert(key);
                     }
                 }
@@ -931,6 +938,51 @@ pub fn written_slices(d: &Draw, p: &Pipeline) -> BTreeSet<Slice> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn clear_reference_is_optional_but_has_exact_original_extent() -> Result<()> {
+        let origin = Initial::UniformClear {
+            value: ClearValue::Color { rgba_bits: [0; 4] },
+            view_format: TextureFormat::Rgba8Unorm,
+            operation: 1,
+            reference_blob: Some("clear-reference.bin".into()),
+        };
+        let mut old = serde_json::to_value(&origin)?;
+        old.as_object_mut().unwrap().remove("reference_blob");
+        assert!(matches!(
+            serde_json::from_value::<Initial>(old)?,
+            Initial::UniformClear {
+                reference_blob: None,
+                ..
+            }
+        ));
+        let dir = std::env::temp_dir().join(format!(
+            "native-clear-reference-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_nanos()
+        ));
+        crate::volume_fixture::make(&dir)?;
+        let mut input = Input::load(&dir.join("scene.json"))?;
+        input
+            .bytes
+            .insert("clear-reference.bin".into(), vec![0; 8 * 4 * 4]);
+        input
+            .scene
+            .textures
+            .iter_mut()
+            .find(|t| t.id == "volume-color")
+            .unwrap()
+            .initial[0]
+            .origin = origin;
+        input.validate()?;
+        input.bytes.get_mut("clear-reference.bin").unwrap().pop();
+        assert!(input.validate().is_err());
+        input.bytes.remove("clear-reference.bin");
+        assert!(input.validate().is_err());
+        fs::remove_dir_all(dir)?;
+        Ok(())
+    }
     #[test]
     fn authored_volume_extent_and_dimension_admission() -> Result<()> {
         let dir = std::env::temp_dir().join(format!(

@@ -108,6 +108,9 @@ pub enum Initial {
         value: ClearValue,
         view_format: TextureFormat,
         operation: u64,
+        /// Original-density byte reference; retained even when provenance proves a clear.
+        #[serde(default)]
+        reference_blob: Option<String>,
     },
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]

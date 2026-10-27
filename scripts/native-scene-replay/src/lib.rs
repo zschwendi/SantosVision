@@ -18,3 +18,5 @@ pub fn sha(bytes: &[u8]) -> String {
 }
 
 pub mod volume_fixture;
+
+mod native_clear;
