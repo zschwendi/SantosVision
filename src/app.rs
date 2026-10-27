@@ -48,6 +48,8 @@ impl ApplicationHandler for App {
         #[cfg(target_os = "ios")]
         input::set_focus(true);
         if self.window.is_some() {
+            #[cfg(target_os = "ios")]
+            crate::touch::set_active(self.started);
             return;
         }
         let attrs = Window::default_attributes()
@@ -87,7 +89,7 @@ impl ApplicationHandler for App {
         #[cfg(target_os = "ios")]
         {
             crate::pad::suspend();
-            crate::touch::release();
+            crate::touch::set_active(false);
         }
     }
 
@@ -101,12 +103,16 @@ impl ApplicationHandler for App {
             WindowEvent::Resized(_) => {
                 let (w, h) = backbuffer_size(&window);
                 input::set_size(w, h);
+                #[cfg(target_os = "ios")]
+                crate::touch::resize(&window);
             }
             WindowEvent::Occluded(hidden) => {
                 gpu::OCCLUDED.store(hidden, std::sync::atomic::Ordering::Relaxed);
             }
             WindowEvent::Focused(f) => {
                 input::set_focus(f);
+                #[cfg(target_os = "ios")]
+                crate::touch::set_active(f && self.started);
                 if !f {
                     #[cfg(target_os = "ios")]
                     crate::pad::suspend();
@@ -115,6 +121,10 @@ impl ApplicationHandler for App {
             }
             WindowEvent::ModifiersChanged(m) => self.mods = m.state(),
             WindowEvent::KeyboardInput { event, .. } => {
+                // Cancel touch-owned keys before the first newly connected
+                // keyboard key reaches the shared input state.
+                #[cfg(target_os = "ios")]
+                crate::touch::refresh();
                 if !self.mode_chosen && input::start_mode() != 0 {
                     self.mode_chosen = true;
                     window.set_title(TITLE);
@@ -165,10 +175,13 @@ impl ApplicationHandler for App {
     }
 
     fn about_to_wait(&mut self, el: &ActiveEventLoop) {
+        // Touch releases must precede the controller's new key-down edges.
+        #[cfg(target_os = "ios")]
+        let touch_wait = crate::touch::refresh();
         #[allow(unused_mut)]
         let mut wait = if crate::pad::poll() { 8 } else if cfg!(target_os = "ios") { 250 } else { 1000 };
         #[cfg(target_os = "ios")]
-        if crate::touch::refresh() { wait = 15; }
+        if touch_wait { wait = 15; }
         #[cfg(target_os = "ios")]
         if !self.started {
             self.launcher();
@@ -189,6 +202,11 @@ impl App {
         let Some(window) = self.window.clone() else { return };
         if self.started { return; }
         self.started = true;
+        #[cfg(target_os = "ios")]
+        {
+            crate::touch::resize(&window);
+            crate::touch::set_active(true);
+        }
         let (w, h) = backbuffer_size(&window);
         input::set_size(w, h);
         let rt = match self.rt.clone() {

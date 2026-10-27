@@ -11,6 +11,9 @@ use std::collections::{HashMap, HashSet};
 use winit::event::{Touch, TouchPhase};
 use winit::window::Window;
 
+#[path = "touch_state.rs"]
+mod state;
+
 #[derive(Clone, Copy, PartialEq)]
 enum Act {
     Key(&'static str),
@@ -45,8 +48,8 @@ struct Spec {
 const fn b(anchor: Anchor, radius: f64, on_foot: Option<(&'static str, Act)>, in_car: Option<(&'static str, Act)>) -> Spec {
     Spec { anchor, radius, on_foot, in_car, nav: false }
 }
-const fn n(x: f64, label: &'static str, key: &'static str) -> Spec {
-    Spec { anchor: Anchor::Nav(x, 0.0), radius: 21.0, on_foot: Some((label, Act::Key(key))), in_car: Some((label, Act::Key(key))), nav: true }
+const fn n(x: f64, y: f64, label: &'static str, key: &'static str) -> Spec {
+    Spec { anchor: Anchor::Nav(x, y), radius: 21.0, on_foot: Some((label, Act::Key(key))), in_car: Some((label, Act::Key(key))), nav: true }
 }
 
 use Act::*;
@@ -57,6 +60,8 @@ const BUTTONS: &[Spec] = &[
     b(BottomRight(58.0, 168.0), 28.0, Some(("JUMP", Key("Space"))), Some(("H.BRAKE", Key("Space")))),
     b(BottomRight(140.0, 132.0), 26.0, Some(("ENTER", Key("KeyF"))), Some(("EXIT", Key("KeyF")))),
     b(BottomRight(222.0, 98.0), 24.0, Some(("RELOAD", Key("KeyR"))), Some(("HORN", Horn))),
+    b(BottomRight(222.0, 166.0), 24.0, Some(("USE", Key("KeyE"))), Some(("FIRE", Mouse(1)))),
+    b(BottomRight(222.0, 234.0), 24.0, Some(("ABILITY", Key("CapsLock"))), Some(("LIGHTS", Key("KeyH")))),
     b(TopRight(30.0, 30.0), 22.0, Some(("WEAPON", Key("Tab"))), Some(("WEAPON", Key("Tab")))),
     b(TopRight(84.0, 30.0), 22.0, Some(("COVER", Key("KeyQ"))), Some(("RADIO", Key("KeyQ")))),
     b(TopRight(138.0, 30.0), 22.0, Some(("CROUCH", Key("ControlLeft"))), Some(("LOOK\nBACK", Key("KeyC")))),
@@ -65,12 +70,18 @@ const BUTTONS: &[Spec] = &[
     b(TopLeft(84.0, 30.0), 22.0, Some(("PHONE", KeyNav("ArrowUp"))), Some(("PHONE", KeyNav("ArrowUp")))),
     b(TopLeft(138.0, 30.0), 22.0, Some(("MENU\nKEYS", NavToggle)), Some(("MENU\nKEYS", NavToggle))),
     b(TopLeft(192.0, 30.0), 22.0, Some(("SWITCH", Key("AltLeft"))), Some(("SWITCH", Key("AltLeft")))),
-    n(-135.0, "◀", "ArrowLeft"),
-    n(-87.0, "▲", "ArrowUp"),
-    n(-39.0, "▼", "ArrowDown"),
-    n(9.0, "▶", "ArrowRight"),
-    n(63.0, "OK", "Enter"),
-    n(117.0, "BACK", "Backspace"),
+    n(-145.0, 0.0, "◀", "ArrowLeft"),
+    n(-87.0, 0.0, "▲", "ArrowUp"),
+    n(-29.0, 0.0, "▼", "ArrowDown"),
+    n(29.0, 0.0, "▶", "ArrowRight"),
+    n(87.0, 0.0, "OK", "Enter"),
+    n(145.0, 0.0, "BACK", "Backspace"),
+    n(-145.0, 58.0, "TAB ◀", "KeyQ"),
+    n(-87.0, 58.0, "TAB ▶", "KeyE"),
+    n(-29.0, 58.0, "ALT", "Tab"),
+    n(29.0, 58.0, "SPACE", "Space"),
+    n(87.0, 58.0, "YES", "KeyY"),
+    n(145.0, 58.0, "NO", "KeyN"),
 ];
 
 const STICK_RADIUS: f64 = 58.0;
@@ -81,8 +92,6 @@ const WHEEL_DEADZONE: f64 = 10.0;
 const WHEEL_FULL: f64 = 45.0;
 const WHEEL_PUSH: f64 = 40.0;
 static TOUCH_SENS: std::sync::LazyLock<f64> = std::sync::LazyLock::new(|| std::env::var("MUGUET_TOUCH_SENS").ok().and_then(|v| v.parse().ok()).unwrap_or(1.0));
-
-const MIN_HOLD: std::time::Duration = std::time::Duration::from_millis(120);
 
 enum Grip {
     Stick { origin: (f64, f64), at: (f64, f64) },
@@ -107,17 +116,12 @@ struct Overlay {
     safe: (f64, f64, f64, f64),
     scale: f64,
     grips: HashMap<u64, Grip>,
-    held: HashSet<&'static str>,
-
-    since: HashMap<&'static str, std::time::Instant>,
-    mouse_since: [std::time::Instant; 2],
-
-    lingering: bool,
-    mouse: u8,
+    input: state::HeldInput,
     aim_latched: bool,
     nav: bool,
     in_car: bool,
     hidden: bool,
+    active: bool,
 }
 
 thread_local! {
@@ -184,7 +188,13 @@ pub fn install(window: &Window) {
     let full = window.outer_size().to_logical::<f64>(scale);
     let pos = window.inner_position().map(|p| p.to_logical::<f64>(scale)).unwrap_or_default();
     let inner = window.inner_size().to_logical::<f64>(scale);
-    let safe = (pos.x, pos.y, inner.width, inner.height);
+    // UIKit owns the notch/home-indicator inset; the winit fallback is only
+    // used before the safe-area guide has its first layout.
+    let guide: Retained<AnyObject> = unsafe { msg_send![view, safeAreaLayoutGuide] };
+    let safe_frame: CGRect = unsafe { msg_send![&*guide, layoutFrame] };
+    let safe = if safe_frame.size.width > 0.0 && safe_frame.size.height > 0.0 {
+        (safe_frame.origin.x, safe_frame.origin.y, safe_frame.size.width, safe_frame.size.height)
+    } else { (pos.x, pos.y, inner.width, inner.height) };
 
     let root = unsafe {
         let v: Retained<AnyObject> = msg_send![class!(UIView), new];
@@ -198,7 +208,7 @@ pub fn install(window: &Window) {
         BottomRight(dx, dy) => (sx + sw - dx, sy + sh - dy),
         TopLeft(dx, dy) => (sx + dx, sy + dy),
         TopRight(dx, dy) => (sx + sw - dx, sy + dy),
-        Nav(dx, dy) => (sx + sw / 2.0 + dx, sy + 30.0 + dy),
+        Nav(dx, dy) => (sx + sw / 2.0 + dx, sy + 94.0 + dy),
     };
     let buttons = BUTTONS
         .iter()
@@ -214,17 +224,18 @@ pub fn install(window: &Window) {
     let stick_knob = circle(&root, stick_home, KNOB_RADIUS, 1.0, 0.3);
     let mut o = Overlay {
         root, buttons, stick_base, stick_knob, stick_home, safe, scale,
-        grips: HashMap::new(), held: HashSet::new(), since: HashMap::new(),
-        mouse_since: [std::time::Instant::now(); 2], lingering: false, mouse: 0, aim_latched: false,
-        nav: false, in_car: false, hidden: false,
+        grips: HashMap::new(), input: state::HeldInput::default(), aim_latched: false,
+        nav: false, in_car: false, hidden: true, active: false,
     };
     o.relabel();
+    set_hidden(&o.root, true);
     eprintln!("[touch] overlay ready ({:.0}x{:.0} pt, safe area {:.0},{:.0} {:.0}x{:.0})", full.width, full.height, sx, sy, sw, sh);
     OVERLAY.with(|cell| *cell.borrow_mut() = Some(o));
 }
 
 impl Overlay {
     fn is_wheel(&self, idx: usize) -> bool {
+        if self.nav { return false; }
         match self.spec_act(idx).map(|(_, a)| a) {
             Some(Key("Tab")) | Some(Key("AltLeft")) => true,
             Some(Key("KeyQ")) => self.in_car,
@@ -235,6 +246,9 @@ impl Overlay {
     fn spec_act(&self, idx: usize) -> Option<(&'static str, Act)> {
         let s = &BUTTONS[idx];
         if s.nav && !self.nav { return None; }
+        // The navigation tray replaces gameplay actions instead of stacking
+        // hit targets over them on a phone's short landscape display.
+        if self.nav && matches!(s.anchor, BottomRight(..)) { return None; }
         if self.in_car { s.in_car } else { s.on_foot }
     }
 
@@ -304,14 +318,15 @@ impl Overlay {
                     None => {}
                 }
             }
-            TouchPhase::Ended | TouchPhase::Cancelled => { self.grips.remove(&t.id); }
+            TouchPhase::Ended => { self.grips.remove(&t.id); }
+            TouchPhase::Cancelled => { self.release_all(); return; }
         }
         self.apply();
     }
 
     fn apply(&mut self) {
         let mut keys: HashSet<&'static str> = HashSet::new();
-        let mut mouse = if self.aim_latched && !self.in_car { 2u8 } else { 0 };
+        let mut mouse = if self.aim_latched && !self.in_car && !self.nav { 2u8 } else { 0 };
         let mut stick = None;
         let mut horn = false;
         for g in self.grips.values() {
@@ -333,12 +348,19 @@ impl Overlay {
             dx *= k;
             dy *= k;
             let (nx, ny) = (dx / STICK_RADIUS, dy / STICK_RADIUS);
-            if nx < -0.35 { keys.insert("KeyA"); }
-            if nx > 0.35 { keys.insert("KeyD"); }
-            if self.in_car {
+            if self.nav {
+                if nx < -0.35 { keys.insert("ArrowLeft"); }
+                if nx > 0.35 { keys.insert("ArrowRight"); }
+                if ny < -0.35 { keys.insert("ArrowUp"); }
+                if ny > 0.35 { keys.insert("ArrowDown"); }
+            } else if self.in_car {
+                if nx < -0.35 { keys.insert("KeyA"); }
+                if nx > 0.35 { keys.insert("KeyD"); }
                 if ny < -0.6 { keys.insert("Numpad8"); }
                 if ny > 0.6 { keys.insert("Numpad2"); }
             } else {
+                if nx < -0.35 { keys.insert("KeyA"); }
+                if nx > 0.35 { keys.insert("KeyD"); }
                 if ny < -0.35 { keys.insert("KeyW"); }
                 if ny > 0.35 { keys.insert("KeyS"); }
                 if len > STICK_RADIUS * 0.95 { keys.insert("ShiftLeft"); }
@@ -350,55 +372,62 @@ impl Overlay {
             move_to(&self.stick_knob, self.stick_home);
         }
         crate::pad::HORN_TOUCH.store(horn, std::sync::atomic::Ordering::Relaxed);
-        let now = std::time::Instant::now();
-        let young = |t: Option<&std::time::Instant>| t.is_some_and(|t| now - *t < MIN_HOLD);
-        self.lingering = false;
-        for k in self.held.clone() {
-            if keys.contains(k) { continue; }
-            if young(self.since.get(k)) { keys.insert(k); self.lingering = true; continue; }
-            input::key(k, false, false, None, false);
-            self.since.remove(k);
-        }
-        for k in keys.difference(&self.held) {
-            crate::mp::key_pressed(k);
-            input::key(k, true, false, None, false);
-            self.since.insert(k, now);
-        }
-        self.held = keys;
-        for (i, (bit, dom)) in [(1u8, 0usize), (2, 2)].into_iter().enumerate() {
-            if self.mouse & bit != 0 && mouse & bit == 0 && young(Some(&self.mouse_since[i])) {
-                mouse |= bit;
-                self.lingering = true;
-            }
-            if (mouse ^ self.mouse) & bit != 0 {
-                input::button(dom, mouse & bit != 0);
-                if mouse & bit != 0 { self.mouse_since[i] = now; }
-            }
-        }
-        self.mouse = mouse;
+        emit(self.input.update(keys, mouse, std::time::Instant::now()));
         self.restyle();
     }
 
     fn release_all(&mut self) {
         self.grips.clear();
         self.aim_latched = false;
-        self.apply();
+        self.nav = false;
+        crate::pad::HORN_TOUCH.store(false, std::sync::atomic::Ordering::Relaxed);
+        emit(self.input.release());
+        move_to(&self.stick_base, self.stick_home);
+        move_to(&self.stick_knob, self.stick_home);
+        self.relabel();
     }
 }
 
 pub fn touch(t: &Touch) {
     OVERLAY.with(|cell| {
         if let Some(o) = cell.borrow_mut().as_mut() {
-            if !o.hidden { o.touch(t); }
+            if !o.hidden && o.active { o.touch(t); }
         }
     });
 }
 
+fn emit(edges: state::Edges) {
+    for (key, pressed) in edges.keys {
+        if pressed { crate::mp::key_pressed(key); }
+        let text = if pressed { match key { "KeyY" => Some("y"), "KeyN" => Some("n"), _ => None } } else { None };
+        input::key(key, pressed, false, text, false);
+    }
+    for (button, pressed) in edges.buttons { input::button(button, pressed); }
+}
+
+/// Queried on the UI event loop, before a physical device emits its input.
+/// Presence, not a recent key press, controls the overlay's visibility.
+fn external_devices() -> (bool, bool) {
+    let controller = unsafe { objc2_game_controller::GCController::controllers().iter()
+        .any(|controller| controller.extendedGamepad().is_some()) };
+    let keyboard: Option<Retained<AnyObject>> = unsafe { msg_send![class!(GCKeyboard), coalescedKeyboard] };
+    (controller, keyboard.is_some())
+}
+
 pub fn refresh() -> bool {
+    let (controller, keyboard) = external_devices();
     OVERLAY.with(|cell| {
         let mut guard = cell.borrow_mut();
         let Some(o) = guard.as_mut() else { return false };
-        if o.lingering { o.apply(); }
+        let hide = !state::visible(o.active, crate::gpu::SUSPENDED.load(std::sync::atomic::Ordering::Relaxed), controller, keyboard);
+        if hide != o.hidden {
+            o.hidden = hide;
+            if hide { o.release_all(); }
+            set_hidden(&o.root, hide);
+        }
+        if hide { return false; }
+        input::set_locked(true);
+        if o.input.lingering { o.apply(); }
         let mut wheeling = false;
         for g in o.grips.values() {
             if let Grip::Button { idx, start, last } = g {
@@ -414,15 +443,6 @@ pub fn refresh() -> bool {
                 }
             }
         }
-        let hide = crate::pad::ACTIVE.load(std::sync::atomic::Ordering::Relaxed);
-
-        if !hide { input::set_locked(true); }
-        if !crate::gpu::SUSPENDED.load(std::sync::atomic::Ordering::Relaxed) { input::set_focus(true); }
-        if hide != o.hidden {
-            o.hidden = hide;
-            if hide { o.release_all(); }
-            set_hidden(&o.root, hide);
-        }
         let in_car = crate::pad::IN_VEHICLE.load(std::sync::atomic::Ordering::Relaxed);
         if in_car != o.in_car && !o.hidden {
             o.grips.retain(|_, g| !matches!(g, Grip::Button { .. }));
@@ -431,10 +451,34 @@ pub fn refresh() -> bool {
             o.apply();
             o.relabel();
         }
-        o.lingering || wheeling
+        o.input.lingering || wheeling
     })
 }
 
-pub fn release() {
-    OVERLAY.with(|cell| { if let Some(o) = cell.borrow_mut().as_mut() { o.release_all(); } });
+/// Losing focus, backgrounding or returning to native UI cancels immediately.
+pub fn set_active(active: bool) {
+    OVERLAY.with(|cell| {
+        if let Some(o) = cell.borrow_mut().as_mut() {
+            o.active = active;
+            if !active {
+                o.release_all();
+                o.hidden = true;
+                set_hidden(&o.root, true);
+            }
+        }
+    });
+    if active { refresh(); }
+}
+
+pub fn resize(window: &Window) {
+    let active = OVERLAY.with(|cell| {
+        let mut previous = cell.borrow_mut().take();
+        if let Some(o) = previous.as_mut() {
+            o.release_all();
+            unsafe { let _: () = msg_send![&*o.root, removeFromSuperview]; }
+            o.active
+        } else { false }
+    });
+    install(window);
+    set_active(active);
 }
