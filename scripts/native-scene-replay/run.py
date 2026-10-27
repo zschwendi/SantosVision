@@ -30,6 +30,21 @@ def main():
     frozen.mkdir()
     (frozen / "scene.json").write_bytes(raw)
     checked = [(manifest, digest(raw)), (frozen / "scene.json", digest(raw))]
+    if metadata.get("provenance", {}).get("kind") == "native":
+        native = root / "native-capture.json"
+        imported = root / "native-import.json"
+        if native.stat().st_size > 32 << 20 or imported.stat().st_size > 64 << 10:
+            raise ValueError("native provenance bound")
+        native_raw, imported_raw = native.read_bytes(), imported.read_bytes()
+        identity = json.loads(imported_raw)
+        if (digest(native_raw) != metadata["provenance"]["source_sha256"]
+                or identity["capture_sha256"] != digest(native_raw)
+                or identity["scene_sha256"] != digest(raw)):
+            raise ValueError("native adapter identity mismatch")
+        for original, data in ((native, native_raw), (imported, imported_raw)):
+            copied = frozen / original.name
+            copied.write_bytes(data)
+            checked.extend(((original, digest(data)), (copied, digest(data))))
     total = 0
     seen = set()
     for item in metadata["blobs"]:

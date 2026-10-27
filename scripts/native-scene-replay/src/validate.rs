@@ -30,7 +30,14 @@ pub fn slice_bytes(d: &TextureDesc, mip: u32, aspect: &Aspect) -> Result<(u32, u
         .format
         .block_copy_size(Some(aspect.gpu()))
         .ok_or("uncopyable aspect")?;
-    Ok((w, h, w.div_ceil(bw) * bpp, h.div_ceil(bh)))
+    Ok((
+        w,
+        h,
+        w.div_ceil(bw).checked_mul(bpp).ok_or("row overflow")?,
+        h.div_ceil(bh)
+            .checked_mul(d.mip_depth(mip))
+            .ok_or("volume rows overflow")?,
+    ))
 }
 impl Input {
     pub fn load(path: &Path) -> Result<Self> {
@@ -145,10 +152,31 @@ impl Input {
                     && d.width <= 16384
                     && d.height <= 16384
                     && d.layers > 0
-                    && d.layers <= 256
+                    && d.layers
+                        <= if d.dimension == TextureDimension::D3 {
+                            2048
+                        } else {
+                            256
+                        }
                     && d.mips > 0
                     && d.mips <= 15
-                    && d.mips <= 32 - d.width.max(d.height).leading_zeros(),
+                    && d.mips
+                        <= 32
+                            - d.width
+                                .max(d.height)
+                                .max(if d.dimension == TextureDimension::D3 {
+                                    d.layers
+                                } else {
+                                    1
+                                })
+                                .leading_zeros()
+                    && (d.dimension != TextureDimension::D1
+                        || (d.height == 1 && d.layers == 1 && d.mips == 1))
+                    && (d.dimension != TextureDimension::D3
+                        || (d.width <= 2048 && d.height <= 2048))
+                    && (!t.mutable_target || d.dimension == TextureDimension::D2)
+                    && (d.dimension == TextureDimension::D2
+                        || (!d.format.is_depth_stencil_format() && !d.format.is_compressed())),
                 "texture dimensions",
             )?;
             require(
@@ -168,7 +196,13 @@ impl Input {
                     .ok_or("allocation row overflow")?;
                 let size = row
                     .checked_mul((d.height >> mip).max(1).div_ceil(bh) as u64)
-                    .and_then(|n| n.checked_mul(d.layers as u64))
+                    .and_then(|n| {
+                        n.checked_mul(if d.dimension == TextureDimension::D3 {
+                            d.mip_depth(mip) as u64
+                        } else {
+                            d.layers as u64
+                        })
+                    })
                     .ok_or("allocation size overflow")?;
                 allocation_bytes = allocation_bytes
                     .checked_add(size)
@@ -196,6 +230,7 @@ impl Input {
             for i in &t.initial {
                 require(
                     !native
+                        || (i.content_version == 0 && matches!(i.origin, Initial::Unknown { .. }))
                         || (i.content_version > 0
                             && native_initial_versions.insert(i.content_version)),
                     "native initial version absent/duplicated",
@@ -207,7 +242,7 @@ impl Input {
                     aspect: i.aspect.clone(),
                 };
                 require(
-                    i.layer < d.layers
+                    i.layer < d.subresource_layers()
                         && aspects(d.format).contains(&i.aspect)
                         && versions.insert(key.clone(), i.content_version).is_none(),
                     "initial subresource",
@@ -241,7 +276,7 @@ impl Input {
                 }
             }
             for mip in 0..d.mips {
-                for layer in 0..d.layers {
+                for layer in 0..d.subresource_layers() {
                     for aspect in aspects(d.format) {
                         require(
                             versions.contains_key(&Slice {
@@ -279,7 +314,8 @@ impl Input {
                     && p.layouts.len() <= 4
                     && p.vertex_layouts.len() <= 16
                     && p.targets.len() <= 8
-                    && p.multisample.count == 1,
+                    && p.multisample.count == 1
+                    && (p.fragment.is_some() || p.targets.is_empty()),
                 "pipeline bounds",
             )?;
             for x in std::iter::once(&p.vertex).chain(p.fragment.iter()) {
@@ -318,15 +354,11 @@ impl Input {
             }
         }
         let mut draws = 0;
-        let mut last_write = if native {
-            native_initial_versions
-                .iter()
-                .next_back()
-                .copied()
-                .unwrap_or(0)
-        } else {
-            0
-        };
+        // Immutable input snapshots can have an independent native version
+        // namespace (e.g. dummy material allocations). Only ordered attachment
+        // writes share this ledger ordering; each transition also checks its
+        // own exact preceding subresource version.
+        let mut last_write = 0;
         for c in &s.commands {
             match c {
                 Command::Clear {
@@ -350,6 +382,7 @@ impl Input {
                     let b = self.texture(&destination.slice.resource)?;
                     require(
                         b.mutable_target
+                            && a.descriptor.dimension == TextureDimension::D2
                             && source.slice != destination.slice
                             && source.slice.aspect == Aspect::Color
                             && destination.slice.aspect == Aspect::Color
@@ -494,8 +527,8 @@ impl Input {
                             } => {
                                 let t = self.texture(texture)?;
                                 require(
-                                    matches!(e.ty, BindingType::Texture { .. }),
-                                    "texture layout",
+                                    matches!(e.ty, BindingType::Texture { view_dimension, .. } if view_dimension == resolved_view_dimension(&t.descriptor, view)),
+                                    "texture layout dimension",
                                 )?;
                                 let selected = self.view_slices(t, view)?;
                                 require(
@@ -675,8 +708,8 @@ impl Input {
                     let mut writes = BTreeSet::new();
                     for x in &d.writes {
                         require(
-                            attached.contains(&x.slice) && writes.insert(x.slice.clone()),
-                            "write transition outside attachments",
+                            writable_attached.contains(&x.slice) && writes.insert(x.slice.clone()),
+                            "write transition outside writable attachments",
                         )?;
                         advance(x, &mut versions, &mut last_write)?;
                     }
@@ -718,6 +751,7 @@ impl Input {
         let t = self.texture(&a.resource)?;
         require(
             t.mutable_target
+                && t.descriptor.dimension == TextureDimension::D2
                 && a.layer < t.descriptor.layers
                 && aspects(t.descriptor.format).contains(&aspect),
             "attachment allocation",
@@ -743,25 +777,36 @@ impl Input {
         let m = v
             .mip_level_count
             .unwrap_or(d.mips.saturating_sub(v.base_mip_level));
-        let layers = v
-            .array_layer_count
-            .unwrap_or(d.layers.saturating_sub(v.base_array_layer));
+        let dimension = resolved_view_dimension(d, v);
+        let available_layers = d.subresource_layers();
+        let layers = v.array_layer_count.unwrap_or(match dimension {
+            TextureViewDimension::D1 | TextureViewDimension::D2 | TextureViewDimension::D3 => 1,
+            TextureViewDimension::Cube => 6,
+            _ => available_layers.saturating_sub(v.base_array_layer),
+        });
+        let dimension_ok = match d.dimension {
+            TextureDimension::D1 => {
+                dimension == TextureViewDimension::D1 && v.base_array_layer == 0 && layers == 1
+            }
+            TextureDimension::D3 => {
+                dimension == TextureViewDimension::D3 && v.base_array_layer == 0 && layers == 1
+            }
+            TextureDimension::D2 => match dimension {
+                TextureViewDimension::D2 => layers == 1,
+                TextureViewDimension::D2Array => true,
+                TextureViewDimension::Cube => layers == 6 && d.width == d.height,
+                TextureViewDimension::CubeArray => layers % 6 == 0 && d.width == d.height,
+                _ => false,
+            },
+        };
         require(
             m > 0
                 && layers > 0
+                && dimension_ok
                 && v.base_mip_level.checked_add(m).is_some_and(|n| n <= d.mips)
                 && v.base_array_layer
                     .checked_add(layers)
-                    .is_some_and(|n| n <= d.layers)
-                && matches!(
-                    v.dimension,
-                    Some(
-                        TextureViewDimension::D2
-                            | TextureViewDimension::D2Array
-                            | TextureViewDimension::Cube
-                            | TextureViewDimension::CubeArray
-                    ) | None
-                ),
+                    .is_some_and(|n| n <= available_layers),
             "selected view unsupported",
         )?;
         let aa = match v.aspect {
@@ -786,6 +831,17 @@ impl Input {
         }
         Ok(result)
     }
+}
+fn resolved_view_dimension(
+    d: &TextureDesc,
+    v: &TextureViewDescriptor<Option<String>>,
+) -> TextureViewDimension {
+    v.dimension.unwrap_or(match d.dimension {
+        TextureDimension::D1 => TextureViewDimension::D1,
+        TextureDimension::D3 => TextureViewDimension::D3,
+        TextureDimension::D2 if d.layers == 1 => TextureViewDimension::D2,
+        TextureDimension::D2 => TextureViewDimension::D2Array,
+    })
 }
 fn validate_view_format(d: &TextureDesc, f: TextureFormat) -> Result<()> {
     require(
@@ -876,6 +932,192 @@ pub fn written_slices(d: &Draw, p: &Pipeline) -> BTreeSet<Slice> {
 mod tests {
     use super::*;
     #[test]
+    fn authored_volume_extent_and_dimension_admission() -> Result<()> {
+        let dir = std::env::temp_dir().join(format!(
+            "native-volume-admission-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_nanos()
+        ));
+        crate::volume_fixture::make(&dir)?;
+        let base = Input::load(&dir.join("scene.json"))?;
+        let reject = |label: &str, change: &dyn Fn(&mut Input)| -> Result<()> {
+            let mut input = Input {
+                scene: base.scene.clone(),
+                bytes: base.bytes.clone(),
+                manifest_sha256: base.manifest_sha256.clone(),
+                targets_have_resolution_independent_initialization: false,
+            };
+            change(&mut input);
+            require(
+                input.validate().is_err(),
+                &format!("invalid volume fixture admitted: {label}"),
+            )
+        };
+        reject("missing z plane", &|i| {
+            i.bytes.get_mut("volume-mip1.bin").unwrap().truncate(16);
+        })?;
+        reject("extra z plane", &|i| {
+            i.bytes.get_mut("volume-mip1.bin").unwrap().extend([0; 16]);
+        })?;
+        for (field, value) in [("height", 2), ("layers", 2), ("mips", 2)] {
+            reject("invalid D1 allocation", &|i| {
+                let d = &mut i
+                    .scene
+                    .textures
+                    .iter_mut()
+                    .find(|t| t.id == "line")
+                    .unwrap()
+                    .descriptor;
+                match field {
+                    "height" => d.height = value,
+                    "layers" => d.layers = value,
+                    _ => d.mips = value,
+                }
+            })?;
+        }
+        reject("D3 render target", &|i| {
+            i.scene
+                .textures
+                .iter_mut()
+                .find(|t| t.id == "volume")
+                .unwrap()
+                .mutable_target = true;
+        })?;
+        reject("D3-as-array layer", &|i| {
+            i.scene
+                .textures
+                .iter_mut()
+                .find(|t| t.id == "volume")
+                .unwrap()
+                .initial[1]
+                .layer = 1;
+        })?;
+        reject("D3 shader layout dimension", &|i| {
+            if let BindingType::Texture { view_dimension, .. } =
+                &mut i.scene.pipelines[0].layouts[1][0].ty
+            {
+                *view_dimension = TextureViewDimension::D2Array;
+            }
+        })?;
+        reject("noPS bound original color", &|i| {
+            if let Command::Draw { draw } = i.scene.commands.last_mut().unwrap() {
+                draw.colors = vec![Some(Attachment {
+                    resource: "volume-color".into(),
+                    mip: 0,
+                    layer: 0,
+                    view_format: TextureFormat::Rgba8Unorm,
+                })];
+            }
+        })?;
+        fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+    #[test]
+    fn volume_layout_and_view_contract() -> Result<()> {
+        let d = TextureDesc {
+            dimension: TextureDimension::D3,
+            width: 4,
+            height: 4,
+            layers: 4,
+            mips: 3,
+            format: TextureFormat::Rgba8Unorm,
+            view_formats: vec![],
+        };
+        assert_eq!(slice_bytes(&d, 0, &Aspect::Color)?, (4, 4, 16, 16));
+        assert_eq!(slice_bytes(&d, 1, &Aspect::Color)?, (2, 2, 8, 4));
+        assert_eq!(slice_bytes(&d, 2, &Aspect::Color)?, (1, 1, 4, 1));
+        let t = Texture {
+            id: "volume".into(),
+            native_allocation_id: None,
+            descriptor: d,
+            mutable_target: false,
+            initial: vec![],
+        };
+        let input = Input {
+            scene: Scene {
+                schema: 1,
+                provenance: Provenance::Authored {
+                    description: "CPU view contract".into(),
+                },
+                eye: None,
+                blobs: vec![],
+                textures: vec![],
+                buffers: vec![],
+                pipelines: vec![],
+                commands: vec![],
+                expected: vec![],
+                original_submission_completed: true,
+                original_gpu_errors: Some(0),
+                omitted_commands: 0,
+            },
+            bytes: BTreeMap::new(),
+            manifest_sha256: String::new(),
+            targets_have_resolution_independent_initialization: false,
+        };
+        let view = TextureViewDescriptor {
+            dimension: Some(TextureViewDimension::D3),
+            base_mip_level: 1,
+            mip_level_count: Some(2),
+            ..Default::default()
+        };
+        let slices = input.view_slices(&t, &view)?;
+        assert_eq!(slices.len(), 2);
+        assert!(slices.iter().all(|s| s.layer == 0 && s.mip >= 1));
+        for bad in [
+            TextureViewDescriptor {
+                dimension: Some(TextureViewDimension::D2),
+                ..view.clone()
+            },
+            TextureViewDescriptor {
+                base_array_layer: 1,
+                ..view.clone()
+            },
+            TextureViewDescriptor {
+                array_layer_count: Some(2),
+                ..view.clone()
+            },
+            TextureViewDescriptor {
+                mip_level_count: Some(3),
+                ..view.clone()
+            },
+        ] {
+            require(
+                input.view_slices(&t, &bad).is_err(),
+                "invalid volume view admitted",
+            )?;
+        }
+        let mut one = t.clone();
+        one.descriptor.dimension = TextureDimension::D1;
+        one.descriptor.height = 1;
+        one.descriptor.layers = 1;
+        one.descriptor.mips = 1;
+        assert_eq!(
+            slice_bytes(&one.descriptor, 0, &Aspect::Color)?,
+            (4, 1, 16, 1)
+        );
+        assert_eq!(
+            input
+                .view_slices(&one, &TextureViewDescriptor::default())?
+                .len(),
+            1
+        );
+        require(
+            input
+                .view_slices(
+                    &one,
+                    &TextureViewDescriptor {
+                        dimension: Some(TextureViewDimension::D2),
+                        ..Default::default()
+                    },
+                )
+                .is_err(),
+            "1D/2D reinterpretation admitted",
+        )?;
+        Ok(())
+    }
+    #[test]
     fn mixed_fixture_admission_and_fail_closed_boundaries() -> Result<()> {
         let dir = std::env::temp_dir().join(format!(
             "native-scene-admission-{}-{}",
@@ -900,6 +1142,10 @@ mod tests {
             )?;
             Ok(())
         };
+        rejected("no-fragment pipeline with bound colors", &|s| {
+            s.pipelines[0].fragment = None;
+            s.pipelines[0].targets.clear();
+        })?;
         rejected("unknown initial load", &|s| {
             s.commands.remove(0);
         })?;
@@ -1060,7 +1306,38 @@ mod tests {
                 }
             }
         })?;
-        // Retain failed artifacts on assertion; successful authored test directory is disposable.
+        rejected("read-only conservative transition", &|s| {
+            for c in &mut s.commands {
+                if let Command::Draw { draw } = c {
+                    let ds = draw.depth.as_mut().unwrap();
+                    ds.read_only_depth = true;
+                    draw.writes.push(Transition {
+                        slice: Slice {
+                            resource: ds.attachment.resource.clone(),
+                            mip: 0,
+                            layer: 0,
+                            aspect: Aspect::Depth,
+                        },
+                        before: 2,
+                        after: 999,
+                    });
+                    return;
+                }
+            }
+        })?;
+        let mut conservative = Input {
+            scene: base.scene.clone(),
+            bytes: base.bytes.clone(),
+            manifest_sha256: base.manifest_sha256.clone(),
+            targets_have_resolution_independent_initialization: false,
+        };
+        for p in &mut conservative.scene.pipelines {
+            for t in p.targets.iter_mut().flatten() {
+                t.write_mask = ColorWrites::empty();
+            }
+        }
+        conservative.validate()?; // Same native invalidations are valid even when writes preserve bytes.
+                                  // Retain failed artifacts on assertion; successful authored test directory is disposable.
         std::fs::remove_dir_all(dir)?;
         Ok(())
     }

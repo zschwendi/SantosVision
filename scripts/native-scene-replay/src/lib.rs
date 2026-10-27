@@ -2,6 +2,7 @@ pub mod execute;
 pub mod fixture;
 pub mod import;
 pub mod model;
+pub mod native_import;
 pub mod validate;
 use sha2::{Digest, Sha256};
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
@@ -15,3 +16,5 @@ pub fn require(value: bool, message: &str) -> Result<()> {
 pub fn sha(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
+
+pub mod volume_fixture;

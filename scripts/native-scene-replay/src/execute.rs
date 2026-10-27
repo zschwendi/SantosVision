@@ -31,6 +31,7 @@ fn upload(
     a: w::TextureAspect,
     width: u32,
     height: u32,
+    depth: u32,
     bytes: &[u8],
     row: u32,
 ) {
@@ -55,7 +56,7 @@ fn upload(
         w::Extent3d {
             width: width.div_ceil(bw) * bw,
             height: height.div_ceil(bh) * bh,
-            depth_or_array_layers: 1,
+            depth_or_array_layers: depth,
         },
     );
 }
@@ -169,6 +170,7 @@ fn restore_depth(
         w::TextureAspect::All,
         width,
         height,
+        1,
         data,
         width * 4,
     );
@@ -517,13 +519,13 @@ fn read(
             layout: w::TexelCopyBufferLayout {
                 offset: 0,
                 bytes_per_row: Some(pitch),
-                rows_per_image: Some(rows),
+                rows_per_image: Some(height.div_ceil(bh)),
             },
         },
         w::Extent3d {
             width: width.div_ceil(bw) * bw,
             height: height.div_ceil(bh) * bh,
-            depth_or_array_layers: 1,
+            depth_or_array_layers: input.texture(&s.resource)?.descriptor.mip_depth(s.mip),
         },
     );
     let sub = q.submit([e.finish()]);
@@ -599,7 +601,7 @@ pub fn run(input: &Input) -> Result<Output> {
             },
             mip_level_count: d.mips,
             sample_count: 1,
-            dimension: w::TextureDimension::D2,
+            dimension: d.dimension,
             format: d.format,
             usage,
             view_formats: &d.view_formats,
@@ -622,7 +624,18 @@ pub fn run(input: &Input) -> Result<Output> {
                     if i.aspect == Aspect::Depth {
                         restore_depth(&device, &q, &tex, &key, bytes, w, h)?;
                     } else {
-                        upload(&q, &tex, i.mip, i.layer, i.aspect.gpu(), w, h, bytes, row);
+                        upload(
+                            &q,
+                            &tex,
+                            i.mip,
+                            i.layer,
+                            i.aspect.gpu(),
+                            w,
+                            h,
+                            d.mip_depth(i.mip),
+                            bytes,
+                            row,
+                        );
                     }
                 }
             }

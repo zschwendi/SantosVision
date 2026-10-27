@@ -59,12 +59,34 @@ pub struct Blob {
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TextureDesc {
+    #[serde(default = "default_texture_dimension")]
+    pub dimension: TextureDimension,
     pub width: u32,
     pub height: u32,
     pub layers: u32,
     pub mips: u32,
     pub format: TextureFormat,
     pub view_formats: Vec<TextureFormat>,
+}
+fn default_texture_dimension() -> TextureDimension {
+    TextureDimension::D2
+}
+impl TextureDesc {
+    /// D3 has one versioned whole-volume subresource per mip, never array slices.
+    pub fn subresource_layers(&self) -> u32 {
+        if self.dimension == TextureDimension::D2 {
+            self.layers
+        } else {
+            1
+        }
+    }
+    pub fn mip_depth(&self, mip: u32) -> u32 {
+        if self.dimension == TextureDimension::D3 {
+            (self.layers >> mip).max(1)
+        } else {
+            1
+        }
+    }
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]

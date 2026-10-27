@@ -98,3 +98,10 @@ depth-only clear between draws must preserve color/stencil. Uniform snapshots ch
 per draw and a final color copy reads the current version. Expected RGBA, Float32
 depth and stencil bytes are calculated independently on the CPU. This is explicitly
 an authored API test, not game imagery.
+
+## Complete native target intervals
+
+Schema 4 uses `import-native`, with real native allocation/version identities and
+actual final shader sources. See [NATIVE-TARGET-SPAN.md](NATIVE-TARGET-SPAN.md) for
+its strict producer contract, emitted draw arguments, selected views and complete
+interval requirements. Imported target bytes remain original-density evidence.

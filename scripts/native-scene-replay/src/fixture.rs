@@ -82,6 +82,7 @@ pub fn make(out: &Path) -> Result<()> {
             id: id.into(),
             native_allocation_id: None,
             descriptor: TextureDesc {
+                dimension: TextureDimension::D2,
                 width: 16,
                 height: 16,
                 layers: 1,
@@ -119,6 +120,7 @@ pub fn make(out: &Path) -> Result<()> {
         id: "material".into(),
         native_allocation_id: None,
         descriptor: TextureDesc {
+            dimension: TextureDimension::D2,
             width: 4,
             height: 4,
             layers: 2,
@@ -139,6 +141,7 @@ pub fn make(out: &Path) -> Result<()> {
         id: "vertex-texture".into(),
         native_allocation_id: None,
         descriptor: TextureDesc {
+            dimension: TextureDimension::D2,
             width: 2,
             height: 2,
             layers: 1,

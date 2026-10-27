@@ -217,6 +217,7 @@ pub fn legacy(path: &Path, out: &Path) -> Result<()> {
                 id: id.clone(),
                 native_allocation_id: None,
                 descriptor: TextureDesc {
+                    dimension: TextureDimension::D2,
                     width: n(a, "width") as u32,
                     height: n(a, "height") as u32,
                     layers: 1,
@@ -314,6 +315,7 @@ pub fn legacy(path: &Path, out: &Path) -> Result<()> {
                         id: id.clone(),
                         native_allocation_id: None,
                         descriptor: TextureDesc {
+                            dimension: TextureDimension::D2,
                             width: n(t, "width") as u32,
                             height: n(t, "height") as u32,
                             layers: n(t, "depth_or_array_layers") as u32,
