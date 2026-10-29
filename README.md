@@ -1,146 +1,165 @@
-# spatial-V
+<p align="center">
+  <img src="assets/branding/spatial-v-front-glass-master-v28.png" alt="V — green Vision Pro front glass reflecting a Los Santos sunset" width="220">
+</p>
 
-**V** is the app name for this native GTA V runtime for Apple Vision Pro.
-The project builds on [Muguet](https://github.com/c22dev/muguet); upstream attribution and licensing are retained.
+<h1 align="center">V</h1>
 
-Current third-person rendering work and verified build/device limits are tracked in
-[the fidelity report](docs/THIRD-PERSON-FIDELITY-20261025.md).
+<p align="center"><strong>Our take on GTA V for iPhone, iPad, and Apple Vision Pro.</strong></p>
 
-## visionOS work in progress
+V brings the GTA V WebAssembly port into a native Apple app. Play on an iPhone or iPad, put Los Santos in a window on Vision Pro, or step into the experimental third-person immersive view with the character still in front of you.
 
-The requested goal for this fork is GTA V surrounding the player with head tracking
-and distinct views for each eye on Apple Vision Pro. The fork now has a native
-visionOS SwiftUI/Rust/Metal runtime, with the actual game executing in the visionOS
-simulator. Actual compositor captures now show the immersive world, using real
-scene color and depth with simulated head motion. The first performance target is
-a smooth 60 FPS. Physical head tracking, binocular stereo and headset performance
-have not been verified.
+This is our Apple-platform fork of [Muguet](https://github.com/c22dev/muguet). Muguet supplies the native WASM runtime foundation; V adds the Vision Pro app, window-to-immersive presentation, head-tracked per-eye rendering, graphics controls, save handling, and ongoing mobile-control improvements.
 
-- Game input is a compiled **GTA V web-port ZIP**, with `data/manifest.json`,
-  `b/<build>/game.wasm`, `b/<build>/shaders/index.json` and matching `.wgsl` shaders.
-  A retail PC installation or console ISO/ROM does not supply that WebAssembly build.
-  The repository includes no retail-to-web-port converter.
-- Run `python3 scripts/validate-game.py /path/to/game.zip` before building.
-  See [game-file requirements](docs/GAME-FILES.md).
-- The [full-game-v1 snapshot release](https://github.com/alihammoud21/playgta5/releases/tag/full-game-v1)
-  provides 14 independent game archives. `scripts/assemble-game.py` verifies them
-  and combines their game files into one Muguet ZIP; the linked game-file guide
-  covers the required metadata and two known source-manifest repairs.
-- `python3 scripts/precompile-visionos.py /path/to/game.zip` uses a built host
-  compiler to produce visionOS AOT code. It does not create a playable app.
-- `cargo build --locked --bin inspect-game`, followed by
-  `target/debug/inspect-game /path/to/game.wasm`, inventories actual function
-  names and signatures without executing the game, for camera-hook research.
-- `./make-visionos.sh game simulator` builds the native game shell and signed
-  AOT runtime; `game device` builds for a physical headset. Provide the compatible
-  WASM module through the build helper and matching imported data in app Documents.
-  Game assets are not included in this repository.
-- The native target also retains a separate **head-tracking calibration** mode.
-  See [visionOS build instructions](visionos/README.md) and the
-  [current runtime audit](docs/VISIONOS-RUNTIME-AUDIT.md).
+**V is a work in progress.** Windowed play is the visual reference. Immersive mode runs on a physical headset, but its grain, detail loss, edge artifacts, flicker, and performance still need work. A full-game completion pass is not certified.
 
-On October 10, 2026, the real snapshot module (build `8b0b5899ed`, SHA-256
-`11ca8d2c04c5e843d18ff4aea4899d72c86973c6b031df334e67c446b2ae83e0`)
-passed WASM validation and hook inspection, compiled to ARM code, and ran in the
-owned visionOS simulator. Source captures show actual outdoor gameplay and the
-standard third-person camera with reference-relative head translation/rotation.
-The camera hook preserves the game's selected primary camera, including cutscenes;
-near-camera geometry fades between 45 and 15 cm. The simulator exposes one view;
-earlier source gameplay was roughly 10–13 FPS at 1280×720. The v5i run kept
-publication active through gameplay and its actual compositor readback contains
-the reprojected world. Uncovered regions and black outlines at depth discontinuities
-remain visible. This is a prototype; hardware stereo and performance remain untested.
+[Install on Vision Pro](docs/INSTALL-VISION-PRO.md) · [Game files](docs/GAME-FILES.md) · [iPhone and iPad](#iphone-and-ipad) · [How it works](#how-it-works) · [Contributing](#contributing)
 
-The native launcher now defaults to **Low, 960×540, with a 60 FPS cap**. It allows
-640×360, 960×540 or 1280×720 and a 30 or 60 FPS cap before starting the engine;
-quit and reopen to change settings after startup. Low reduces textures, shadows,
-reflections and grass to level 0 and disables antialiasing, SSAO, tessellation,
-depth of field and motion blur. Shader quality remains at the engine's level-1
-minimum. The saved settings are backed up before modification. The cap is a
-limit, not a measured frame rate. A six-minute 960×540 test averaged 18.5 game FPS
-in its warmed intervals and did not repeat the earlier simulator crash. A
-three-minute 640×360 comparison averaged 29.8 game FPS in its warmed intervals.
-These one-view simulator tests do not establish smooth 60 FPS or headset stability.
+## What you can expect
 
-Native rendering changes are built into the app and apply to compatible imported
-game data; they do not rewrite the ZIP, WASM module or cached game AOT. The first
-reusable buffer-upload experiment passed correctness checks but reduced simulator
-source FPS: about 21.7 versus 38.7 and 31.3 in the original-path runs bracketing it.
-The original queue upload path remains the default. Experimental 64 KiB/1 MiB
-staging pages and a conservative Metal optimization that skips empty transition
-command buffers are available for comparison. All 46 integrated Rust tests pass,
-including actual Metal initialization, discard, query and upload-order checks.
-The Metal toggle measured 31.75 FPS off, 34.47 FPS on and 37.70 FPS on the off
-repeat, so its apparent gain was not consistent. A 64 KiB public-pool attempt
-failed during guest texture loading before reaching the immersive world and
-does not provide a world-FPS result. Both experiments remain off by default.
-The Metal change removes an eligible command buffer in those focused tests;
-that result alone does not establish a gameplay speedup. See the
-[runtime audit](docs/VISIONOS-RUNTIME-AUDIT.md) for measured performance and limits.
+| Platform | Experience | Current limits |
+| --- | --- | --- |
+| **Apple Vision Pro** | Native game window, gamepad input, and experimental third-person immersion with head tracking and separate eye views. | Immersive image quality and sustained performance are unfinished. First-person aiming, Sense motion controls, and hand tracking are not the supported setup path. |
+| **iPhone / iPad** | Native app, on-device ZIP import, gamepad/keyboard input, and on-screen controls. | The latest automatic touch-control handoff is in development source, after the frozen V28 package; physical gameplay validation continues. |
+| **Apple silicon Mac** | Inherited desktop runtime and the tools used to prepare mobile builds. | The main focus of this fork is iOS, iPadOS, and visionOS. |
 
-A further source experiment reuses small Metal upload allocations inside the
-original queue encoder, without adding submission or wait triggers. It is
-controlled by `MUGUET_METAL_INTERNAL_UPLOAD_POOL=1` and remains off by default.
-Both modes pass the 46 app tests, eight focused Metal tests and ten allocator
-lifetime/concurrency tests. The updated simulator and device apps build and
-contain the same game AOT; the device build has not been installed on a headset.
-Its Low 640×360 simulator sequence measured 17.17 FPS off, 37.52 FPS on and
-32.38 FPS off again. The enabled run exercised real reuse, but differing scenes
-and command workloads prevent attributing the FPS difference solely to it.
-It remains experimental; smooth 60 FPS is unverified.
+The name on your device is **V**. The GitHub repository is currently **SantosVision**, and internal targets, bundle identifiers, and save paths still use SantosVision or Muguet. Those names preserve build and data compatibility; they are not separate apps you need to install.
 
-The upstream instructions below describe the existing iOS/macOS port.
+## Install and play on Vision Pro
 
-## How does this work ?
-this whole port relies on the WebAssembly compilation of the game. in a browser, that `game.wasm` runs inside the JS engine, behind WebGPU, Web Audio, web workers...
-Muguet throws that layer away and runs the same `game.wasm` as a regular native app, with [wasmtime](https://wasmtime.dev) for the code and [wgpu](https://wgpu.rs) on Metal for the graphics
+The complete walkthrough is [From zero to V on Vision Pro](docs/INSTALL-VISION-PRO.md). It covers a fresh Mac checkout, the matching game package, signing, headset pairing, data transfer, and the first launch.
 
-On macOS, the game code is compiled to native arm64 the first time you launch it, then cached. On iOS, we can't properly do that (i dont rlly want you to deal with the hassle of enabling JIT), so the game code is compiled when you build the app and baked into it
+There are two things to install: **the app**, containing the compiled game code, and **your matching game data**. Installing the app alone does not make Play ready.
 
-On top of that, Muguet adds a small UDP multiplayer (for other people who have the same port to play with you)
+1. **Prepare compatible game files.** V needs the GTA V web-port package: `data/` plus `b/<build>/game.wasm` and its matching shaders. A retail PC installation, console disc image, or this repository's source ZIP cannot be imported directly.
+2. **Build and sign V on your Mac.** The guide compiles the WASM ahead of time for Vision Pro and signs the native app with your own Apple development team.
+3. **Install the app and copy the prepared data.** Pair your headset with Xcode, install V, then copy the imported game folder into its app container.
+4. **Open V and choose Play.** Start in the ordinary game window with a compatible controller.
+5. **Try immersion.** Once the game world is loaded and GTA's pause menu is closed, use the window's upper-right expand button, **Enter immersive view**.
 
-## Game files
-Because I care about me not getting sued, you will need your own copy as a `.zip` : the folder holding `data/` and `b/<build>/` (with `game.wasm` and `shaders/`)
+**The current Vision Pro launcher does not have an on-device ZIP import button.** Its setup uses the Mac-side preparation and transfer described in the guide. The iPhone/iPad ZIP picker is a different interface.
 
-It's basically the same source as the web port.
+The main branch contains the V port; update an older Muguet-only checkout before following the build instructions.
 
-Muguet itself will then asks for that zip
+No public V release package is published as of October 28, 2026. The current installation route is a source build; a private signed development app is not a general download. Check [Releases](https://github.com/zschwendi/SantosVision/releases) for future packages and their specific signing instructions.
 
-## Requirements
-- Apple Silicon Mac, macOS 14 or later
-- Rust toolchain
-- Xcode 26 or later
+### Source and installed-build status
 
-For iOS, also :
-- `rustup` with `rustup toolchain install 1.98.1` and `rustup target add aarch64-apple-ios --toolchain 1.98.1`
-- `xcodegen` (`brew install xcodegen`)
-- an Apple developer account
-- a device on iOS 15 or later, ideally 8 GB of RAM
+The main branch contains our current V development work, not just the inherited Muguet launcher. The last recorded physical Vision Pro installation is **27.3**. A newer **V28** headset package was built and signed locally but has not been installed for acceptance; current source also includes changes made after that frozen package. Do not treat a build number or successful compilation as proof those later changes were tested on the headset.
 
-## Building
-macOS :
-```
-./make-app.sh
-```
-gives `build/Muguet.app`
+The [fidelity checkpoint](docs/THIRD-PERSON-FIDELITY-20261025.md) and [V28 package record](docs/V28-FRONT-GLASS-PACKAGE-20261026.md) distinguish installed, packaged, and source-only work. The original 27.3 source is preserved by the `los-santos-third-person-quality-preview27-3-20261025` tag.
 
-iOS :
-```
-TEAM=<your team id> ./make-ios.sh game.zip --install
-```
-`--ipa` makes `build/Muguet.ipa` instead. With a free account, add `FREE=1` (+ a `BUNDLE_ID` of your own)
+## Bring your game data
 
-Please install this app with AltStore. This probably won't work well with Sideloadly (or even SideStore, as per [this issue])(https://github.com/SideStore/SideStore/issues/1616)
+V includes no GTA V game assets. You must supply a compatible package you have the right to use. Owning the PC game does not automatically create the required WASM package, and V does not include a retail-to-WASM converter.
 
-The app also works with a paid developer account.
+A supported package has **one build**, with code, shaders, and data that belong together:
 
-## Multiplayer
-One player hosts from the launcher (or runs `muguet-server` on any machine), the others join with that address. UDP port 47520
+~~~text
+game.zip
+├── data/
+│   ├── manifest.json
+│   └── …game assets…
+└── b/
+    └── <build-id>/
+        ├── game.wasm
+        └── shaders/
+            ├── index.json
+            └── …WGSL shaders…
+~~~
 
-## Limitations
-- iOS needs the increased memory limit entitlement
-- Minimap doesn't show
-- Story missions are single player only
+Run the package check before compiling or importing:
 
+~~~sh
+python3 scripts/validate-game.py /absolute/path/to/game.zip
+~~~
 
-Contributions are welcome !
+[Game-file preparation](docs/GAME-FILES.md) explains supported layouts, validation, and assembly of the previously tested snapshot. Changing the ZIP's name or wrapping a PC install in this layout does not convert it. Use the same package for the build and the later import.
+
+## iPhone and iPad
+
+The iOS/iPadOS launcher has an actual file picker:
+
+1. Install a device-signed V build with the matching game code embedded.
+2. Put the compatible ZIP somewhere the device's Files picker can access. Download it locally before starting a large import.
+3. Open V and select **Import game data .zip**.
+4. Keep the app in the foreground until **Importing…** finishes, then choose **Play**.
+
+Source builds use the existing iOS helper after installing Rust 1.98.1, the `aarch64-apple-ios` target, and XcodeGen:
+
+~~~sh
+rustup toolchain install 1.98.1
+rustup target add aarch64-apple-ios --toolchain 1.98.1
+RUSTUP_TOOLCHAIN=1.98.1 \
+  TEAM=YOUR_TEAM_ID BUNDLE_ID=com.yourname.v \
+  ./make-ios.sh /absolute/path/to/game.zip --install YOUR_DEVICE_ID
+~~~
+
+Use your own signing identity and select the exact iPhone or iPad from `xcrun devicectl list devices`. The helper's internal Xcode target remains **Muguet**; the installed app title is **V**. The project's iOS deployment target is 15.0, which is not a promise of acceptable performance on every device running that version. The normal build requests increased-memory and extended-address-space entitlements; signing eligibility and available memory matter.
+
+The helper also supports `--ipa` and a reduced-memory `FREE=1` configuration. These are packaging options, not a guarantee that every signing service or free account will run the game. See `make-ios.sh` before choosing them.
+
+### Controls
+
+A normal compatible gamepad is the starting point on Vision Pro. Use GTA's own button prompts for movement, combat, driving, and menus. Advanced tracked aiming and hand interactions are unfinished.
+
+On iPhone and iPad, the latest source shows touch controls during gameplay when neither an extended game controller nor a hardware keyboard is connected. They cover movement, camera, combat, vehicles, interaction, weapons, and menu navigation. Connecting a physical input device hides the overlay and releases touch-held inputs. This improvement is for the next build after the frozen V28 package.
+
+## Graphics and immersion
+
+V keeps the game's rendering effects and builds immersion from separately retained per-eye color, depth, and camera data. The current focus is making that immersive image match the finished windowed game more closely.
+
+Vision Pro Settings offers **Existing GTA**, **Performance**, and **Clarity** presets. A fresh configuration starts at **960×540**, a **60 FPS cap**, and **Existing GTA**. Existing saved choices remain in use. A frame cap is a limit, not measured performance.
+
+Change launch graphics settings before Play; quit the game and reopen V to apply another configuration. Raising resolution costs memory and render time, and cannot by itself fix every reprojection artifact.
+
+Known work remains on:
+
+- Fine detail and grain: extra image coverage for head movement spreads the available source samples over a larger view.
+- Depth edges, uncovered areas, and temporal flicker.
+- Latency and sustained performance on the headset.
+- HUD presentation and broader mission/device compatibility.
+
+Local shader comparisons demonstrate specific fixes; they do not certify a finished headset experience or 60 FPS. Developers can find the current evidence in the [third-person fidelity checkpoint](docs/THIRD-PERSON-FIDELITY-20261025.md).
+
+## Saves and updates
+
+Save through GTA's own menus. The Vision Pro app keeps game data in `Documents/game` and local saves separately in `Documents/saves`.
+
+Install updates over the existing app using the same signing identity and bundle ID. Export or back up your app data before changing identity or replacing an installation; deleting the app also deletes its local container.
+
+Vision Pro includes save-history and iCloud integration, but cloud sync requires a correctly provisioned container. The public source-build guide uses **local saves** so you do not need the maintainer's iCloud setup. [Save-sync developer notes](visionos/SAVE-SYNC.md) explain that separate configuration. Cross-device save compatibility is not assumed.
+
+## How it works
+
+The web port supplies `game.wasm` and translated WGSL shaders. V hosts the game using [Wasmtime](https://wasmtime.dev/) and [wgpu](https://wgpu.rs/), with Apple's Metal underneath.
+
+On iPhone, iPad, and Vision Pro, the game code is compiled to ARM64 **before installation** and embedded in the signed app. The device does not need an on-device JIT or jailbreak. Imported data supplies the world, textures, audio, and matching shaders; it does not replace the embedded executable.
+
+On Vision Pro, a SwiftUI app manages the launcher and game window. ARKit and CompositorServices provide the tracking and presentation used by the experimental immersive renderer. Windowed and immersive views share the same game session.
+
+Upstream Muguet also includes experimental UDP multiplayer. It is not GTA Online, and multiplayer interoperability is outside this fork's current verified setup path.
+
+## Contributing
+
+Start with the [Vision Pro setup guide](docs/INSTALL-VISION-PRO.md), [native integration notes](visionos/README.md), and the latest [fidelity checkpoint](docs/THIRD-PERSON-FIDELITY-20261025.md). Preserve player data and keep source/build checks separate from physical-device results.
+
+| Location | Purpose |
+| --- | --- |
+| `src/` | Rust runtime, game imports, Metal/wgpu integration, input and camera hooks |
+| `visionos/` | Native Vision Pro app, game window, immersive renderer and focused checks |
+| `ios/` | iPhone/iPad launcher, signing configuration and app assets |
+| `launcher/` | Inherited desktop launcher |
+| `scripts/` | Package validation, assembly, native builds and development checks |
+| `docs/` | Setup, architecture and dated investigation records |
+
+Please do not commit game packages, extracted assets, saves, private device captures, or signing material. Development records are dated evidence, not promises that every experiment ships in a release.
+
+## Credits and license
+
+V is our Apple-platform take by **Zach Schwendiman / Zephyr Studios**, built on **Constantin Clerc (c22dev)'s [Muguet](https://github.com/c22dev/muguet)** and the GTA V WebAssembly port it hosts. Wasmtime, wgpu, and their contributors make the native runtime possible. Upstream attribution is retained; this repository is [GPL-3.0-or-later](LICENSE).
+
+GTA V and its game assets belong to their respective rights holders. V is an unofficial community project, unaffiliated with Rockstar Games, Take-Two Interactive, or Apple.
+
+## Issues
+
+[Check existing issues](https://github.com/zschwendi/SantosVision/issues) before opening a bug report or feature request. Include your device and OS, V build or source commit, windowed versus immersive mode, graphics settings, reproduction steps, and relevant logs. Explain what you expected and what happened; avoid uploading game files or personal data.

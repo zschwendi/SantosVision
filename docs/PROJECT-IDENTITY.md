@@ -1,9 +1,9 @@
-# spatial-V
+# V
 
-The project is **spatial-V**. The customer-facing app name is **V** on visionOS and iOS. The selected public repository slug is `spatial-v`.
+**V** is the app name on iPhone, iPad and Apple Vision Pro. It is our Apple-platform fork of Muguet, hosting the GTA V WebAssembly port.
 
-This replaces the former Los Santos app branding, following the user's October 26, 2026 decision. Launcher headings, window/control titles, loading messages, settings help and tracking permission explanations use V.
+The public repository is currently [zschwendi/SantosVision](https://github.com/zschwendi/SantosVision). Earlier notes used the working project name **spatial-V** and proposed the slug `spatial-v`; that repository rename has not been performed. Use the live SantosVision URL until an actual migration occurs.
 
-Existing technical identities remain stable: bundle identifiers, signing entitlements, iCloud containers, save archives, preferences, scene identifiers, executable/target names and local checkout paths. These retain their original names to preserve installed-app updates and player data. Historical evidence and rollback tags also retain their recorded names.
+Existing technical identities remain stable: bundle identifiers, signing entitlements, iCloud containers, save archives, preferences, scene identifiers, executable/target names and local checkout paths retain SantosVision or Muguet where required for compatibility. Historical evidence and rollback tags retain their recorded names.
 
-Muguet is credited as the upstream codebase; the fork retains its license and attribution. Public repository/account migration is separate from this display-name change.
+Muguet is credited as the upstream codebase; its license and attribution are retained. Changing the visible app name does not migrate signing identities, repositories or player data.

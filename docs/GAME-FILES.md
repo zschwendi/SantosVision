@@ -1,6 +1,8 @@
-# Game package for SantosVision
+# Game files for V
 
-SantosVision is a fork of Muguet, a native runtime for the **compiled GTA V web port**. It is not a console emulator. The input is a ZIP of that port's compiled package, containing matching game data, WebAssembly code, and WGSL shaders.
+V is our Apple-platform fork of Muguet, a native runtime for the **compiled GTA V web port**. It is not a console emulator. The input is a ZIP of that port's compiled package, containing matching game data, WebAssembly code, and WGSL shaders.
+
+For the complete app build, signing and headset installation, follow [From zero to V on Vision Pro](INSTALL-VISION-PRO.md). Package preparation below is one step in that process.
 
 A PlayStation/Xbox ROM or disc ISO, an ordinary Steam/Epic/Rockstar PC installation, and a ZIP of this source repository are not direct inputs. This repository does not include game assets or a conversion procedure from a retail copy. Owning a retail copy alone does not produce the required package.
 
@@ -40,12 +42,12 @@ A successful preflight confirms these structural requirements. It does not certi
 
 The [alihammoud21/playgta5 full-game-v1 release](https://github.com/alihammoud21/playgta5/releases/tag/full-game-v1) supplies 14 independent ZIP archives, plus `download-manifest.json` and `file-inventory.json`. Download all 14 `playgta5-part-XX-of-14.zip` files and both JSON files into one ordinary local folder. These archives must be read separately; concatenating them does not produce a game ZIP. The repository's **Code → Download ZIP** contains source and helpers, not this release payload.
 
-From the SantosVision repository folder:
+From the V repository folder:
 
 ```sh
-python3 scripts/assemble-game.py /Users/zach/gaming/game-assets/playgta5-full-game-v1 \
-  --output /Users/zach/gaming/game-assets/muguet-game.zip
-python3 scripts/validate-game.py /Users/zach/gaming/game-assets/muguet-game.zip
+python3 scripts/assemble-game.py /absolute/path/to/playgta5-full-game-v1 \
+  --output /absolute/path/to/game.zip
+python3 scripts/validate-game.py /absolute/path/to/game.zip
 ```
 
 The assembler works entirely locally. It checks the two metadata files against pinned release SHA-256 values, checks all 14 archive hashes, and verifies every copied game's file size and SHA-256 against the inventory. It streams only `mirror/playgta5.com/b/` and `mirror/playgta5.com/data/` into a new stored ZIP64 archive with `b/` and `data/` at its root. Release launchers and Windows runtimes are excluded. The source archives remain unchanged; no release scripts are run or files extracted. Allow about 21.2 GB of additional free space for the assembled ZIP, on top of the downloaded parts.
@@ -54,8 +56,8 @@ This release has two stale asset-size declarations in `data/manifest.json`: `com
 
 ## Local package verified — October 10, 2026
 
-All 14 release archives were downloaded and verified against their published SHA-256 values. The assembled package is `/Users/zach/gaming/game-assets/muguet-game.zip`: **21,161,246,270 bytes**, SHA-256 `103ecf8d4b45ff5043e318bd71c0acb032a1c700f614cf7d144372d9f4c5eb35`. Its adjacent receipt records verification of all 12,479 copied source files and the two manifest repairs.
+All 14 release archives were downloaded and verified against their published SHA-256 values. The historically verified assembled ZIP was **21,161,246,270 bytes**, SHA-256 `103ecf8d4b45ff5043e318bd71c0acb032a1c700f614cf7d144372d9f4c5eb35`. Its adjacent receipt records verification of all 12,479 copied source files and the two manifest repairs.
 
 The package passed strict preflight and the fork's actual Rust importer in a temporary directory. The import produced 12,156 files, 5,537 manifest assets and 4,808 WGSL shaders. Every imported manifest byte count matched its file, including the importer-modified DLC list, and the retained `game.wasm` matched the published hash. Muguet's existing importer omits 277 manifest assets in its excluded directories; the assembled ZIP retains the full source game payload. The temporary extraction was removed after the check. Local evidence is `target/verification/actual-game-package.json` and `target/verification/actual-import-receipt.json`.
 
-Actual game startup, shader execution, headset installation and full immersive gameplay remain separate acceptance checks.
+These are historical package checks, not a current hardware certification. The app has since run on a physical Vision Pro; current immersive quality and performance limits are recorded in the [fidelity checkpoint](THIRD-PERSON-FIDELITY-20261025.md).
