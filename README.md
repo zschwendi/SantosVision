@@ -44,7 +44,7 @@ No public V release package is published as of October 28, 2026. The current ins
 
 ### Source and installed-build status
 
-The main branch contains our current V development work, not just the inherited Muguet launcher. **V29**, built from [`366a5af`](https://github.com/zschwendi/SantosVision/commit/366a5af4829c9d69d7057410148a7221fdc2be6e), was installed on an M2 Apple Vision Pro on October 28, 2026, replacing 27.3. Device readback confirmed build 29; the existing saves, preferences, and game manifest were preserved. This includes the current native runtime and immersive renderer fixes. In-headset image-quality acceptance is still pending.
+The main branch contains our current V development work, not just the inherited Muguet launcher. **V30**, built from [`7bd22fb`](https://github.com/zschwendi/SantosVision/commit/7bd22fbacd4f656d7ff1039c73ae293a9102ac9d), was installed on an M2 Apple Vision Pro on October 28, 2026. V29 was rejected for washed-out rendering in both the cold game window and immersive. V30 [restores retained texture inputs in the shared renderer](docs/V30-TEXTURE-INPUT-REGRESSION.md), with new native pixel regressions, while retaining the immersive sharpness changes. In-headset visual acceptance of this correction is still pending.
 
 The [fidelity checkpoint](docs/THIRD-PERSON-FIDELITY-20261025.md) and [V28 package record](docs/V28-FRONT-GLASS-PACKAGE-20261026.md) preserve the earlier investigation and frozen package history. The original 27.3 source is preserved by the `los-santos-third-person-quality-preview27-3-20261025` tag.
 

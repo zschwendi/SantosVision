@@ -1,5 +1,7 @@
 # Preserve native passes when color inputs overlap outputs
 
+**Superseded by the [V30 retained-input correction](V30-TEXTURE-INPUT-REGRESSION.md).** The wearer rejected V29 for washed-out rendering in both the cold game window and immersive. Persistent nulling is now removed from the shared state packets; actual graphics feedback protection remains at draw binding resolution. The historical checks below proved their chosen D3D11 policy, but did not protect the known-good windowed image or establish that this bridge should synthesize those persistent state changes.
+
 The native adapter now implements D3D11's persistent null-binding rule for color render targets and overlapping shader inputs. Previously, it forwarded both bindings to wgpu. A real game draw demonstrated that this invalidated the render pass; it was not a gamma, post-processing selection or resolution problem.
 
 ## Demonstrated failure
