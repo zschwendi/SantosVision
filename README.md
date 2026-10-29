@@ -162,4 +162,4 @@ GTA V and its game assets belong to their respective rights holders. V is an uno
 
 ## Issues
 
-[Check existing issues](https://github.com/zschwendi/SantosVision/issues) before opening a bug report or feature request. Include your device and OS, V build or source commit, windowed versus immersive mode, graphics settings, reproduction steps, and relevant logs. Explain what you expected and what happened; avoid uploading game files or personal data.
+[Check existing issues](https://github.com/zschwendi/SantosVision/issues) before opening a bug report or feature request. Include your device and OS, V build or source commit, windowed versus immersive mode, graphics settings, reproduction steps, and relevant logs. Explain what you expected and what happened; avoid uploading game files or personal data. Please keep Issues focused on bugs and feature requests.
