@@ -54,3 +54,7 @@ One player hosts from the launcher (or runs `muguet-server` on any machine), the
 
 
 Contributions are welcome !
+
+## Issues
+
+Found a reproducible bug or have a concrete feature request? [Check existing issues](https://github.com/zschwendi/SantosVision/issues) first, then open an issue if needed. For bugs, include your device/OS, app version, steps to reproduce, expected and actual behavior, and relevant logs. For features, explain the use case. Please keep Issues focused on bugs and feature requests.
