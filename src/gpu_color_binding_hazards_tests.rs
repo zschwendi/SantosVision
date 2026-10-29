@@ -181,12 +181,13 @@ fn gpu(fast: bool, layer: u32) -> Gpu {
     command(&mut g, 29, &[24]);
     g
 }
-fn scenario(fast: bool, name: &str) {
+fn scenario(fast: bool, key_first: bool, name: &str) {
     let disjoint = name.starts_with("disjoint");
     let layer = if name == "disjoint_layer" { 1 } else { 0 };
     let mip = if name == "disjoint_mip" { 1 } else { 0 };
     let side = SIZE >> mip;
     let mut g = gpu(fast, layer);
+    g.bind_group_prepare.key_first = key_first;
     upload(&g, 1, 0, layer, MATERIAL);
     upload(&g, 1, mip, 0, SENTINEL);
     if disjoint {
@@ -215,21 +216,23 @@ fn scenario(fast: bool, name: &str) {
     for stage in 0..3 {
         assert_eq!(
             g.s.srv[stage][0],
-            if disjoint { 11 } else { 0 },
+            11,
             "{name} stage{stage}"
         );
     }
     assert_eq!(g.s.srv[1][1], 13);
-    if name == "null_persists" {
+    if name == "temporary_alias" {
         outputs(&mut g, 0, 0, 0);
-        assert_eq!(g.s.srv[1][0], 0);
+        assert_eq!(g.s.srv[1][0], 11);
+        let restored = g.stage_bind_group(1, &ps, 1, &bgl).unwrap().uid;
+        assert_eq!(cached, restored, "unalias restores the original cached source binding");
         outputs(&mut g, 1, mip, 0);
     }
     let rebound = g.stage_bind_group(1, &ps, 1, &bgl).unwrap().uid;
     if !disjoint {
         assert_ne!(
             cached, rebound,
-            "cached resource binding cannot survive NULL transition"
+            "cached source must not bypass actual draw feedback protection"
         );
     }
     command(&mut g, 31, &[1, 0, 0, side, side]);
@@ -262,23 +265,22 @@ fn scenario(fast: bool, name: &str) {
     assert_eq!(g.draws, 2);
     assert_eq!(g.skipped, 0);
     assert_eq!(g.errors.load(Ordering::SeqCst), 0);
-    // Output unbind does not restore input, but an explicit legal input bind does.
+    // Graphics feedback protection never changes the guest-selected resources.
     outputs(&mut g, 0, 0, 0);
-    input(&mut g, 1, 0, 11);
-    assert_eq!(g.s.srv[1][0], 11);
+    assert_eq!(g.s.srv[1][0], 13);
     eprintln!("native color binding PASS {name} fast={fast}: 2 draws, exact two-MRT pixels, unchanged unrelated texture, zero errors");
 }
 #[test]
-fn metal_native_color_binding_orders_persistence_and_disjoint_subresources() {
-    for fast in [false, true] {
+fn metal_native_color_binding_orders_feedback_and_disjoint_subresources() {
+    for (fast, key_first) in [(false, false), (true, false), (true, true)] {
         for name in [
             "input_then_output",
             "output_then_input",
-            "null_persists",
+            "temporary_alias",
             "disjoint_mip",
             "disjoint_layer",
         ] {
-            scenario(fast, name);
+            scenario(fast, key_first, name);
         }
     }
 }
@@ -297,4 +299,110 @@ fn metal_native_depth_targets_do_not_null_color_binding_state() {
         assert_eq!(g.s.srv[1][5], 91, "depth flags {flags}");
     }
     assert_eq!(g.errors.load(Ordering::SeqCst), 0);
+}
+
+
+/// An input that temporarily aliases an output remains selected for a later
+/// legal draw. Read the prior output without rebinding its SRV.
+#[test]
+fn metal_native_color_state_batches_restore_source_pixels_without_rebind() {
+    for (fast, key_first) in [(false, false), (true, false), (true, true)] {
+        for input_before_output in [false, true] {
+            let mut g = gpu(fast, 0);
+            g.bind_group_prepare.key_first = key_first;
+            upload(&g, 1, 0, 0, MATERIAL);
+            upload(&g, 2, 0, 0, SENTINEL);
+            upload(&g, 4, 0, 0, SENTINEL);
+            if input_before_output { input(&mut g, 1, 0, 11); }
+            outputs(&mut g, 1, 0, 0);
+            if !input_before_output { input(&mut g, 1, 0, 11); }
+            // Force actual feedback binding resolution/cache creation before
+            // changing output. A dummy here must not mutate retained state.
+            let ps = g.shader_program(22).unwrap();
+            let bgl = g.bgl_for(&ps, 1, 1);
+            let feedback = g.stage_bind_group(1, &ps, 1, &bgl).unwrap().uid;
+            outputs(&mut g, 4, 0, 0);
+            let legal = g.stage_bind_group(1, &ps, 1, &bgl).unwrap().uid;
+            command(&mut g, 31, &[1, 0, 0, SIZE, SIZE]);
+            command(&mut g, 32, &[0, 3, 1, 0, 0, 0]);
+            // Pixel assertion deliberately precedes state assertions so the
+            // previous implementation demonstrates its visibly black input.
+            assert_eq!(read(&mut g, 4, 0, 0), MATERIAL.repeat((SIZE * SIZE) as usize),
+                "source lost between state packets: fast={fast} key_first={key_first} input_before_output={input_before_output}");
+            assert_eq!(read(&mut g, 1, 0, 0), MATERIAL.repeat((SIZE * SIZE) as usize));
+            assert_eq!(read(&mut g, 2, 0, 0), [0, 255, 0, 255].repeat((SIZE * SIZE) as usize));
+            assert_eq!(g.s.srv[1][0], 11);
+            assert_ne!(feedback, legal);
+            assert_eq!(g.draws, 1);
+            assert_eq!(g.skipped, 0);
+            assert_eq!(g.errors.load(Ordering::SeqCst), 0);
+        }
+    }
+}
+
+/// A graphics target is not an attachment of a compute dispatch. Preserve its
+/// selected compute input regardless of graphics binding packet order.
+#[test]
+fn metal_native_compute_reads_retained_graphics_target_pixels() {
+    for (fast, key_first) in [(false, false), (true, false), (true, true)] {
+        for input_before_output in [false, true] {
+            let mut g = gpu(fast, 0);
+            g.bind_group_prepare.key_first = key_first;
+            upload(&g, 1, 0, 0, SENTINEL);
+            upload(&g, 2, 0, 0, SENTINEL);
+            upload(&g, 3, 0, 0, MATERIAL);
+            g.create_texture(5, 2, SIZE, SIZE, 1, 1, 1, 28, BIND_UAV | BIND_SRV, 1);
+            upload(&g, 5, 0, 0, SENTINEL);
+            command(&mut g, 37, &[15, 2, 5, 28, 4, 0, 0, 0, 1]);
+            let cs = program(&mut g, "@group(0) @binding(32) var source:texture_2d<f32>; @group(0) @binding(160) var destination:texture_storage_2d<rgba8unorm,write>; @compute @workgroup_size(1,1,1) fn main(@builtin(global_invocation_id) id:vec3u){textureStore(destination,vec2i(id.xy),textureLoad(source,vec2i(id.xy),0));}");
+            g.set_obj(25, Obj::Shader(ShaderObj {
+                stage: 2, hash: "authored compute graphics overlap".into(), sig: vec![], program: Some(Some(cs)),
+            }));
+            command(&mut g, 18, &[2, 25]);
+            command(&mut g, 38, &[2, 0, 1, 15, u32::MAX]);
+            if input_before_output { input(&mut g, 2, 0, 11); }
+            outputs(&mut g, 1, 0, 0);
+            input(&mut g, 1, 0, 13);
+            command(&mut g, 31, &[1, 0, 0, SIZE, SIZE]);
+            command(&mut g, 32, &[0, 3, 1, 0, 0, 0]);
+            if !input_before_output { input(&mut g, 2, 0, 11); }
+            command(&mut g, 39, &[SIZE, SIZE, 1]);
+            assert_eq!(read(&mut g, 5, 0, 0), MATERIAL.repeat((SIZE * SIZE) as usize),
+                "compute input lost to graphics target: fast={fast} key_first={key_first} input_before_output={input_before_output}");
+            assert_eq!(read(&mut g, 1, 0, 0), MATERIAL.repeat((SIZE * SIZE) as usize));
+            assert_eq!(read(&mut g, 2, 0, 0), [0, 255, 0, 255].repeat((SIZE * SIZE) as usize));
+            assert_eq!(g.s.srv[2][0], 11);
+            assert_eq!(g.draws, 1);
+            assert_eq!(g.skipped, 0);
+            assert_eq!(g.errors.load(Ordering::SeqCst), 0);
+        }
+    }
+}
+
+/// A sampled depth proxy has a distinct native allocation from its color
+/// source. It must retain the pre-draw source even when that color is an RT.
+#[test]
+fn metal_native_color_depth_proxy_keeps_source_pixels() {
+    for (fast, key_first) in [(false, false), (true, false), (true, true)] {
+        let mut g = gpu(fast, 0);
+        g.bind_group_prepare.key_first = key_first;
+        upload(&g, 1, 0, 0, MATERIAL);
+        upload(&g, 2, 0, 0, SENTINEL);
+        upload(&g, 3, 0, 0, SENTINEL);
+        let ps = program(&mut g, "@group(1) @binding(32) var source:texture_depth_2d; struct O{@location(0)a:vec4f,@location(1)b:vec4f}; @fragment fn main()->O{let d=textureLoad(source,vec2i(0),0);return O(vec4f(d,d,d,1),vec4f(0,1,0,1));}");
+        g.set_obj(22, Obj::Shader(ShaderObj {
+            stage: 1, hash: "authored distinct depth proxy".into(), sig: vec![], program: Some(Some(ps)),
+        }));
+        outputs(&mut g, 1, 0, 0);
+        input(&mut g, 1, 0, 11);
+        command(&mut g, 31, &[1, 0, 0, SIZE, SIZE]);
+        command(&mut g, 32, &[0, 3, 1, 0, 0, 0]);
+        assert_eq!(read(&mut g, 1, 0, 0), [MATERIAL[0], MATERIAL[0], MATERIAL[0], 255].repeat((SIZE * SIZE) as usize));
+        assert_eq!(read(&mut g, 2, 0, 0), [0, 255, 0, 255].repeat((SIZE * SIZE) as usize));
+        assert_eq!(read(&mut g, 3, 0, 0), SENTINEL.repeat((SIZE * SIZE) as usize));
+        assert_eq!(g.s.srv[1][0], 11);
+        assert_eq!(g.draws, 1);
+        assert_eq!(g.skipped, 0);
+        assert_eq!(g.errors.load(Ordering::SeqCst), 0);
+    }
 }

@@ -1,11 +1,8 @@
-//! D3D11 color output/input binding conflicts persistently null the SRV slot.
-//! Apply at binding commands, before wgpu accumulates bind-group usages into a
-//! render pass. Draw-only dummy substitution would resurrect a nulled binding
-//! after the render target was unbound, which is not D3D11 behavior.
-//!
-//! https://learn.microsoft.com/windows/win32/api/d3d11/nf-d3d11-id3d11devicecontext-omsetrendertargets
-//! https://learn.microsoft.com/windows/win32/api/d3d11/nf-d3d11-id3d11devicecontext-pssetshaderresources
-//! Depth/stencil and their existing proxy/read-only handling are unchanged.
+//! Guard actual graphics feedback without rewriting the guest's retained state.
+//! Preserve the bridge's original retained bindings: a texture can be used by later passes
+//! without rebinding it after every output change. Only the graphics draw that
+//! aliases its own color output receives a dummy. Compute has no color outputs;
+//! depth proxies have separate allocations and retain their existing handling.
 use super::*;
 
 #[derive(Clone,Copy,Debug,PartialEq,Eq)]
@@ -17,24 +14,12 @@ impl Subresources {
     }
 }
 
-/// Normalize the immutable SRV descriptor exactly as srv_view does for its
-/// declared view dimension. As in srv_view, cube-array `d` is used as a count
+/// Normalize the immutable SRV descriptor exactly as srv_view does for the
+/// shader's resolved binding dimension. Cube-array `d` is used as a count
 /// of array layers (not multiplied by six again).
 /// A 3D mip is one D3D subresource regardless of a target's selected z slice.
-fn sampled_subresources(desc:TexDesc,view:&ViewObj)->Option<Subresources> {
+fn sampled_subresources(desc:TexDesc,view:&ViewObj,dimension:TextureViewDimension)->Option<Subresources> {
     if desc.mips==0 || desc.d==0 || view.is_buf {return None;}
-    let dimension=match view.vdim {
-        2=>TextureViewDimension::D1,
-        4|6=>TextureViewDimension::D2,
-        5|7=>TextureViewDimension::D2Array,
-        8=>TextureViewDimension::D3,
-        9=>TextureViewDimension::Cube,
-        10=>TextureViewDimension::CubeArray,
-        // wgpu has no 1D-array view. create_texture forwards dimension D1 and
-        // an array count directly, which rejects a real D1 array; srv_view has
-        // no D1-array mapping either. Do not invent a 2D reinterpretation here.
-        _=>return None,
-    };
     let first=view.a.min(desc.mips-1);
     let count=if view.b==0 || view.b==u32::MAX {desc.mips.saturating_sub(view.a)}else{view.b};
     let count=count.min(desc.mips.saturating_sub(view.a)).max(1);
@@ -54,10 +39,13 @@ impl Gpu {
     /// Both currently resolved native resource parents must be the same;
     /// matching recycled guest IDs or differently allocated depth proxies are
     /// not sufficient. This only inspects the color outputs in s.rt.
-    pub(super) fn color_safe_srv(&self,id:u32)->u32 {
+    pub(super) fn color_safe_srv(&self,id:u32,stage:usize,binding:&Binding)->u32 {
+        if stage==2 {return id;}
         let Some(view)=self.view_obj(id).filter(|v|!v.is_buf) else{return id;};
         let Some(source)=self.tex(view.res) else{return id;};
-        let Some(range)=sampled_subresources(source.desc,view) else{return id;};
+        // srv_view converts these inputs into independent depth/color proxies.
+        if is_depth(source.format)!=(binding.sample==Sample::Depth) {return id;}
+        let Some(range)=sampled_subresources(source.desc,view,binding.dim) else{return id;};
         for target in &self.s.rt {
             let Some(destination)=self.tex(target.tex) else{continue;};
             if is_depth(destination.format) || source.tex!=destination.tex {continue;}
@@ -67,23 +55,19 @@ impl Gpu {
         id
     }
 
-    pub(super) fn unbind_color_target_srvs(&mut self) {
-        for stage in 0..self.s.srv.len() {
-            for slot in 0..self.s.srv[stage].len() {
-                let id=self.s.srv[stage][slot];
-                if id!=0 {
-                    self.s.srv[stage][slot]=self.color_safe_srv(id);
-                    #[cfg(all(target_os = "macos", feature = "native-draw-capture"))]
-                    if let Some(capture)=&self.draw_capture {capture.color_srv_binding(self,26,stage,slot,id,self.s.srv[stage][slot]);}
-                }
-            }
-        }
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn sampled_subresources(desc:TexDesc,view:&ViewObj)->Option<Subresources> {
+        let dimension=match view.vdim {
+            2=>TextureViewDimension::D1,4|6=>TextureViewDimension::D2,
+            5|7=>TextureViewDimension::D2Array,8=>TextureViewDimension::D3,
+            9=>TextureViewDimension::Cube,10=>TextureViewDimension::CubeArray,_=>return None,
+        };
+        super::sampled_subresources(desc,view,dimension)
+    }
     fn descriptor(vdim:u32,a:u32,b:u32,c:u32,d:u32)->ViewObj {
         ViewObj{res:1,is_buf:false,fmt:87,vdim,a,b,c,d,views:HashMap::new()}
     }

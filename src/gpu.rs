@@ -2021,7 +2021,7 @@ impl Gpu {
                 let (st, s, c) = (u(0) as usize, u(1) as usize, u(2) as usize);
                 for i in 0..c { if s + i < 128 && st < 3 {
                     let id=u(3+i as u64);
-                    self.s.srv[st][s+i]=self.color_safe_srv(id);
+                    self.s.srv[st][s+i]=id;
                     #[cfg(all(target_os = "macos", feature = "native-draw-capture"))]
                     if let Some(capture)=&self.draw_capture {capture.color_srv_binding(self,24,st,s+i,id,self.s.srv[st][s+i]);}
                 } }
@@ -2036,7 +2036,6 @@ impl Gpu {
                     self.s.rt[i] = Rt { tex: u(q), mip: u(q + 1), slice: u(q + 2), fmt: u(q + 3) };
                 }
                 self.s.ds = Ds { tex: u(32), mip: u(33), slice: u(34), fmt: u(35), flags: u(36) };
-                self.unbind_color_target_srvs();
                 self.pdirty = true;
             }
             27 => {
@@ -3382,6 +3381,7 @@ impl Gpu {
                 }
                 Kind::Texture => {
                     let id = *self.s.srv[stage].get((b.binding as usize).wrapping_sub(32)).unwrap_or(&0);
+                    let id = self.color_safe_srv(id, stage, b);
                     let is_tex = self.view_obj(id).map(|v| !v.is_buf).unwrap_or(false);
                     if is_tex { if let Some(r) = self.view_obj(id).map(|v| v.res) { if self.pending_clears.contains_key(&r) { self.materialize_clears(r); } } }
                     let v = if is_tex { self.srv_view(id, b) } else { None };

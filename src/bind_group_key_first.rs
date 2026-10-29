@@ -66,6 +66,7 @@ impl Gpu {
                 // Exclude exactly the two proxy branches of srv_view: they
                 // can refresh GPU contents even when a bind group hits.
                 if is_depth(texture.format)!=(binding.sample==Sample::Depth) {return false;}
+                if self.color_safe_srv(id,stage,binding)!=id {return false;}
                 view.views.contains_key(ordinary_view_key(binding.dim))
             }
             Kind::ReadOnlyStorage|Kind::Storage=>{
