@@ -12,7 +12,9 @@ game builds the matching runtime using scripts/build-vision-runtime.sh.
 Set MUGUET_GAME_WASM to override its source module, or MUGUET_RUNTIME_ARCHIVE to use an existing archive.
 Game Swift is optimized; set MUGUET_SWIFT_OPTIMIZATION=-Onone when debugging Swift code.
 Game data must be installed separately. World images require qualified native camera/color/depth snapshots.
-The device build is unsigned. This script never boots simulators or installs to a headset.
+Builds are unsigned by default. Set both TEAM and your own BUNDLE_ID for a signed device build.
+Signed builds use local saves; optionally set MUGUET_CODE_SIGN_ENTITLEMENTS to your configured entitlements file.
+This script never boots simulators, installs an app, or launches it.
 USAGE
 }
 
@@ -30,13 +32,27 @@ case "$destination" in
     device) xcode_destination='generic/platform=visionOS' ;;
     *) usage >&2; exit 64 ;;
 esac
+settings=(CODE_SIGNING_ALLOWED=NO)
+if [[ -n "${TEAM:-}" || -n "${BUNDLE_ID:-}" ]]; then
+    [[ -n "${TEAM:-}" && -n "${BUNDLE_ID:-}" && "$destination" == device ]] || {
+        echo 'Signing requires both TEAM and your own BUNDLE_ID, with the device destination.' >&2
+        exit 64
+    }
+    signing_entitlements="${MUGUET_CODE_SIGN_ENTITLEMENTS:-}"
+    if [[ -n "$signing_entitlements" ]]; then
+        [[ -f "$signing_entitlements" ]] || { echo 'Signing entitlements file does not exist.' >&2; exit 66; }
+        signing_entitlements="$(cd -- "$(dirname -- "$signing_entitlements")" && pwd)/$(basename -- "$signing_entitlements")"
+    fi
+    settings=(CODE_SIGNING_ALLOWED=YES CODE_SIGN_STYLE=Automatic
+        "DEVELOPMENT_TEAM=$TEAM" "PRODUCT_BUNDLE_IDENTIFIER=$BUNDLE_ID"
+        "CODE_SIGN_ENTITLEMENTS=$signing_entitlements" -allowProvisioningUpdates)
+fi
 command -v xcodegen >/dev/null || { echo 'Missing XcodeGen. Install it before generating the visionOS project.' >&2; exit 69; }
 xcrun --sdk xros --show-sdk-path >/dev/null || { echo 'A full Xcode installation with the visionOS SDK is required.' >&2; exit 69; }
 repo="$(cd -- "$(dirname -- "$0")" && pwd)"
 project_dir="$repo/target/visionos-xcode"
 mkdir -p "$project_dir"
 xcodegen generate --spec "$repo/visionos/project.yml" --project "$project_dir"
-settings=(CODE_SIGNING_ALLOWED=NO)
 if [[ "$mode" == game ]]; then
     if [[ -n "${MUGUET_RUNTIME_ARCHIVE:-}" ]]; then
         runtime_archive="$MUGUET_RUNTIME_ARCHIVE"

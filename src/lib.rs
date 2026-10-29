@@ -158,8 +158,22 @@ pub fn desktop_main() -> Result<()> {
     let argv: Vec<String> = std::env::args().collect();
 
     if argv.get(1).map(String::as_str) == Some("--import") {
-        let zip = argv.get(2).context("--import <game.zip>")?;
-        let dest = config::game_dir();
+        let zip = argv.get(2).context("--import <game.zip> [new-destination]")?;
+        anyhow::ensure!(argv.len() <= 4, "--import <game.zip> [new-destination]");
+        let dest = if let Some(explicit) = argv.get(3) {
+            let dest = std::path::PathBuf::from(explicit);
+            anyhow::ensure!(dest.file_name().is_some(), "import destination must name a new directory");
+            for path in [&dest, &dest.with_extension("importing")] {
+                match std::fs::symlink_metadata(path) {
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {},
+                    Ok(_) => anyhow::bail!("refusing to replace existing import path: {}", path.display()),
+                    Err(error) => return Err(error).with_context(|| format!("checking {}", path.display())),
+                }
+            }
+            dest
+        } else {
+            config::game_dir()
+        };
         return import::import(std::path::Path::new(zip), &dest, !code_embedded(), |done, total| println!("progress {done} {total}"));
     }
 
