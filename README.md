@@ -44,9 +44,9 @@ No public V release package is published as of October 28, 2026. The current ins
 
 ### Source and installed-build status
 
-The main branch contains our current V development work, not just the inherited Muguet launcher. The last recorded physical Vision Pro installation is **27.3**. A newer **V28** headset package was built and signed locally but has not been installed for acceptance; current source also includes changes made after that frozen package. Do not treat a build number or successful compilation as proof those later changes were tested on the headset.
+The main branch contains our current V development work, not just the inherited Muguet launcher. **V29**, built from [`366a5af`](https://github.com/zschwendi/SantosVision/commit/366a5af4829c9d69d7057410148a7221fdc2be6e), was installed on an M2 Apple Vision Pro on October 28, 2026, replacing 27.3. Device readback confirmed build 29; the existing saves, preferences, and game manifest were preserved. This includes the current native runtime and immersive renderer fixes. In-headset image-quality acceptance is still pending.
 
-The [fidelity checkpoint](docs/THIRD-PERSON-FIDELITY-20261025.md) and [V28 package record](docs/V28-FRONT-GLASS-PACKAGE-20261026.md) distinguish installed, packaged, and source-only work. The original 27.3 source is preserved by the `los-santos-third-person-quality-preview27-3-20261025` tag.
+The [fidelity checkpoint](docs/THIRD-PERSON-FIDELITY-20261025.md) and [V28 package record](docs/V28-FRONT-GLASS-PACKAGE-20261026.md) preserve the earlier investigation and frozen package history. The original 27.3 source is preserved by the `los-santos-third-person-quality-preview27-3-20261025` tag.
 
 ## Bring your game data
 
