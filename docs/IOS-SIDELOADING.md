@@ -2,7 +2,7 @@
 
 **Paid Apple Developer account required to sign this iPhone/iPad IPA.**
 
-Download [SantosVision-iOS-28.1.ipa](https://github.com/zschwendi/SantosVision/releases/tag/ios-v28.1-preview).
+Download [SantosVision-iOS-28.1.ipa](https://github.com/zschwendi/avp-gta/releases/tag/ios-v28.1-preview).
 This **one iOS IPA supports both iPhone and iPad** (native arm64, device families 1 and 2). Its minimum OS is **iOS/iPadOS 15.0**; that minimum does not guarantee enough RAM on every older device. Use the separate [Vision Pro guide](SIDELOADING.md) for visionOS.
 
 **Paid developer signing is required for this package's Extended Virtual Addressing entitlement.** Increased Memory Limit is also preserved. Do not remove either capability to force an install. Apparition's [capability notes](https://github.com/illixion/Apparition#what-it-does) explain the paid-account requirement. These downloads are experimental; a fresh recipient's re-sign, install, import and gameplay have not been validated.
@@ -25,6 +25,6 @@ Allow roughly 16 GB for prepared data plus the app and working space. Open V and
 
 ## What is in this preview
 
-This is the existing iOS **Build 28** runtime repackaged as **28.1**, not the Vision Pro V30 renderer. All 33 non-signature Mach-O sections match the original device binary. Source inventory matches [native revision 039aaad](https://github.com/zschwendi/SantosVision/commit/039aaad40fef98e7aee75684f3e02b000394174c), except build-number metadata; its embedded AOT was prepared from [cfc03d7](https://github.com/zschwendi/SantosVision/commit/cfc03d7dd281e52a4bad95905445acf0a8850346). The runtime and embedded compiled game code remain; retail assets, saves, profiles and developer certificates are excluded.
+This is the existing iOS **Build 28** runtime repackaged as **28.1**, not the Vision Pro V30 renderer. All 33 non-signature Mach-O sections match the original device binary. Source inventory matches [native revision 039aaad](https://github.com/zschwendi/avp-gta/commit/039aaad40fef98e7aee75684f3e02b000394174c), except build-number metadata; its embedded AOT was prepared from [cfc03d7](https://github.com/zschwendi/avp-gta/commit/cfc03d7dd281e52a4bad95905445acf0a8850346). The runtime and embedded compiled game code remain; retail assets, saves, profiles and developer certificates are excluded.
 
 The release contains a complete file manifest and SHA256SUMS. On Windows, compare Get-FileHash -Algorithm SHA256 on the downloaded IPA with that checksum; on Linux, use sha256sum -c SHA256SUMS. Maintainer recipe: [sideload-ios.json](../packaging/sideload-ios.json), consumed by tools/package_sideload.py with --recipe packaging/sideload-ios.json.

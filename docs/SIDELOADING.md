@@ -4,7 +4,7 @@
 
 **iPhone/iPad users:** use the separate [iOS download and USB-pairing guide](IOS-SIDELOADING.md). [All platform downloads](DOWNLOADS.md).
 
-Download the [V30.1 visionOS preview](https://github.com/zschwendi/SantosVision/releases/tag/visionos-v30.1).
+Download the [V30.1 visionOS preview](https://github.com/zschwendi/avp-gta/releases/tag/visionos-v30.1).
 It contains the V30 compiled runtime, with Files access enabled for game-data
 transfer. Supply your own matching GTA V web-port data. Ordinary retail PC
 files, console images and the repository source ZIP cannot be imported directly.
@@ -124,7 +124,7 @@ different sideloader; Apparition does not automatically sign or refresh them.
 
 ### 5. Download and install this game's IPA
 
-Open [this game's release](https://github.com/zschwendi/SantosVision/releases/tag/visionos-v30.1), expand **Assets**, and download:
+Open [this game's release](https://github.com/zschwendi/avp-gta/releases/tag/visionos-v30.1), expand **Assets**, and download:
 
 ```text
 SantosVision-visionOS-30.1.ipa
@@ -315,7 +315,7 @@ and extracting it will not work. Do not replace the `saves` folder.
 The IPA is ad-hoc signed for transport and **must be re-signed by the recipient**.
 It contains compiled game code, but no game asset folder, saves, user accounts,
 Apple development certificate or provisioning profile. Source runtime revision:
-[`7bd22fb`](https://github.com/zschwendi/SantosVision/commit/7bd22fbacd4f656d7ff1039c73ae293a9102ac9d).
+[`7bd22fb`](https://github.com/zschwendi/avp-gta/commit/7bd22fbacd4f656d7ff1039c73ae293a9102ac9d).
 The release includes `manifest.json` and `SHA256SUMS`; verify the download with
 `Get-FileHash -Algorithm SHA256 <file.ipa>` in PowerShell if needed.
 

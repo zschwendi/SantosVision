@@ -26,11 +26,11 @@ Plan storage for the ZIP, the imported data, AOT output, and Rust/Xcode build ca
 The main branch contains the V Apple-platform port. Clone the complete repository; the GitHub source ZIP is not a game-data package:
 
 ~~~sh
-git clone https://github.com/zschwendi/SantosVision.git V
+git clone https://github.com/zschwendi/avp-gta.git V
 cd V
 ~~~
 
-The repository name and internal target remain SantosVision; the app is named V. Work from the repository root in the same Terminal session for the commands below.
+The repository is named avp-gta and the app is named V. The internal target remains SantosVision. Work from the repository root in the same Terminal session for the commands below.
 
 If you have an older Muguet-only checkout, use a fresh clone or update it before following this guide. The V source includes `visionos/`, `make-visionos.sh`, and this guide.
 
@@ -238,7 +238,7 @@ Launch graphics changes apply on the next game start: choose **Quit game**, reop
 | Changing graphics has no effect | Quit and relaunch the game; make the change before Play. |
 | “The app installed” but the game has not run | Installation, complete data transfer, windowed gameplay, and immersive acceptance are four separate checks. |
 
-For a reproducible failure, include the source commit, headset/OS, build mode, and exact error in a [bug report](https://github.com/zschwendi/SantosVision/issues). The Vision Pro runtime writes `Documents/native-runtime-report.json`; inspect it for personal paths before sharing. Do not attach game assets or saves.
+For a reproducible failure, include the source commit, headset/OS, build mode, and exact error in a [bug report](https://github.com/zschwendi/avp-gta/issues). The Vision Pro runtime writes `Documents/native-runtime-report.json`; inspect it for personal paths before sharing. Do not attach game assets or saves.
 
 ## Updating your build
 

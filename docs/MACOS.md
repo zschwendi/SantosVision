@@ -1,6 +1,6 @@
 # V on Apple Silicon Mac
 
-Download the [native macOS preview](https://github.com/zschwendi/SantosVision/releases/tag/macos-v30.1-preview).
+Download the [native macOS preview](https://github.com/zschwendi/avp-gta/releases/tag/macos-v30.1-preview).
 It is a ZIP containing **V.app**, for **Apple Silicon / arm64 and macOS 14.0 or newer**. It is separate from the iOS/iPadOS and Vision Pro IPAs; it does not support Intel Macs, Windows or Linux.
 
 1. Compare the ZIP's SHA-256 with SHA256SUMS, then extract it.
