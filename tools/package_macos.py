@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Package freshly compiled arm64 Mac runtimes with the existing native launcher."""
-import argparse,hashlib,json,os,plistlib,shutil,subprocess,tempfile,zipfile
+import argparse,hashlib,json,os,plistlib,re,shutil,subprocess,tempfile,zipfile
 from pathlib import Path
 ROOT=Path(__file__).resolve().parents[1]
 def sha(path):
@@ -43,6 +43,10 @@ def main():
      dest=licenses/crate.name/f.name;dest.parent.mkdir(exist_ok=True);shutil.copy2(f,dest)
   for binary in mac.iterdir():
    if run('xcrun','lipo','-archs',binary).strip()!='arm64':raise ValueError('Wrong architecture')
+   load=run('xcrun','vtool','-show-build',binary)
+   versions=re.findall(r'\bminos (\S+)',load)
+   if not versions or any(tuple(map(int,v.split('.')))>(14,0,0) for v in versions):
+    raise ValueError('Binary requires a newer OS than the declared macOS14.0 minimum')
    run('codesign','--force','--sign','-','--timestamp=none',binary)
   run('codesign','--force','--sign','-','--timestamp=none',app)
   run('codesign','--verify','--deep','--strict',app)
