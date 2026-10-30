@@ -1,5 +1,7 @@
 # Install V on Vision Pro from Windows or Linux
 
+**Paid Apple Developer account required for the supported GTA / V IPA installation route (iPhone/iPad and Vision Pro).** The native Mac ZIP does not require a developer account.
+
 **iPhone/iPad users:** use the separate [iOS download and USB-pairing guide](IOS-SIDELOADING.md). [All platform downloads](DOWNLOADS.md).
 
 Download the [V30.1 visionOS preview](https://github.com/zschwendi/SantosVision/releases/tag/visionos-v30.1).
@@ -49,7 +51,8 @@ import, gameplay and save-preserving refresh are not yet verified for this relea
 
 ### 3. Set the anisette server, then sign in
 
-Choose the **Apple ID** signing option and use **your own Apple Account**.
+For the game IPA, use your **own paid Apple Developer signing identity**.
+Apparition supports [your own developer certificate and device profile](https://github.com/illixion/Apparition#your-own-developer-certificate); that route bypasses Apple-ID sign-in and anisette. If using Apple Account signing, use your enrolled developer team. A free account is not a supported signing route for these game previews.
 The project maintainer does not need your account, password, verification codes,
 or signing certificate.
 
@@ -186,17 +189,15 @@ After the game-specific import finishes:
 2. Make a save, fully close the app, reopen it and confirm the save is there.
 3. For a game installed through the headset's Library, check its signing expiry
    there and **refresh before expiry**. For the desktop-only alternative,
-   re-sign/reinstall the retained IPA from the PC before expiry. Free-account
-   signatures normally last **7 days**. Keep the companion reachable for
+   re-sign/reinstall the retained IPA from the PC before your developer
+   provisioning profile expires. Keep the companion reachable for
    headset refreshes; the PC is not streaming the game during play.
 4. Refresh/reinstall an update using the **same account and app identifier**,
    then confirm the save remains. Back up first; do not uninstall to fix expiry.
 
-Free signing has app and App ID limits. The usual active-app allowance is
-**three sideloaded apps total, including Apparition**, so plan for Apparition
-plus two games, not all three previews at once. Check Apparition's actual
-account/slot messages. Paid accounts have different limits and capability
-requirements. Refresh automation is optional; use the [upstream Shortcuts guide](https://github.com/illixion/Apparition#shortcuts-automation)
+Use the expiry date and capabilities of your own paid developer profile.
+Apparition supporting free accounts for other apps does not establish free-account
+support for this game. Refresh automation is optional; use the [upstream Shortcuts guide](https://github.com/illixion/Apparition#shortcuts-automation)
 once manual refresh works. Do not assume background refresh always fires.
 
 These preview IPAs use local saves. The maintainer's iCloud containers and

@@ -1,6 +1,8 @@
-**[Windows / Linux: download the IPA and follow the full installation guide](docs/SIDELOADING.md)**
+**[Windows / Linux IPA downloads — paid Apple Developer account required](docs/DOWNLOADS.md)**
 
 **Downloads:** [Choose iPhone/iPad, Vision Pro or Mac](docs/DOWNLOADS.md).
+
+**Paid Apple Developer account required for the supported GTA / V IPA installation route (iPhone/iPad and Vision Pro).** The native Mac ZIP does not require a developer account.
 
 <p align="center">
   <img src="assets/branding/spatial-v-front-glass-master-v28.png" alt="V — green Vision Pro front glass reflecting a Los Santos sunset" width="220">

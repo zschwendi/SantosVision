@@ -1,5 +1,7 @@
 # Install V on iPhone or iPad
 
+**Paid Apple Developer account required to sign this iPhone/iPad IPA.**
+
 Download [SantosVision-iOS-28.1.ipa](https://github.com/zschwendi/SantosVision/releases/tag/ios-v28.1-preview).
 This **one iOS IPA supports both iPhone and iPad** (native arm64, device families 1 and 2). Its minimum OS is **iOS/iPadOS 15.0**; that minimum does not guarantee enough RAM on every older device. Use the separate [Vision Pro guide](SIDELOADING.md) for visionOS.
 
