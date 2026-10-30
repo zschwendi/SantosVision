@@ -5,7 +5,7 @@ It is a ZIP containing **V.app**, for **Apple Silicon / arm64 and macOS 14.0 or 
 
 1. Compare the ZIP's SHA-256 with SHA256SUMS, then extract it.
 2. Put the app in a location you choose without overwriting an existing copy you want to keep.
-3. Open it. This preview is ad-hoc signed and is **not notarized**. If macOS blocks a known, verified download, use **System Settings → Privacy & Security → Open Anyway** for this app. Do not disable Gatekeeper globally.
+3. Open it. This preview is ad-hoc signed and is **not notarized**. If macOS blocks a known, verified download, use **System Settings → Privacy & Security → Open Anyway** for this app, following [Apple’s instructions](https://support.apple.com/en-us/102445). Do not disable Gatekeeper globally.
 4. Supply your own matching game files as described below. No sideloader, Apple developer account or device pairing is needed to launch the Mac app.
 
 This is an experimental native desktop build. Architecture, dependency linkage, signature, archive integrity and input checks are separate from full gameplay acceptance. This packaged Mac preview has not passed an end-to-end game session.
