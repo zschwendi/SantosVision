@@ -1,4 +1,4 @@
-**[Install without a Mac / download the IPA](docs/SIDELOADING.md)**
+**[Windows / Linux: download the IPA and follow the full installation guide](docs/SIDELOADING.md)**
 
 <p align="center">
   <img src="assets/branding/spatial-v-front-glass-master-v28.png" alt="V — green Vision Pro front glass reflecting a Los Santos sunset" width="220">
@@ -14,7 +14,7 @@ This is our Apple-platform fork of [Muguet](https://github.com/c22dev/muguet). M
 
 **V is a work in progress.** Windowed play is the visual reference. Immersive mode runs on a physical headset, but its grain, detail loss, edge artifacts, flicker, and performance still need work. A full-game completion pass is not certified.
 
-[Install on Vision Pro](docs/INSTALL-VISION-PRO.md) · [Game files](docs/GAME-FILES.md) · [iPhone and iPad](#iphone-and-ipad) · [How it works](#how-it-works) · [Contributing](#contributing)
+[Windows / Linux IPA guide](docs/SIDELOADING.md) · [Mac source build](docs/INSTALL-VISION-PRO.md) · [Game files](docs/GAME-FILES.md) · [iPhone and iPad](#iphone-and-ipad) · [How it works](#how-it-works) · [Contributing](#contributing)
 
 ## What you can expect
 
@@ -28,7 +28,12 @@ The name on your device is **V**. The GitHub repository is currently **SantosVis
 
 ## Install and play on Vision Pro
 
-The complete walkthrough is [From zero to V on Vision Pro](docs/INSTALL-VISION-PRO.md). It covers a fresh Mac checkout, the matching game package, signing, headset pairing, data transfer, and the first launch.
+**Windows or Linux:** follow the [IPA installation walkthrough](docs/SIDELOADING.md)
+for Apparition, pairing, Apple signing, the V30.1 download, game-file preparation
+and transfer, and refreshes. No Mac is needed to install the published preview.
+
+**Mac source build:** [From zero to V on Vision Pro](docs/INSTALL-VISION-PRO.md)
+covers a fresh Mac checkout and the build steps below.
 
 There are two things to install: **the app**, containing the compiled game code, and **your matching game data**. Installing the app alone does not make Play ready.
 
@@ -38,7 +43,11 @@ There are two things to install: **the app**, containing the compiled game code,
 4. **Open V and choose Play.** Start in the ordinary game window with a compatible controller.
 5. **Try immersion.** Once the game world is loaded and GTA's pause menu is closed, use the window's upper-right expand button, **Enter immersive view**.
 
-**The current Vision Pro launcher does not have an on-device ZIP import button.** Its setup uses the Mac-side preparation and transfer described in the guide. The iPhone/iPad ZIP picker is a different interface.
+**The current Vision Pro launcher does not have an on-device ZIP import button.**
+For the IPA preview, prepare the matching data on Windows or Linux and copy it
+through Files as described in the [sideloading guide](docs/SIDELOADING.md).
+The source-build guide uses Mac-side preparation and transfer. The iPhone/iPad
+ZIP picker is a different interface.
 
 The main branch contains the V port; update an older Muguet-only checkout before following the build instructions.
 
