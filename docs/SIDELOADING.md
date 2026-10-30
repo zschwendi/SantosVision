@@ -1,4 +1,6 @@
-# Install V from Windows or Linux
+# Install V on Vision Pro from Windows or Linux
+
+**iPhone/iPad users:** use the separate [iOS download and USB-pairing guide](IOS-SIDELOADING.md). [All platform downloads](DOWNLOADS.md).
 
 Download the [V30.1 visionOS preview](https://github.com/zschwendi/SantosVision/releases/tag/visionos-v30.1).
 It contains the V30 compiled runtime, with Files access enabled for game-data

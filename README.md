@@ -1,5 +1,7 @@
 **[Windows / Linux: download the IPA and follow the full installation guide](docs/SIDELOADING.md)**
 
+**Downloads:** [Choose iPhone/iPad, Vision Pro or Mac](docs/DOWNLOADS.md).
+
 <p align="center">
   <img src="assets/branding/spatial-v-front-glass-master-v28.png" alt="V — green Vision Pro front glass reflecting a Los Santos sunset" width="220">
 </p>

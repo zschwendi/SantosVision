@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Package a reviewed visionOS app for re-signing, without modifying the input."""
+"""Package a reviewed iOS or visionOS app for re-signing, without modifying the input."""
 import argparse
 import hashlib
 import json
@@ -28,10 +28,17 @@ def package(app, output, recipe):
         raise ValueError('Output already exists; choose a new directory')
     info = plistlib.loads((app / 'Info.plist').read_bytes())
     executable = info['CFBundleExecutable']
-    if (info.get('CFBundleSupportedPlatforms') != ['XROS']
+    platform = recipe.get('platform', 'visionOS')
+    platforms = {'visionOS': (['XROS'], [7], ['VISIONOS', 'XROS']),
+                 'iOS': (['iPhoneOS'], [1, 2], ['IOS'])}
+    if platform not in platforms:
+        raise ValueError('Unsupported platform')
+    supported, families, macho_platforms = platforms[platform]
+    if (info.get('CFBundleSupportedPlatforms') != supported
+            or info.get('UIDeviceFamily') != families
             or executable != recipe['executable']
             or info.get('CFBundleVersion') != recipe['inputBuild']):
-        raise ValueError('App does not match the reviewed visionOS build')
+        raise ValueError('App does not match the reviewed platform/build')
     include = recipe['include']
     if set(include) != set(recipe['inputSHA256']):
         raise ValueError('Every included file must have a reviewed input hash')
@@ -46,8 +53,19 @@ def package(app, output, recipe):
         if sha256(p) != recipe['inputSHA256'][name]:
             raise ValueError('Input changed since review: ' + name)
     build = subprocess.check_output(['xcrun', 'vtool', '-show-build', str(app / executable)], text=True)
-    if not any(('platform ' + name) in build for name in ['VISIONOS', 'XROS']) or 'SIMULATOR' in build:
-        raise ValueError('Executable is not a physical visionOS build')
+    if not any(line.split() == ['platform', name]
+               for line in build.splitlines() for name in macho_platforms) or 'SIMULATOR' in build:
+        raise ValueError('Executable is not a physical build for the declared platform')
+    arch = subprocess.check_output(['xcrun', 'lipo', '-archs', str(app / executable)], text=True).strip()
+    if arch != 'arm64':
+        raise ValueError('Expected native arm64 executable, got: ' + arch)
+    if 'requiredInputCapabilities' in recipe:
+        original = subprocess.check_output(['codesign', '-d', '--entitlements', ':-', str(app)],
+                                           stderr=subprocess.DEVNULL)
+        entitlements = plistlib.loads(original)
+        for key, value in recipe['requiredInputCapabilities'].items():
+            if entitlements.get(key) != value or recipe.get('entitlements', {}).get(key) != value:
+                raise ValueError('Required memory capability must be preserved: ' + key)
     output.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix='ipa-stage-', dir=output.parent) as temporary:
         stage = Path(temporary)
@@ -90,8 +108,9 @@ def package(app, output, recipe):
         manifest = {
             'schemaVersion': 1, 'repository': recipe['repository'],
             'sourceRevision': recipe['sourceRevision'], 'inputBuild': recipe['inputBuild'],
+            'inputProvenance': recipe.get('inputProvenance', {}),
             'packagedBuild': info['CFBundleVersion'], 'version': info['CFBundleShortVersionString'],
-            'minimumOSVersion': info['MinimumOSVersion'], 'platform': 'visionOS',
+            'minimumOSVersion': info['MinimumOSVersion'], 'platform': platform, 'deviceFamilies': families,
             'bundleIdentifier': info['CFBundleIdentifier'], 'signing': 'ad-hoc; user must re-sign',
             'entitlements': recipe.get('entitlements', {}), 'changes': recipe['changes'],
             'asset': {'name': ipa.name, 'bytes': ipa.stat().st_size, 'sha256': sha256(ipa)},
