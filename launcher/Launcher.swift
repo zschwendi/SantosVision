@@ -243,7 +243,7 @@ func localIPs() -> [String] {
 @main
 struct MuguetLauncher: App {
     var body: some Scene {
-        WindowGroup("Muguet") { LauncherView() }
+        WindowGroup("V") { LauncherView() }
             .windowResizability(.contentSize)
     }
 }
