@@ -1,0 +1,38 @@
+{
+  "repository": "https://github.com/zschwendi/SantosVision",
+  "sourceRevision": "7bd22fbacd4f656d7ff1039c73ae293a9102ac9d",
+  "executable": "SantosVision",
+  "inputBuild": "30",
+  "assetName": "SantosVision-visionOS-30.1.ipa",
+  "include": [
+    "Assets.car",
+    "Info.plist",
+    "PkgInfo",
+    "SantosVision",
+    "default.metallib"
+  ],
+  "exclude": [
+    "_CodeSignature",
+    "embedded.mobileprovision"
+  ],
+  "inputSHA256": {
+    "Assets.car": "5fe10adb8705b7964e35cbffff9637b612e72ae3aa579200ba2cdb208a0b3060",
+    "Info.plist": "98c55a48918043c6329fa17241721d4527de75a59d25aa75f388eab98d35a6c5",
+    "PkgInfo": "82502191c9484b04d685374f9879a0066069c49b8acae7a04b01d38d07e8eca0",
+    "SantosVision": "d882a35257b7b09d9a78c761a2ca1834c6dc690e1be84eab1d2538007381681a",
+    "default.metallib": "3cd42e68b37d557ba3497f08f0644e9c171a09cf7492f378344713ace844381e"
+  },
+  "plistOverrides": {
+    "CFBundleVersion": "30.1",
+    "UIFileSharingEnabled": true,
+    "LSSupportsOpeningDocumentsInPlace": true
+  },
+  "entitlements": {},
+  "changes": [
+    "Enable Documents access in Files for copying owned game data without Xcode.",
+    "Replace developer signing with ad-hoc signing for recipient re-signing; use local saves.",
+    "Keep the V30 game executable unchanged apart from its code signature."
+  ],
+  "gameBuild": "8b0b5899ed",
+  "gameWasmSHA256": "11ca8d2c04c5e843d18ff4aea4899d72c86973c6b031df334e67c446b2ae83e0"
+}

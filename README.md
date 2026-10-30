@@ -1,3 +1,5 @@
+**[Install without a Mac / download the IPA](docs/SIDELOADING.md)**
+
 <p align="center">
   <img src="assets/branding/spatial-v-front-glass-master-v28.png" alt="V — green Vision Pro front glass reflecting a Los Santos sunset" width="220">
 </p>
@@ -40,7 +42,7 @@ There are two things to install: **the app**, containing the compiled game code,
 
 The main branch contains the V port; update an older Muguet-only checkout before following the build instructions.
 
-No public V release package is published as of October 28, 2026. The current installation route is a source build; a private signed development app is not a general download. Check [Releases](https://github.com/zschwendi/SantosVision/releases) for future packages and their specific signing instructions.
+An experimental [V30.1 IPA preview](docs/SIDELOADING.md) is available for re-signing with your own account. It exposes the app folder in Files for copying prepared game data from Windows or Linux. Fresh-account installation and gameplay through this route are not yet verified; the Mac source-build route above remains available.
 
 ### Source and installed-build status
 
