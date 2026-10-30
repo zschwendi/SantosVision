@@ -14,10 +14,20 @@ unfinished. This is a packaging update, not a new renderer build.
 You need a Vision Pro, an Apple account, a computer for the initial setup, and
 both devices on the same Wi-Fi. Xcode is not needed for this route.
 
+**Apple sign-in requirement (29 October 2026):** Apparition's
+[0.4.2 release notes](https://github.com/illixion/Apparition/releases/tag/v0.4.2)
+report that Apple rejects its Android-library anisette provider. A Windows
+computer can install the app, but free-account signing needs a working
+compatible external anisette service. The Linux/Docker provider alone is not
+a working replacement. See Apparition's [current options](https://github.com/illixion/Apparition#anisette)
+for third-party services and supported Mac/macOS-VM sources. Your own paid
+developer certificate and device provisioning profiles can bypass Apple-ID
+sign-in. This guide does not establish that any particular service works.
+
 1. Download the desktop installer from [Apparition](https://apparition.illixion.com/).
-   Use its current instructions for your operating system. Windows also needs
-   an anisette service for Apple sign-in; its [setup documentation](https://github.com/illixion/Apparition#anisette)
-   explains the available and self-hosted options.
+   Use its current instructions for your operating system and configure a
+   supported signing method before continuing. Each person uses their own
+   account or certificate; the maintainer does not need anyone's credentials.
 2. On Vision Pro, open **Settings → General → Remote Devices**. Select the
    headset in Apparition on your computer and enter the pairing code.
 3. Follow Apparition's prompts to sign in with **your own Apple account** and
