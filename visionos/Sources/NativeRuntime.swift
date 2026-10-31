@@ -164,6 +164,11 @@ final class NativeRuntimeModel: ObservableObject {
     @Published private(set) var graphicsStatus = ""
     @Published private(set) var playSettings = NativePlaySettings()
     @Published private(set) var playSettingsStatus = ""
+    @Published private(set) var multiplayerSettings = NativeMultiplayerSettings()
+    /// The launcher's explicit Textures choice; nil keeps GTA's own value.
+    @Published private(set) var textureChoice: Int?
+    @Published private(set) var gtaTextureQuality: Int?
+    @Published private(set) var launcherOptionsStatus = ""
     @Published private(set) var adaptiveRenderingEnabled = RenderingOptimizations.storedAdaptive
     @Published private(set) var frozenDepthHandoffEnabled = RenderingOptimizations.storedFrozenDepth
     @Published private(set) var drawSetupOverheadEnabled = RenderingOptimizations.storedDrawSetup
@@ -245,6 +250,7 @@ final class NativeRuntimeModel: ObservableObject {
     private var graphicsStartupError: String?
     private var graphicsConfigWritten = false
     private var playSettingsStartupError: String?
+    private var launcherOptionsStartupError: String?
 
     var graphicsConfigURL: URL { saveRoot.appendingPathComponent("native-graphics.json") }
     var canChangeGraphics: Bool { isLinked && !hasStarted && !isBusy }
@@ -287,6 +293,14 @@ final class NativeRuntimeModel: ObservableObject {
             playSettingsStartupError = error.localizedDescription
             playSettingsStatus = "Sound and controls need attention: \(error.localizedDescription)"
         }
+        do {
+            multiplayerSettings = try NativeMultiplayerSettings.load(from: saveRoot)
+            textureChoice = try NativeTextureChoice.load(from: saveRoot)
+        } catch {
+            launcherOptionsStartupError = error.localizedDescription
+            launcherOptionsStatus = "Launcher options need attention: \(error.localizedDescription)"
+        }
+        gtaTextureQuality = NativeTextureChoice.gtaValue(saveRoot: saveRoot)
         if let device = MTLCreateSystemDefaultDevice() { recordMetalCapabilities(device) }
         SpatialGamepadInput.shared.start()
         leftWristObservation = leftWrist.$flow.map(\.cardVisible).removeDuplicates().dropFirst().sink { [weak self] visible in
@@ -358,6 +372,12 @@ final class NativeRuntimeModel: ObservableObject {
             recordReport()
             return
         }
+        if let problem = launcherOptionsStartupError ?? multiplayerSettings.problem {
+            status = "Check V options before starting. \(problem)"
+            launcherOptionsStatus = problem
+            recordReport()
+            return
+        }
         isBusy = true
         guard await cloudSaves.prepareForLaunch() else {
             status = cloudSaves.status
@@ -423,6 +443,49 @@ final class NativeRuntimeModel: ObservableObject {
         guard canChangePlaySettings else { return }
         playSettings.developerMode = enabled
         savePlaySettings()
+    }
+
+    func setMute(_ muted: Bool) {
+        guard canChangePlaySettings else { return }
+        playSettings.mute = muted
+        savePlaySettings()
+    }
+
+    /// GTA's settings.xml may change in game; the launcher shows its value.
+    func refreshLauncherOptions() {
+        gtaTextureQuality = NativeTextureChoice.gtaValue(saveRoot: saveRoot)
+    }
+
+    /// The value the next launch will use: the explicit choice, else GTA's.
+    var effectiveTextureQuality: Int {
+        textureChoice ?? gtaTextureQuality ?? (graphicsSettings.preset == .clarity ? 2 : 0)
+    }
+
+    func setTextureQuality(_ quality: Int) {
+        guard canChangePlaySettings, (0...2).contains(quality) else { return }
+        saveLauncherOptions { try NativeTextureChoice.save(quality, to: saveRoot); textureChoice = quality }
+    }
+
+    func updateMultiplayer(_ change: (inout NativeMultiplayerSettings) -> Void) {
+        guard canChangePlaySettings else { return }
+        var updated = multiplayerSettings
+        change(&updated)
+        if updated.enabled, updated.playerName.trimmingCharacters(in: .whitespaces).isEmpty, !multiplayerSettings.enabled {
+            updated.playerName = NativeMultiplayerSettings.defaultPlayerName
+        }
+        saveLauncherOptions { try updated.save(to: saveRoot); multiplayerSettings = updated }
+    }
+
+    private func saveLauncherOptions(_ operation: () throws -> Void) {
+        do {
+            try operation()
+            launcherOptionsStartupError = nil
+            launcherOptionsStatus = ""
+        } catch {
+            launcherOptionsStartupError = error.localizedDescription
+            launcherOptionsStatus = "Could not save V options: \(error.localizedDescription)"
+        }
+        recordReport()
     }
 
     private func savePlaySettings() {
@@ -1167,6 +1230,12 @@ final class NativeRuntimeModel: ObservableObject {
             "save_sync_status": cloudSaves.status,
             "graphics_requested": graphicsSettings.reportValue,
             "play_settings_requested": playSettings.reportValue,
+            "launcher_options_requested": [
+                "multiplayer": multiplayerSettings.reportValue,
+                "texture_choice": textureChoice.map { $0 as Any } ?? NSNull(),
+                "gta_texture_quality": gtaTextureQuality.map { $0 as Any } ?? NSNull(),
+                "status": launcherOptionsStatus,
+            ] as [String: Any],
             "play_settings_status": playSettingsStatus,
             "graphics_config_path": graphicsConfigURL.path,
             "graphics_config_written": graphicsConfigWritten,

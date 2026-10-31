@@ -5,6 +5,8 @@ import CoreFoundation
 /// settings, whose native save files remain under the game's control.
 struct NativePlaySettings: Equatable, Sendable {
     var masterVolume = 1.0
+    /// Separate from masterVolume so unmuting restores the chosen level.
+    var mute = false
     var lookSensitivityPercent = 75.0
     var developerMode = false
 
@@ -14,7 +16,7 @@ struct NativePlaySettings: Equatable, Sendable {
     private static let audioMigrationName = "native-audio-restored-v1.json"
 
     var reportValue: [String: Any] {
-        ["master_volume": masterVolume,
+        ["master_volume": masterVolume, "mute": mute,
          "controller_look_sensitivity_percent": lookSensitivityPercent,
          "controller_look_semantics": "percent_of_original_host_right_stick_speed",
          "developer_mode": developerMode,
@@ -40,6 +42,7 @@ struct NativePlaySettings: Equatable, Sendable {
         let controller = try readObject(root.appendingPathComponent(controllerName))
         let gameplay = try readObject(root.appendingPathComponent(gameplayName))
         return Self(masterVolume: try number(audio, key: "master_volume", range: 0...1) ?? 1,
+                    mute: try boolean(audio, key: "mute") ?? false,
                     lookSensitivityPercent: try number(controller, key: "look_sensitivity_percent", range: 0...100) ?? 75,
                     developerMode: try boolean(gameplay, key: "developer_mode") ?? false)
     }
@@ -53,6 +56,7 @@ struct NativePlaySettings: Equatable, Sendable {
         let audioURL = root.appendingPathComponent(Self.audioName)
         var audio = try Self.readObject(audioURL)
         audio["master_volume"] = masterVolume
+        audio["mute"] = mute
         try Self.writeObject(audio, to: audioURL)
         let controllerURL = root.appendingPathComponent(Self.controllerName)
         var controller = try Self.readObject(controllerURL)

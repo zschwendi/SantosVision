@@ -14,6 +14,7 @@ struct Status {
     imports: usize,
     exports: usize,
     graphics: Option<serde_json::Value>,
+    session: Option<serde_json::Value>,
 }
 static ACTIVE: AtomicBool = AtomicBool::new(true);
 static APP_FROZEN_DEPTH_REQUESTED: AtomicBool = AtomicBool::new(false);
@@ -222,6 +223,7 @@ fn start(game_root: &Path, save_root: &Path) -> Result<()> {
         status.state = "initializing";
         status.last_error = None;
         status.graphics = None;
+        status.session = None;
     }
     crate::raise_open_file_limit();
     crate::world_latency_trace::initialize_from_env();
@@ -231,6 +233,7 @@ fn start(game_root: &Path, save_root: &Path) -> Result<()> {
     {
         let mut status = STATUS.lock().map_err(|_| anyhow::anyhow!("native status lock poisoned"))?;
         status.graphics = Some(graphics.status_json());
+        status.session = crate::config::native_session_status();
     }
     let rt = crate::make_runtime(&startup)?;
     crate::input::set_size(width as i32, height as i32);
@@ -294,6 +297,7 @@ pub extern "C" fn sv_runtime_status(out: *mut c_char, capacity: usize) -> i32 {
     write_text(out, capacity, &json!({"abi_version": 1, "state": status.state, "active": is_active(),
         "import_count": status.imports, "export_count": status.exports, "last_error": status.last_error,
         "graphics": status.graphics,
+        "launcher_session": status.session,
         "heap_bytes": crate::RT.get().map(|runtime| runtime.mem.data_size()).unwrap_or(0),
         "gpu_started": crate::gpu::STARTED.load(Ordering::Relaxed),
         "frozen_depth_transfer_requested": frozen_depth_transfer_requested(),

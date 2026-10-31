@@ -16,7 +16,7 @@ const DEFAULT_MASTER_VOLUME: f32 = 1.0;
 
 /// Launch override, then the persistent setting, then the default. Anything
 /// that is not a finite gain in 0...1 is ignored rather than played.
-fn resolve_master_volume(env: Option<&str>, setting: Option<&str>) -> f32 {
+pub(crate) fn resolve_master_volume(env: Option<&str>, setting: Option<&str>) -> f32 {
     let valid = |v: f64| (v.is_finite() && (0.0..=1.0).contains(&v)).then_some(v as f32);
     env.and_then(|v| v.trim().parse::<f64>().ok()).and_then(valid)
         .or_else(|| setting.and_then(|text| serde_json::from_str::<serde_json::Value>(text).ok())

@@ -96,6 +96,8 @@ struct WindowGameView: View {
     @Environment(\.scenePhase) private var scenePhase
     @ObservedObject var runtime: NativeRuntimeModel
     @ObservedObject var surface: WindowGameSurface
+    @State private var launcherOptionsPresented = false
+    @State private var fullSettingsAfterOptions = false
     #if SV_GAME_RUNTIME
     @EnvironmentObject private var world: GameWorldModel
     @EnvironmentObject private var gameScenes: GameSceneTransitions
@@ -110,6 +112,19 @@ struct WindowGameView: View {
         if runtime.hasStarted { return "Playing · \(runtime.graphicsSettings.summary)" }
         if runtime.isBusy { return "Loading…" }
         return runtime.hasGameData ? "Ready to play" : "Game files required"
+    }
+
+    private var launchSummary: String {
+        let play = runtime.playSettings, multiplayer = runtime.multiplayerSettings
+        let friends = !multiplayer.enabled ? nil : multiplayer.host ? "Hosting friends"
+            : "Joining \(multiplayer.server.trimmingCharacters(in: .whitespaces))"
+        return [play.developerMode ? "Sandbox" : "Story Mode",
+                "\(runtime.graphicsSettings.width)×\(runtime.graphicsSettings.height)",
+                "\(runtime.graphicsSettings.fpsLimit) FPS",
+                "Textures \(NativeTextureChoice.labels[runtime.effectiveTextureQuality])",
+                "Look \(Int(play.lookSensitivityPercent.rounded()))%",
+                play.mute ? "Muted" : "Sound \(Int((play.masterVolume * 100).rounded()))%",
+                friends].compactMap { $0 }.joined(separator: " · ")
     }
 
     private var senseWindowUtilitiesVisible: Bool {
@@ -244,8 +259,22 @@ struct WindowGameView: View {
                 }
             }
             VStack(spacing: 18) {
-                Text("V").font(.largeTitle.weight(.semibold))
-                Text("GTA V").font(.headline).foregroundStyle(.secondary)
+                Button { launcherOptionsPresented = true } label: {
+                    VStack(spacing: 6) {
+                        Text("V").font(.largeTitle.weight(.semibold))
+                        Text("GTA V").font(.headline).foregroundStyle(.secondary)
+                        Label("Options", systemImage: "slider.horizontal.3")
+                            .font(.caption.weight(.semibold))
+                            .padding(.horizontal, 12).padding(.vertical, 5)
+                            .background(SantosTheme.accent.opacity(0.28), in: Capsule())
+                    }
+                    .padding(.horizontal, 28).padding(.vertical, 14)
+                    .contentShape(RoundedRectangle(cornerRadius: 20))
+                }
+                .buttonStyle(.plain)
+                .hoverEffect()
+                .accessibilityLabel("V options")
+                .accessibilityHint("Mode, resolution, textures, frame limit, look sensitivity, audio and play with friends")
                 if runtime.isBusy {
                     ProgressView()
                 } else {
@@ -253,7 +282,12 @@ struct WindowGameView: View {
                         .buttonStyle(.borderedProminent)
                         .disabled(!runtime.probePassed || !runtime.hasGameData || !runtime.windowSurfaceReady)
                 }
+                Text(launchSummary).font(.caption).foregroundStyle(.secondary).multilineTextAlignment(.center)
+                if !runtime.launcherOptionsStatus.isEmpty {
+                    Text(runtime.launcherOptionsStatus).font(.caption).foregroundStyle(.orange).multilineTextAlignment(.center)
+                }
             }
+            .padding(.horizontal, 24)
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .background(SantosTheme.surface.opacity(0.45), in: RoundedRectangle(cornerRadius: 22))
             HStack {
@@ -264,6 +298,17 @@ struct WindowGameView: View {
         }
         .padding(28)
         .background(SantosTheme.background)
+        .sheet(isPresented: $launcherOptionsPresented, onDismiss: {
+            if fullSettingsAfterOptions {
+                fullSettingsAfterOptions = false
+                runtime.nativeSettingsPresented = true
+            }
+        }) {
+            VLauncherOptionsView(runtime: runtime) {
+                fullSettingsAfterOptions = true
+                launcherOptionsPresented = false
+            }
+        }
     }
 
     #if SV_GAME_RUNTIME
@@ -401,6 +446,7 @@ struct SantosSettingsView: View {
                     LabeledContent("Master volume", value: "\(Int((runtime.playSettings.masterVolume * 100).rounded()))%")
                     Slider(value: Binding(get: { runtime.playSettings.masterVolume },
                                           set: { runtime.setMasterVolume($0) }), in: 0...1, step: 0.01)
+                    Toggle("Mute audio", isOn: Binding(get: { runtime.playSettings.mute }, set: { runtime.setMute($0) }))
                 }
                 .disabled(!runtime.canChangePlaySettings)
                 Section("Controller") {
@@ -430,12 +476,9 @@ struct SantosSettingsView: View {
                         .disabled(!runtime.hasStarted)
                     Button("Quit game", systemImage: "power", role: .destructive) { quitGame() }
                 }
-                Section {
-                    Toggle("Developer mode", isOn: Binding(
-                        get: { runtime.playSettings.developerMode },
-                        set: { runtime.setDeveloperMode($0) }))
-                        .disabled(!runtime.canChangePlaySettings)
-                    Text("Starts in Sandbox. Turn off for Story Mode and story saves. Quit and reopen to change this setting.")
+                Section("Mode") {
+                    VModePicker(runtime: runtime)
+                    Text("Story Mode uses your story saves. Sandbox starts the original free-roam sandbox. Quit and reopen to change mode.")
                         .font(.caption).foregroundStyle(.secondary)
                 }
                 DisclosureGroup("Diagnostics") {

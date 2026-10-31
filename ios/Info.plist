@@ -8,7 +8,7 @@
   <key>CFBundleExecutable</key><string>$(EXECUTABLE_NAME)</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleShortVersionString</key><string>0.1</string>
-  <key>CFBundleVersion</key><string>28</string>
+  <key>CFBundleVersion</key><string>31</string>
   <key>LSRequiresIPhoneOS</key><true/>
   <key>UILaunchScreen</key><dict><key>UIColorName</key><string></string></dict>
   <key>UIRequiresFullScreen</key><true/>
@@ -24,6 +24,6 @@
   <key>GCSupportsControllerUserInteraction</key><true/>
   <key>GCSupportedGameControllers</key>
   <array><dict><key>ProfileName</key><string>ExtendedGamepad</string></dict></array>
-  <key>NSLocalNetworkUsageDescription</key><string>Multiplayer connects to a game server on your local network.</string>
+  <key>NSLocalNetworkUsageDescription</key><string>Play with friends connects V players on your local network.</string>
 </dict>
 </plist>

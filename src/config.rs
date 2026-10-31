@@ -202,8 +202,15 @@ pub fn setup_native(game_root: &Path, save_root: &Path) -> anyhow::Result<Startu
     anyhow::ensure!(game_root.join("data/manifest.json").is_file(), "game root has no data/manifest.json: {}", game_root.display());
     let build = build_dir(game_root).ok_or_else(|| anyhow::anyhow!("game root has no b/<build>/shaders/index.json"))?;
     std::fs::create_dir_all(save_root)?;
-    let native_graphics = prepare_native_graphics(save_root)?;
+    // Validate every launcher choice before graphics may rewrite settings.xml.
     let start_mode = native_start_mode(save_root)?;
+    let session = NativeSession::load(save_root)?;
+    let native_graphics = prepare_native_graphics(save_root)?;
+    for (key, value) in session.environment() {
+        match value { Some(value) => std::env::set_var(key, value), None => std::env::remove_var(key) }
+    }
+    if let Ok(mut status) = NATIVE_SESSION_STATUS.lock() { *status = Some(session.status_json()); }
+    eprintln!("[config] native session {}", session.status_json());
     let cache_dir = save_root.join("cache");
     std::fs::create_dir_all(&cache_dir)?;
     std::env::set_var("MUGUET_FSROOT", save_root);
@@ -269,6 +276,7 @@ pub struct NativeGraphicsLaunch {
     marker_path: PathBuf,
     marker_action: &'static str,
     quality_action: &'static str,
+    texture_override: Option<u8>,
     actual_graphics_values: std::collections::BTreeMap<String, String>,
 }
 
@@ -279,32 +287,149 @@ impl NativeGraphicsLaunch {
             "config_path":self.config_path,"settings_path":self.settings_path,
             "settings_action":self.settings_action,"changed_tags":self.changed_tags,"backup_path":self.backup_path,
             "marker_path":self.marker_path,"marker_action":self.marker_action,
-            "quality_action":self.quality_action,"actual_graphics_values":self.actual_graphics_values,
-            "settings_scope":"Preset is a requested one-time change, not a claim about current GTA quality. Existing choices are preserved on unchanged launch; Clarity changes textures/filtering/blur only; MSAA remains disabled for immersive depth. Resolution and frame cap apply separately."})
+            "quality_action":self.quality_action,"texture_override":self.texture_override,
+            "actual_graphics_values":self.actual_graphics_values,
+            "settings_scope":"Preset is a requested one-time change, not a claim about current GTA quality. Existing choices are preserved on unchanged launch; Clarity changes textures/filtering/blur only; a launcher Textures choice is applied after any preset; MSAA remains disabled for immersive depth. Resolution and frame cap apply separately."})
     }
+}
+
+/// Read one small optional launcher JSON object. A missing file is `None`;
+/// unknown keys are left to their owners.
+fn read_native_object(save_root: &Path, name: &str) -> anyhow::Result<Option<serde_json::Map<String, serde_json::Value>>> {
+    use anyhow::{ensure, Context};
+    use std::io::Read;
+    let file = match std::fs::File::open(save_root.join(name)) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).with_context(|| format!("open {name}")),
+    };
+    let mut text = String::new();
+    file.take(65_537).read_to_string(&mut text).with_context(|| format!("read {name}"))?;
+    ensure!(text.len() <= 65_536, "{name} is too large");
+    let value: serde_json::Value = serde_json::from_str(&text).with_context(|| format!("parse {name}"))?;
+    match value {
+        serde_json::Value::Object(object) => Ok(Some(object)),
+        _ => anyhow::bail!("{name} must contain a JSON object"),
+    }
+}
+
+fn optional_bool(object: &serde_json::Map<String, serde_json::Value>, key: &str) -> anyhow::Result<Option<bool>> {
+    object.get(key).map(|value| value.as_bool().ok_or_else(|| anyhow::anyhow!("{key} must be a boolean"))).transpose()
 }
 
 /// Story is the normal launch. Developer mode deliberately opts into the
 /// original guest's Sandbox path; this does not alter the compiled game AOT.
 fn native_start_mode(save_root: &Path) -> anyhow::Result<u32> {
+    let Some(object) = read_native_object(save_root, "native-gameplay.json")? else { return Ok(1) };
+    Ok(if optional_bool(&object, "developer_mode")?.unwrap_or(false) { 2 } else { 1 })
+}
+
+/// The launcher's Textures choice. Absent or null keeps GTA's own value; a
+/// choice is applied after any quality preset, so the two stay independent.
+fn native_texture_quality(save_root: &Path) -> anyhow::Result<Option<u8>> {
+    let Some(object) = read_native_object(save_root, "native-textures.json")? else { return Ok(None) };
+    match object.get("texture_quality") {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(value) => value.as_u64().filter(|quality| *quality <= 2).map(|quality| Some(quality as u8))
+            .ok_or_else(|| anyhow::anyhow!("texture_quality must be 0, 1, 2 or null")),
+    }
+}
+
+/// Prelaunch audio and multiplayer choices. Mute is separate from the saved
+/// master volume, so unmuting restores the chosen level.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct NativeSession {
+    pub mute: bool,
+    pub multiplayer: Option<NativeMultiplayer>,
+}
+
+/// Muguet's existing UDP session, selected before the engine starts.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NativeMultiplayer {
+    pub host: bool,
+    /// Normalized `host:port` when joining.
+    pub server: Option<String>,
+    pub player_name: String,
+}
+
+const NATIVE_DEFAULT_PLAYER: &str = "Vision Pro";
+
+impl NativeSession {
+    fn load(save_root: &Path) -> anyhow::Result<Self> {
+        let mute = match read_native_object(save_root, "native-audio.json")? {
+            Some(object) => optional_bool(&object, "mute")?.unwrap_or(false),
+            None => false,
+        };
+        let multiplayer = match read_native_object(save_root, "native-multiplayer.json")? {
+            Some(object) if optional_bool(&object, "multiplayer")?.unwrap_or(false) => Some(NativeMultiplayer::parse(&object)?),
+            _ => None,
+        };
+        Ok(Self { mute, multiplayer })
+    }
+
+    /// Environment consumed by audio::start and mp::net. Absent choices leave
+    /// any explicit diagnostic environment untouched.
+    fn environment(&self) -> Vec<(&'static str, Option<String>)> {
+        let mut values = Vec::new();
+        if self.mute { values.push(("MUGUET_MUTE", Some("1".into()))); }
+        if let Some(multiplayer) = &self.multiplayer {
+            values.push(("MUGUET_HOST", multiplayer.host.then(|| "1".into())));
+            values.push(("MUGUET_SERVER", multiplayer.server.clone()));
+            values.push(("MUGUET_NAME", Some(multiplayer.player_name.clone())));
+        }
+        values
+    }
+
+    pub fn status_json(&self) -> serde_json::Value {
+        serde_json::json!({"mute": self.mute, "multiplayer": self.multiplayer.as_ref().map(|multiplayer| serde_json::json!({
+            "role": if multiplayer.host { "host" } else { "join" }, "server": multiplayer.server,
+            "player_name": multiplayer.player_name, "port": crate::proto::DEFAULT_PORT,
+            "scope": "Muguet LAN UDP session between V players; not Rockstar GTA Online"}))})
+    }
+}
+
+impl NativeMultiplayer {
+    fn parse(object: &serde_json::Map<String, serde_json::Value>) -> anyhow::Result<Self> {
+        let text = |key: &str| -> anyhow::Result<String> {
+            match object.get(key) {
+                None => Ok(String::new()),
+                Some(value) => value.as_str().map(|text| text.trim().to_string()).ok_or_else(|| anyhow::anyhow!("{key} must be text")),
+            }
+        };
+        let host = optional_bool(object, "host")?.unwrap_or(false);
+        let server = if host { None } else { Some(multiplayer_address(&text("server")?)?) };
+        let name: String = text("player_name")?.chars().filter(|c| !c.is_control()).collect();
+        anyhow::ensure!(name.chars().count() <= 24, "Use a player name of at most 24 characters.");
+        let player_name = if name.trim().is_empty() { NATIVE_DEFAULT_PLAYER.into() } else { name.trim().into() };
+        Ok(Self { host, server, player_name })
+    }
+}
+
+/// Validate a host address for Muguet's IPv4 UDP client: IPv4 or a host name,
+/// with an optional port. Returns `host:port`.
+pub fn multiplayer_address(raw: &str) -> anyhow::Result<String> {
     use anyhow::{ensure, Context};
-    use std::io::Read;
-    let path = save_root.join("native-gameplay.json");
-    let file = match std::fs::File::open(&path) {
-        Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(1),
-        Err(error) => return Err(error).context("open native-gameplay.json"),
+    let text = raw.trim();
+    ensure!(!text.is_empty(), "Enter the host's address to join.");
+    ensure!(text.matches(':').count() <= 1 && !text.contains('['), "Use the host's IPv4 address or name, for example 192.168.1.20.");
+    let (host, port) = match text.split_once(':') {
+        Some((host, port)) => (host, port.parse::<u16>().ok().filter(|port| *port != 0).context("The port must be a number from 1 to 65535.")?),
+        None => (text, crate::proto::DEFAULT_PORT),
     };
-    let mut text = String::new();
-    file.take(65_537).read_to_string(&mut text).context("read native-gameplay.json")?;
-    ensure!(text.len() <= 65_536, "native-gameplay.json is too large");
-    let value: serde_json::Value = serde_json::from_str(&text).context("parse native-gameplay.json")?;
-    let object = value.as_object().ok_or_else(|| anyhow::anyhow!("native gameplay config must be an object"))?;
-    let developer = match object.get("developer_mode") {
-        None => false,
-        Some(value) => value.as_bool().ok_or_else(|| anyhow::anyhow!("developer_mode must be a boolean"))?,
-    };
-    Ok(if developer { 2 } else { 1 })
+    let labels: Vec<&str> = host.split('.').collect();
+    let valid_name = host.len() <= 253 && labels.iter().all(|label| !label.is_empty() && label.len() <= 63
+        && !label.starts_with('-') && !label.ends_with('-') && label.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-'));
+    let numeric = labels.iter().all(|label| label.bytes().all(|c| c.is_ascii_digit()));
+    ensure!(valid_name && (!numeric || host.parse::<std::net::Ipv4Addr>().is_ok()),
+        "Use the host's IPv4 address or name, for example 192.168.1.20.");
+    Ok(format!("{host}:{port}"))
+}
+
+static NATIVE_SESSION_STATUS: std::sync::Mutex<Option<serde_json::Value>> = std::sync::Mutex::new(None);
+
+/// The launcher choices applied by the latest native startup.
+pub fn native_session_status() -> Option<serde_json::Value> {
+    NATIVE_SESSION_STATUS.lock().ok().and_then(|status| status.clone())
 }
 
 const LOW_GRAPHICS: &[(&str, &str)] = &[
@@ -605,6 +730,12 @@ fn prepare_native_graphics(save_root: &Path) -> anyhow::Result<NativeGraphicsLau
         NativeGraphicsPreset::Existing => "kept_existing",
         _ => "preserved_game_choices",
     };
+    let texture_override = native_texture_quality(save_root)?;
+    if let Some(quality) = texture_override {
+        let wanted = [(("graphics", "TextureQuality"), quality.to_string())].into_iter().collect();
+        let (updated, tags) = settings_xml_with_values(&xml, wanted).context("apply launcher texture quality")?;
+        xml = updated; changed_tags.extend(tags);
+    }
     if existed && video_changed {
         let (updated, tags) = video_settings_xml(&xml, &config).context("apply changed native resolution and frame cap")?;
         xml = updated; changed_tags.extend(tags);
@@ -650,7 +781,7 @@ fn prepare_native_graphics(save_root: &Path) -> anyhow::Result<NativeGraphicsLau
     let mut actual_graphics_values = std::collections::BTreeMap::new();
     settings_xml_with_observed_values(&xml, std::collections::BTreeMap::new(), &mut actual_graphics_values)?;
     let launch = NativeGraphicsLaunch { config, config_path, config_source, settings_path, settings_action,
-        changed_tags, backup_path, marker_path, marker_action, quality_action, actual_graphics_values };
+        changed_tags, backup_path, marker_path, marker_action, quality_action, texture_override, actual_graphics_values };
     eprintln!("[config] native graphics {}", launch.status_json());
     Ok(launch)
 }
@@ -1117,5 +1248,127 @@ mod native_graphics_tests {
         std::fs::remove_dir_all(fixture.0.join("userdata")).unwrap();
         std::fs::write(fixture.0.join("userdata"), "directory blocked").unwrap();
         assert!(prepare_native_graphics(&fixture.0).is_err());
+    }
+
+    #[test]
+    fn launcher_session_absent_files_keep_previous_launch_exactly() {
+        let fixture = Fixture::new();
+        let session = NativeSession::load(&fixture.0).unwrap();
+        assert_eq!(session, NativeSession::default());
+        assert!(session.environment().is_empty(), "solo launch must not touch diagnostic environment");
+        assert_eq!(native_texture_quality(&fixture.0).unwrap(), None);
+        // The current Vision Pro files: volume and look stay; no mute or session keys yet.
+        std::fs::write(fixture.0.join("native-audio.json"), r#"{"master_volume":1}"#).unwrap();
+        std::fs::write(fixture.0.join("native-multiplayer.json"), r#"{"multiplayer":false,"host":false,"server":"not an address"}"#).unwrap();
+        assert_eq!(NativeSession::load(&fixture.0).unwrap(), NativeSession::default());
+    }
+
+    #[test]
+    fn mute_is_separate_from_the_saved_master_volume() {
+        let fixture = Fixture::new();
+        let text = r#"{"master_volume":0.8,"mute":true,"other":1}"#;
+        std::fs::write(fixture.0.join("native-audio.json"), text).unwrap();
+        let session = NativeSession::load(&fixture.0).unwrap();
+        assert!(session.mute);
+        assert_eq!(session.environment(), [("MUGUET_MUTE", Some("1".to_string()))]);
+        assert_eq!(std::fs::read_to_string(fixture.0.join("native-audio.json")).unwrap(), text);
+        assert_eq!(crate::audio::resolve_master_volume(None, Some(text)), 0.8, "unmuting restores the chosen volume");
+        for bad in [r#"{"mute":1}"#, r#"{"mute":"yes"}"#, "[]"] {
+            std::fs::write(fixture.0.join("native-audio.json"), bad).unwrap();
+            assert!(NativeSession::load(&fixture.0).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn multiplayer_join_and_host_select_muguet_transport_environment() {
+        let fixture = Fixture::new();
+        let path = fixture.0.join("native-multiplayer.json");
+        std::fs::write(&path, r#"{"multiplayer":true,"host":false,"server":" 192.168.1.20 ","player_name":" Zach "}"#).unwrap();
+        let join = NativeSession::load(&fixture.0).unwrap();
+        assert_eq!(join.environment(), [("MUGUET_HOST", None), ("MUGUET_SERVER", Some("192.168.1.20:47520".into())),
+            ("MUGUET_NAME", Some("Zach".into()))]);
+        std::fs::write(&path, r#"{"multiplayer":true,"host":true,"server":"stale text","player_name":""}"#).unwrap();
+        let host = NativeSession::load(&fixture.0).unwrap();
+        assert_eq!(host.environment(), [("MUGUET_HOST", Some("1".into())), ("MUGUET_SERVER", None),
+            ("MUGUET_NAME", Some(NATIVE_DEFAULT_PLAYER.into()))]);
+        assert_eq!(host.status_json()["multiplayer"]["role"], "host");
+        for bad in [r#"{"multiplayer":true,"host":false,"server":""}"#, r#"{"multiplayer":true,"server":"10.0.0.300"}"#,
+            r#"{"multiplayer":"yes"}"#, r#"{"multiplayer":true,"host":true,"player_name":"abcdefghijklmnopqrstuvwxyz"}"#,
+            r#"{"multiplayer":true,"host":1}"#] {
+            std::fs::write(&path, bad).unwrap();
+            assert!(NativeSession::load(&fixture.0).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn multiplayer_addresses_are_ipv4_or_names_with_valid_ports() {
+        for (raw, expected) in [("192.168.1.20", "192.168.1.20:47520"), ("10.0.0.5:5000", "10.0.0.5:5000"),
+            ("zachs-mac.local", "zachs-mac.local:47520"), ("host:65535", "host:65535")] {
+            assert_eq!(multiplayer_address(raw).unwrap(), expected);
+        }
+        for raw in ["", "  ", "1.2.3", "300.1.1.1", "a b", "host:0", "host:70000", "host:", "fe80::1", "[::1]:47520",
+            "-bad.local", "under_score", "http://host"] {
+            assert!(multiplayer_address(raw).is_err(), "{raw}");
+        }
+    }
+
+    #[test]
+    fn launcher_texture_choice_follows_any_preset_and_null_keeps_gta_value() {
+        let fixture = Fixture::new();
+        let path = fixture.settings();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let original = current_quality_xml();
+        std::fs::write(&path, &original).unwrap();
+        // Clarity's one-time TextureQuality 2 is still followed by the explicit launcher choice.
+        fixture.preset(2560, 1440, 60, "clarity");
+        std::fs::write(fixture.0.join("native-textures.json"), r#"{"texture_quality":0}"#).unwrap();
+        let launch = prepare_native_graphics(&fixture.0).unwrap();
+        assert_eq!(launch.texture_override, Some(0));
+        assert_eq!(launch.actual_graphics_values["TextureQuality"], "0");
+        assert_eq!(launch.actual_graphics_values["AnisotropicFiltering"], "16", "preset still applies its other choices");
+        assert_eq!(std::fs::read_to_string(launch.backup_path.unwrap()).unwrap(), original);
+        // Unchanged preset, new texture choice: only TextureQuality moves.
+        std::fs::write(fixture.0.join("native-textures.json"), r#"{"texture_quality":2}"#).unwrap();
+        let launch = prepare_native_graphics(&fixture.0).unwrap();
+        assert_eq!(launch.changed_tags, ["TextureQuality"]);
+        let current = std::fs::read_to_string(&path).unwrap();
+        // Null and absent keep whatever GTA now has.
+        std::fs::write(fixture.0.join("native-textures.json"), r#"{"texture_quality":null}"#).unwrap();
+        assert_eq!(prepare_native_graphics(&fixture.0).unwrap().settings_action, "unchanged");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), current);
+        for bad in [r#"{"texture_quality":3}"#, r#"{"texture_quality":"high"}"#, r#"{"texture_quality":-1}"#, "nope"] {
+            std::fs::write(fixture.0.join("native-textures.json"), bad).unwrap();
+            assert!(prepare_native_graphics(&fixture.0).is_err(), "{bad}");
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), current, "invalid choice must not write");
+        }
+    }
+
+    #[test]
+    fn setup_native_applies_launcher_choices_before_engine_start() {
+        let fixture = Fixture::new();
+        let game = fixture.0.join("game");
+        std::fs::create_dir_all(game.join("data")).unwrap();
+        std::fs::write(game.join("data/manifest.json"), "{}").unwrap();
+        std::fs::create_dir_all(game.join("b/test/shaders")).unwrap();
+        std::fs::write(game.join("b/test/shaders/index.json"), "{}").unwrap();
+        let saves = fixture.0.join("saves");
+        std::fs::create_dir_all(&saves).unwrap();
+        std::fs::write(saves.join("native-gameplay.json"), r#"{"developer_mode":false}"#).unwrap();
+        std::fs::write(saves.join("native-graphics.json"), r#"{"width":2560,"height":1440,"fps_limit":60,"graphics_preset":"clarity"}"#).unwrap();
+        std::fs::write(saves.join("native-multiplayer.json"), r#"{"multiplayer":true,"host":false,"server":"192.168.4.7","player_name":"Vision"}"#).unwrap();
+        // A rejected choice fails before settings.xml exists and before any environment is chosen.
+        std::fs::write(saves.join("native-textures.json"), r#"{"texture_quality":9}"#).unwrap();
+        assert!(setup_native(&game, &saves).is_err());
+        assert!(!saves.join("userdata").exists());
+        std::fs::write(saves.join("native-textures.json"), r#"{"texture_quality":1}"#).unwrap();
+        let startup = setup_native(&game, &saves).unwrap();
+        assert_eq!(startup.engine_args, ["-frameLimit=1", "-wasmstartchoice=1"]);
+        assert_eq!(std::env::var("MUGUET_SERVER").unwrap(), "192.168.4.7:47520");
+        assert_eq!(std::env::var("MUGUET_NAME").unwrap(), "Vision");
+        assert!(std::env::var_os("MUGUET_HOST").is_none());
+        assert_eq!(native_session_status().unwrap()["multiplayer"]["role"], "join");
+        let xml = std::fs::read_to_string(saves.join("userdata/Documents/Rockstar Games/GTA V/settings.xml")).unwrap();
+        assert!(xml.contains(r#"<TextureQuality value="1" />"#));
+        for key in ["MUGUET_SERVER", "MUGUET_NAME", "MUGUET_FSROOT", "MUGUET_DATA", "MUGUET_SHADERS"] { std::env::remove_var(key); }
     }
 }

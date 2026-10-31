@@ -2994,3 +2994,60 @@ fn remove_mirror(c: &mut Cmd, m: Mirror) {
         delete_ped(c, m.ent);
     }
 }
+
+#[cfg(test)]
+mod session_tests {
+    use super::*;
+
+    fn receive(sock: &UdpSocket, kind: u8) -> Vec<u8> {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut buf = [0u8; 1500];
+        while Instant::now() < deadline {
+            if let Ok(n) = sock.recv(&mut buf) {
+                if let Some((k, payload)) = proto::parse(&buf[..n]) {
+                    if k == kind { return payload.to_vec(); }
+                }
+            }
+        }
+        panic!("no packet {kind} within 10 s");
+    }
+
+    /// The exact host environment config::setup_native applies on Vision Pro:
+    /// mp::net starts the real UDP server, joins it, and a second player
+    /// joining over UDP is announced to both sides.
+    #[test]
+    #[ignore = "binds UDP port 47520 and sets process environment; run alone"]
+    fn native_host_session_accepts_a_joining_player_over_udp() {
+        std::env::set_var("MUGUET_HOST", "1");
+        std::env::remove_var("MUGUET_SERVER");
+        std::env::set_var("MUGUET_NAME", "Vision Pro");
+        let net = net().expect("host session");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while net.my_id.lock().unwrap().is_none() {
+            assert!(Instant::now() < deadline, "host never received WELCOME");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let host_id = net.my_id.lock().unwrap().unwrap();
+
+        let friend = UdpSocket::bind("127.0.0.1:0").unwrap();
+        friend.set_read_timeout(Some(Duration::from_millis(100))).unwrap();
+        friend.connect(("127.0.0.1", proto::DEFAULT_PORT)).unwrap();
+        friend.send(&proto::packet(proto::HELLO, b"iPad")).unwrap();
+        let friend_id = receive(&friend, proto::WELCOME)[0];
+        assert_ne!(friend_id, host_id);
+        let name = receive(&friend, proto::NAME);
+        assert_eq!((name[0], proto::clean_name(&name[1..])), (host_id, "Vision Pro".to_string()));
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while net.peers.lock().unwrap().get(&friend_id).map(|peer| peer.name.as_str()) != Some("iPad") {
+            assert!(Instant::now() < deadline, "host never learned the joining player's name");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        // A reliable game event relayed by the server reaches the host's
+        // receive loop, which acknowledges it back through the server.
+        friend.send(&proto::packet(proto::REL, &[1, 0, proto::KILLFEED, friend_id, 0, 0, 0, 0])).unwrap();
+        assert_eq!(receive(&friend, proto::ACK), [host_id, friend_id, 1, 0]);
+        shutdown();
+        friend.send(&proto::packet(proto::BYE, &[])).unwrap();
+    }
+}
