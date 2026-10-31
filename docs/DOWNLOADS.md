@@ -14,5 +14,5 @@ All downloads are experimental and require your own supported game files. Check 
 
 The iPhone/iPad and Vision Pro packages above predate **build 31**, which adds V options and Play with friends to the iPhone/iPad and Vision Pro launchers. For what changed and how to build it from source, see [Build 31: V options and Play with friends](V31-LAUNCHER-MULTIPLAYER.md) and [V on iPhone and iPad](IPAD-IPHONE-SETUP.md).
 
-<!-- V31-DOWNLOADS: build 31 package links, if published, go here. -->
+Build 31 has no public download: its device builds embed compiled game code and a private signing profile. Build it from source with your own game files.
 

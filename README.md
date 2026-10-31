@@ -66,9 +66,9 @@ The main branch contains our current V development work, not just the inherited 
 
 ### Build 31 packages
 
-<!-- V31-PACKAGES: package names, SHA-256 values and install results go here. -->
+Build 31 was built from [`430b768`](https://github.com/zschwendi/avp-gta/commit/430b768e2599590012a16397d1a532f132d56722) and installed in place on October 31, 2026 on an M2 Apple Vision Pro (30 → 31), an M5 iPad Pro (28 → 31) and an iPhone Air (28 → 31). Saves and launcher settings were kept: every Vision Pro save/settings file and the iPhone's game files kept their paths and sizes, and the iPad's `config.json` is byte-identical. The iPad's game data was then imported from a Mac (12,156 files, 15.65 GB, manifest published last) and the Story Mode prologue started on build 31. Two-device Play with friends is not yet accepted.
 
-Build 31 package and installation results have not been recorded yet.
+These device-signed builds contain the compiled game code and a private development profile, so build 31 is not attached to a GitHub release. Build it from source with your own game files: [iPhone and iPad](docs/IPAD-IPHONE-SETUP.md), [Vision Pro](AVP-INSTALL.md). The published 28.1 and 30.1 previews predate build 31.
 
 The [fidelity checkpoint](docs/THIRD-PERSON-FIDELITY-20261025.md) and [V28 package record](docs/V28-FRONT-GLASS-PACKAGE-20261026.md) preserve the earlier investigation and frozen package history. The original 27.3 source is preserved by the `los-santos-third-person-quality-preview27-3-20261025` tag.
 

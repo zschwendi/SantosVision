@@ -114,7 +114,7 @@ Addresses are validated before launch. Spaces, IPv6 brackets, invalid IPv4 numbe
 
 ## Acceptance status
 
-<!-- V31-DEVICE-RESULTS: add per-device install and in-game results here when they exist. -->
+Installed in place on October 31, 2026 from `430b768`: Vision Pro 30 → 31, iPad Pro 28 → 31 and iPhone Air 28 → 31, with saves and launcher settings kept. On the iPad the new launcher read the saved values (Story Mode, 50 %, 60 fps) and, after the game data import, the Story Mode prologue started. The Vision Pro options sheet has not yet been checked in the headset, and no two-device session has been played.
 
 Verified so far:
 
