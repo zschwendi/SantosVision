@@ -1,0 +1,56 @@
+{
+  "repository": "https://github.com/zschwendi/SantosVision",
+  "platform": "iOS",
+  "sourceRevision": "039aaad40fef98e7aee75684f3e02b000394174c",
+  "inputProvenance": {
+    "kind": "historical-build-repack",
+    "originalExecutableSHA256": "968d1c8425182dac8137144b5937e253ed6fa5fc33d80dca73656b203e0b2bfd",
+    "gameplayAfterResigningTested": false,
+    "nativeSourceRevision": "039aaad40fef98e7aee75684f3e02b000394174c",
+    "aotSourceRevision": "cfc03d7dd281e52a4bad95905445acf0a8850346",
+    "gameBuild": "8b0b5899ed",
+    "sourceNote": "Native source inventory matches this commit except build-number metadata in ios/Info.plist."
+  },
+  "executable": "muguet",
+  "inputBuild": "28",
+  "assetName": "SantosVision-iOS-28.1.ipa",
+  "include": [
+    "AppIcon60x60@2x.png",
+    "AppIcon76x76@2x~ipad.png",
+    "Assets.car",
+    "Info.plist",
+    "PkgInfo",
+    "muguet"
+  ],
+  "exclude": [
+    "_CodeSignature",
+    "embedded.mobileprovision"
+  ],
+  "inputSHA256": {
+    "AppIcon60x60@2x.png": "fc2da7b19b59c85dbf8ecec72eeab57a9c940b9cd9ec228c698cd573fec35efa",
+    "AppIcon76x76@2x~ipad.png": "72438f2915390fcdff2a630d18b52f987e237ad73f7212b2f51951a5cafa34cb",
+    "Assets.car": "06010bd481839dc81ad99f2e3d466270c3bf6aed553ccfa7027e32fc15c00234",
+    "Info.plist": "af881ca1c326404ecc7bd43cc458f7630c601429dc6dfb965301a7378d0a629e",
+    "PkgInfo": "82502191c9484b04d685374f9879a0066069c49b8acae7a04b01d38d07e8eca0",
+    "muguet": "968d1c8425182dac8137144b5937e253ed6fa5fc33d80dca73656b203e0b2bfd"
+  },
+  "plistOverrides": {
+    "CFBundleVersion": "28.1",
+    "UIFileSharingEnabled": true,
+    "LSSupportsOpeningDocumentsInPlace": true
+  },
+  "entitlements": {
+    "com.apple.developer.kernel.extended-virtual-addressing": true,
+    "com.apple.developer.kernel.increased-memory-limit": true
+  },
+  "requiredInputCapabilities": {
+    "com.apple.developer.kernel.extended-virtual-addressing": true,
+    "com.apple.developer.kernel.increased-memory-limit": true
+  },
+  "changes": [
+    "Package the existing physical iPhone/iPad build; no engine recompilation.",
+    "Replace developer signing with ad-hoc transport signing; recipient must re-sign.",
+    "Preserve Extended Virtual Addressing and Increased Memory Limit; paid developer signing is required.",
+    "Enable Files access; no developer profile, signing certificate, registration or retail game-data files included."
+  ]
+}

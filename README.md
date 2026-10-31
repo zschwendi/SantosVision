@@ -1,3 +1,9 @@
+**[Windows / Linux IPA downloads — paid Apple Developer account required](docs/DOWNLOADS.md)**
+
+**Downloads:** [Choose iPhone/iPad, Vision Pro or Mac](docs/DOWNLOADS.md).
+
+**Paid Apple Developer account required for the supported GTA / V IPA installation route (iPhone/iPad and Vision Pro).** The native Mac ZIP does not require a developer account.
+
 <p align="center">
   <img src="assets/branding/spatial-v-front-glass-master-v28.png" alt="V — green Vision Pro front glass reflecting a Los Santos sunset" width="220">
 </p>
@@ -12,7 +18,7 @@ This is our Apple-platform fork of [Muguet](https://github.com/c22dev/muguet). M
 
 **V is a work in progress.** Windowed play is the visual reference. Immersive mode runs on a physical headset, but its grain, detail loss, edge artifacts, flicker, and performance still need work. A full-game completion pass is not certified.
 
-[Install on Vision Pro](docs/INSTALL-VISION-PRO.md) · [Game files](docs/GAME-FILES.md) · [iPhone and iPad](#iphone-and-ipad) · [How it works](#how-it-works) · [Contributing](#contributing)
+[Windows / Linux IPA guide](docs/SIDELOADING.md) · [Mac source build](docs/INSTALL-VISION-PRO.md) · [Game files](docs/GAME-FILES.md) · [iPhone and iPad](#iphone-and-ipad) · [How it works](#how-it-works) · [Contributing](#contributing)
 
 ## What you can expect
 
@@ -22,11 +28,16 @@ This is our Apple-platform fork of [Muguet](https://github.com/c22dev/muguet). M
 | **iPhone / iPad** | Native app, on-device ZIP import, gamepad/keyboard input, and on-screen controls. | The latest automatic touch-control handoff is in development source, after the frozen V28 package; physical gameplay validation continues. |
 | **Apple silicon Mac** | Inherited desktop runtime and the tools used to prepare mobile builds. | The main focus of this fork is iOS, iPadOS, and visionOS. |
 
-The name on your device is **V**. The GitHub repository is currently **SantosVision**, and internal targets, bundle identifiers, and save paths still use SantosVision or Muguet. Those names preserve build and data compatibility; they are not separate apps you need to install.
+The name on your device is **V**. The GitHub repository is **avp-gta** (formerly SantosVision). Internal targets, bundle identifiers, and save paths still use SantosVision or Muguet. Those names preserve build and data compatibility; they are not separate apps you need to install.
 
 ## Install and play on Vision Pro
 
-The complete walkthrough is [From zero to V on Vision Pro](docs/INSTALL-VISION-PRO.md). It covers a fresh Mac checkout, the matching game package, signing, headset pairing, data transfer, and the first launch.
+**Windows or Linux:** follow the [IPA installation walkthrough](docs/SIDELOADING.md)
+for Apparition, pairing, Apple signing, the V30.1 download, game-file preparation
+and transfer, and refreshes. No Mac is needed to install the published preview.
+
+**Mac source build:** [From zero to V on Vision Pro](docs/INSTALL-VISION-PRO.md)
+covers a fresh Mac checkout and the build steps below.
 
 There are two things to install: **the app**, containing the compiled game code, and **your matching game data**. Installing the app alone does not make Play ready.
 
@@ -36,15 +47,19 @@ There are two things to install: **the app**, containing the compiled game code,
 4. **Open V and choose Play.** Start in the ordinary game window with a compatible controller.
 5. **Try immersion.** Once the game world is loaded and GTA's pause menu is closed, use the window's upper-right expand button, **Enter immersive view**.
 
-**The current Vision Pro launcher does not have an on-device ZIP import button.** Its setup uses the Mac-side preparation and transfer described in the guide. The iPhone/iPad ZIP picker is a different interface.
+**The current Vision Pro launcher does not have an on-device ZIP import button.**
+For the IPA preview, prepare the matching data on Windows or Linux and copy it
+through Files as described in the [sideloading guide](docs/SIDELOADING.md).
+The source-build guide uses Mac-side preparation and transfer. The iPhone/iPad
+ZIP picker is a different interface.
 
 The main branch contains the V port; update an older Muguet-only checkout before following the build instructions.
 
-No public V release package is published as of October 28, 2026. The current installation route is a source build; a private signed development app is not a general download. Check [Releases](https://github.com/zschwendi/SantosVision/releases) for future packages and their specific signing instructions.
+An experimental [V30.1 IPA preview](docs/SIDELOADING.md) is available for re-signing with your own account. It exposes the app folder in Files for copying prepared game data from Windows or Linux. Fresh-account installation and gameplay through this route are not yet verified; the Mac source-build route above remains available.
 
 ### Source and installed-build status
 
-The main branch contains our current V development work, not just the inherited Muguet launcher. **V30**, built from [`7bd22fb`](https://github.com/zschwendi/SantosVision/commit/7bd22fbacd4f656d7ff1039c73ae293a9102ac9d), was installed on an M2 Apple Vision Pro on October 28, 2026. V29 was rejected for washed-out rendering in both the cold game window and immersive. V30 [restores retained texture inputs in the shared renderer](docs/V30-TEXTURE-INPUT-REGRESSION.md), with new native pixel regressions, while retaining the immersive sharpness changes. In-headset visual acceptance of this correction is still pending.
+The main branch contains our current V development work, not just the inherited Muguet launcher. **V30**, built from [`7bd22fb`](https://github.com/zschwendi/avp-gta/commit/7bd22fbacd4f656d7ff1039c73ae293a9102ac9d), was installed on an M2 Apple Vision Pro on October 28, 2026. V29 was rejected for washed-out rendering in both the cold game window and immersive. V30 [restores retained texture inputs in the shared renderer](docs/V30-TEXTURE-INPUT-REGRESSION.md), with new native pixel regressions, while retaining the immersive sharpness changes. In-headset visual acceptance of this correction is still pending.
 
 The [fidelity checkpoint](docs/THIRD-PERSON-FIDELITY-20261025.md) and [V28 package record](docs/V28-FRONT-GLASS-PACKAGE-20261026.md) preserve the earlier investigation and frozen package history. The original 27.3 source is preserved by the `los-santos-third-person-quality-preview27-3-20261025` tag.
 
@@ -162,4 +177,4 @@ GTA V and its game assets belong to their respective rights holders. V is an uno
 
 ## Issues
 
-[Check existing issues](https://github.com/zschwendi/SantosVision/issues) before opening a bug report or feature request. Include your device and OS, V build or source commit, windowed versus immersive mode, graphics settings, reproduction steps, and relevant logs. Explain what you expected and what happened; avoid uploading game files or personal data. Please keep Issues focused on bugs and feature requests.
+[Check existing issues](https://github.com/zschwendi/avp-gta/issues) before opening a bug report or feature request. Include your device and OS, V build or source commit, windowed versus immersive mode, graphics settings, reproduction steps, and relevant logs. Explain what you expected and what happened; avoid uploading game files or personal data. Please keep Issues focused on bugs and feature requests.

@@ -1,3 +1,6 @@
+For the IPA route and its current limits, see [sideloading](docs/SIDELOADING.md).
+The guide below covers building from source.
+
 # Install V on Apple Vision Pro
 
 V is the native Apple-platform GTA V port built on

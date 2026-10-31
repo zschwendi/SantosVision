@@ -21,3 +21,6 @@ __pycache__/
 /game/
 /gamedat/
 /mirror/
+
+# Local sideload packages; publish through GitHub Releases.
+release-output/
