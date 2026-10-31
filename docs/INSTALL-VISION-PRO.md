@@ -8,7 +8,7 @@ This is the source-build walkthrough for **V**, our iOS/iPadOS/visionOS take on 
 
 **Compatible game ZIP → validate → prepare data on the Mac → compile and sign V → install on Vision Pro → copy data → Play → expand into immersion.**
 
-The current Vision Pro launcher has **Play** and **Settings**, but no ZIP picker. The Mac-side import below is required. iPhone/iPad use a different launcher with **Import game data .zip**.
+The current Vision Pro launcher has **Play** and **Settings**, but no ZIP picker. The Mac-side import below is required. iPhone/iPad use a different launcher with **Import game data**.
 
 ## 1. What you need
 

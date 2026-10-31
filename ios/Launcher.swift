@@ -528,7 +528,7 @@ struct OptionsView: View {
                     friends
                     VStack(spacing: 4) {
                         Text(verbatim: "V \u{00B7} Build \(buildNumber)")
-                        Text("Based on Muguet by Constantin Clerc (c22dev) \u{00B7} MIT license")
+                        Text("Based on Muguet by Constantin Clerc (c22dev) \u{00B7} GPL-3.0 license")
                     }
                     .font(.caption2)
                     .foregroundStyle(.secondary)

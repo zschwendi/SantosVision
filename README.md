@@ -18,14 +18,14 @@ This is our Apple-platform fork of [Muguet](https://github.com/c22dev/muguet). M
 
 **V is a work in progress.** Windowed play is the visual reference. Immersive mode runs on a physical headset, but its grain, detail loss, edge artifacts, flicker, and performance still need work. A full-game completion pass is not certified.
 
-[Windows / Linux IPA guide](docs/SIDELOADING.md) · [Mac source build](docs/INSTALL-VISION-PRO.md) · [Game files](docs/GAME-FILES.md) · [iPhone and iPad](#iphone-and-ipad) · [How it works](#how-it-works) · [Contributing](#contributing)
+[Windows / Linux IPA guide](docs/SIDELOADING.md) · [Mac source build](docs/INSTALL-VISION-PRO.md) · [Game files](docs/GAME-FILES.md) · [iPhone and iPad setup](docs/IPAD-IPHONE-SETUP.md) · [Build 31 options and multiplayer](docs/V31-LAUNCHER-MULTIPLAYER.md) · [How it works](#how-it-works) · [Contributing](#contributing)
 
 ## What you can expect
 
 | Platform | Experience | Current limits |
 | --- | --- | --- |
 | **Apple Vision Pro** | Native game window, gamepad input, and experimental third-person immersion with head tracking and separate eye views. | Immersive image quality and sustained performance are unfinished. First-person aiming, Sense motion controls, and hand tracking are not the supported setup path. |
-| **iPhone / iPad** | Native app, on-device ZIP import, gamepad/keyboard input, and on-screen controls. | The latest automatic touch-control handoff is in development source, after the frozen V28 package; physical gameplay validation continues. |
+| **iPhone / iPad** | Native app, on-device ZIP import, V options, gamepad/keyboard input, and on-screen controls. | Build 31 source adds V options, Play with friends and the automatic touch-control handoff; the published 28.1 preview predates them. Physical gameplay validation continues. |
 | **Apple silicon Mac** | Inherited desktop runtime and the tools used to prepare mobile builds. | The main focus of this fork is iOS, iPadOS, and visionOS. |
 
 The name on your device is **V**. The GitHub repository is **avp-gta** (formerly SantosVision). Internal targets, bundle identifiers, and save paths still use SantosVision or Muguet. Those names preserve build and data compatibility; they are not separate apps you need to install.
@@ -37,7 +37,8 @@ for Apparition, pairing, Apple signing, the V30.1 download, game-file preparatio
 and transfer, and refreshes. No Mac is needed to install the published preview.
 
 **Mac source build:** [From zero to V on Vision Pro](docs/INSTALL-VISION-PRO.md)
-covers a fresh Mac checkout and the build steps below.
+covers a fresh Mac checkout and the build steps below. Starting from an existing
+checkout, such as one from the AVP Ports Index? Use [Install V on Apple Vision Pro](AVP-INSTALL.md).
 
 There are two things to install: **the app**, containing the compiled game code, and **your matching game data**. Installing the app alone does not make Play ready.
 
@@ -59,7 +60,15 @@ An experimental [V30.1 IPA preview](docs/SIDELOADING.md) is available for re-sig
 
 ### Source and installed-build status
 
-The main branch contains our current V development work, not just the inherited Muguet launcher. **V30**, built from [`7bd22fb`](https://github.com/zschwendi/avp-gta/commit/7bd22fbacd4f656d7ff1039c73ae293a9102ac9d), was installed on an M2 Apple Vision Pro on October 28, 2026. V29 was rejected for washed-out rendering in both the cold game window and immersive. V30 [restores retained texture inputs in the shared renderer](docs/V30-TEXTURE-INPUT-REGRESSION.md), with new native pixel regressions, while retaining the immersive sharpness changes. In-headset visual acceptance of this correction is still pending.
+The main branch contains our current V development work, not just the inherited Muguet launcher. **V30**, built from [`7bd22fb`](https://github.com/zschwendi/avp-gta/commit/7bd22fbacd4f656d7ff1039c73ae293a9102ac9d), was installed on an M2 Apple Vision Pro on October 28, 2026. V29 was rejected for washed-out rendering in both the cold game window and immersive. V30 [restores retained texture inputs in the shared renderer](docs/V30-TEXTURE-INPUT-REGRESSION.md), with new native pixel regressions, while retaining the immersive sharpness changes. The wearer has since accepted the V30 normal game window; immersive image quality is still unresolved.
+
+**Build 31** (visionOS and iOS/iPadOS) adds **V options** to both launchers: tap the **V** title before Play to choose Story Mode or Sandbox, resolution, textures, frame limit, look sensitivity, mute, and **Play with friends**. Each device keeps its saved values; the update resets nothing. Build 31 makes no renderer changes. See [Build 31: V options and Play with friends](docs/V31-LAUNCHER-MULTIPLAYER.md).
+
+### Build 31 packages
+
+<!-- V31-PACKAGES: package names, SHA-256 values and install results go here. -->
+
+Build 31 package and installation results have not been recorded yet.
 
 The [fidelity checkpoint](docs/THIRD-PERSON-FIDELITY-20261025.md) and [V28 package record](docs/V28-FRONT-GLASS-PACKAGE-20261026.md) preserve the earlier investigation and frozen package history. The original 27.3 source is preserved by the `los-santos-third-person-quality-preview27-3-20261025` tag.
 
@@ -92,12 +101,14 @@ python3 scripts/validate-game.py /absolute/path/to/game.zip
 
 ## iPhone and iPad
 
+The complete walkthrough is [V on iPhone and iPad](docs/IPAD-IPHONE-SETUP.md): building with your own game ZIP, signing and installing, getting game files onto the device, V options, updates that keep your saves, and troubleshooting. From Windows or Linux, the [iOS IPA guide](docs/IOS-SIDELOADING.md) installs the published 28.1 preview, which predates build 31's launcher.
+
 The iOS/iPadOS launcher has an actual file picker:
 
 1. Install a device-signed V build with the matching game code embedded.
-2. Put the compatible ZIP somewhere the device's Files picker can access. Download it locally before starting a large import.
-3. Open V and select **Import game data .zip**.
-4. Keep the app in the foreground until **Importing…** finishes, then choose **Play**.
+2. Put the compatible ZIP somewhere the device's Files picker can access, for example through Finder › your device › **Files** › **V**. Download it locally before starting a large import.
+3. Open V and select **Import game data**.
+4. Keep the app in the foreground until **Importing…** finishes. Optionally tap the **V** title for **V options**, then choose **Play**.
 
 Source builds use the existing iOS helper after installing Rust 1.98.1, the `aarch64-apple-ios` target, and XcodeGen:
 
@@ -109,7 +120,7 @@ RUSTUP_TOOLCHAIN=1.98.1 \
   ./make-ios.sh /absolute/path/to/game.zip --install YOUR_DEVICE_ID
 ~~~
 
-Use your own signing identity and select the exact iPhone or iPad from `xcrun devicectl list devices`. The helper's internal Xcode target remains **Muguet**; the installed app title is **V**. The project's iOS deployment target is 15.0, which is not a promise of acceptable performance on every device running that version. The normal build requests increased-memory and extended-address-space entitlements; signing eligibility and available memory matter.
+Use your own signing identity and select the exact iPhone or iPad from `xcrun devicectl list devices`. Always set `BUNDLE_ID` and reuse it for updates; if it is unset, the helper uses upstream Muguet's `ch.cclerc.muguet.ios`, which is a separate app container. The helper's internal Xcode target remains **Muguet**; the installed app title is **V**. The project's iOS deployment target is 15.0, which is not a promise of acceptable performance on every device running that version. The normal build requests increased-memory and extended-address-space entitlements; signing eligibility and available memory matter.
 
 The helper also supports `--ipa` and a reduced-memory `FREE=1` configuration. These are packaging options, not a guarantee that every signing service or free account will run the game. See `make-ios.sh` before choosing them.
 
@@ -117,13 +128,13 @@ The helper also supports `--ipa` and a reduced-memory `FREE=1` configuration. Th
 
 A normal compatible gamepad is the starting point on Vision Pro. Use GTA's own button prompts for movement, combat, driving, and menus. Advanced tracked aiming and hand interactions are unfinished.
 
-On iPhone and iPad, the latest source shows touch controls during gameplay when neither an extended game controller nor a hardware keyboard is connected. They cover movement, camera, combat, vehicles, interaction, weapons, and menu navigation. Connecting a physical input device hides the overlay and releases touch-held inputs. This improvement is for the next build after the frozen V28 package.
+On iPhone and iPad, the latest source shows touch controls during gameplay when neither an extended game controller nor a hardware keyboard is connected. They cover movement, camera, combat, vehicles, interaction, weapons, and menu navigation. Connecting a physical input device hides the overlay and releases touch-held inputs. Build 31 is the first iPhone/iPad build to include this; the 28.1 preview does not.
 
 ## Graphics and immersion
 
 V keeps the game's rendering effects and builds immersion from separately retained per-eye color, depth, and camera data. The current focus is making that immersive image match the finished windowed game more closely.
 
-Vision Pro Settings offers **Existing GTA**, **Performance**, and **Clarity** presets. A fresh configuration starts at **960×540**, a **60 FPS cap**, and **Existing GTA**. Existing saved choices remain in use. A frame cap is a limit, not measured performance.
+Vision Pro Settings offers **Existing GTA**, **Performance**, and **Clarity** presets. A fresh configuration starts at **960×540**, a **60 FPS cap**, and **Existing GTA**. Existing saved choices remain in use. A frame cap is a limit, not measured performance. Build 31's **V options** add a separate **Textures** choice, applied after any preset at each launch; until you pick one, GTA's own texture setting is kept.
 
 Change launch graphics settings before Play; quit the game and reopen V to apply another configuration. Raising resolution costs memory and render time, and cannot by itself fix every reprojection artifact.
 
@@ -138,7 +149,7 @@ Local shader comparisons demonstrate specific fixes; they do not certify a finis
 
 ## Saves and updates
 
-Save through GTA's own menus. The Vision Pro app keeps game data in `Documents/game` and local saves separately in `Documents/saves`.
+Save through GTA's own menus. On iPhone, iPad, and Vision Pro, V keeps game data in `Documents/game` and local saves separately in `Documents/saves`. Launcher settings are `Documents/config.json` on iPhone/iPad and the `native-*.json` files in `Documents/saves` on Vision Pro; updates read them as they are. [Settings files](docs/V31-LAUNCHER-MULTIPLAYER.md#settings-files-and-what-is-preserved) lists every key.
 
 Install updates over the existing app using the same signing identity and bundle ID. Export or back up your app data before changing identity or replacing an installation; deleting the app also deletes its local container.
 
@@ -152,7 +163,7 @@ On iPhone, iPad, and Vision Pro, the game code is compiled to ARM64 **before ins
 
 On Vision Pro, a SwiftUI app manages the launcher and game window. ARKit and CompositorServices provide the tracking and presentation used by the experimental immersive renderer. Windowed and immersive views share the same game session.
 
-Upstream Muguet also includes experimental UDP multiplayer. It is not GTA Online, and multiplayer interoperability is outside this fork's current verified setup path.
+Upstream Muguet also includes experimental UDP multiplayer. Build 31 exposes it on both platforms as **Play with friends**: one device hosts the session inside V and also plays, and friends on the same local network join by its address (UDP port 47520, up to 8 players). It is not GTA Online and does not use Rockstar services. A real UDP loopback session test passes; two-device in-game play has not been accepted yet. See [Play with friends](docs/V31-LAUNCHER-MULTIPLAYER.md#play-with-friends).
 
 ## Contributing
 
